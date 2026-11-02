@@ -1,0 +1,33 @@
+# Build-context filter for frontend/Dockerfile (context ./frontend, Compose service
+# `frontend`). Everything not listed here is sent to the builder; package.json,
+# package-lock.json, public/, src/, next.config.ts, tsconfig.json, next-env.d.ts,
+# eslint.config.mjs, jest.setup.ts and the other config files must stay in.
+
+# Dependencies and build output: the image installs and builds its own.
+node_modules
+.next
+out
+coverage
+*.tsbuildinfo
+
+# Test outputs and test sources the runtime image does not need.
+test-results
+playwright-report
+blob-report
+e2e
+src/__tests__
+
+# Secrets and local environment files. The *.example templates are not matched
+# and stay in the context.
+.env
+.env.local
+.env.e2e
+.env*.local
+
+# Logs, editor and VCS noise, and the Docker files themselves.
+npm-debug.log*
+*.log
+**/.DS_Store
+.git
+Dockerfile
+.dockerignore
