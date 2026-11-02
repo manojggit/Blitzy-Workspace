@@ -49,12 +49,14 @@ def StoreInto(value: Decimal | int, intDigits: int, decDigits: int, signed: bool
     Surplus fraction digits truncate toward zero (no ROUNDED) and integer digits beyond intDigits
     are dropped, keeping the sign (no ON SIZE ERROR). An unsigned receiver keeps the absolute
     value. The result always has exponent -decDigits, and a zero result is never negative.
-    A value needing more than 31 digits at the receiver's scale fits no COBOL intermediate and
-    raises decimal.InvalidOperation.
+    A value whose integer part needs more than the 31 digits of a COBOL intermediate raises
+    decimal.InvalidOperation.
     """
     number = _RequireDecimal(value)
     _RequirePicture(intDigits, decDigits)
-    with localcontext(COBOL_CONTEXT):
+    # A 31-digit intermediate keeps every digit while gaining the receiver's decimal places.
+    # Nothing is rounded: quantize truncates explicitly and the modulo is exact.
+    with localcontext(COBOL_CONTEXT, prec=COBOL_CONTEXT.prec + decDigits):
         truncated = number.quantize(Decimal(10) ** -decDigits, rounding=ROUND_DOWN)
         magnitude = _TruncateHighOrder(truncated.copy_abs(), intDigits)
     if signed and truncated.is_signed() and not magnitude.is_zero():

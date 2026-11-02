@@ -16,9 +16,12 @@ NEGATIVE_SIGNS = frozenset({"-", "CR", "DB"})
 # Fragments shared by both grammars. A space is only " ": TAB, LOW-VALUES and any other
 # character are invalid. [0-9] is used instead of \d, which also matches non-ASCII digits that
 # Decimal() accepts and a 3270 field cannot carry. The conditional admits a trailing sign only
-# when no leading sign was keyed, so at most one sign is present.
-_LEADING_SIGN_GRAMMAR = r"[ ]*(?:(?P<leadingSign>[+-])[ ]*)?"
-_TRAILING_SIGN_GRAMMAR = r"[ ]*(?(leadingSign)|(?P<trailingSign>[+-]|(?i:CR|DB))?)[ ]*"
+# when no leading sign was keyed, so at most one sign is present. The fragments' space runs are
+# possessive ([ ]*+): a space a run gave back could match nothing after it, or only the next
+# space run, which would end at the same place, so the grammar is unchanged and matching stays
+# linear on long runs of spaces.
+_LEADING_SIGN_GRAMMAR = r"[ ]*+(?:(?P<leadingSign>[+-])[ ]*+)?"
+_TRAILING_SIGN_GRAMMAR = r"[ ]*+(?(leadingSign)|(?P<trailingSign>[+-]|(?i:CR|DB))?)[ ]*+"
 
 # NUMVAL-C: [sp][+|-][sp][$][sp]{int[.[frac]] | .frac}[sp][+|-|CR|DB][sp], where commas may
 # group the integer part and never follow the decimal point.
