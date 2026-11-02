@@ -43,16 +43,13 @@ function IsEnterExcludedTarget(target: EventTarget | null): boolean {
     return target instanceof Element && target.closest(ENTER_EXCLUDED_SELECTOR) !== null;
 }
 
-// One physical press is one action, and modifier chords belong to the browser or the OS.
-function IsRepeatOrChord(event: KeyboardEvent): boolean {
-    if (event.repeat || event.isComposing) {
-        return true;
-    }
-    return event.ctrlKey || event.altKey || event.metaKey;
+// Modifier chords belong to the browser or the OS, and an IME composition owns its Enter.
+function IsChordOrComposing(event: KeyboardEvent): boolean {
+    return event.isComposing || event.ctrlKey || event.altKey || event.metaKey;
 }
 
 function HandleKeyDown(event: KeyboardEvent, definitions: readonly FunctionKeyDefinition[]): void {
-    if (IsRepeatOrChord(event)) {
+    if (IsChordOrComposing(event)) {
         return;
     }
     const definition = FindDefinition(definitions, event.key);
@@ -64,8 +61,9 @@ function HandleKeyDown(event: KeyboardEvent, definitions: readonly FunctionKeyDe
     }
     // Stops browser F3 search, F5 reload and F12 devtools, and native form submission on Enter.
     event.preventDefault();
-    // A disabled key is still swallowed, so F5 cannot reload the page and lose a screen_token.
-    if (definition.disabled) {
+    // One physical press is one action. An auto-repeat and a disabled key are still swallowed, so a
+    // held or inactive F5 cannot reload the page and lose a screen_token.
+    if (event.repeat || definition.disabled) {
         return;
     }
     definition.onPress();
