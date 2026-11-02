@@ -1,0 +1,19 @@
+tran_type_cd,tran_cat_cd,description
+01,1,Regular Sales Draft
+01,2,Regular Cash Advance
+01,3,Convenience Check Debit
+01,4,ATM Cash Advance
+01,5,Interest Amount
+02,1,Cash payment
+02,2,Electronic payment
+02,3,Check payment
+03,1,Credit to Account
+03,2,Credit to Purchase balance
+03,3,Credit to Cash balance
+04,1,Zero dollar authorization
+04,2,Online purchase authorization
+04,3,Travel booking authorization
+05,1,Refund credit
+06,1,Fraud reversal
+06,2,Non-fraud reversal
+07,1,Sales draft credit adjustment
