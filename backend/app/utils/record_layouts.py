@@ -782,9 +782,11 @@ class LineLayout:
 def RenderLine(values: dict[str, object], layout: LineLayout) -> str:
     """Render a print line as MOVEs into its record do, right-padded with spaces to its width.
 
-    A literal is padded or cut to its length. A field with a picture is the numeric-edited text
-    of a Decimal or int value. A field without one is a str, left-justified and padded or cut as
-    an alphanumeric MOVE leaves it. Raises RecordFormatError for a missing or unusable value.
+    A literal is padded with spaces to its length; LineSegment refuses a longer one when it is
+    built. A field with a picture is the numeric-edited text of a Decimal or int value. A field
+    without one is a str, left-justified and padded or cut as an alphanumeric MOVE leaves it.
+    Raises RecordFormatError for a missing or unusable value, including a non-finite Decimal and
+    one needing more than the 31 digits of a COBOL intermediate.
     """
     renderedSegments = [_RenderSegment(values, segment, layout) for segment in layout.segments]
     return "".join(renderedSegments).ljust(layout.width)
@@ -796,8 +798,11 @@ def _RenderSegment(values: dict[str, object], segment: LineSegment, layout: Line
         return _FitText(segment.literal, segment.length)
     try:
         return _RenderFieldSegment(values, segment)
-    except _FieldValueError as error:
+    except (_FieldValueError, ZonedDecimalError) as error:
         raise RecordFormatError(f"{layout.name} field {segment.fieldName}: {error}") from error
+    except InvalidOperation as error:
+        reason = "the value needs more than the 31 digits of a COBOL intermediate"
+        raise RecordFormatError(f"{layout.name} field {segment.fieldName}: {reason}") from error
 
 
 def _RenderFieldSegment(values: dict[str, object], segment: LineSegment) -> str:

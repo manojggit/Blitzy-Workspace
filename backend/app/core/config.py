@@ -8,8 +8,12 @@ Specified in the Technical Specification, Sections 0.7.1 and 0.7.6.
 Each value comes from the process environment, which overrides backend/.env (ENV_FILE), which
 overrides the defaults below. Field names are the environment-variable names, identical to
 backend/.env.example, docker-compose.yml and batch/config.py. SECRET_KEY and the database
-URLs come only from the environment: SECRET_KEY defaults to blank and fails closed, and the
-database URLs have no default, so no credential is written in code.
+URLs come only from the environment (the process environment or backend/.env). SECRET_KEY
+defaults to blank and fails closed. CommonSettings requires SYNC_DATABASE_URL, and its
+subclass Settings requires DATABASE_URL as well; both are declared without a default.
+MigrationSettings defaults SYNC_DATABASE_URL to blank so that offline migration SQL
+(alembic upgrade --sql) can be generated without a database. A blank default holds no
+credential, so no credential is written in code.
 
 Importing this module reads no setting; values are read when a settings class is built.
 """
@@ -41,9 +45,12 @@ class CommonSettings(BaseSettings):
     """
 
     # extra="ignore": leftover lines such as AUTH_MODE, CARDDEMO_OUTPUT_DIR or TEST_* in
-    # backend/.env are harmless. env_ignore_empty: "SECRET_KEY=" counts as unset, so the
-    # blank default applies and is refused. hide_input_in_errors: a ValidationError never
-    # echoes a rejected SECRET_KEY or a database URL with its password.
+    # backend/.env are harmless. env_ignore_empty: an empty value such as "SECRET_KEY=" in the
+    # process environment or in backend/.env is skipped like an unset one, so the next
+    # lower-priority source with a nonempty value supplies the setting. The blank SECRET_KEY
+    # default, which Settings.RejectWeakSecretKey refuses, applies only when no source supplies
+    # a nonempty value. hide_input_in_errors: a ValidationError never echoes a rejected
+    # SECRET_KEY or a database URL with its password.
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,
         env_file_encoding="utf-8",
@@ -83,9 +90,9 @@ class Settings(CommonSettings):
     LOGIN_LOCKOUT_SECONDS: int = Field(default=900, gt=0)
     # A plain comma-separated string: a list field would make pydantic-settings expect JSON.
     BACKEND_CORS_ORIGINS: str = "http://127.0.0.1:3000"
-    DB_CONNECT_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0)
-    DB_COMMAND_TIMEOUT_SECONDS: float = Field(default=30.0, gt=0)
-    HEALTH_READY_TIMEOUT_SECONDS: float = Field(default=2.0, gt=0)
+    DB_CONNECT_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0, allow_inf_nan=False)
+    DB_COMMAND_TIMEOUT_SECONDS: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+    HEALTH_READY_TIMEOUT_SECONDS: float = Field(default=2.0, gt=0, allow_inf_nan=False)
     ENABLE_API_DOCS: bool | None = None
     CARDDEMO_ASCII_DIR: str = "data/ASCII"
 
