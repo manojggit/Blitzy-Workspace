@@ -1,0 +1,310 @@
+"""Replaces: COUSR00C (CU00), BMS COUSR00, copybooks CSUSR01Y.
+
+The admin user list: USRSEC users 10 rows per page in EBCDIC key order, browsed from the
+search key with ENTER, paged with F8 and F7, and the U or D row selection that opens the
+update (COUSR02C) or delete (COUSR03C) screen.
+
+The COMMAREA paging state (CDEMO-CU00-PAGE-NUM, -USRID-FIRST, -USRID-LAST) comes back from the
+client as ``page`` and ``startKey``. NEXT-PAGE-FLG is derived instead: F8 reads past the last
+key shown, and finding nothing is the flag's ``N``. A browse that reads no row re-sent the
+screen with its old rows and only the message changed (SEND-ERASE-NO, or rows left in place),
+so it raises LegacyMessageError: the error body has no rows, and the page keeps its table.
+
+Legacy paths with no code here: ``EIBCALEN = 0`` (back to sign-on) is the RequireAdmin session
+guard; PF3 (``XCTL COADM01C``) is frontend navigation; other AID keys cannot reach the server;
+POPULATE-HEADER-INFO is the frontend ScreenShell; clearing USRIDIN after a browse is the page's.
+"""
+
+from collections.abc import Awaitable, Mapping, Sequence
+from typing import Any
+from urllib.parse import urlencode
+
+from app.core.dependencies import OnlineContext
+from app.core.errors import (
+    HTTP_EDIT_FAILURE,
+    HTTP_FILE_ERROR,
+    LegacyMessageError,
+    RepositoryError,
+)
+from app.core.locks import FileNotOpenError
+from app.core.messages import (
+    ALREADY_AT_BOTTOM_MESSAGE,
+    ALREADY_AT_TOP_MESSAGE,
+    AT_TOP_OF_PAGE_MESSAGE,
+    REACHED_BOTTOM_MESSAGE,
+    REACHED_TOP_MESSAGE,
+)
+from app.repositories.user_repository import UserRepository
+from app.schemas.common import Direction
+from app.schemas.users import (
+    UserListQuery,
+    UserListResponse,
+    UserListRow,
+    UserSelection,
+    UserSelectionRequest,
+    UserSelectionResponse,
+)
+
+# WS-USER-DATA, USER-REC OCCURS 10 TIMES (line 57).
+PAGE_SIZE = 10
+# PROCESS-ENTER-KEY line 212.
+INVALID_SELECTION_MESSAGE = "Invalid selection. Valid values are U and D"
+# The WHEN OTHER branches of STARTBR-, READNEXT- and READPREV-USER-SEC-FILE (lines 610, 644,
+# 678); the batch window's NOTOPEN reaches them too.
+UNABLE_TO_LOOKUP_USER_MESSAGE = "Unable to lookup User..."
+# The frontend pages of XCTL COUSR02C and XCTL COUSR03C (lines 190-209), keyed by userId.
+UPDATE_ROUTE = "/admin/users/update"
+DELETE_ROUTE = "/admin/users/delete"
+ROUTE_USER_ID_PARAMETER = "userId"
+# EVALUATE CDEMO-CU00-USR-SEL-FLG, WHEN 'U' WHEN 'u' and WHEN 'D' WHEN 'd' (lines 189-201).
+UPDATE_SELECTION_CODES = ("U", "u")
+DELETE_SELECTION_CODES = ("D", "d")
+# Every path ends with MOVE -1 TO USRIDINL: the cursor goes to the search field.
+SEARCH_CURSOR_FIELD = "search_user_id"
+REFUSAL_STATUS = HTTP_EDIT_FAILURE
+LOOKUP_ERROR_STATUS = HTTP_FILE_ERROR
+# MOVE SPACES TO WS-MESSAGE (MAIN-PARA): a page with no paging literal has a blank line.
+NO_MESSAGE = ""
+# ENTER moves 0 to CDEMO-CU00-PAGE-NUM before PROCESS-PAGE-FORWARD adds 1 (line 227).
+ENTER_BASE_PAGE = 0
+FIRST_PAGE = 1
+BLANK_CHARACTER = " "
+
+
+async def ListUsers(context: OnlineContext, query: UserListQuery) -> UserListResponse:
+    """Port the COUSR00 browse keys: ENTER and the first entry, F8 and F7.
+
+    The first entry (MAIN-PARA lines 115-119) and ENTER run PROCESS-ENTER-KEY, whose browse
+    starts at the search key (lines 218-228, then PROCESS-PAGE-FORWARD). F8 is PROCESS-PF8-KEY
+    (lines 260-277) and F7 PROCESS-PF7-KEY (lines 237-255), each followed by
+    PROCESS-PAGE-FORWARD or PROCESS-PAGE-BACKWARD.
+
+    Args:
+        context: The admin request context; its session serves the USRSEC browse.
+        query: Direction forward with an empty ``start_key`` is ENTER from ``search_user_id``;
+            forward with a ``start_key`` is F8 after that last key; backward is F7 before the
+            first key, from page ``page``.
+
+    Returns:
+        The page of at most 10 users, its page number, its first and last user IDs, and the
+        paging literal that applies, or an empty message.
+
+    Raises:
+        LegacyMessageError: 400 with ``You are already at the top of the page...`` (F7 on page
+            1), ``You are already at the bottom of the page...`` (F8 with nothing after the
+            last key), ``You are at the top of the page...`` (STARTBR NOTFND) or
+            ``You have reached the top of the page...`` (nothing before the first key); 503
+            with ``Unable to lookup User...`` while the batch window holds USRSEC or on a
+            database failure.
+    """
+    repository = UserRepository(context)
+    if query.direction == Direction.BACKWARD:
+        return await _PageBackward(repository, query.start_key, query.page)
+    # UserListQuery has no ENTER direction: forward with an empty startKey reads the first page,
+    # so it is ENTER (and the first entry) and browses from the search key.
+    if query.start_key == "":
+        return await _BrowseFromSearch(repository, query.search_user_id, NO_MESSAGE)
+    return await _PageForward(repository, query.start_key, query.page)
+
+
+async def ProcessUserSelection(
+    context: OnlineContext, request: UserSelectionRequest
+) -> UserSelectionResponse:
+    """Port ENTER with selection codes, PROCESS-ENTER-KEY (lines 149-232).
+
+    The first row with a non-blank code is the selection (EVALUATE TRUE, lines 151-185). With
+    a non-blank user ID, ``U`` or ``u`` routes to the update screen and ``D`` or ``d`` to the
+    delete screen, ending the request as XCTL ended the task. Any other code sets
+    ``Invalid selection. Valid values are U and D`` and processing continues: the list is
+    browsed from ``search_user_id``, and a paging literal set by that browse replaces it.
+
+    Args:
+        context: The admin request context; its session serves the USRSEC browse.
+        request: The shown rows with their codes, and the search key as keyed.
+
+    Returns:
+        The route of a valid selection with empty list fields, or ``route`` None with the
+        re-browsed page and its message.
+
+    Raises:
+        LegacyMessageError: 400 ``You are at the top of the page...`` when no user ID is at or
+            after the search key; 503 ``Unable to lookup User...`` while the batch window
+            holds USRSEC or on a database failure.
+    """
+    selection = _FindFirstSelection(request.selections)
+    priorMessage = NO_MESSAGE
+    if selection is not None and not _IsBlank(selection.user_id):
+        route = _RouteFor(selection)
+        if route is not None:
+            return UserSelectionResponse(route=route)
+        priorMessage = INVALID_SELECTION_MESSAGE
+    repository = UserRepository(context)
+    listPage = await _BrowseFromSearch(repository, request.search_user_id, priorMessage)
+    return UserSelectionResponse(**listPage.model_dump())
+
+
+def _IsBlank(text: str) -> bool:
+    """Return whether screen text is SPACES OR LOW-VALUES: empty or only spaces."""
+    return text.strip(BLANK_CHARACTER) == ""
+
+
+def _FindFirstSelection(selections: Sequence[UserSelection]) -> UserSelection | None:
+    """Return the first row whose SELnnnn code is not blank; later codes are ignored."""
+    for selection in selections:
+        if not _IsBlank(selection.selection):
+            return selection
+    return None
+
+
+def _RouteFor(selection: UserSelection) -> str | None:
+    """Return the update or delete route for a U/u or D/d code, or None for any other code.
+
+    The code is compared exactly and the user ID is passed as keyed, never case-folded.
+    """
+    if selection.selection in UPDATE_SELECTION_CODES:
+        return _RouteWithUserId(UPDATE_ROUTE, selection.user_id)
+    if selection.selection in DELETE_SELECTION_CODES:
+        return _RouteWithUserId(DELETE_ROUTE, selection.user_id)
+    return None
+
+
+def _RouteWithUserId(route: str, userId: str) -> str:
+    """Return ``route`` with the selected user ID as its ``userId`` query parameter."""
+    return f"{route}?{urlencode({ROUTE_USER_ID_PARAMETER: userId})}"
+
+
+def _Refusal(message: str) -> LegacyMessageError:
+    """Return the 400 refusal of a browse that reads no row, with the cursor on the search."""
+    return LegacyMessageError(message, field=SEARCH_CURSOR_FIELD, httpStatus=REFUSAL_STATUS)
+
+
+async def _Lookup(
+    browse: Awaitable[list[dict[str, Any]] | None],
+) -> list[dict[str, Any]] | None:
+    """Await one USRSEC browse; a file condition becomes ``Unable to lookup User...``.
+
+    Ports the WHEN OTHER branches of the STARTBR, READNEXT and READPREV paragraphs (lines
+    607-613, 641-647, 675-681). FileNotOpenError is the NOTOPEN of a USRSEC that CLOSEFIL closed.
+    """
+    try:
+        return await browse
+    except (FileNotOpenError, RepositoryError) as exc:
+        raise LegacyMessageError(
+            UNABLE_TO_LOOKUP_USER_MESSAGE,
+            field=SEARCH_CURSOR_FIELD,
+            httpStatus=LOOKUP_ERROR_STATUS,
+        ) from exc
+
+
+async def _BrowseFromSearch(
+    repository: UserRepository, searchUserId: str, priorMessage: str
+) -> UserListResponse:
+    """ENTER: browse from the search key, inclusive, as page 1 (lines 218-228, 282-331).
+
+    A blank search key is LOW-VALUES, the lowest key (line 219); ENTER skips no READNEXT
+    (line 288), so the first user ID at or after the key is shown. STARTBR NOTFND (lines
+    600-606) leaves the shown rows in place with ``You are at the top of the page...``.
+    """
+    startKey = None if _IsBlank(searchUserId) else searchUserId
+    browse = repository.BrowseForward(startKey, inclusive=True, limit=PAGE_SIZE)
+    records = await _Lookup(browse)
+    if records is None:
+        raise _Refusal(AT_TOP_OF_PAGE_MESSAGE)
+    return _BuildForwardPage(records, ENTER_BASE_PAGE, priorMessage)
+
+
+async def _PageForward(repository: UserRepository, lastKey: str, page: int) -> UserListResponse:
+    """F8: the page after the last key shown (PROCESS-PF8-KEY, PROCESS-PAGE-FORWARD).
+
+    The READNEXT skipped after STARTBR (line 289) makes the browse exclusive of the last key.
+    No key, or no user ID after it, is NEXT-PAGE-NO: ``You are already at the bottom of the
+    page...`` with the shown rows kept (lines 270-276).
+    """
+    if _IsBlank(lastKey):
+        raise _Refusal(ALREADY_AT_BOTTOM_MESSAGE)
+    browse = repository.BrowseForward(lastKey, inclusive=False, limit=PAGE_SIZE)
+    records = await _Lookup(browse)
+    if not records:
+        raise _Refusal(ALREADY_AT_BOTTOM_MESSAGE)
+    return _BuildForwardPage(records, page, NO_MESSAGE)
+
+
+def _BuildForwardPage(
+    records: Sequence[Mapping[str, Any]], basePage: int, priorMessage: str
+) -> UserListResponse:
+    """Build a PROCESS-PAGE-FORWARD result (lines 298-323).
+
+    ``records`` holds up to 10 page rows plus the look-ahead READNEXT. Without the look-ahead
+    the browse reached ENDFILE, whose ``You have reached the bottom of the page...`` replaces
+    any earlier message (lines 634-640). The page number grows by 1 once a row was read.
+    """
+    pageRows = records[:PAGE_SIZE]
+    hasNextPage = len(records) > PAGE_SIZE
+    message = priorMessage if hasNextPage else REACHED_BOTTOM_MESSAGE
+    page = basePage + 1 if pageRows else basePage
+    return _BuildPage(pageRows, page, message)
+
+
+async def _PageBackward(repository: UserRepository, firstKey: str, page: int) -> UserListResponse:
+    """F7: the page before the first key shown (PROCESS-PF7-KEY, PROCESS-PAGE-BACKWARD).
+
+    Page 1 refuses with ``You are already at the top of the page...`` (lines 248-255). A blank
+    first key is LOW-VALUES (line 240). The READPREV skipped after STARTBR (line 343) makes the
+    browse exclusive of the first key. STARTBR NOTFND and a READPREV ENDFILE before any row
+    leave the shown rows in place (lines 600-606, 668-674).
+    """
+    if page <= FIRST_PAGE:
+        raise _Refusal(ALREADY_AT_TOP_MESSAGE)
+    startKey = None if _IsBlank(firstKey) else firstKey
+    records = await _Lookup(repository.BrowseBackward(startKey, limit=PAGE_SIZE))
+    if records is None:
+        raise _Refusal(AT_TOP_OF_PAGE_MESSAGE)
+    if not records:
+        raise _Refusal(REACHED_TOP_MESSAGE)
+    return _BuildBackwardPage(records, page)
+
+
+def _BuildBackwardPage(records: Sequence[Mapping[str, Any]], page: int) -> UserListResponse:
+    """Build a PROCESS-PAGE-BACKWARD result (lines 351-372).
+
+    ``records`` holds the users before the first key, nearest first: up to 10 page rows plus
+    the look-ahead READPREV. The program filled rows 10 down to 1, so the page is the nearest
+    10 in ascending order. Fewer than 10 is ENDFILE with the page number unchanged; exactly 10
+    with ENDFILE on the look-ahead resets it to 1; a look-ahead row lowers it by 1.
+    """
+    pageRows = list(reversed(records[:PAGE_SIZE]))
+    if len(records) < PAGE_SIZE:
+        return _BuildPage(pageRows, page, REACHED_TOP_MESSAGE)
+    if len(records) > PAGE_SIZE:
+        return _BuildPage(pageRows, page - 1, NO_MESSAGE)
+    return _BuildPage(pageRows, FIRST_PAGE, REACHED_TOP_MESSAGE)
+
+
+def _BuildPage(pageRows: Sequence[Mapping[str, Any]], page: int, message: str) -> UserListResponse:
+    """Return the COUSR00 screen: the rows, the page number, the first and last keys, ERRMSG.
+
+    The first and last user IDs replace CDEMO-CU00-USRID-FIRST and -LAST (lines 388-389,
+    434-435); they are raw keys, which the client sends back as ``startKey``.
+    """
+    listRows = [_ToListRow(record) for record in pageRows]
+    return UserListResponse(
+        rows=listRows,
+        page=page,
+        first_key=listRows[0].user_id if listRows else "",
+        last_key=listRows[-1].user_id if listRows else "",
+        message=message,
+        cursor_field=SEARCH_CURSOR_FIELD,
+    )
+
+
+def _ToListRow(record: Mapping[str, Any]) -> UserListRow:
+    """Return the USRIDnn, FNAMEnn, LNAMEnn and UTYPEnn fields of one SEC-USER-DATA record.
+
+    POPULATE-USER-DATA moves only these four fields; ``password_hash`` is never read.
+    """
+    return UserListRow(
+        user_id=record["user_id"],
+        first_name=record["first_name"],
+        last_name=record["last_name"],
+        user_type=record["user_type"],
+    )
