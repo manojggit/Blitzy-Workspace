@@ -95,10 +95,10 @@ async def DisposeEngine(engine: AsyncEngine) -> None:
 async def GetSession(request: Request) -> AsyncIterator[AsyncSession]:
     """Yield the request's session, for reads that lock nothing.
 
-    The session never commits on its own: a caller that writes through it (only the login
-    throttle, in its own short transaction) commits explicitly. Leaving the request rolls back
-    anything uncommitted and returns the connection to the pool. Tests replace this dependency
-    through ``app.dependency_overrides[GetSession]``.
+    The session never commits and nothing writes through it: every write, the login throttle's
+    included, runs in a WriteUnit. Leaving the request rolls back the read-only transaction and
+    returns the connection to the pool. Tests replace this dependency through
+    ``app.dependency_overrides[GetSession]``.
     """
     sessionFactory: async_sessionmaker[AsyncSession] = request.app.state.sessionFactory
     async with sessionFactory() as session:
