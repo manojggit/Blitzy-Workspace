@@ -90,11 +90,13 @@ def ScreenText(maxLength: int) -> Any:
 
 
 def OpaqueToken(maxLength: int) -> Any:
-    """Opaque server-issued text (``card_ref``, ``screen_token``, paging keys), length only.
+    """Opaque server-issued token text, length only: ``card_ref``, ``screen_token`` and the
+    CCLI ``startKey``, which is a ``card_ref`` token.
 
     It has no pattern and no repertoire check: a forged or garbled ``screen_token`` must reach
     its decoder and restart the CAUP or CCUP flow, and a bad ``card_ref`` must give
-    ``Did not find cards for this search condition``, never a 422.
+    ``Did not find cards for this search condition``, never a 422. Raw record keys sent back
+    for paging, such as the CT00 TRAN-ID and the CU00 user ID, are ``ScreenText`` instead.
     """
     return Annotated[str, StringConstraints(max_length=maxLength)]
 

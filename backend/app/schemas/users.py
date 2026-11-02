@@ -19,9 +19,7 @@ from enum import StrEnum
 from pydantic import BaseModel, Field
 
 from app.schemas.common import (
-    START_KEY_MAX_LENGTH,
     Direction,
-    OpaqueToken,
     PageState,
     QueryModel,
     ScreenText,
@@ -42,13 +40,13 @@ class UserListQuery(QueryModel):
             "to it, in EBCDIC order; blank starts at the lowest key."
         ),
     )
-    start_key: OpaqueToken(START_KEY_MAX_LENGTH) = Field(
+    start_key: ScreenText(8) = Field(
         default="",
         alias="startKey",
         description=(
             "The shown page's first_key (direction backward, F7) or last_key (direction "
-            "forward, F8); empty reads the first page. A raw user ID, which may hold spaces "
-            "or any code-page-037 character."
+            "forward, F8); empty reads the first page. A raw user ID of at most 8 characters, "
+            "which may hold spaces or any code-page-037 character."
         ),
     )
     direction: Direction = Field(

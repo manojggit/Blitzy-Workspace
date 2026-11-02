@@ -12,17 +12,19 @@ programs (for example ``Tran ID must be Numeric ...`` or
 ``Amount should be in format -99999999.99``) stays reachable in the services.
 
 Attribute names are snake_case, not the MK_Modernization Rule's camelCase, because they are the
-API's JSON keys, which mirror the snake_case database columns; query parameters keep camelCase
+API's JSON keys. CT00 and CT01 response fields that carry a stored value mirror the
+transactions column names (``tran_type_cd``, ``tran_cat_cd``, ``tran_source``, ``tran_desc``,
+``tran_amt``); ``tran_date`` and ``card_num_masked`` name a derived and a masked value. The
+CT02 screen fields keep the request names the API contract prescribes (``type_cd``,
+``cat_cd``, ``source``, ``desc``, ``amount`` and the rest). Query parameters keep camelCase
 wire names through their aliases.
 """
 
 from pydantic import BaseModel, Field
 
 from app.schemas.common import (
-    START_KEY_MAX_LENGTH,
     Direction,
     MoneyAmount,
-    OpaqueToken,
     PageState,
     QueryModel,
     ScreenText,
@@ -48,12 +50,13 @@ class TransactionListQuery(QueryModel):
             "browse starts at the first TRAN-ID greater than or equal to it."
         ),
     )
-    start_key: OpaqueToken(START_KEY_MAX_LENGTH) = Field(
+    start_key: ScreenText(16) = Field(
         default="",
         alias="startKey",
         description=(
             "Paging key: the shown page's first_key with direction backward (F7), or its "
-            "last_key with direction forward (F8). Empty reads the first page."
+            "last_key with direction forward (F8). Empty reads the first page. A raw TRAN-ID "
+            "of at most 16 code-page-037 characters."
         ),
     )
     direction: Direction = Field(
@@ -79,10 +82,10 @@ class TransactionListRow(BaseModel):
             "as COTRN00C POPULATE-TRAN-DATA formats it."
         ),
     )
-    description: str = Field(
+    tran_desc: str = Field(
         description="TDESCnn: the first 26 characters of TRAN-DESC, truncated by the service.",
     )
-    amount: MoneyAmount(9) = Field(
+    tran_amt: MoneyAmount(9) = Field(
         description="TAMTnnn: TRAN-AMT (S9(09)V99), serialised as a JSON decimal string.",
     )
 
@@ -149,11 +152,12 @@ class TransactionSelectionRequest(BaseModel):
         default="",
         description="TRNIDIN search key as keyed, applied after the selection is processed.",
     )
-    first_key: OpaqueToken(START_KEY_MAX_LENGTH) = Field(
+    first_key: ScreenText(16) = Field(
         default="",
         description=(
             "TRAN-ID of the first row shown (CDEMO-CT00-TRNID-FIRST), so the service can "
-            "return the unchanged list when the search key is non-numeric."
+            "return the unchanged list when the search key is non-numeric. A raw TRAN-ID of at "
+            "most 16 code-page-037 characters."
         ),
     )
     page: int = Field(
@@ -190,13 +194,13 @@ class TransactionDetailResponse(BaseModel):
     card_num_masked: str = Field(
         description="CARDNUM: TRAN-CARD-NUM masked as twelve asterisks plus the last 4 digits.",
     )
-    type_cd: str = Field(description="TTYPCD: TRAN-TYPE-CD, 2 characters.")
-    cat_cd: int = Field(
+    tran_type_cd: str = Field(description="TTYPCD: TRAN-TYPE-CD, 2 characters.")
+    tran_cat_cd: int = Field(
         description="TCATCD: TRAN-CAT-CD, a 9(04) code rendered zero-padded to 4 digits.",
     )
-    source: str = Field(description="TRNSRC: TRAN-SOURCE, 10 characters.")
-    description: str = Field(description="TDESC: the first 60 characters of TRAN-DESC.")
-    amount: MoneyAmount(9) = Field(
+    tran_source: str = Field(description="TRNSRC: TRAN-SOURCE, 10 characters.")
+    tran_desc: str = Field(description="TDESC: the first 60 characters of TRAN-DESC.")
+    tran_amt: MoneyAmount(9) = Field(
         description="TRNAMT: TRAN-AMT (S9(09)V99), serialised as a JSON decimal string.",
     )
     orig_ts: str = Field(
