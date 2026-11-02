@@ -2,9 +2,9 @@
 
 This document is the reviewed design of the CardDemo batch layer: the legacy JCL jobs and their
 Python replacements, the order they run in, how reruns and failures are handled, how generation
-data groups (GDGs) are archived, and how outputs are reconciled with the COBOL rules. It was
-written before any `batch/**` module, and it is the authority for all of them: code that differs
-from it is a defect. A later change is made in this document first.
+data groups (GDGs) are archived, and how outputs are reconciled with the COBOL rules. It is the
+authority for every `batch/**` module: code that differs from it is a defect, and a later change
+is made in this document first.
 
 Table and column definitions are not restated here. They live in [data-model.md](data-model.md),
 together with the numeric truncation rules every job applies.
@@ -286,9 +286,11 @@ framing and decoding are in [data-model.md](data-model.md#loader-decoding).
 
 - **Module.** `batch/jobs/statement_gen/creastmt.py`, with `cbstm03a.py` (statement writer) and
     `cbstm03b.py` (data access).
-- **Inputs → outputs.** Transactions by `card_num_sort` then `tran_id_sort`; the cross-reference
-    by `card_num_sort`; customers; accounts → `statements/STATEMNT.PS` (80-column lines) and
-    `statements/STATEMNT.HTML` (100-column lines) under `CARDDEMO_OUTPUT_DIR`.
+- **Inputs → outputs.** Transactions ordered by `cards.cards.card_num_sort`, joined on `card_num`,
+    then by `transactions.transactions.tran_id_sort`; the cross-reference ordered by
+    `cards.cards.card_num_sort`, joined on `card_num`; customers; accounts →
+    `statements/STATEMNT.PS` (80-column lines) and `statements/STATEMNT.HTML` (100-column lines)
+    under `CARDDEMO_OUTPUT_DIR`.
 - **Durability and rerun class.** Files only; each run overwrites them.
 - **Parameters.** None.
 - **Exit status.** 0; 16 when the statement table capacity is exceeded
@@ -806,6 +808,12 @@ The same CLI runs as a module:
 To run the chain, or to resume the `OPEN` cycle:
 
 ```bash
+.venv/bin/carddemo-batch run-all
+```
+
+The `run-all` syntax, with optional arguments in square brackets:
+
+```text
 .venv/bin/carddemo-batch run-all [--new-cycle] [--start-at STEP] [--force]
 ```
 
@@ -831,9 +839,16 @@ To abandon any `OPEN` cycle and run the loaders of steps 1–5 and 7–12 in a n
 
 ### Run one job
 
-To run one job as its step in the `OPEN` cycle:
+To run one job as its step in the `OPEN` cycle, here POSTTRAN:
 
 ```bash
+.venv/bin/carddemo-batch job post-tran
+```
+
+The `job` syntax, with optional arguments in square brackets and alternative values in braces,
+separated by `|`:
+
+```text
 .venv/bin/carddemo-batch job JOB_NAME [--occurrence {1|2}] [--force]
 ```
 
@@ -848,6 +863,15 @@ Replace `JOB_NAME` with a name from this table. Each legacy JCL name is accepted
 | `comb-tran` | `COMBTRAN` | 16 |
 | `statement-gen` | `CREASTMT` | 17 |
 | `tran-index` | `TRANIDX` | 18 |
+
+To run step 6, the first TRANBKP occurrence, whatever its state, `COMPLETED` included:
+
+```bash
+.venv/bin/carddemo-batch job tran-backup --occurrence 1 --force
+```
+
+Each TRANBKP run archives `transactions` to a new `TRANSACT.BKUP` generation, then empties the
+table.
 
 ### Run one loader
 
@@ -913,7 +937,7 @@ against the repository root. The default daily image is
 
 ### Configuration
 
-`batch/config.BatchSettings` reads these variables, so batch runs without `SECRET_KEY`:
+`batch.config.BatchSettings` reads these variables, so batch runs without `SECRET_KEY`:
 
 | Variable | Default | Use |
 |---|---|---|
