@@ -1,0 +1,8 @@
+# Development and test dependencies of carddemo-backend (also used by batch/tests).
+# Not installed in the container image.
+pytest==9.1.1
+pytest-asyncio==1.4.1.post1  # asyncio_mode = "auto" in pyproject.toml
+pytest-cov==7.1.0
+httpx==0.28.1  # httpx.AsyncClient with ASGITransport against app.main.app
+schemathesis==4.33.0  # tests/contract/test_openapi_contract.py over the OpenAPI document
+ruff==0.17.3  # lint and format for backend and batch
