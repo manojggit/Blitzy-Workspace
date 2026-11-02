@@ -264,11 +264,12 @@ class DateEditResult:
     inputError: bool
     messageSuffix: str
 
-    @property
-    def isValid(self) -> bool:
+    def IsValid(self) -> bool:
         """88 WS-EDIT-DATE-IS-VALID: the year, month and day flags are all VALID."""
         partStatuses = (self.yearStatus, self.monthStatus, self.dayStatus)
         return all(status is DatePartStatus.VALID for status in partStatuses)
+
+    isValid = property(IsValid)
 
 
 class _DatePart(Enum):
@@ -299,18 +300,15 @@ class _DateEditState:
     monthValue: int | None = None
     dayValue: int | None = None
 
-    @property
-    def centuryYearText(self) -> str:
+    def CenturyYearText(self) -> str:
         """WS-EDIT-DATE-CCYY, positions 1-4."""
         return self.dateText[0:4]
 
-    @property
-    def monthText(self) -> str:
+    def MonthText(self) -> str:
         """WS-EDIT-DATE-MM, positions 5-6."""
         return self.dateText[4:6]
 
-    @property
-    def dayText(self) -> str:
+    def DayText(self) -> str:
         """WS-EDIT-DATE-DD, positions 7-8."""
         return self.dateText[6:8]
 
@@ -379,7 +377,7 @@ def _RunDateEdits(dateText: str) -> _DateEditState:
 
 def _EditYear(state: _DateEditState) -> None:
     """Port of EDIT-YEAR-CCYY, CSUTLDPY lines 25-90: supplied, numeric, century 19 or 20."""
-    centuryYear = state.centuryYearText
+    centuryYear = state.CenturyYearText()
     if _IsBlankPart(centuryYear):
         _Fail(state, YEAR_REQUIRED_SUFFIX, DatePartStatus.BLANK, _DatePart.YEAR)
     elif not _IsAsciiDigits(centuryYear):
@@ -397,7 +395,7 @@ def _EditMonth(state: _DateEditState) -> None:
     text never satisfies the numeric 88-level. The TEST-NUMVAL/NUMVAL step after it therefore
     always passes and leaves the value unchanged.
     """
-    monthText = state.monthText
+    monthText = state.MonthText()
     if _IsBlankPart(monthText):
         _Fail(state, MONTH_REQUIRED_SUFFIX, DatePartStatus.BLANK, _DatePart.MONTH)
     elif _TwoDigitValue(monthText) not in VALID_MONTHS:
@@ -414,7 +412,7 @@ def _EditDay(state: _DateEditState) -> None:
     NUMVAL(day) stores into unsigned 9(2), so " 5" and "5 " give 5, "-5" gives 5 and ".5" gives 0.
     """
     _SetStatus(state, DatePartStatus.VALID, _DatePart.DAY)
-    dayText = state.dayText
+    dayText = state.DayText()
     if _IsBlankPart(dayText):
         _Fail(state, DAY_REQUIRED_SUFFIX, DatePartStatus.BLANK, _DatePart.DAY)
     elif not TestNumval(dayText):
@@ -431,15 +429,15 @@ def _EditDayMonthYear(state: _DateEditState) -> bool:
     Returns True for GO TO EDIT-DATE-CCYYMMDD-EXIT, which skips EDIT-DATE-LE. A part with no
     stored value and no two digits is None, which equals no 88-level value.
     """
-    month = _PartValue(state.monthText, state.monthValue)
-    day = _PartValue(state.dayText, state.dayValue)
+    month = _PartValue(state.MonthText(), state.monthValue)
+    day = _PartValue(state.DayText(), state.dayValue)
     if day == THIRTY_FIRST_DAY and month not in THIRTY_ONE_DAY_MONTHS:
         _Fail(state, NO_31_DAYS_SUFFIX, DatePartStatus.NOT_OK, _DatePart.DAY, _DatePart.MONTH)
         return True
     if month == FEBRUARY and day == THIRTIETH_DAY:
         _Fail(state, NO_30_DAYS_SUFFIX, DatePartStatus.NOT_OK, _DatePart.DAY, _DatePart.MONTH)
         return True
-    if month == FEBRUARY and day == LEAP_DAY and not _IsLeapYear(state.centuryYearText):
+    if month == FEBRUARY and day == LEAP_DAY and not _IsLeapYear(state.CenturyYearText()):
         _Fail(state, NOT_LEAP_YEAR_SUFFIX, DatePartStatus.NOT_OK, *_DatePart)
         return True
     return not state.IsValid()
@@ -472,9 +470,9 @@ def _EditedDate(dateText: str) -> date:
 
 def _NormalizedDateText(state: _DateEditState) -> str:
     """WS-EDIT-DATE-CCYYMMDD after the COMPUTEs that overwrite its month and day parts."""
-    monthText = state.monthText if state.monthValue is None else f"{state.monthValue:02d}"
-    dayText = state.dayText if state.dayValue is None else f"{state.dayValue:02d}"
-    return state.centuryYearText + monthText + dayText
+    monthText = state.MonthText() if state.monthValue is None else f"{state.monthValue:02d}"
+    dayText = state.DayText() if state.dayValue is None else f"{state.dayValue:02d}"
+    return state.CenturyYearText() + monthText + dayText
 
 
 def _IsLeapYear(centuryYear: str) -> bool:
