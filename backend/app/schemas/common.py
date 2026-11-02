@@ -181,7 +181,11 @@ class ScreenFeedback(BaseModel):
     Replaces the BMS ERRMSG and INFOMSG fields and the ``MOVE -1 TO <field>L`` cursor. The
     names in ``field_errors`` and ``cursor_field`` are the snake_case attribute names of the
     request or screen model fields (for example ``credit_limit``), also for query fields whose
-    wire name is camelCase. The frontend maps them to its inputs.
+    wire name is camelCase. CR00 (CORPT00C) is the exception: its error bodies, like
+    ``reports.TransactionReportResponse``, use the ``ReportQuery`` wire names (``reportType``,
+    ``startMm``, ``startDd``, ``startYyyy``, ``endMm``, ``endDd``, ``endYyyy`` and ``confirm``),
+    because those query keys are the CORPT00 page's field names. The frontend maps the names to
+    its inputs.
     """
 
     message: str = Field(
@@ -199,14 +203,18 @@ class ScreenFeedback(BaseModel):
         description=(
             "Snake_case attribute names of the failing fields, in source edit order: every "
             "failing field in the all-field edit mode of CAVW, CAUP, CCLI, CCDL and CCUP, "
-            "otherwise the single failing field."
+            "otherwise the single failing field. CR00 names the failing field by its ReportQuery "
+            "wire name instead (reportType, startMm, startDd, startYyyy, endMm, endDd, endYyyy "
+            "or confirm)."
         ),
     )
     cursor_field: str | None = Field(
         default=None,
         description=(
             "Snake_case attribute name of the field that receives focus, replacing "
-            "MOVE -1 TO <field>L; null or empty when the program sets no cursor."
+            "MOVE -1 TO <field>L; null or empty when the program sets no cursor. CR00 names the "
+            "field by its ReportQuery wire name instead (reportType, startMm, startDd, "
+            "startYyyy, endMm, endDd, endYyyy or confirm)."
         ),
     )
 

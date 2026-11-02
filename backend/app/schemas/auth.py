@@ -3,7 +3,7 @@
 Replaces program COSGN00C (transaction CC00) and its BMS map COSGN00 (``bms/COSGN00.bms``,
 symbolic map ``cpy-bms/COSGN00.CPY``), the user record of copybook CSUSR01Y, the CSMSG01Y
 thank-you literal, and the COMMAREA user fields of COCOM01Y (CDEMO-USER-ID, CDEMO-USER-TYPE),
-which the HttpOnly session cookie now carries.
+which the HttpOnly session cookie carries.
 
 ``LoginRequest`` holds the only identity inputs the backend ever reads from a caller. No
 response model holds a password, a password hash or a session token: the router sets the
@@ -14,7 +14,7 @@ columns. They are wire names fixed by that contract, so the MK_Modernization Rul
 convention for variables does not apply to them.
 """
 
-from typing import Literal
+from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, Field
 
@@ -84,7 +84,7 @@ class LogoutResponse(BaseModel):
     )
 
 
-class CurrentUserResponse(BaseModel):
+class CurrentUser(BaseModel):
     """The user of the current COSGN00C session, for the header and the choice of menu.
 
     The user ID and type come from the verified session token and hold for its lifetime, as
@@ -117,3 +117,9 @@ class CurrentUserResponse(BaseModel):
             "otherwise /menu (COMEN01C)."
         ),
     )
+
+
+# The same GET /auth/me model, under the name the auth router and the COSGN00C service import.
+# UP040's ``type`` statement would bind a TypeAliasType, which cannot be called to build the
+# model, so the alias keeps the TypeAlias form and stays the class itself.
+CurrentUserResponse: TypeAlias = CurrentUser  # noqa: UP040 the alias must remain the class

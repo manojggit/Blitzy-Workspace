@@ -4,10 +4,12 @@ Replaces the BMS ERRMSG line and cursor (``MOVE -1 TO <field>L``), the informati
 COACTUPC/COCRDUPC, and CICS RESP/RESP2 file conditions (e.g. COACTVWC
 ``WS-FILE-ERROR-MESSAGE``), as AAP 0.6.5 defines them.
 
-Every error body has exactly the keys ``message``, ``info_message``, ``field_errors`` and
-``cursor_field``; the CAUP and CCUP screens add their screen keys. The CSMSG02Y abend work area
-has no counterpart here: no catch-all handler is registered, so an unexpected error is FastAPI's
-500 and the frontend shows ``UNEXPECTED ABEND OCCURRED.``.
+Every error body this module builds carries the four standard legacy keys ``message``,
+``info_message``, ``field_errors`` and ``cursor_field``. The CAUP and CCUP screens add their
+screen keys, and the 422 body of a structurally invalid request adds FastAPI's ``detail`` list
+(``loc``, ``msg`` and ``type`` only) beside them. The CSMSG02Y abend work area has no
+counterpart here: no catch-all handler is registered, so an unexpected error is FastAPI's 500
+and the frontend shows ``UNEXPECTED ABEND OCCURRED.``.
 
 This is a leaf module. It imports only the standard library, FastAPI and ``sqlalchemy.exc``, so
 repositories and batch jobs import it without ``SECRET_KEY`` or a database.
@@ -240,9 +242,20 @@ async def HandleRequestValidationError(
 ) -> JSONResponse:
     """Answer a structurally malformed request with 422 and a body that echoes no input.
 
-    Only the BMS field-length and character-repertoire limits fail here (AAP 0.6.4), which a
-    3270 terminal could never send; the legacy edits run in the services. The body is FastAPI's
-    ``HTTPValidationError`` (``detail``) with the four legacy keys beside it.
+    Every request FastAPI's validation rejects arrives here: malformed JSON; a wrong JSON type
+    or null; an invalid enum value on a non-screen field (an ``action``, a paging
+    ``direction``, the user-fetch ``screen``, the CR00 report type or export format); a missing
+    export format; a negative page number; a list or opaque token over its maximum length; and
+    screen text over its BMS field length or outside the code-page-037 repertoire, which a 3270
+    terminal could never send (AAP 0.6.4). The legacy type, sign, range and format edits run in
+    the services, never here.
+
+    The body is FastAPI's ``HTTPValidationError`` ``detail`` list, each item holding only
+    ``loc``, ``msg`` and ``type``, with the four standard legacy keys beside it. ``message`` and
+    ``info_message`` are empty. ``field_errors`` names each failing field as its location names
+    it: the snake_case attribute of a body field, or the wire name of a query or path parameter
+    (``reportType``, ``format``). A location that names no field, such as a malformed JSON
+    body, adds none. ``cursor_field`` is the first named field, or empty when there is none.
     """
     errors = exc.errors()
     fieldDetails = LegacyErrorDetails(fieldErrors=tuple(FieldErrorsOf(errors)))
