@@ -6,7 +6,7 @@ adds the login-throttle table.
 - ``batch.job_runs``: run history, one row per job execution, replacing condition codes.
 - ``batch.cycle_steps``: authoritative state of each (cycle, step) identity.
 - ``batch.gdg_generations``: generation files of TRANSACT.BKUP, DALYREJS, SYSTRAN and
-  TRANSACT.COMBINED, each base keeping LIMIT 5 as cataloged.
+    TRANSACT.COMBINED, each base keeping LIMIT 5 as cataloged.
 
 These tables hold application state rather than copybook records, so they are SQLAlchemy Core
 tables on ``Base.metadata``, not ORM models. Revisions 0007 (login attempts), 0008 (cycles,

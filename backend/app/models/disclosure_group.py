@@ -39,7 +39,9 @@ class DisclosureGroup(Base):
     # Attributes keep the snake_case column names the schema design fixes, a deliberate
     # departure from the MK_Modernization Rule's camelCase variables for database names.
     # DIS-ACCT-GROUP-ID X(10) at offset 0.
-    group_id: Mapped[str] = mapped_column(String(10, collation=KEY_COLLATION), primary_key=True)
+    group_id: Mapped[str] = mapped_column(
+        String(10, collation=KEY_COLLATION), primary_key=True, server_default=""
+    )
     # DIS-TRAN-TYPE-CD X(02) at offset 10.
     tran_type_cd: Mapped[str] = mapped_column(CHAR(2, collation=KEY_COLLATION), primary_key=True)
     # DIS-TRAN-CAT-CD 9(04) at offset 12, a code rendered zero-padded to four digits.

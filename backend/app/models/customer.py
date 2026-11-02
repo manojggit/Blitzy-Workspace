@@ -6,9 +6,11 @@ layout apart from the DOB field name. The trailing ``FILLER X(168)`` at offset 3
 recorded in the table comment.
 
 The SSN is stored in full because COACTUPC edits it. API responses mask it with
-``core/security.MaskSsn``; this model never masks or renders it, and has no ``__repr__`` so a row
-cannot carry the SSN into a log line. The FICO score is a code that responses render zero-padded
-to three digits. It has no range check: seed customers below 300 exist and load unchanged.
+``core/security.MaskSsn``, except ``GET /accounts/{acctId}/edit`` and ``PUT /accounts/{acctId}``,
+which return it unmasked for that edit. This model never masks or renders it, and has no
+``__repr__`` so a row cannot carry the SSN into a log line. The FICO score is a code that
+responses render zero-padded to three digits. It has no range check: seed customers below 300
+exist and load unchanged.
 """
 
 from datetime import date

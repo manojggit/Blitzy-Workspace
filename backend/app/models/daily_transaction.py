@@ -14,9 +14,9 @@ names, with the same types and widths, so POSTTRAN copies a staged record field 
 - ``record_seq`` is the record's position in the daily file, starting at 1.
 - ``tran_id`` is indexed but not unique, because a sequential file may repeat an ID.
 - ``card_num`` deliberately has no foreign key, so CBTRN02C reject 100
-  (``INVALID CARD NUMBER FOUND``) stays reachable for a card the cross-reference lacks.
+    (``INVALID CARD NUMBER FOUND``) stays reachable for a card the cross-reference lacks.
 - ``orig_ts_format`` and ``proc_ts_format`` hold the text form of each 26-byte timestamp
-  (``S``, ``D``, ``T`` or blank); a blank timestamp is stored as NULL.
+    (``S``, ``D``, ``T`` or blank); a blank timestamp is stored as NULL.
 """
 
 from datetime import datetime
@@ -44,7 +44,9 @@ class DailyTransaction(Base):
     # autoincrement=False keeps the column a plain INTEGER: the loader numbers the records.
     record_seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     # DALYTRAN-ID X(16) @0
-    tran_id: Mapped[str] = mapped_column(String(16, collation=KEY_COLLATION), index=True)
+    tran_id: Mapped[str] = mapped_column(
+        String(16, collation=KEY_COLLATION), index=True, server_default=""
+    )
     # DALYTRAN-TYPE-CD X(02) @16
     tran_type_cd: Mapped[str] = mapped_column(CHAR(2, collation=KEY_COLLATION))
     # DALYTRAN-CAT-CD 9(04) @18
@@ -64,7 +66,7 @@ class DailyTransaction(Base):
     # DALYTRAN-MERCHANT-ZIP X(10) @252
     merchant_zip: Mapped[str] = mapped_column(String(10), server_default="")
     # DALYTRAN-CARD-NUM X(16) @262; collated "C" for POSTTRAN's join to xref.card_xref.card_num
-    card_num: Mapped[str] = mapped_column(String(16, collation=KEY_COLLATION))
+    card_num: Mapped[str] = mapped_column(String(16, collation=KEY_COLLATION), server_default="")
     # DALYTRAN-ORIG-TS X(26) @278
     orig_ts: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=False, precision=6), nullable=True

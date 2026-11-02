@@ -36,6 +36,7 @@ class CardXref(Base):
         String(16, collation=KEY_COLLATION),
         ForeignKey("cards.cards.card_num", **FOREIGN_KEY_OPTIONS),
         primary_key=True,
+        server_default="",
     )
     # XREF-CUST-ID 9(09) at offset 16.
     cust_id: Mapped[str] = mapped_column(

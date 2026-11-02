@@ -30,7 +30,9 @@ class User(Base):
 
     # Attributes are named as the snake_case PostgreSQL columns they map, which the schema fixes;
     # the MK_Modernization Rule's camelCase variable naming does not apply to mapped columns.
-    user_id: Mapped[str] = mapped_column(String(8, collation=KEY_COLLATION), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(8, collation=KEY_COLLATION), primary_key=True, server_default=""
+    )
     # EBCDIC key order for the CU00 browse: VSAM orders USRSEC keys by their cp037 bytes.
     user_id_sort: Mapped[str] = mapped_column(
         Text(collation=KEY_COLLATION),

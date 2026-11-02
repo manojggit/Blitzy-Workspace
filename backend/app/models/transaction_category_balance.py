@@ -4,28 +4,35 @@ The 17-byte TRAN-CAT-KEY (KEYS(17 0)) becomes a three-column primary key: TRANCA
 9(11), TRANCAT-TYPE-CD X(02) and TRANCAT-CD 9(04). There is no foreign key to
 reference.transaction_categories, because CBTRN02C creates a balance for any type and category
 code (cbl/CBTRN02C.cbl lines 500-512). TRAN-CAT-BAL S9(09)V99 is exact NUMERIC(11,2), read as
-Decimal and never as float.
+Decimal and never as float. ``acct_id`` carries the ``^[0-9]{11}$`` digit check of every PIC
+9(n) identifier, which revision 0005 creates as ``ck_transaction_category_balances_acct_id_digits``.
 """
 
 from decimal import Decimal
-from typing import ClassVar
 
 from sqlalchemy import CHAR, ForeignKey, Numeric, SmallInteger, String
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import FOREIGN_KEY_OPTIONS, KEY_COLLATION, TRANSACTIONS_SCHEMA, Base
+from app.models.base import (
+    FOREIGN_KEY_OPTIONS,
+    KEY_COLLATION,
+    TRANSACTIONS_SCHEMA,
+    Base,
+    DigitCheck,
+)
 
 
 class TransactionCategoryBalance(Base):
     """One TRAN-CAT-BAL-RECORD: the balance of one account for one type and category code."""
 
     __tablename__ = "transaction_category_balances"
-    # ClassVar marks this declarative directive as class-level, not a mapped column; ruff RUF012
-    # rejects an unannotated mutable class attribute.
-    __table_args__: ClassVar[dict[str, str]] = {
-        "schema": TRANSACTIONS_SCHEMA,
-        "comment": "CVTRA01Y 50 bytes; FILLER X(22) at offset 28 dropped",
-    }
+    __table_args__ = (
+        DigitCheck("acct_id", 11),
+        {
+            "schema": TRANSACTIONS_SCHEMA,
+            "comment": "CVTRA01Y 50 bytes; FILLER X(22) at offset 28 dropped",
+        },
+    )
 
     # Attributes keep the snake_case column names rather than the MK_Modernization Rule's
     # camelCase, because the schema fixes them and every query and API key uses them.

@@ -46,7 +46,9 @@ class Transaction(Base):
     # Attributes keep the snake_case column names the schema mapping fixes, which the
     # MK_Modernization Rule's camelCase variable convention yields to.
     # TRAN-ID X(16) at offset 0, the KEYS(16 0) prime key.
-    tran_id: Mapped[str] = mapped_column(String(16, collation=KEY_COLLATION), primary_key=True)
+    tran_id: Mapped[str] = mapped_column(
+        String(16, collation=KEY_COLLATION), primary_key=True, server_default=""
+    )
     tran_id_sort: Mapped[str] = mapped_column(
         Text(collation=KEY_COLLATION),
         Computed("ebcdic_sort_key(tran_id)", persisted=True),
@@ -70,6 +72,7 @@ class Transaction(Base):
         String(16, collation=KEY_COLLATION),
         ForeignKey("cards.cards.card_num", **FOREIGN_KEY_OPTIONS),
         index=True,
+        server_default="",
     )
     # TRAN-ORIG-TS and TRAN-PROC-TS X(26) at 278 and 304; the copybook carries no time zone.
     orig_ts: Mapped[datetime | None] = mapped_column(

@@ -1,8 +1,8 @@
 # CardDemo data model: COBOL types, rounding and schema design
 
 This document is the reviewed mapping of CardDemo's COBOL data types, arithmetic truncation and
-VSAM datasets onto Python and PostgreSQL. It was written before any model, migration, utility,
-service or job module, and it is the authority for all of them: code that differs from it is a
+VSAM datasets onto Python and PostgreSQL. It is the design authority for the models, migrations,
+utilities, services and jobs that implement it: they follow it, and code that differs from it is a
 defect. A later change to the mapping is made in this document first, and is shown by the reviewed
 fixture diff under `batch/tests/fixtures/expected/`.
 
@@ -21,7 +21,7 @@ The general conversion rules from the modernization request, as applied column b
 
 - `PIC X(n)` becomes `VARCHAR(n)`, or `CHAR(n)` for fixed-width codes.
 - `PIC 9(n)` DISPLAY becomes `VARCHAR(n)` when the field is an identifier or key, which keeps its
-  leading zeros, and a numeric type when the field is used arithmetically.
+    leading zeros, and a numeric type when the field is used arithmetically.
 - Signed money, `PIC S9(n)V99`, becomes `NUMERIC(n+2,2)`.
 - 10-byte `YYYY-MM-DD` date text becomes `DATE`.
 - A VSAM KSDS key becomes the `PRIMARY KEY`. A VSAM alternate index (AIX) becomes an index on the
@@ -32,9 +32,13 @@ The general conversion rules from the modernization request, as applied column b
 Money is never floating point. Every monetary value is `NUMERIC` in PostgreSQL and `Decimal` in
 Python.
 
-Every in-scope signed field is zoned DISPLAY with a trailing sign overpunch, not `COMP-3`. The
-request's notes describe these fields as `COMP-3`; the copybooks declare them DISPLAY. No in-scope
-seed image contains a `COMP` or `COMP-3` field.
+Every signed field of the in-scope dataset copybooks and seed images is zoned DISPLAY with a
+trailing sign overpunch, not `COMP-3`. The request's notes describe these fields as `COMP-3`; the
+copybooks declare them DISPLAY. No in-scope seed image contains a `COMP` or `COMP-3` field, so no
+packed decoder is built (see [Loader decoding](#loader-decoding)). Packed and binary usages remain
+in program working storage only, with no column: the CBSTM03A amounts `S9(9)V99 COMP-3` (row 6 of
+[PIC to type mapping](#pic-to-type-mapping)) and the `9(n) COMP-3` and `S9(4) COMP` counters
+(row 7).
 
 ## Numeric storage rule
 
@@ -64,21 +68,38 @@ Worked examples:
 
 ## PIC to type mapping
 
-The second column gives the PostgreSQL type, the Python type and the response-model type, in that
-order. Screen inputs arrive as raw text, not in these types (see [Screen input](#screen-input)).
+The mapping has ten rows, numbered alike in both tables and in the notes below. Screen inputs
+arrive as raw text, not in these types (see [Screen input](#screen-input)).
 
-| # | PIC / USAGE pattern | PostgreSQL / Python / response model | Sign handling | Truncation |
+The PostgreSQL type, the Python type and the response-model type of each pattern:
+
+| # | PIC / USAGE pattern | PostgreSQL | Python | Response model |
 |---|---|---|---|---|
-| 1 | `9(n)` DISPLAY, identifier | `VARCHAR(n)`, digit check / `str` / `str` | Unsigned | Zero-padded to n |
-| 2 | `9(n)` DISPLAY, code | `SMALLINT` / `int` / `int` | Unsigned | Modulo `10**n` |
-| 3 | `S9(10)V99` DISPLAY zoned | `NUMERIC(12,2)` / `Decimal` / `Decimal` | Trailing overpunch | `StoreInto(v, 10, 2)` |
-| 4 | `S9(09)V99` DISPLAY | `NUMERIC(11,2)` / `Decimal` / `Decimal` | Trailing overpunch | `StoreInto(v, 9, 2)` |
-| 5 | `S9(04)V99` DISPLAY | `NUMERIC(6,2)` / `Decimal` / `Decimal` | Trailing overpunch | `StoreInto(v, 4, 2)` |
-| 6 | `S9(9)V99 COMP-3` | No column / `Decimal` | Signed | `StoreInto(v, 9, 2)` |
-| 7 | Counters | No column / `int` | Unsigned or signed binary | Width rule |
-| 8 | `X(n)` | `VARCHAR(n)` right-trimmed / `str` / `str` | n/a | Right-padded with spaces |
-| 9 | `X(10)` date text `YYYY-MM-DD` | `DATE` (nullable for blank) / `date` / `str` (ISO) | n/a | n/a |
-| 10 | `X(26)` timestamp | `TIMESTAMP(6)` plus format / `datetime` / `str` | n/a | [Timestamps](#timestamps) |
+| 1 | `9(n)` DISPLAY, identifier | `VARCHAR(n)`, digit check | `str` | `str` |
+| 2 | `9(n)` DISPLAY, code | `SMALLINT` | `int` | `int` |
+| 3 | `S9(10)V99` DISPLAY zoned | `NUMERIC(12,2)` | `Decimal` | `Decimal` |
+| 4 | `S9(09)V99` DISPLAY | `NUMERIC(11,2)` | `Decimal` | `Decimal` |
+| 5 | `S9(04)V99` DISPLAY | `NUMERIC(6,2)` | `Decimal` | `Decimal` |
+| 6 | `S9(9)V99 COMP-3` | No column | `Decimal` | |
+| 7 | Counters | No column | `int` | |
+| 8 | `X(n)` | `VARCHAR(n)` right-trimmed | `str` | `str` |
+| 9 | `X(10)` date text `YYYY-MM-DD` | `DATE` (nullable for blank) | `date` | `str` (ISO) |
+| 10 | `X(26)` timestamp | `TIMESTAMP(6)` plus format | `datetime` | `str` |
+
+The sign handling and truncation of each pattern:
+
+| # | PIC / USAGE pattern | Sign handling | Truncation |
+|---|---|---|---|
+| 1 | `9(n)` DISPLAY, identifier | Unsigned | Zero-padded to n |
+| 2 | `9(n)` DISPLAY, code | Unsigned | Modulo `10**n` |
+| 3 | `S9(10)V99` DISPLAY zoned | Trailing overpunch | `StoreInto(v, 10, 2)` |
+| 4 | `S9(09)V99` DISPLAY | Trailing overpunch | `StoreInto(v, 9, 2)` |
+| 5 | `S9(04)V99` DISPLAY | Trailing overpunch | `StoreInto(v, 4, 2)` |
+| 6 | `S9(9)V99 COMP-3` | Signed | `StoreInto(v, 9, 2)` |
+| 7 | Counters | Unsigned or signed binary | Width rule |
+| 8 | `X(n)` | n/a | Right-padded with spaces |
+| 9 | `X(10)` date text `YYYY-MM-DD` | n/a | n/a |
+| 10 | `X(26)` timestamp | n/a | [Timestamps](#timestamps) |
 
 Notes by row:
 
@@ -99,8 +120,11 @@ Notes by row:
     CBTRN03C WS-LINE-COUNTER, and CBSTM03A CR-CNT, TR-CNT and WS-TRCT. Width rule: every `ADD 1`
     stores `(n + 1) % 10**digits` for the receiver's PIC digits, with no size check, as the source
     has none.
-8. The column is `NOT NULL DEFAULT ''`. `CHAR(n)` is used instead for fixed codes. Fixed-width
-    output is right-padded with spaces.
+8. Every `X(n)` field stored as `VARCHAR(n)`, key columns included, is `NOT NULL DEFAULT ''`.
+    `CHAR(n)` is used instead for fixed codes and carries no empty default; the timestamp format
+    columns default to a single space, as their tables say. `password_hash` replaces SEC-USR-PWD
+    rather than mapping it, so it is a required `VARCHAR(255)` with no default. Fixed-width output
+    is right-padded with spaces.
 9. A blank date is stored as `NULL`.
 10. The column is `TIMESTAMP(6) WITHOUT TIME ZONE`, nullable, plus a `CHAR(1)` format column. The
     response model carries the 26-character text. Truncation follows the
@@ -108,23 +132,72 @@ Notes by row:
 
 ## Arithmetic statements and numeric moves
 
-Every arithmetic statement and numeric move in the ported programs, with its Python expression:
+The specified arithmetic statements and numeric moves of the ported programs are below, as 13
+numbered rows. Any other arithmetic result or numeric `MOVE` in those programs, for example the
+total reset and counter increment at `cbl/CBTRN03C.cbl` lines 298–299, is stored by the
+[numeric storage rule](#numeric-storage-rule), and every counter `ADD 1` follows the width rule of
+PIC row 7.
 
-| # | Source | COBOL statement | Python expression | Receiver and intermediate precision |
-|---|---|---|---|---|
-| 1 | `cbl/CBACT04C.cbl` lines 464–465 | `COMPUTE WS-MONTHLY-INT = (TRAN-CAT-BAL * DIS-INT-RATE) / 1200` | `StoreInto(tranCatBal * disIntRate / Decimal(1200), 9, 2)` | Note 1 |
-| 2 | `cbl/CBACT04C.cbl` line 467 | `ADD WS-MONTHLY-INT TO WS-TOTAL-INT` | `StoreInto(total + monthly, 9, 2)` | Exact |
-| 3 | `cbl/CBACT04C.cbl` lines 352–354 | `ADD WS-TOTAL-INT TO ACCT-CURR-BAL`; cycle credit and debit `MOVE 0` | `StoreInto(bal + total, 10, 2)`; both cycle fields `Decimal("0.00")` | Exact |
-| 4 | `cbl/CBACT04C.cbl` lines 474–479 | `ADD 1 TO WS-TRANID-SUFFIX`, then `STRING PARM-DATE WS-TRANID-SUFFIX` | `suffix = (suffix + 1) % 10**6`; `tranId = parmDate + f"{suffix:06d}"` | Note 4 |
-| 5 | `cbl/CBTRN02C.cbl` lines 403–405 | `COMPUTE WS-TEMP-BAL = ACCT-CURR-CYC-CREDIT - ACCT-CURR-CYC-DEBIT + DALYTRAN-AMT` | `StoreInto(cycCredit - cycDebit + amt, 9, 2)` | Note 5 |
-| 6 | `cbl/CBTRN02C.cbl` lines 508, 527 | `ADD DALYTRAN-AMT TO TRAN-CAT-BAL` (create or update) | `StoreInto(catBal + amt, 9, 2)` | Exact |
-| 7 | `cbl/CBTRN02C.cbl` lines 547–552 | `ADD DALYTRAN-AMT TO ACCT-CURR-BAL`; then to CYC-CREDIT or CYC-DEBIT | `StoreInto(field + amt, 10, 2)` | Exact; note 7 |
-| 8 | `cbl/COBIL00C.cbl` line 224 | `MOVE ACCT-CURR-BAL TO TRAN-AMT` | `tranAmt = StoreInto(currBal, 9, 2)` | Note 8 |
-| 9 | `cbl/COBIL00C.cbl` line 234 | `COMPUTE ACCT-CURR-BAL = ACCT-CURR-BAL - TRAN-AMT` | `StoreInto(currBal - tranAmt, 10, 2)` | Note 9 |
-| 10 | `cbl/COTRN02C.cbl` lines 444–449; `cbl/COBIL00C.cbl` lines 212–217 | `MOVE TRAN-ID TO WS-TRAN-ID-N` / `WS-TRAN-ID-NUM`, then `ADD 1` | `nextId = (int(highestId or "0") + 1) % 10**16`, zero-padded to 16 | Note 10 |
-| 11 | `cbl/CBTRN03C.cbl` lines 200, 287, 297 | `ADD TRAN-AMT TO WS-PAGE-TOTAL WS-ACCOUNT-TOTAL`; `ADD WS-PAGE-TOTAL TO WS-GRAND-TOTAL` | `StoreInto(total + amt, 9, 2)` | Exact |
-| 12 | `cbl/CBSTM03A.CBL` line 429 | `ADD TRNX-AMT TO WS-TOTAL-AMT` | `StoreInto(total + amt, 9, 2)` | Exact |
-| 13 | `cbl/COTRN02C.cbl` lines 383, 456; `cbl/COACTUPC.cbl` lines 1079–1135 | `FUNCTION NUMVAL-C(...)` on screen amounts | `cobol_intrinsics.NumvalC(rawText)` after the program's edit passes | Note 13 |
+The source of each row, and its receiver and intermediate precision:
+
+| # | Source | Receiver and intermediate precision |
+|---|---|---|
+| 1 | `cbl/CBACT04C.cbl` lines 464–465 | Note 1 |
+| 2 | `cbl/CBACT04C.cbl` line 467 | Exact |
+| 3 | `cbl/CBACT04C.cbl` lines 352–354 | Exact |
+| 4 | `cbl/CBACT04C.cbl` lines 474–479 | Note 4 |
+| 5 | `cbl/CBTRN02C.cbl` lines 403–405 | Note 5 |
+| 6 | `cbl/CBTRN02C.cbl` lines 508, 527 | Exact |
+| 7 | `cbl/CBTRN02C.cbl` lines 547–552 | Exact; note 7 |
+| 8 | `cbl/COBIL00C.cbl` line 224 | Note 8 |
+| 9 | `cbl/COBIL00C.cbl` line 234 | Note 9 |
+| 10 | `cbl/COTRN02C.cbl` lines 444–449; `cbl/COBIL00C.cbl` lines 212–217 | Note 10 |
+| 11 | `cbl/CBTRN03C.cbl` lines 200, 287, 297 | Exact |
+| 12 | `cbl/CBSTM03A.CBL` line 429 | Exact |
+| 13 | `cbl/COTRN02C.cbl` lines 383, 456; `cbl/COACTUPC.cbl` lines 1079–1135 | Note 13 |
+
+The COBOL statement of each row and its Python expression:
+
+- **Row 1.**
+    - COBOL: `COMPUTE WS-MONTHLY-INT = (TRAN-CAT-BAL * DIS-INT-RATE) / 1200`
+    - Python: `StoreInto(tranCatBal * disIntRate / Decimal(1200), 9, 2)`
+- **Row 2.**
+    - COBOL: `ADD WS-MONTHLY-INT TO WS-TOTAL-INT`
+    - Python: `StoreInto(total + monthly, 9, 2)`
+- **Row 3.**
+    - COBOL: `ADD WS-TOTAL-INT TO ACCT-CURR-BAL`; cycle credit and debit `MOVE 0`
+    - Python: `StoreInto(bal + total, 10, 2)`; both cycle fields `Decimal("0.00")`
+- **Row 4.**
+    - COBOL: `ADD 1 TO WS-TRANID-SUFFIX`, then `STRING PARM-DATE WS-TRANID-SUFFIX`
+    - Python: `suffix = (suffix + 1) % 10**6`; `tranId = parmDate + f"{suffix:06d}"`
+- **Row 5.**
+    - COBOL: `COMPUTE WS-TEMP-BAL = ACCT-CURR-CYC-CREDIT - ACCT-CURR-CYC-DEBIT + DALYTRAN-AMT`
+    - Python: `StoreInto(cycCredit - cycDebit + amt, 9, 2)`
+- **Row 6.**
+    - COBOL: `ADD DALYTRAN-AMT TO TRAN-CAT-BAL` (create or update)
+    - Python: `StoreInto(catBal + amt, 9, 2)`
+- **Row 7.**
+    - COBOL: `ADD DALYTRAN-AMT TO ACCT-CURR-BAL`; then to CYC-CREDIT or CYC-DEBIT
+    - Python: `StoreInto(field + amt, 10, 2)`
+- **Row 8.**
+    - COBOL: `MOVE ACCT-CURR-BAL TO TRAN-AMT`
+    - Python: `tranAmt = StoreInto(currBal, 9, 2)`
+- **Row 9.**
+    - COBOL: `COMPUTE ACCT-CURR-BAL = ACCT-CURR-BAL - TRAN-AMT`
+    - Python: `StoreInto(currBal - tranAmt, 10, 2)`
+- **Row 10.**
+    - COBOL: `MOVE TRAN-ID TO WS-TRAN-ID-N` / `WS-TRAN-ID-NUM`, then `ADD 1`
+    - Python: `nextId = (int(highestId or "0") + 1) % 10**16`, zero-padded to 16
+- **Row 11.**
+    - COBOL: `ADD TRAN-AMT TO WS-PAGE-TOTAL WS-ACCOUNT-TOTAL`;
+        `ADD WS-PAGE-TOTAL TO WS-GRAND-TOTAL`
+    - Python: `StoreInto(total + amt, 9, 2)`
+- **Row 12.**
+    - COBOL: `ADD TRNX-AMT TO WS-TOTAL-AMT`
+    - Python: `StoreInto(total + amt, 9, 2)`
+- **Row 13.**
+    - COBOL: `FUNCTION NUMVAL-C(...)` on screen amounts
+    - Python: `cobol_intrinsics.NumvalC(rawText)` after the program's edit passes
 
 Notes by statement:
 
@@ -153,10 +226,17 @@ field length as `max_length`, and the code-page-037 printable repertoire. A requ
 rejected with 422. Type, sign, range and format edits run in the service's port of the program's
 edits, on the raw text.
 
-`TestNumvalC`, `NumvalC` and `Numval` in `backend/app/utils/cobol_intrinsics.py` port the
-`TEST-NUMVAL-C`, `NUMVAL-C` and `NUMVAL` intrinsic functions. They accept leading and trailing
-spaces; `+`, `-`, `CR` and `DB`; `$`; `,` grouping; and `.` as the decimal point. Numeric conversion
-happens only after the program's edit passes. For example:
+`TestNumvalC`, `NumvalC`, `TestNumval` and `Numval` in `backend/app/utils/cobol_intrinsics.py`
+port the `TEST-NUMVAL-C`, `NUMVAL-C`, `TEST-NUMVAL` and `NUMVAL` intrinsic functions. Their
+grammars:
+
+- All four accept leading and trailing spaces, at most one sign (a leading `+` or `-`, or a
+    trailing `+`, `-`, `CR` or `DB`), and `.` as the decimal point.
+- `TEST-NUMVAL-C` and `NUMVAL-C` also accept a `$` currency sign, after the leading sign when there
+    is one, and `,` grouping in the integer part.
+- `TEST-NUMVAL` and `NUMVAL` accept neither `$` nor `,`.
+
+Numeric conversion happens only after the program's edit passes. For example:
 
 - CAUP accepts `$1,234.567` for a credit limit and stores `1234.56`.
 - CT02 rejects the same text with `Amount should be in format -99999999.99`.
@@ -216,9 +296,9 @@ Rules:
     returns `(value, format)`. Any other text fails the load with exit 12.
 - **Clock precision.** Batch `Clock.Now()` is truncated to hundredths of a second. CB00's clock is
     truncated to whole seconds.
-- **Serialization.** `record_layouts.EncodeTimestamp(value, format)` rebuilds the original 26
-    bytes. GDG records therefore reproduce the source bytes exactly, and API responses show the
-    same text the map showed.
+- **Serialization.** `record_layouts.EncodeTimestamp(value, timestampFormat)` rebuilds the
+    original 26 bytes. GDG records therefore reproduce the source bytes exactly, and API responses
+    show the same text the map showed.
 
 ## Schema design
 
@@ -276,7 +356,7 @@ USRSEC KSDS, `KEYS(8,0)`.
 | `user_id_sort` | generated | `TEXT` | Generated and stored; indexed; ordering for CU00 |
 | `first_name` | SEC-USR-FNAME `X(20)` (8) | `VARCHAR(20)` | |
 | `last_name` | SEC-USR-LNAME `X(20)` (28) | `VARCHAR(20)` | |
-| `password_hash` | replaces SEC-USR-PWD `X(08)` (48) | `VARCHAR(255)` | bcrypt; plaintext never stored |
+| `password_hash` | replaces SEC-USR-PWD `X(08)` (48) | `VARCHAR(255)` | bcrypt; no plaintext |
 | `user_type` | SEC-USR-TYPE `X(01)` (56) | `CHAR(1)` | No check constraint |
 | `created_at` | new audit column | `TIMESTAMPTZ DEFAULT now()` | |
 | `updated_at` | new audit column | `TIMESTAMPTZ DEFAULT now()` | Trigger, revision `0006` |
@@ -299,7 +379,7 @@ ACCTDATA KSDS, `KEYS(11 0)`, with no AIX.
 | `active_status` | ACCT-ACTIVE-STATUS `X(01)` (11) | `CHAR(1)` | |
 | `curr_balance` | ACCT-CURR-BAL `S9(10)V99` (12) | `NUMERIC(12,2)` | Zoned DISPLAY, not `COMP-3` |
 | `credit_limit` | ACCT-CREDIT-LIMIT `S9(10)V99` (24) | `NUMERIC(12,2)` | As `curr_balance` |
-| `cash_credit_limit` | ACCT-CASH-CREDIT-LIMIT `S9(10)V99` (36) | `NUMERIC(12,2)` | As `curr_balance` |
+| `cash_credit_limit` | ACCT-CASH-CREDIT-LIMIT `S9(10)V99` (36) | `NUMERIC(12,2)` | See notes |
 | `open_date` | ACCT-OPEN-DATE `X(10)` (48) | `DATE NULL` | |
 | `expiration_date` | ACCT-EXPIRAION-DATE `X(10)` (58) | `DATE NULL` | Source name misspelt (sic) |
 | `reissue_date` | ACCT-REISSUE-DATE `X(10)` (68) | `DATE NULL` | |
@@ -336,12 +416,19 @@ CUSTDATA KSDS, `KEYS(9 0)`. `cpy/CUSTREC.cpy` is identical apart from the DOB fi
 | `addr_zip` | CUST-ADDR-ZIP `X(10)` (239) | `VARCHAR(10)` | |
 | `phone_num_1` | CUST-PHONE-NUM-1 `X(15)` (249) | `VARCHAR(15)` | |
 | `phone_num_2` | CUST-PHONE-NUM-2 `X(15)` (264) | `VARCHAR(15)` | |
-| `ssn` | CUST-SSN `9(09)` (279) | `VARCHAR(9)` | Digit check; masked in API responses |
+| `ssn` | CUST-SSN `9(09)` (279) | `VARCHAR(9)` | Digit check; masked in API responses, see notes |
 | `govt_issued_id` | CUST-GOVT-ISSUED-ID `X(20)` (288) | `VARCHAR(20)` | |
 | `date_of_birth` | CUST-DOB-YYYY-MM-DD `X(10)` (308) | `DATE NULL` | |
 | `eft_account_id` | CUST-EFT-ACCOUNT-ID `X(10)` (318) | `VARCHAR(10)` | |
 | `primary_holder_ind` | CUST-PRI-CARD-HOLDER-IND `X(01)` (328) | `CHAR(1)` | |
 | `fico_credit_score` | CUST-FICO-CREDIT-SCORE `9(03)` (329) | `SMALLINT` | |
+
+Notes:
+
+- `ssn` is stored in full, because COACTUPC edits it. API responses mask it as `***-**-` plus the
+    last four digits (`MaskSsn` in `backend/app/core/security.py`), except
+    `GET /accounts/{acctId}/edit` and `PUT /accounts/{acctId}`, which carry it unmasked for that
+    edit (see [architecture.md](architecture.md)).
 
 ### `cards.cards`
 
@@ -487,6 +574,8 @@ TCATBALF KSDS, `KEYS(17 0)`.
 Notes:
 
 - The primary key is all three key columns (`KEYS(17 0)`).
+- `acct_id` carries the `^[0-9]{11}$` digit check of [PIC row 1](#pic-to-type-mapping), because
+    TRANCAT-ACCT-ID is a `9(11)` identifier. Revision `0005_pic9_digit_checks` creates it.
 - There is no foreign key to the categories, because CBTRN02C creates a balance for any code
     (`cbl/CBTRN02C.cbl` lines 500–512).
 - The request says INTCALC updates this table. It does not: INTCALC opens TCATBALF for input only
@@ -598,24 +687,28 @@ The revisions live in `backend/alembic/versions/`. The head is `0009`.
 
 | Revision | Content |
 |---|---|
-| `0001_create_dataset_schemas_and_tables` | Nine schemas; the eleven dataset tables with primary keys, column types and FILLER comments |
+| `0001_create_dataset_schemas_and_tables` | The schemas and dataset tables (notes below) |
 | `0002_seed_sample_data` | Loads the eleven dataset tables from the EBCDIC images (notes below) |
-| `0003_alternate_index_replacements` | The indexes above; `ebcdic_sort_key(text)`; the three generated sort columns and their indexes |
+| `0003_alternate_index_replacements` | The indexes and sort columns (notes below) |
 | `0004_relationship_foreign_keys` | The foreign keys above |
 | `0005_pic9_digit_checks` | The `^[0-9]{n}$` checks on the identifier columns |
 | `0006_users_audit_timestamps` | The `updated_at` trigger on `security.users` |
 | `0007_security_login_attempts` | `security.login_attempts` |
-| `0008_batch_job_run_ledger` | `batch.cycles`, `batch.cycle_steps` and `batch.job_runs`; records the seed (notes below) |
+| `0008_batch_job_run_ledger` | The batch ledger tables; records the seed (notes below) |
 | `0009_batch_gdg_catalog` | `batch.gdg_generations` |
 
 Notes:
 
+- **`0001`.** Nine schemas; the eleven dataset tables with primary keys, column types and FILLER
+    comments.
 - **`0002`.** `app.seed.sample_seed.LoadSampleData` loads the tables with the loader semantics of
     [batch.md](batch.md). It runs only when `APP_ENV` is `local` or `test`. Under `production` it
     logs a skip and loads nothing, so the sample users never reach a production database.
-- **`0008`.** When `0002` loaded data, `0008` also records that seed as an `OPEN` cycle
-    (`opened_by = 'SEED'`): one `job_runs` row per seeded loader, chain steps 1–5 and 7–12
-    `COMPLETED`, and the rest `PENDING`.
+- **`0003`.** The indexes named above; `ebcdic_sort_key(text)`; the three generated sort columns
+    and their indexes.
+- **`0008`.** `batch.cycles`, `batch.cycle_steps` and `batch.job_runs`. When `0002` loaded data,
+    `0008` also records that seed as an `OPEN` cycle (`opened_by = 'SEED'`): one `job_runs` row
+    per seeded loader, chain steps 1–5 and 7–12 `COMPLETED`, and the rest `PENDING`.
 
 ### Expected rows after migration
 
@@ -635,7 +728,7 @@ Expected rows after `alembic upgrade head`:
 | `transactions.daily_transactions` | 300 |
 | `transactions.transactions` | 0 |
 
-Why two counts differ from older figures:
+Seed-count rationale for the category-balance and transaction counts:
 
 - **Category balances are 50, not 49.** Both images hold 50 records:
     `data/EBCDIC/AWS.M2.CARDDEMO.TCATBALF.PS` is 2,500 bytes, or 50 records of 50 bytes, and

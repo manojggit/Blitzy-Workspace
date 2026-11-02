@@ -2,12 +2,12 @@
 
 Expected values are derived by hand from the COBOL rules, never from the unit:
 - IBM Enterprise COBOL stores without ROUNDED or ON SIZE ERROR by truncating surplus fraction
-  digits toward zero and dropping high-order integer digits, keeping the sign (AAP 0.6.6).
+    digits toward zero and dropping high-order integer digits, keeping the sign (AAP 0.6.6).
 - cbl/CBACT04C.cbl lines 464-465: COMPUTE WS-MONTHLY-INT = (TRAN-CAT-BAL * DIS-INT-RATE) / 1200.
 - cbl/COBIL00C.cbl line 224: MOVE ACCT-CURR-BAL (S9(10)V99) TO TRAN-AMT (S9(09)V99).
 - cpy/CVACT01Y.cpy ACCT-CURR-BAL S9(10)V99 and cpy/CVTRA06Y.cpy DALYTRAN-AMT S9(09)V99, zoned
-  DISPLAY fields with a trailing sign overpunch, read from data/ASCII/acctdata.txt record 1
-  (offset 12) and data/ASCII/dailytran.txt (offset 132).
+    DISPLAY fields with a trailing sign overpunch, read from data/ASCII/acctdata.txt record 1
+    (offset 12) and data/ASCII/dailytran.txt (offset 132).
 """
 
 from decimal import Decimal, localcontext

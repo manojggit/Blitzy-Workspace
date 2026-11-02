@@ -41,7 +41,9 @@ class Card(Base):
 
     # Attributes carry the snake_case column names the schema fixes, not the camelCase the
     # MK_Modernization Rule's naming clause gives variables, so ORM and SQL names stay identical.
-    card_num: Mapped[str] = mapped_column(String(16, collation=KEY_COLLATION), primary_key=True)
+    card_num: Mapped[str] = mapped_column(
+        String(16, collation=KEY_COLLATION), primary_key=True, server_default=""
+    )
     card_num_sort: Mapped[str] = mapped_column(
         Text(collation=KEY_COLLATION),
         Computed("ebcdic_sort_key(card_num)", persisted=True),
