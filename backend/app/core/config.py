@@ -61,7 +61,9 @@ class CommonSettings(BaseSettings):
     )
 
     APP_ENV: Literal["local", "test", "production"] = "local"
-    SYNC_DATABASE_URL: str
+    # repr=False and exclude=True on SECRET_KEY and the database URLs keep the key and the
+    # database passwords out of repr(), str(), log records and model_dump output.
+    SYNC_DATABASE_URL: str = Field(repr=False, exclude=True)
     CARDDEMO_EBCDIC_DIR: str = "data/EBCDIC"
     BCRYPT_ROUNDS: int = Field(default=12, ge=4, le=31)
 
@@ -82,8 +84,8 @@ class Settings(CommonSettings):
     MINIMUM_SECRET_KEY_LENGTH characters, so the backend refuses to start without a real key.
     """
 
-    DATABASE_URL: str
-    SECRET_KEY: str = Field(default="", validate_default=True)
+    DATABASE_URL: str = Field(repr=False, exclude=True)
+    SECRET_KEY: str = Field(default="", validate_default=True, repr=False, exclude=True)
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60, gt=0)
     SESSION_COOKIE_NAME: str = "carddemo_session"
     LOGIN_MAX_ATTEMPTS: int = Field(default=5, gt=0)
@@ -137,4 +139,4 @@ class MigrationSettings(CommonSettings):
     # Blank instead of required: offline SQL generation (alembic upgrade --sql) needs no
     # database URL, and alembic/env.py raises its own actionable error when an online run
     # finds the URL blank. A blank default holds no credential.
-    SYNC_DATABASE_URL: str = ""
+    SYNC_DATABASE_URL: str = Field(default="", repr=False, exclude=True)
