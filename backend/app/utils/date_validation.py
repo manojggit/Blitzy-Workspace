@@ -26,7 +26,7 @@ No function reads the clock or the settings: EditDateOfBirth takes today's date 
 import calendar
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from enum import Enum
 
 from app.utils.cobol_intrinsics import Numval, TestNumval
@@ -342,12 +342,13 @@ def EditDateOfBirth(dateText: str, today: date) -> DateEditResult:
     """Port of EDIT-DATE-OF-BIRTH, CSUTLDPY lines 341-372.
 
     COACTUPC performs it only when EditDateCcyymmdd(dateText).isValid; a date whose flags are
-    not valid raises ValueError. today is the caller's local date (FUNCTION CURRENT-DATE). The
+    not valid raises ValueError. today is the caller's local date (FUNCTION CURRENT-DATE). A
+    datetime such as datetime.now() is accepted and only its date part is compared. The
     date of birth is valid only when today is later; today or a later date sets every part
     NOT-OK, inputError and ":cannot be in the future ".
     """
     birthDate = _EditedDate(dateText)
-    if today > birthDate:
+    if _CalendarDate(today) > birthDate:
         return DateEditResult(
             yearStatus=DatePartStatus.VALID,
             monthStatus=DatePartStatus.VALID,
@@ -466,6 +467,17 @@ def _EditedDate(dateText: str) -> date:
         )
     editedText = _NormalizedDateText(state)
     return date(int(editedText[0:4]), int(editedText[4:6]), int(editedText[6:8]))
+
+
+def _CalendarDate(today: date) -> date:
+    """WS-CURRENT-DATE-YYYYMMDD: the calendar date of today, without any time of day.
+
+    EDIT-DATE-OF-BIRTH moves only the YYYYMMDD part of FUNCTION CURRENT-DATE (CSUTLDPY line
+    343), so a datetime gives its date() and a plain date is returned as it is.
+    """
+    if isinstance(today, datetime):
+        return today.date()
+    return today
 
 
 def _NormalizedDateText(state: _DateEditState) -> str:
