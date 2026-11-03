@@ -187,10 +187,27 @@ const MONTHLY_CONFIRMED_QUERY: ReportQuery = {
     confirm: "Y",
 };
 
+// A valid Custom range that matches no posted transaction, confirmed with Y.
+const EMPTY_RANGE_DATE_PARTS: DatePartValues = {
+    startMm: "01",
+    startDd: "01",
+    startYyyy: "2021",
+    endMm: "01",
+    endDd: "31",
+    endYyyy: "2021",
+};
+const EMPTY_RANGE_CONFIRMED_QUERY: ReportQuery = {
+    reportType: ReportType.CUSTOM,
+    ...EMPTY_RANGE_DATE_PARTS,
+    confirm: "Y",
+};
+const EMPTY_RANGE_HEADING = "Date Range: 2021-01-01 to 2021-01-31";
+
 // The corpt00c.py literals (CORPT00C lines 213-531).
 const SELECT_REPORT_TYPE_MESSAGE = "Select a report type to print report...";
 const START_MONTH_INVALID_MESSAGE = "Start Date - Not a valid Month...";
 const MONTHLY_SUBMITTED_MESSAGE = "Monthly report submitted for printing ...";
+const CUSTOM_SUBMITTED_MESSAGE = "Custom report submitted for printing ...";
 
 function BuildReportLine(fields: Partial<ReportLine> & Pick<ReportLine, "line_kind">): ReportLine {
     return {
@@ -356,6 +373,114 @@ const DOWNLOAD_CASES: readonly (readonly [ExportFormat, string])[] = [
     [ExportFormat.PDF, "Download PDF"],
 ];
 
+// The on-screen page size of the report table and the MUI TablePagination next-page control.
+const REPORT_LINES_PER_PAGE = 50;
+const NEXT_PAGE_BUTTON_NAME = "Go to next page";
+const TRAN_ID_DIGITS = 16;
+
+// Detail lines whose transaction IDs count their print position from 1, so each row shows where
+// it sits in the report.
+function BuildDetailLines(count: number): ReportLine[] {
+    return Array.from({ length: count }, (_unused, position) =>
+        BuildReportLine({
+            line_kind: ReportLineKind.DETAIL,
+            tran_id: String(position + 1).padStart(TRAN_ID_DIGITS, "0"),
+        }),
+    );
+}
+
+// Two full pages and a last page of three lines.
+const LONG_REPORT_LINES: readonly ReportLine[] = BuildDetailLines(2 * REPORT_LINES_PER_PAGE + 3);
+
+// The page shown after pressing next a number of times: its first line's position, its line count
+// and the TablePagination range label.
+interface ReportPageCase {
+    nextPageClicks: number;
+    firstPosition: number;
+    lineCount: number;
+    rangeLabel: string;
+}
+
+const FIRST_PAGE_CASE: ReportPageCase = {
+    nextPageClicks: 0,
+    firstPosition: 0,
+    lineCount: 50,
+    rangeLabel: "1–50 of 103",
+};
+const SECOND_PAGE_CASE: ReportPageCase = {
+    nextPageClicks: 1,
+    firstPosition: 50,
+    lineCount: 50,
+    rangeLabel: "51–100 of 103",
+};
+const LONG_REPORT_PAGE_CASES: readonly ReportPageCase[] = [
+    FIRST_PAGE_CASE,
+    SECOND_PAGE_CASE,
+    { nextPageClicks: 2, firstPosition: 100, lineCount: 3, rangeLabel: "101–103 of 103" },
+];
+// A short report and one of exactly one full page.
+const ONE_PAGE_LINE_COUNTS: readonly number[] = [REPORT_LINES.length, REPORT_LINES_PER_PAGE];
+
+const REPORT_TYPE_GROUP_LABEL = "Report type";
+
+// An error outcome that names reportType, with the report type chosen before ENTER, if any.
+interface FlaggedReportTypeCase {
+    name: string;
+    status: number;
+    body: LegacyErrorResponse;
+    chosenLabel: string | null;
+}
+
+const FLAGGED_REPORT_TYPE_CASES: readonly FlaggedReportTypeCase[] = [
+    {
+        name: "the no-selection edit (400, field_errors and cursor_field)",
+        status: HTTP_BAD_REQUEST,
+        body: BuildErrorBody({
+            message: SELECT_REPORT_TYPE_MESSAGE,
+            field_errors: ["reportType"],
+            cursor_field: "reportType",
+        }),
+        chosenLabel: null,
+    },
+    {
+        name: "the file error (503, cursor_field only) with Monthly chosen",
+        status: HTTP_SERVICE_UNAVAILABLE,
+        body: BuildErrorBody({
+            message: "Unable to Write TDQ (JOBS)...",
+            cursor_field: "reportType",
+        }),
+        chosenLabel: MONTHLY_LABEL,
+    },
+];
+
+// The ENTER outcomes answered, in order, before the Report type group is checked.
+interface UnflaggedReportTypeCase {
+    name: string;
+    outcomes: readonly LiteralCase[];
+}
+
+const UNFLAGGED_REPORT_TYPE_CASES: readonly UnflaggedReportTypeCase[] = [
+    { name: "on first display", outcomes: [] },
+    {
+        name: "after an edit naming startMm",
+        outcomes: [EditFailure(START_MONTH_INVALID_MESSAGE, "startMm")],
+    },
+    {
+        name: "once an edit naming startMm follows the no-selection edit",
+        outcomes: [
+            EditFailure(SELECT_REPORT_TYPE_MESSAGE, "reportType"),
+            EditFailure(START_MONTH_INVALID_MESSAGE, "startMm"),
+        ],
+    },
+    {
+        name: "once the submission, cursor on MONTHLY, follows the no-selection edit",
+        outcomes: [
+            EditFailure(SELECT_REPORT_TYPE_MESSAGE, "reportType"),
+            SubmittedOutcome(MONTHLY_SUBMITTED_MESSAGE, REPORT_LINES),
+        ],
+    },
+];
+
 // Resolves once the first-display cursor sits on MONTHLY (IC): that focus starts a MUI focus
 // ripple asynchronously, which must settle inside the testing-library wrapper, not after a test.
 async function RenderScreen(): Promise<UserEvent> {
@@ -442,6 +567,33 @@ function ReportTypeButton(label: string): HTMLElement {
     return screen.getByRole("button", { name: label });
 }
 
+function ReportTypeGroup(): HTMLElement {
+    return screen.getByRole("group", { name: REPORT_TYPE_GROUP_LABEL });
+}
+
+// The error colour on every segment border and on each label not chosen; the chosen segment keeps
+// its container colour, so its label stays legible.
+function ExpectErrorSegments(chosenLabel: string | null): void {
+    const { error, m3 } = CARD_DEMO_THEME.palette;
+    for (const label of REPORT_TYPE_LABELS) {
+        const isChosen = label === chosenLabel;
+        const button = ReportTypeButton(label);
+        expect(button).toHaveAttribute("aria-pressed", String(isChosen));
+        expect(button).toHaveStyle({
+            borderColor: error.main,
+            color: isChosen ? m3.onPrimaryContainer : error.main,
+        });
+    }
+}
+
+// ENTER answered with one outcome; resolves once the message line shows its literal.
+async function SubmitOutcome(user: UserEvent, outcome: LiteralCase): Promise<void> {
+    MockReportOutcome(outcome);
+    await PressScreenKey(user, ENTER_KEY, "click");
+    await screen.findByText(outcome.literal);
+    await ExpectAlert(outcome.literal, outcome.severity);
+}
+
 // A focused button acts on Enter itself, so the physical key is pressed from the start month
 // part, as the 3270 cursor sat in an input field.
 async function PressScreenKey(user: UserEvent, key: ScreenKey, entry: KeyEntry): Promise<void> {
@@ -459,14 +611,69 @@ async function FillDateParts(user: UserEvent, values: DatePartValues): Promise<v
     }
 }
 
-// MONTHLY chosen, Y confirmed and ENTER pressed, answered with the five report lines.
-async function ShowMonthlyReport(): Promise<void> {
-    mockFetchTransactionReport.mockResolvedValue(BuildReportResponse());
-    const user = await RenderScreen();
+// MONTHLY chosen, Y confirmed and ENTER pressed on the screen shown.
+async function SubmitMonthlyReport(user: UserEvent): Promise<void> {
     await user.click(ReportTypeButton(MONTHLY_LABEL));
     await user.type(ConfirmInput(), "Y");
     await PressScreenKey(user, ENTER_KEY, "click");
+}
+
+// MONTHLY confirmed with Y, answered with the given report lines: the five line kinds unless
+// another report is given.
+async function ShowMonthlyReport(lines: readonly ReportLine[] = REPORT_LINES): Promise<UserEvent> {
+    mockFetchTransactionReport.mockResolvedValue(BuildReportResponse({ lines: [...lines] }));
+    const user = await RenderScreen();
+    await SubmitMonthlyReport(user);
     await screen.findByRole("table", { name: REPORT_TABLE_LABEL });
+    return user;
+}
+
+async function PressNextPage(user: UserEvent): Promise<void> {
+    await user.click(screen.getByRole("button", { name: NEXT_PAGE_BUTTON_NAME }));
+}
+
+// The transaction ID cell of every body row the report table shows, top to bottom.
+function ShownTranIds(): string[] {
+    const table = screen.getByRole("table", { name: REPORT_TABLE_LABEL });
+    const bodyRows = within(table).getAllByRole("row").slice(1);
+    return bodyRows.map((row) => within(row).getAllByRole("cell")[0]?.textContent ?? "");
+}
+
+function LongReportTranIds(firstPosition: number, lineCount: number): string[] {
+    const pageLines = LONG_REPORT_LINES.slice(firstPosition, firstPosition + lineCount);
+    return pageLines.map((line) => line.tran_id);
+}
+
+// CUSTOM chosen for a range with no posted transaction, Y confirmed and ENTER pressed.
+async function ShowEmptyCustomReport(): Promise<void> {
+    mockFetchTransactionReport.mockResolvedValue(
+        BuildReportResponse({
+            start_date: "2021-01-01",
+            end_date: "2021-01-31",
+            message: CUSTOM_SUBMITTED_MESSAGE,
+            lines: [],
+        }),
+    );
+    const user = await RenderScreen();
+    await user.click(ReportTypeButton(CUSTOM_LABEL));
+    await FillDateParts(user, EMPTY_RANGE_DATE_PARTS);
+    await user.type(ConfirmInput(), "Y");
+    await PressScreenKey(user, ENTER_KEY, "click");
+    await ExpectAlert(CUSTOM_SUBMITTED_MESSAGE, "success");
+}
+
+// Both download links repeat the whole confirmed query, and every link built so far was built
+// from it.
+function ExpectCompleteDownloads(query: ReportQuery): void {
+    for (const [format, linkName] of DOWNLOAD_CASES) {
+        expect(mockBuildReportExportUrl).toHaveBeenCalledWith(query, format);
+        const link = screen.getByRole("link", { name: linkName });
+        expect(link).toHaveAttribute("href", EXPORT_URL_PREFIX + format);
+        expect(link).toHaveAttribute("download");
+    }
+    for (const [builtQuery] of mockBuildReportExportUrl.mock.calls) {
+        expect(builtQuery).toStrictEqual(query);
+    }
 }
 
 // The body row of one report line; the first row of the table holds the column headings.
@@ -610,6 +817,40 @@ it("CORPT00C flags every field_errors part and focuses cursor_field", async () =
     await waitFor(() => expect(DatePartInput(START_MONTH_PART)).toHaveFocus());
 });
 
+it.each(FLAGGED_REPORT_TYPE_CASES)(
+    "CORPT00C marks the Report type group invalid after $name",
+    async ({ status, body, chosenLabel }) => {
+        mockFetchTransactionReport.mockRejectedValue(BuildAxiosError(status, body));
+        const user = await RenderScreen();
+        if (chosenLabel !== null) {
+            await user.click(ReportTypeButton(chosenLabel));
+        }
+        await PressScreenKey(user, ENTER_KEY, "click");
+        await ExpectAlert(body.message, "error");
+        expect(ReportTypeGroup()).toHaveAttribute("aria-invalid", "true");
+        expect(ReportTypeGroup()).toHaveAccessibleDescription(body.message);
+        ExpectErrorSegments(chosenLabel);
+        await waitFor(() => expect(ReportTypeButton(MONTHLY_LABEL)).toHaveFocus());
+    },
+);
+
+it.each(UNFLAGGED_REPORT_TYPE_CASES)(
+    "CORPT00C leaves the Report type group unflagged $name",
+    async ({ outcomes }) => {
+        const user = await RenderScreen();
+        for (const outcome of outcomes) {
+            await SubmitOutcome(user, outcome);
+        }
+        expect(ReportTypeGroup()).toHaveAttribute("aria-invalid", "false");
+        expect(ReportTypeGroup()).not.toHaveAccessibleDescription();
+        for (const label of REPORT_TYPE_LABELS) {
+            expect(ReportTypeButton(label)).not.toHaveStyle({
+                borderColor: CARD_DEMO_THEME.palette.error.main,
+            });
+        }
+    },
+);
+
 it("CORPT00C confirm N clears every field and the message (INITIALIZE-ALL-FIELDS)", async () => {
     mockFetchTransactionReport.mockResolvedValue(
         BuildReportResponse({ start_date: "", end_date: "", message: "", lines: [] }),
@@ -641,15 +882,14 @@ it("CORPT00C Y shows the CBTRN03C report below the cleared form", async () => {
     await waitFor(() => expect(ReportTypeButton(MONTHLY_LABEL)).toHaveFocus());
 });
 
-it("CORPT00C confirmed range with no transactions shows its range and no table", async () => {
-    MockReportOutcome(SubmittedOutcome("Custom report submitted for printing ...", []));
-    const user = await RenderScreen();
-    await PressScreenKey(user, ENTER_KEY, "click");
-    await ExpectAlert("Custom report submitted for printing ...", "success");
-    expect(screen.getByRole("heading", { level: 2, name: DATE_RANGE_HEADING })).toBeInTheDocument();
+it("CORPT00C empty confirmed range shows its range and both downloads, no table", async () => {
+    await ShowEmptyCustomReport();
+    expect(mockFetchTransactionReport).toHaveBeenCalledWith(EMPTY_RANGE_CONFIRMED_QUERY);
+    expect(
+        screen.getByRole("heading", { level: 2, name: EMPTY_RANGE_HEADING }),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    expect(mockBuildReportExportUrl).not.toHaveBeenCalled();
+    ExpectCompleteDownloads(EMPTY_RANGE_CONFIRMED_QUERY);
 });
 
 it.each(LINE_KIND_CASES)(
@@ -676,6 +916,54 @@ it.each(DOWNLOAD_CASES)(
         expect(link).toHaveAttribute("download");
     },
 );
+
+it.each(LONG_REPORT_PAGE_CASES)(
+    "CORPT00C long report page $rangeLabel shows its lines in print order, downloads whole",
+    async ({ nextPageClicks, firstPosition, lineCount, rangeLabel }) => {
+        const user = await ShowMonthlyReport(LONG_REPORT_LINES);
+        for (let click = 0; click < nextPageClicks; click += 1) {
+            await PressNextPage(user);
+        }
+        expect(screen.getByText(rangeLabel)).toBeInTheDocument();
+        const table = screen.getByRole("table", { name: REPORT_TABLE_LABEL });
+        expect(within(table).getAllByRole("columnheader")).toHaveLength(TABLE_HEADINGS.length);
+        expect(ShownTranIds()).toEqual(LongReportTranIds(firstPosition, lineCount));
+        ExpectCompleteDownloads(MONTHLY_CONFIRMED_QUERY);
+    },
+);
+
+it.each(ONE_PAGE_LINE_COUNTS)(
+    "CORPT00C report of %i lines fits one page and shows no pagination",
+    async (lineCount) => {
+        await ShowMonthlyReport(BuildDetailLines(lineCount));
+        expect(ShownTranIds()).toHaveLength(lineCount);
+        const nextPageButton = screen.queryByRole("button", { name: NEXT_PAGE_BUTTON_NAME });
+        expect(nextPageButton).not.toBeInTheDocument();
+    },
+);
+
+it("CORPT00C a new report opens on its first page", async () => {
+    const user = await ShowMonthlyReport(LONG_REPORT_LINES);
+    await PressNextPage(user);
+    expect(screen.getByText(SECOND_PAGE_CASE.rangeLabel)).toBeInTheDocument();
+    mockFetchTransactionReport.mockResolvedValueOnce(
+        BuildReportResponse({ lines: [...LONG_REPORT_LINES] }),
+    );
+    await SubmitMonthlyReport(user);
+    await waitFor(() => expect(mockFetchTransactionReport).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(FIRST_PAGE_CASE.rangeLabel)).toBeInTheDocument();
+    expect(ShownTranIds()).toEqual(LongReportTranIds(0, FIRST_PAGE_CASE.lineCount));
+    ExpectCompleteDownloads(MONTHLY_CONFIRMED_QUERY);
+});
+
+it("CORPT00C criteria edits do not render the shown report again", async () => {
+    const user = await ShowMonthlyReport(LONG_REPORT_LINES);
+    mockBuildReportExportUrl.mockClear();
+    await user.click(ReportTypeButton(CUSTOM_LABEL));
+    await FillDateParts(user, EMPTY_RANGE_DATE_PARTS);
+    expect(mockBuildReportExportUrl).not.toHaveBeenCalled();
+    expect(ShownTranIds()).toEqual(LongReportTranIds(0, FIRST_PAGE_CASE.lineCount));
+});
 
 it.each(KEY_ENTRIES)("CORPT00C F3 by %s returns to the main menu", async (entry) => {
     const user = await RenderScreen();

@@ -21,6 +21,7 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import {
+    Box,
     Button,
     Grid,
     Stack,
@@ -29,17 +30,20 @@ import {
     TableCell,
     TableContainer,
     TableHead,
+    TablePagination,
     TableRow,
     TextField,
     ToggleButton,
     ToggleButtonGroup,
     Typography,
+    toggleButtonClasses,
     useMediaQuery,
     useTheme,
     type GridProps,
     type SxProps,
     type TextFieldProps,
     type Theme,
+    type ToggleButtonGroupProps,
 } from "@mui/material";
 import DownloadIcon from "@mui/icons-material/Download";
 import axios, { type AxiosError } from "axios";
@@ -94,6 +98,17 @@ const REPORT_TYPE_OPTIONS: readonly ReportTypeOption[] = [
     { value: ReportType.CUSTOM, label: "Custom (Date Range)" },
 ];
 const REPORT_TYPE_GROUP_LABEL = "Report type";
+// The message line's id, by which a report-type group the server names in error is described.
+const MESSAGE_LINE_ID = "report-message-line";
+// A report-type group the server names in error: every segment border, the inner ones of either
+// orientation included, and the label of each segment not chosen take the error colour. The
+// chosen segment keeps its container colours, so its label stays legible.
+const FLAGGED_SELECTOR_STYLE: SxProps<Theme> = {
+    [`& .${toggleButtonClasses.root}`]: { borderColor: "error.main" },
+    [`& .${toggleButtonClasses.root}:not(.${toggleButtonClasses.selected})`]: {
+        color: "error.main",
+    },
+};
 // Each date part takes a third of the row on a phone and a sixth of it from the md breakpoint.
 const DATE_PART_GRID_SIZE: GridProps["size"] = { xs: 4, md: 2 };
 // The three selectors stack, as on the map, where a row of segments would overflow the screen.
@@ -116,6 +131,13 @@ const REPORT_TABLE_MAX_HEIGHT_UNITS = 150;
 const REPORT_TABLE_STYLE: SxProps<Theme> = {
     maxHeight: (theme) => theme.spacing(REPORT_TABLE_MAX_HEIGHT_UNITS),
 };
+// The screen mounts the TRANREPT lines a page at a time, so a report of any length mounts a
+// bounded number of rows. These pages only view the print report: CBTRN03C's own page breaks stay
+// in its lines, and both downloads hold every line.
+const REPORT_LINES_PER_PAGE = 50;
+// A single page size, so the pagination offers no size choice.
+const REPORT_PAGE_SIZE_OPTIONS: readonly number[] = [REPORT_LINES_PER_PAGE];
+const FIRST_REPORT_PAGE = 0;
 
 // The CVTRA07Y REPORT-ACCOUNT-TOTALS, REPORT-PAGE-TOTALS and REPORT-GRAND-TOTALS literals.
 const TOTAL_LABELS: Readonly<Partial<Record<ReportLineKind, string>>> = {
@@ -556,6 +578,8 @@ interface ReportTypeSelectorProps {
     value: ReportType | null;
     onChange: ReportTypeSetter;
     firstButtonRef: Ref<HTMLButtonElement>;
+    // The server names reportType in cursor_field or field_errors.
+    isFlagged: boolean;
 }
 
 type SelectorOrientation = "horizontal" | "vertical";
@@ -579,23 +603,37 @@ function RenderReportTypeButton(
     );
 }
 
+// A flagged group reads as invalid, is described by the server's message on the message line and
+// shows the error colour; the message itself is shown once, on the message line.
+function FlaggedSelectorProps(isFlagged: boolean): Partial<ToggleButtonGroupProps> {
+    if (!isFlagged) {
+        return { "aria-invalid": false };
+    }
+    return {
+        "aria-invalid": true,
+        "aria-describedby": MESSAGE_LINE_ID,
+        sx: FLAGGED_SELECTOR_STYLE,
+    };
+}
+
 // One exclusive choice replaces the three one-byte selectors. Pressing the chosen type again
 // clears the choice, as blanking the field did, so the no-selection literal stays reachable.
-function ReportTypeSelector({ value, onChange, firstButtonRef }: ReportTypeSelectorProps) {
+function ReportTypeSelector(props: ReportTypeSelectorProps) {
     const orientation = useSelectorOrientation();
     const handleChange = (_event: MouseEvent<HTMLElement>, next: ReportType | null): void => {
-        onChange(next);
+        props.onChange(next);
     };
     return (
         <ToggleButtonGroup
             exclusive
-            value={value}
+            value={props.value}
             orientation={orientation}
             onChange={handleChange}
             aria-label={REPORT_TYPE_GROUP_LABEL}
+            {...FlaggedSelectorProps(props.isFlagged)}
         >
             {REPORT_TYPE_OPTIONS.map((option, position) =>
-                RenderReportTypeButton(option, position === 0 ? firstButtonRef : undefined),
+                RenderReportTypeButton(option, position === 0 ? props.firstButtonRef : undefined),
             )}
         </ToggleButtonGroup>
     );
@@ -737,10 +775,24 @@ function ReportCriteriaSection({ form }: ReportFormSectionProps) {
                 value={form.inputs.reportType}
                 onChange={form.setReportType}
                 firstButtonRef={form.bindRef("reportType")}
+                isFlagged={errorFields.includes("reportType")}
             />
             <DateRangeFields form={form} errorFields={errorFields} />
             <ReportConfirmField form={form} errorFields={errorFields} />
         </Stack>
+    );
+}
+
+// ERRMSG and INFOMSG, under the id a flagged report-type group names as its description.
+function ReportMessageLine({ form }: ReportFormSectionProps) {
+    return (
+        <Box id={MESSAGE_LINE_ID}>
+            <MessageLine
+                message={form.feedback.message}
+                severity={form.feedback.severity}
+                infoMessage={form.feedback.infoMessage}
+            />
+        </Box>
     );
 }
 
@@ -833,21 +885,80 @@ function ReportTableHead() {
     );
 }
 
-// The TRANREPT lines in print order; the order never changes, so a position key is stable.
-function ReportLinesTable({ lines }: ReportLinesTableProps) {
+interface ReportLinesPageProps {
+    lines: readonly ReportLine[];
+    page: number;
+}
+
+// One on-screen page of the TRANREPT lines, in print order. The order never changes, so each row
+// keys on its position in the whole report. Each page remounts the container, which therefore
+// opens scrolled to the page's first line.
+function ReportLinesPageTable({ lines, page }: ReportLinesPageProps) {
+    const firstPosition = page * REPORT_LINES_PER_PAGE;
+    const pageLines = lines.slice(firstPosition, firstPosition + REPORT_LINES_PER_PAGE);
     return (
-        <TableContainer sx={REPORT_TABLE_STYLE}>
+        <TableContainer key={page} sx={REPORT_TABLE_STYLE}>
             <Table stickyHeader size="small" aria-label={REPORT_TABLE_LABEL}>
                 <ReportTableHead />
                 <TableBody>
-                    {lines.map((line, position) => (
-                        <Fragment key={`${line.line_kind}-${position}`}>
+                    {pageLines.map((line, offset) => (
+                        <Fragment key={`${line.line_kind}-${firstPosition + offset}`}>
                             {RenderReportLine(line)}
                         </Fragment>
                     ))}
                 </TableBody>
             </Table>
         </TableContainer>
+    );
+}
+
+type ReportPageChanger = (event: MouseEvent<HTMLButtonElement> | null, page: number) => void;
+
+interface ReportLinesPaginationProps {
+    lineCount: number;
+    page: number;
+    onPageChange: ReportPageChanger;
+}
+
+// Shown only for a report longer than one page. These pages are not PF-key paging: the CORPT00
+// legend is ENTER and F3 alone, and the pages only view the print report.
+function ReportLinesPagination({ lineCount, page, onPageChange }: ReportLinesPaginationProps) {
+    if (lineCount <= REPORT_LINES_PER_PAGE) {
+        return null;
+    }
+    return (
+        <TablePagination
+            component="div"
+            count={lineCount}
+            page={page}
+            rowsPerPage={REPORT_LINES_PER_PAGE}
+            rowsPerPageOptions={REPORT_PAGE_SIZE_OPTIONS}
+            onPageChange={onPageChange}
+        />
+    );
+}
+
+interface ReportLinesPageState {
+    lines: readonly ReportLine[];
+    page: number;
+}
+
+// The chosen page belongs to the lines it was chosen in, so a new report opens on its first page
+// with no effect resetting it.
+function ReportLinesTable({ lines }: ReportLinesTableProps) {
+    const [pageState, setPageState] = useState<ReportLinesPageState>({
+        lines,
+        page: FIRST_REPORT_PAGE,
+    });
+    const page = pageState.lines === lines ? pageState.page : FIRST_REPORT_PAGE;
+    const changePage: ReportPageChanger = (_event, nextPage) => {
+        setPageState({ lines, page: nextPage });
+    };
+    return (
+        <Stack>
+            <ReportLinesPageTable lines={lines} page={page} />
+            <ReportLinesPagination lineCount={lines.length} page={page} onPageChange={changePage} />
+        </Stack>
     );
 }
 
@@ -881,7 +992,7 @@ interface ReportResultSectionProps {
 }
 
 // A confirmed range that matched no transaction shows its range and no table, as CBTRN03C
-// prints nothing for an empty input.
+// prints nothing for an empty input; its downloads still give that empty report.
 function ReportResultSection({ result }: ReportResultSectionProps) {
     if (result === null) {
         return null;
@@ -891,18 +1002,16 @@ function ReportResultSection({ result }: ReportResultSectionProps) {
             <Typography variant="titleSmall" component="h2">
                 {DATE_RANGE_PREFIX + result.startDate + DATE_RANGE_SEPARATOR + result.endDate}
             </Typography>
-            {result.lines.length > 0 ? (
-                <>
-                    <ReportLinesTable lines={result.lines} />
-                    <ReportDownloadButtons query={result.submittedQuery} />
-                </>
-            ) : null}
+            {result.lines.length > 0 ? <ReportLinesTable lines={result.lines} /> : null}
+            <ReportDownloadButtons query={result.submittedQuery} />
         </Stack>
     );
 }
 
 function TransactionReportsScreen() {
     const form = useReportForm();
+    // The report renders again only for a new result, never for a criteria keystroke.
+    const resultView = useMemo(() => <ReportResultSection result={form.result} />, [form.result]);
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}
@@ -911,12 +1020,8 @@ function TransactionReportsScreen() {
             isBusy={form.isBusy}
         >
             <ReportCriteriaSection form={form} />
-            <MessageLine
-                message={form.feedback.message}
-                severity={form.feedback.severity}
-                infoMessage={form.feedback.infoMessage}
-            />
-            <ReportResultSection result={form.result} />
+            <ReportMessageLine form={form} />
+            {resultView}
             <FunctionKeyBar keys={form.keys} />
         </ScreenShell>
     );
