@@ -565,3 +565,77 @@ it.each(UNEXPECTED_ROUTES)(
         expect(KeyButton(CONTINUE_BUTTON_NAME)).toBeEnabled();
     },
 );
+
+const HTTP_INTERNAL_SERVER_ERROR = 500;
+// FastAPI's own text answer to an unhandled exception: not the legacy error model.
+const SERVER_ERROR_BODY = "Internal Server Error";
+
+interface SignOffFailureCase {
+    cause: string;
+    error: AxiosError;
+    message: string;
+}
+
+// A logout that never reached the server: an axios error with no response.
+function BuildNetworkError(): AxiosError {
+    return new AxiosError("Network Error", AxiosError.ERR_NETWORK, REQUEST_CONFIG);
+}
+
+// The logout answered 500 by FastAPI itself, with no legacy body.
+function BuildServerError(): AxiosError {
+    const status = HTTP_INTERNAL_SERVER_ERROR;
+    const config = REQUEST_CONFIG;
+    const response = { status, statusText: "", headers: {}, config, data: SERVER_ERROR_BODY };
+    const message = `Request failed with status code ${status}`;
+    return new AxiosError(message, AxiosError.ERR_BAD_RESPONSE, config, null, response);
+}
+
+// Ordinary F3 sign-offs the server never confirmed, each with the message line it shows.
+const SIGN_OFF_FAILURE_CASES: readonly SignOffFailureCase[] = [
+    { cause: "a network failure", error: BuildNetworkError(), message: ABEND_MESSAGE },
+    { cause: "a 500 without a legacy body", error: BuildServerError(), message: ABEND_MESSAGE },
+];
+
+// An unconfirmed sign-off keeps the session, stores no thank-you literal for /signon, stays on
+// /menu with the cursor back on OPTION, and unlocks both PF keys.
+function ExpectSignOffUnconfirmed(): void {
+    expect(mockLogout).toHaveBeenCalledTimes(1);
+    expect(mockClearSession).not.toHaveBeenCalled();
+    expect(TakePendingMessage()).toBe("");
+    expect(mockRouterPush).not.toHaveBeenCalled();
+    expect(mockRouterReplace).not.toHaveBeenCalled();
+    expect(OptionInput()).toHaveFocus();
+    expect(KeyButton(EXIT_BUTTON_NAME)).toBeEnabled();
+    expect(KeyButton(CONTINUE_BUTTON_NAME)).toBeEnabled();
+}
+
+it.each(SIGN_OFF_FAILURE_CASES)(
+    "COMEN01C F3 after $cause stays signed on and shows $message in red",
+    async ({ error, message }) => {
+        mockLogout.mockRejectedValue(error);
+        const user = await RenderLoadedScreen();
+        await user.click(KeyButton(EXIT_BUTTON_NAME));
+        await ExpectAlert(message, "error");
+        await WaitForIdle();
+        ExpectSignOffUnconfirmed();
+    },
+);
+
+it("COMEN01C F3 again after a failed sign-off signs off to /signon", async () => {
+    mockLogout.mockRejectedValueOnce(BuildNetworkError());
+    mockLogout.mockResolvedValue({ message: THANK_YOU_MESSAGE });
+    await RenderLoadedScreen();
+    PressKey("F3");
+    await ExpectAlert(ABEND_MESSAGE, "error");
+    await WaitForIdle();
+    expect(mockClearSession).not.toHaveBeenCalled();
+    PressKey("F3");
+    await waitFor(() => {
+        expect(mockRouterPush).toHaveBeenCalledWith(SIGN_ON_ROUTE);
+    });
+    await WaitForIdle();
+    expect(mockLogout).toHaveBeenCalledTimes(2);
+    expect(mockClearSession).toHaveBeenCalledTimes(1);
+    expect(TakePendingMessage()).toBe(THANK_YOU_MESSAGE);
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+});

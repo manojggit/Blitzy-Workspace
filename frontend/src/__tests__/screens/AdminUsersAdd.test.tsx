@@ -1,6 +1,8 @@
 // Screen tests: BMS COUSR01, program COUSR01C (CU01), page /admin/users/add.
 // Literals are copied from backend/app/services/users/cousr01c.py, cbl/COUSR01C.cbl
 // (PROCESS-ENTER-KEY and WRITE-USER-SEC-FILE, lines 120-270) and cpy/CSMSG01Y.cpy.
+import { randomBytes } from "node:crypto";
+
 import { ThemeProvider } from "@mui/material/styles";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
@@ -82,8 +84,8 @@ type OutcomeCase = readonly [string, number, MessageSeverity, UserFieldName];
 
 const ADMIN_MENU_ROUTE = "/admin";
 const TEST_USER_ID = "TESTUSR1";
-// Built at run time, so no password literal sits in the test (MK_Modernization Rule clause 3).
-const TEST_PASSWORD = "pw" + "test";
+// A fresh random 8-character value per run (PASSWD LENGTH=8), so no password is in the test.
+const TEST_PASSWORD = randomBytes(4).toString("hex");
 
 // CSMSG01Y CCDA-MSG-INVALID-KEY without its X(50) padding.
 const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";

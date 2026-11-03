@@ -4,6 +4,8 @@
 // lines 336-386) and cpy/CSUSR01Y.cpy. The literals are copied verbatim from
 // backend/app/services/users/cousr02c.py; the user API module is mocked, so every server outcome
 // is a resolved or a rejected call.
+import { randomBytes } from "node:crypto";
+
 import { ThemeProvider } from "@mui/material/styles";
 import {
     act,
@@ -133,8 +135,8 @@ const FETCHED_USER_TYPE = "U";
 const EDITED_LAST_NAME = "van Dyke";
 // The last name the newer of two overlapping fetches answers with.
 const NEWEST_LAST_NAME = "Newest";
-// Built at run time, so no password value is typed into the code (MK_Modernization Rule).
-const NEW_PASSWORD = "pw" + "new1";
+// A fresh random 8-character value per run (PASSWD LENGTH=8), so no password is in the test.
+const NEW_PASSWORD = randomBytes(4).toString("hex");
 const BLANK_USER_ID = " ";
 // A second user COUSR00C can select, with details unlike the first user's.
 const OTHER_USER_ID = "TESTUSR2";
@@ -148,6 +150,7 @@ const UPDATED_MESSAGE = "User TESTUSR1 has been updated ...";
 const OTHER_UPDATED_MESSAGE = "User TESTUSR2 has been updated ...";
 const USER_ID_EMPTY_MESSAGE = "User ID can NOT be empty...";
 const FIRST_NAME_EMPTY_MESSAGE = "First Name can NOT be empty...";
+const LAST_NAME_EMPTY_MESSAGE = "Last Name can NOT be empty...";
 const USER_TYPE_EMPTY_MESSAGE = "User Type can NOT be empty...";
 const USER_NOT_FOUND_MESSAGE = "User ID NOT found...";
 const UNABLE_TO_LOOKUP_MESSAGE = "Unable to lookup User...";
@@ -232,6 +235,9 @@ const UNEDITED_REQUEST: UserUpdateRequest = {
     password: "",
     user_type: FETCHED_USER_TYPE,
 };
+
+// The fetched record with only the Last Name cleared: FNAME and USRTYPE pass their checks.
+const LAST_NAME_CLEARED_REQUEST: UserUpdateRequest = { ...UNEDITED_REQUEST, last_name: "" };
 
 // A screen with nothing keyed sends every COUSR2AI field blank.
 const BLANK_REQUEST: UserUpdateRequest = {
@@ -441,6 +447,14 @@ async function Trigger(view: ScreenView, action: ScreenAction, mode: TriggerMode
 
 function FieldInput(label: string): HTMLInputElement {
     return screen.getByLabelText<HTMLInputElement>(label);
+}
+
+// The field with the given label is marked in error, and no other COUSR2A input is.
+function ExpectOnlyFieldInvalid(invalidLabel: string): void {
+    for (const label of ALL_FIELD_LABELS) {
+        const expectedInvalid = String(label === invalidLabel);
+        expect(FieldInput(label)).toHaveAttribute("aria-invalid", expectedInvalid);
+    }
 }
 
 // A new last name and a new password, typed over the fetched record.
@@ -812,6 +826,28 @@ describe("COUSR02C field errors and cursor (MOVE -1 TO <field>L)", () => {
         expect(FieldInput(PASSWORD_LABEL)).not.toHaveAttribute("aria-invalid", "true");
         await waitFor(() => {
             expect(FieldInput(FIRST_NAME_LABEL)).toHaveFocus();
+        });
+    });
+});
+
+// UPDATE-USER-INFO: USRIDIN and FNAME pass, so a blank LNAMEI is the first presence refusal.
+describe("COUSR02C PF5 with a blank Last Name (MOVE -1 TO LNAMEL)", () => {
+    it("COUSR02C PF5 with only LNAME cleared shows its literal in red at LNAME", async () => {
+        const view = await RenderFromList();
+        const body = BuildErrorBody({
+            message: LAST_NAME_EMPTY_MESSAGE,
+            field_errors: ["last_name"],
+            cursor_field: "last_name",
+        });
+        mockUpdateUser.mockRejectedValue(BuildAxiosError(HTTP_BAD_REQUEST, body));
+        await view.user.clear(FieldInput(LAST_NAME_LABEL));
+        await Trigger(view, SAVE_ACTION, "click");
+        await ExpectAlert(LAST_NAME_EMPTY_MESSAGE, "error");
+        expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+        expect(mockUpdateUser).toHaveBeenCalledWith(TEST_USER_ID, LAST_NAME_CLEARED_REQUEST);
+        ExpectOnlyFieldInvalid(LAST_NAME_LABEL);
+        await waitFor(() => {
+            expect(FieldInput(LAST_NAME_LABEL)).toHaveFocus();
         });
     });
 });

@@ -2,6 +2,8 @@
 // Literals are copied verbatim from backend/app/services/auth/cosgn00c.py (cbl/COSGN00C.cbl
 // lines 120, 125, 242, 249 and 254), login_throttle.py and backend/app/core/messages.py, whose
 // thank-you text is CSMSG01Y CCDA-MSG-THANK-YOU without its PIC X(50) padding.
+import { randomBytes } from "node:crypto";
+
 import { ThemeProvider } from "@mui/material/styles";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
@@ -114,8 +116,8 @@ const NAVIGATION_NOT_IMPLEMENTED = "Not implemented: navigation";
 
 // Lower case, so the call proves the page sends the user ID as typed: COSGN00C upper-cases it.
 const TEST_USER_ID = "testusr1";
-// Built at runtime, so no credential literal sits in the code.
-const TEST_PASSWORD = "pw" + "test";
+// A fresh random 8-character value per run (PASSWD LENGTH=8), so no password is in the test.
+const TEST_PASSWORD = randomBytes(4).toString("hex");
 const TYPED_CREDENTIALS: Required<LoginRequest> = {
     user_id: TEST_USER_ID,
     password: TEST_PASSWORD,
@@ -745,6 +747,88 @@ describe("COSGN00C unexpected next_route with a failed logout on /signon", () =>
         expect(refreshSessionMock).toHaveBeenCalledTimes(1);
         expect(screen.queryByText(ABEND_MESSAGE)).not.toBeInTheDocument();
         expect(CredentialInput("user_id")).toHaveValue("");
+        ExpectNoNavigation();
+    });
+});
+
+// FastAPI's own text answer to an unhandled exception: not the legacy error model.
+const SERVER_ERROR_BODY = "Internal Server Error";
+
+interface SignOffFailureCase {
+    cause: string;
+    error: AxiosError;
+    message: string;
+}
+
+// The logout answered 500 by FastAPI itself, with no legacy body.
+function BuildLogoutServerError(): AxiosError {
+    const config: InternalAxiosRequestConfig = {
+        url: LOGOUT_PATH,
+        method: "post",
+        headers: new AxiosHeaders(),
+    };
+    const status = HTTP_INTERNAL_SERVER_ERROR;
+    const response = { status, statusText: "", headers: {}, config, data: SERVER_ERROR_BODY };
+    const message = "Request failed with status code " + status;
+    return new AxiosError(message, AxiosError.ERR_BAD_RESPONSE, config, null, response);
+}
+
+// Ordinary F3 sign-offs the server never confirmed, each with the message line it shows.
+const SIGN_OFF_FAILURE_CASES: readonly SignOffFailureCase[] = [
+    { cause: "a network failure", error: BuildLogoutNetworkError(), message: ABEND_MESSAGE },
+    {
+        cause: "a 500 without a legacy body",
+        error: BuildLogoutServerError(),
+        message: ABEND_MESSAGE,
+    },
+];
+
+// An unconfirmed sign-off keeps the session and both typed credentials, shows no thank-you
+// notice, stays on /signon and unlocks both PF keys.
+function ExpectSignOffUnconfirmed(): void {
+    expect(logoutMock).toHaveBeenCalledTimes(1);
+    expect(clearSessionMock).not.toHaveBeenCalled();
+    expect(loginMock).not.toHaveBeenCalled();
+    expect(screen.queryByText(THANK_YOU_MESSAGE)).not.toBeInTheDocument();
+    expect(CredentialInput("user_id")).toHaveValue(TEST_USER_ID);
+    expect(CredentialInput("password")).toHaveValue(TYPED_CREDENTIALS.password);
+    expect(ExitButton()).toBeEnabled();
+    expect(SignOnButton()).toBeEnabled();
+    ExpectNoNavigation();
+}
+
+describe("COSGN00C PF3 sign-off failure on /signon", () => {
+    it.each(SIGN_OFF_FAILURE_CASES)(
+        "COSGN00C F3 after $cause keeps the session and shows $message in red",
+        async ({ error, message }) => {
+            logoutMock.mockRejectedValue(error);
+            const { user } = await RenderScreen();
+            await TypeCredentials(user, TYPED_CREDENTIALS);
+            await user.click(ExitButton());
+            await ExpectAlert(message, "error");
+            await WaitForIdle();
+            ExpectSignOffUnconfirmed();
+        },
+    );
+});
+
+describe("COSGN00C PF3 sign-off retry on /signon", () => {
+    it("COSGN00C F3 again after a failed sign-off shows the thank-you literal", async () => {
+        logoutMock.mockRejectedValueOnce(BuildLogoutNetworkError());
+        const { user } = await RenderScreen();
+        await TypeCredentials(user, TYPED_CREDENTIALS);
+        await PressKey("F3");
+        await ExpectAlert(ABEND_MESSAGE, "error");
+        await WaitForIdle();
+        expect(clearSessionMock).not.toHaveBeenCalled();
+        await PressKey("F3");
+        await ExpectAlert(THANK_YOU_MESSAGE, "info");
+        await WaitForIdle();
+        expect(logoutMock).toHaveBeenCalledTimes(2);
+        expect(clearSessionMock).toHaveBeenCalledTimes(1);
+        expect(screen.queryByText(ABEND_MESSAGE)).not.toBeInTheDocument();
+        expect(CredentialInput("user_id")).toHaveValue("");
+        expect(CredentialInput("password")).toHaveValue("");
         ExpectNoNavigation();
     });
 });
