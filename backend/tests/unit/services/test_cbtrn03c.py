@@ -5,7 +5,10 @@ layouts from TRAN-RECORD (CVTRA05Y) input that the procedure has already filtere
 sorted by card. BuildReport is pure, so these tests call it directly with no database. Expected
 lines and totals are typed from the cited COBOL and worked by hand with Decimal literals, or read
 from the reconciliation oracle's tranrept_lines.txt; none is taken from the module:
-- lines 127-137: WS-LINE-COUNTER starts at 0 and WS-PAGE-SIZE is 20;
+- lines 127-137: WS-LINE-COUNTER starts at 0 and WS-PAGE-SIZE is 20; WS-LINE-COUNTER is
+    PIC 9(09) COMP-3 (line 129), so ADD 1 keeps nine digits and 999999999 steps to 0, and the
+    PIC S9(09)V99 page, account and grand totals (lines 134-136) lose their high-order integer
+    digits, keeping the sign, as no ADD into them has ON SIZE ERROR (lines 200, 287 and 297);
 - lines 274-290: 1100-WRITE-TRANSACTION-REPORT writes the headers on the first record, then,
     whenever MOD(WS-LINE-COUNTER, 20) = 0 before a detail, the page totals and the headers, and
     then adds TRAN-AMT to the page and account totals and writes the detail;
@@ -17,12 +20,15 @@ from the reconciliation oracle's tranrept_lines.txt; none is taken from the modu
     totals follow, and the final account total is never written;
 - lines 170-178: empty input meets end of file on the first READ and writes nothing;
 - lines 484-512 and 626-630: a card, type or category key not on file abends with code 999;
-- CVTRA07Y: -ZZZ,ZZZ,ZZZ.ZZ on detail lines and +ZZZ,ZZZ,ZZZ.ZZ on total lines, 133 columns.
+- CVTRA07Y: -ZZZ,ZZZ,ZZZ.ZZ on detail lines and +ZZZ,ZZZ,ZZZ.ZZ on total lines, 133 columns;
+- proc/TRANREPT.prc STEP05R: the INCLUDE keeps a record only when TRAN-PROC-DT (positions
+    305-314, CH) is GE the start date and LE the end date, so the time of day is never compared
+    and a blank PROC-TS never matches; the range case applies it before BuildReport.
 """
 
 import csv
 from collections.abc import Mapping, Sequence
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -30,7 +36,14 @@ import pytest
 
 from app.core.paths import REPO_ROOT
 from app.schemas.reports import ReportLine, ReportLineKind
-from app.services.reports.cbtrn03c import BuildReport, ReportAbendError, ReportRequestData
+from app.services.reports.cbtrn03c import (
+    BuildReport,
+    ProcessRecord,
+    ReportAbendError,
+    ReportLookups,
+    ReportRequestData,
+    ReportState,
+)
 from app.utils.record_layouts import TRANSACTION_LAYOUT, DecodeRecord
 
 # FD-REPTFILE-REC PIC X(133): every TRANREPT record is padded with spaces to this width.
@@ -73,6 +86,8 @@ COLUMN_HEADINGS = (
 PAGE_TOTAL_PREFIX = "Page Total".ljust(11) + "." * 86
 ACCOUNT_TOTAL_PREFIX = "Account Total".ljust(13) + "." * 84
 GRAND_TOTAL_PREFIX = "Grand Total".ljust(11) + "." * 86
+# WS-LINE-COUNTER PIC 9(09) COMP-3 (CBTRN03C line 129) at its largest value.
+NINE_DIGIT_COUNTER_MAX = 999_999_999
 
 # The sample-report parity inputs and the oracle's expected TRANREPT lines.
 EXPECTED_DIR = REPO_ROOT / "batch" / "tests" / "fixtures" / "expected"
@@ -86,6 +101,10 @@ SAMPLE_START_DATE = date(2022, 7, 18)
 SAMPLE_END_DATE = date(2022, 7, 18)
 # TRANREPT sorts by TRAN-CARD-NUM over TRANSACT key order, both EBCDIC byte orders.
 EBCDIC_CODEC = "cp037"
+# The range-filter case: three days, so each inclusive bound falls on its own date.
+RANGE_QUERY = ReportRequestData("2022-07-17", "2022-07-19")
+RANGE_START_DATE = date(2022, 7, 17)
+RANGE_END_DATE = date(2022, 7, 19)
 
 
 def BuildRow(tranId: str, cardNum: str, amount: str) -> dict[str, object]:
@@ -236,6 +255,138 @@ def test_account_total_lines_can_step_the_counter_over_twenty_without_a_page_bre
     assert lines[24].text == TotalText(PAGE_TOTAL_PREFIX, "+         19.00")
 
 
+@pytest.mark.parametrize(
+    ("amounts", "expectedTotal", "editedTotal"),
+    [
+        # 999999999.99 + 2.01 is 1,000,000,002.00, which keeps 2.00; 2.01 again makes 4.01.
+        pytest.param(
+            ["999999999.99", "2.01"], Decimal("4.01"), "+          4.01", id="positive-overflow"
+        ),
+        # The mirror: -1,000,000,002.00 keeps -2.00, and -2.01 again makes -4.01.
+        pytest.param(
+            ["-999999999.99", "-2.01"], Decimal("-4.01"), "-          4.01", id="negative-overflow"
+        ),
+        # 2.00 after the overflow, then -500000000.00 twice: -999999998.00 fits unwrapped.
+        pytest.param(
+            ["999999999.99", "2.01", "-500000000.00"],
+            Decimal("-999999998.00"),
+            "-999,999,998.00",
+            id="positive-overflow-then-cancellation",
+        ),
+        # The mirror: -2.00 after the overflow, then 500000000.00 twice: 999999998.00.
+        pytest.param(
+            ["-999999999.99", "-2.01", "500000000.00"],
+            Decimal("999999998.00"),
+            "+999,999,998.00",
+            id="negative-overflow-then-cancellation",
+        ),
+        # The two bounds cancel to 0.00, and -999999999.99 again is the bound itself.
+        pytest.param(
+            ["999999999.99", "-999999999.99"],
+            Decimal("-999999999.99"),
+            "-999,999,999.99",
+            id="cancellation-to-zero-then-the-bound",
+        ),
+        # 999999999.99 twice (end of file) is 1,999,999,999.98, which keeps 999999999.98.
+        pytest.param(
+            ["999999999.99"],
+            Decimal("999999999.98"),
+            "+999,999,999.98",
+            id="positive-end-of-file-overflow",
+        ),
+        # The mirror: -1,999,999,999.98 keeps -999999999.98.
+        pytest.param(
+            ["-999999999.99"],
+            Decimal("-999999999.98"),
+            "-999,999,999.98",
+            id="negative-end-of-file-overflow",
+        ),
+    ],
+)
+def test_page_and_grand_totals_keep_nine_integer_digits_through_the_end_of_file_add(
+    amounts: list[str], expectedTotal: Decimal, editedTotal: str
+) -> None:
+    lines = RunReport(BuildCardRows(CARD_A, amounts))
+
+    details = [DETAIL] * len(amounts)
+    assert KindsOf(lines) == [HEADER] * 4 + details + [PAGE_TOTAL, HEADER, GRAND_TOTAL]
+    pageTotal, grandTotal = lines[-3], lines[-1]
+    assert pageTotal.amount == expectedTotal
+    assert pageTotal.text == TotalText(PAGE_TOTAL_PREFIX, editedTotal)
+    # One page adds its page total to a zero grand total, so both print the same amount.
+    assert grandTotal.amount == expectedTotal
+    assert grandTotal.text == TotalText(GRAND_TOTAL_PREFIX, editedTotal)
+
+
+@pytest.mark.parametrize(
+    ("boundAmount", "unitAmount", "expectedTotals"),
+    [
+        pytest.param(
+            "999999999.99",
+            "1.00",
+            [
+                (Decimal("14.99"), TotalText(PAGE_TOTAL_PREFIX, "+         14.99")),
+                (Decimal("14.98"), TotalText(ACCOUNT_TOTAL_PREFIX, "+         14.98")),
+                (Decimal("999999999.97"), TotalText(PAGE_TOTAL_PREFIX, "+999,999,999.97")),
+                (Decimal("14.96"), TotalText(GRAND_TOTAL_PREFIX, "+         14.96")),
+            ],
+            id="positive",
+        ),
+        pytest.param(
+            "-999999999.99",
+            "-1.00",
+            [
+                (Decimal("-14.99"), TotalText(PAGE_TOTAL_PREFIX, "-         14.99")),
+                (Decimal("-14.98"), TotalText(ACCOUNT_TOTAL_PREFIX, "-         14.98")),
+                (Decimal("-999999999.97"), TotalText(PAGE_TOTAL_PREFIX, "-999,999,999.97")),
+                (Decimal("-14.96"), TotalText(GRAND_TOTAL_PREFIX, "-         14.96")),
+            ],
+            id="negative-mirror",
+        ),
+    ],
+)
+def test_account_page_and_grand_totals_keep_nine_integer_digits_across_a_page_break(
+    boundAmount: str, unitAmount: str, expectedTotals: list[tuple[Decimal, str]]
+) -> None:
+    cardARows = BuildCardRows(CARD_A, [boundAmount, *[unitAmount] * 15, boundAmount])
+    cardBRow = {**BuildRow("0000000000000018", CARD_B, boundAmount), "xref_acct_id": ACCOUNT_B}
+    lines = RunReport([*cardARows, cardBRow])
+
+    # Details 1-16 fill counted lines 5-20, so detail 17 opens page 2; card B's detail follows
+    # card A's account total, and end of file writes the last page total and the grand total.
+    firstPage = [HEADER] * 4 + [DETAIL] * 16
+    secondPage = [PAGE_TOTAL, HEADER] + [HEADER] * 4 + [DETAIL, ACCOUNT_TOTAL, HEADER, DETAIL]
+    assert KindsOf(lines) == firstPage + secondPage + [PAGE_TOTAL, HEADER, GRAND_TOTAL]
+    # Page 1: the bound plus 1.00 is 1,000,000,000.99, kept as 0.99; fourteen more 1.00: 14.99.
+    # Card A: 14.99 plus detail 17's bound is 1,000,000,014.98, kept as 14.98.
+    # Page 2: the bound twice keeps 999999999.98; the end-of-file bound again: 999999999.97.
+    # Grand: 14.99 plus 999999999.97 is 1,000,000,014.96, kept as 14.96. Mirrored when negative.
+    totalIndexes = (20, 27, 30, 32)
+    assert [(lines[index].amount, lines[index].text) for index in totalIndexes] == expectedTotals
+
+
+def test_line_counter_keeps_nine_digits_so_one_past_999999999_is_zero() -> None:
+    state = ReportState(
+        query=QUERY,
+        lineCounter=NINE_DIGIT_COUNTER_MAX,
+        firstTime=False,
+        currentCardNum=CARD_A,
+        currentAcctId=ACCOUNT_A,
+    )
+    lookups = ReportLookups(TYPE_DESCRIPTIONS, CATEGORY_DESCRIPTIONS)
+
+    # MOD(999999999, 20) is 19, so the record writes only its detail, and ADD 1 then leaves 0,
+    # not 1000000000. As 20 divides 10**9, only the counter itself shows the wrap.
+    ProcessRecord(state, BuildRow(FIRST_TRAN_ID, CARD_A, "3.00"), lookups)
+    assert (KindsOf(state.lines), state.lineCounter) == ([DETAIL], 0)
+    # MOD(0, 20) is 0: the page total and dash rule, four headers, then the detail make 7.
+    ProcessRecord(state, BuildRow("0000000000000002", CARD_A, "5.00"), lookups)
+    pageBreakLines = [PAGE_TOTAL, HEADER] + [HEADER] * 4
+    assert (KindsOf(state.lines), state.lineCounter) == ([DETAIL, *pageBreakLines, DETAIL], 7)
+    assert state.lines[1].amount == Decimal("3.00")
+    assert state.lines[1].text == TotalText(PAGE_TOTAL_PREFIX, "+          3.00")
+
+
 def test_empty_input_writes_no_lines() -> None:
     assert RunReport([]) == []
 
@@ -303,10 +454,19 @@ def LoadXrefAccounts() -> dict[str, str]:
     return {row["card_num"]: row["acct_id"] for row in ReadCsvRows(CARD_XREF_PATH)}
 
 
-def IsInSampleRange(record: Mapping[str, object]) -> bool:
-    """The TRANREPT INCLUDE on TRAN-PROC-TS (1:10): a blank PROC-TS never matches."""
+def IsInReportRange(record: Mapping[str, object], startDate: date, endDate: date) -> bool:
+    """The TRANREPT INCLUDE: TRAN-PROC-DT (PROC-TS 1:10) GE startDate and LE endDate.
+
+    Only the date part of PROC-TS is compared, so the time of day never matters and both
+    bounds are inclusive; a blank PROC-TS, held as None, never matches.
+    """
     procTs = record["proc_ts"]
-    return procTs is not None and SAMPLE_START_DATE <= procTs.date() <= SAMPLE_END_DATE
+    return procTs is not None and startDate <= procTs.date() <= endDate
+
+
+def IsInSampleRange(record: Mapping[str, object]) -> bool:
+    """IsInReportRange over the sample report range, SAMPLE_START_DATE to SAMPLE_END_DATE."""
+    return IsInReportRange(record, SAMPLE_START_DATE, SAMPLE_END_DATE)
 
 
 def SampleSortKey(record: Mapping[str, object]) -> tuple[bytes, bytes]:
@@ -331,3 +491,41 @@ def test_sample_report_matches_the_oracle_tranrept_lines() -> None:
     result = BuildReport(SAMPLE_QUERY, rows, LoadTypeDescriptions(), LoadCategoryDescriptions())
 
     assert [line.text for line in result] == ReadFixtureLines(TRANREPT_LINES_PATH)
+
+
+def BuildRangeRows() -> list[dict[str, object]]:
+    """TRAN-IDs 1-6 on CARD_A: a blank PROC-TS, then times on each side of both RANGE_QUERY bounds.
+
+    Each amount sets a digit of its own, so a total shows every row it took in.
+    """
+    datedAmounts = [
+        (None, "0.01"),
+        (datetime(2022, 7, 16, 23, 59, 59, 999999), "0.20"),
+        (datetime(2022, 7, 17, 0, 0, 0), "3.00"),
+        (datetime(2022, 7, 18, 12, 0, 0), "40.00"),
+        (datetime(2022, 7, 19, 23, 59, 59, 999999), "500.00"),
+        (datetime(2022, 7, 20, 0, 0, 0), "6000.00"),
+    ]
+    return [
+        {**BuildRow(f"{sequence:016d}", CARD_A, amount), "proc_ts": procTs}
+        for sequence, (procTs, amount) in enumerate(datedAmounts, start=1)
+    ]
+
+
+def test_report_range_keeps_only_dated_rows_within_both_inclusive_bounds() -> None:
+    selectedRows = [
+        row for row in BuildRangeRows() if IsInReportRange(row, RANGE_START_DATE, RANGE_END_DATE)
+    ]
+    lines = BuildReport(RANGE_QUERY, selectedRows, TYPE_DESCRIPTIONS, CATEGORY_DESCRIPTIONS)
+
+    # Out: 1 (blank), 2 (07-16, last microsecond) and 6 (07-20, midnight). In: 3 (07-17,
+    # midnight), 4 (07-18, noon) and 5 (07-19, last microsecond).
+    selectedIds = ("0000000000000003", "0000000000000004", "0000000000000005")
+    assert tuple(row["tran_id"] for row in selectedRows) == selectedIds
+    assert KindsOf(lines) == [HEADER] * 4 + [DETAIL] * 3 + [PAGE_TOTAL, HEADER, GRAND_TOTAL]
+    assert [line.text for line in lines[:4]] == HeaderTexts(RANGE_QUERY)
+    assert tuple(line.tran_id for line in lines[4:7]) == selectedIds
+    # 3.00 + 40.00 + 500.00, plus the last 500.00 again at end of file.
+    assert [lines[7].amount, lines[9].amount] == [Decimal("1043.00"), Decimal("1043.00")]
+    assert lines[7].text == TotalText(PAGE_TOTAL_PREFIX, "+      1,043.00")
+    assert lines[9].text == TotalText(GRAND_TOTAL_PREFIX, "+      1,043.00")
