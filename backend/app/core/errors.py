@@ -7,12 +7,14 @@ COACTUPC/COCRDUPC, and CICS RESP/RESP2 file conditions (e.g. COACTVWC
 Every error body this module builds carries the four standard legacy keys ``message``,
 ``info_message``, ``field_errors`` and ``cursor_field``. The CAUP and CCUP screens add their
 screen keys, and the 422 body of a structurally invalid request adds FastAPI's ``detail`` list
-(``loc``, ``msg`` and ``type`` only) beside them. The CSMSG02Y abend work area has no
-counterpart here: no catch-all handler is registered, so an unexpected error is FastAPI's 500
-and the frontend shows ``UNEXPECTED ABEND OCCURRED.``.
+(``loc``, ``msg`` and ``type`` only) beside them. A JSON body FastAPI cannot parse at all, such
+as one that is not valid UTF-8, gets the same 422 body as malformed JSON. The CSMSG02Y abend
+work area has no counterpart here: no catch-all handler is registered, so an unexpected error is
+FastAPI's 500 and the frontend shows ``UNEXPECTED ABEND OCCURRED.``.
 
-This is a leaf module. It imports only the standard library, FastAPI and ``sqlalchemy.exc``, so
-repositories and batch jobs import it without ``SECRET_KEY`` or a database.
+This is a leaf module. It imports only the standard library, FastAPI, Starlette and
+``sqlalchemy.exc``, so repositories and batch jobs import it without ``SECRET_KEY`` or a
+database.
 """
 
 from collections.abc import Mapping, Sequence
@@ -20,9 +22,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.exc import DBAPIError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 HTTP_EDIT_FAILURE = 400
 HTTP_SIGN_ON_FAILURE = 401
@@ -44,6 +48,13 @@ LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 
 STANDARD_BODY_KEYS = ("message", "info_message", "field_errors", "cursor_field")
 REQUEST_LOCATION_KINDS = frozenset({"body", "query", "path", "header", "cookie"})
+
+# The detail of the HTTP 400 FastAPI raises when reading a JSON body fails other than by a
+# JSON decode error: a body that is not valid UTF-8, or one nested too deeply to parse.
+FASTAPI_BODY_PARSE_DETAIL = "There was an error parsing the body"
+# The validation error such a body is answered with: FastAPI's own malformed-JSON item, without
+# the decode position, which a body that cannot be decoded at all does not have.
+BODY_PARSE_ERRORS = ({"type": "json_invalid", "loc": ("body",), "msg": "JSON decode error"},)
 
 
 @dataclass(frozen=True)
@@ -264,3 +275,36 @@ async def HandleRequestValidationError(
     fieldDetails = LegacyErrorDetails(fieldErrors=tuple(FieldErrorsOf(errors)))
     content = {"detail": SanitisedDetail(errors), **ErrorBody("", details=fieldDetails)}
     return JSONResponse(status_code=HTTP_VALIDATION_FAILURE, content=content)
+
+
+def IsBodyParseFailure(exc: StarletteHTTPException) -> bool:
+    """Return True only for the HTTP 400 FastAPI raises when it cannot read a JSON body.
+
+    FastAPI's request handler turns a ``json.JSONDecodeError`` into a ``RequestValidationError``
+    but every other failure of ``request.json()``, such as the ``UnicodeDecodeError`` of a body
+    that is not valid UTF-8 or the ``RecursionError`` of a too deeply nested one, into
+    ``HTTPException(400, FASTAPI_BODY_PARSE_DETAIL)`` raised from that error. All three marks
+    are required, so a 400 the application raises itself, which has no cause, never matches.
+    """
+    return (
+        exc.status_code == HTTP_EDIT_FAILURE
+        and exc.detail == FASTAPI_BODY_PARSE_DETAIL
+        and exc.__cause__ is not None
+    )
+
+
+async def HandleHttpException(request: Request, exc: StarletteHTTPException) -> Response:
+    """Answer FastAPI's body-parse 400 as malformed JSON; leave every other HTTP error to FastAPI.
+
+    This is not a catch-all: it is registered for ``HTTPException`` alone, which replaces
+    FastAPI's default handler for that one class. A JSON body FastAPI cannot read at all gets
+    the 422 body of ``HandleRequestValidationError`` for ``BODY_PARSE_ERRORS``, the same as
+    malformed JSON, so it carries the four standard legacy keys and echoes none of the body.
+    Every other HTTP exception, such as the 404 of an unknown path or of disabled API docs and
+    the 405 of an unsupported method with its ``Allow`` header, is passed to FastAPI's own
+    ``http_exception_handler`` and answered exactly as it would be without this handler.
+    """
+    if IsBodyParseFailure(exc):
+        bodyParseError = RequestValidationError(BODY_PARSE_ERRORS)
+        return await HandleRequestValidationError(request, bodyParseError)
+    return await http_exception_handler(request, exc)

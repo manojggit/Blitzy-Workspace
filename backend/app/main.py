@@ -24,12 +24,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.health import ROUTER as HEALTH_ROUTER
 from app.api.v1.router import ROUTER as API_V1_ROUTER
 from app.core.config import API_V1_PREFIX, GetSettings, Settings
 from app.core.database import BuildEngine, BuildSessionFactory, DisposeEngine
 from app.core.errors import (
+    HandleHttpException,
     HandleLegacyMessageError,
     HandleRequestValidationError,
     LegacyMessageError,
@@ -137,13 +139,17 @@ def AddMiddleware(application: FastAPI, settings: Settings) -> None:
 
 
 def AddExceptionHandlers(application: FastAPI) -> None:
-    """Register the legacy-message and request-validation handlers, and nothing broader.
+    """Register the legacy-message, request-validation and HTTP-exception handlers only.
 
-    No catch-all handler is registered: an unexpected error is FastAPI's default 500, which the
-    frontend shows as the legacy abend text UNEXPECTED ABEND OCCURRED.
+    The HTTP-exception handler rewrites one case, FastAPI's 400 for a JSON body it cannot read
+    (not valid UTF-8, for example), into the 422 request-validation body, and hands every other
+    HTTP exception to FastAPI's default handler unchanged. No catch-all handler is registered:
+    an unexpected error is FastAPI's default 500, which the frontend shows as the legacy abend
+    text UNEXPECTED ABEND OCCURRED.
     """
     application.add_exception_handler(LegacyMessageError, HandleLegacyMessageError)
     application.add_exception_handler(RequestValidationError, HandleRequestValidationError)
+    application.add_exception_handler(StarletteHTTPException, HandleHttpException)
 
 
 def IncludeRouters(application: FastAPI) -> None:
