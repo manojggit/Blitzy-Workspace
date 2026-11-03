@@ -9,8 +9,8 @@ Origin is refused with 403 by ``core.middleware.OriginGuard`` before it reaches 
 
 Each handler makes one awaited call to the service that ports its program and returns the
 service's model. Legacy outcomes are raised by the services as ``LegacyMessageError`` and
-serialised by ``app.core.errors``, the CT02 screen ``fields`` included; screen text breaking
-its BMS LENGTH or the code-page-037 repertoire is a 422. Every CT00 screen outcome, the paging
+serialised by ``app.core.errors`` as the four standard keys; screen text breaking its BMS
+LENGTH or the code-page-037 repertoire is a 422. Every CT00 screen outcome, the paging
 literals and ``Tran ID must be Numeric ...`` included, is a 200 list response, so the list and
 selection routes declare only the 503 file error besides the session and role refusals.
 """

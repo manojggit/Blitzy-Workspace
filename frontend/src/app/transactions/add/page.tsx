@@ -39,7 +39,6 @@ import {
     type TransactionAddResponse,
 } from "@/lib/api/transactions";
 import {
-    LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
     ToScreenFeedback,
@@ -209,6 +208,9 @@ const INPUT_NAMES: readonly AddFieldName[] = [
     CONFIRM_FIELD,
 ];
 
+// The two keys of VALIDATE-INPUT-KEY-FIELDS; the card the server resolved belongs to them.
+const KEY_FIELD_NAMES: readonly AddFieldName[] = [ACCOUNT_FIELD.name, CARD_FIELD.name];
+
 // INITIALIZE-ALL-FIELDS: every input blank, CONFIRMI included. The keys stay the snake_case JSON
 // keys of backend/app/schemas/transactions.py, the AAP's exception to the MK_Modernization Rule's
 // camelCase naming.
@@ -237,8 +239,11 @@ interface AddFeedback {
     cursorField: string | null;
 }
 
+// values is what ENTER and F5 send, its card_num only ever the card as the user keyed it;
+// servedCard is the masked card the server resolved, which is only ever displayed.
 interface AddScreenSetters {
     setValues: Dispatch<SetStateAction<AddFieldValues>>;
+    setServedCard: Dispatch<SetStateAction<string>>;
     setFeedback: Dispatch<SetStateAction<AddFeedback>>;
     setIsBusy: Dispatch<SetStateAction<boolean>>;
 }
@@ -324,10 +329,11 @@ function IsAddedResponse(response: TransactionAddResponse): boolean {
     return (response.tran_id ?? "") !== "";
 }
 
-// The screen as COTRN02C sends it back: the resolved account, the reformatted amount and the
-// F5-copied values. The server masks a 16-digit card number in every response, so the card number
-// keyed here stays in its field and the next ENTER never sends a masked value; only the add's
-// INITIALIZE-ALL-FIELDS blanks it, together with every other field.
+// The keyed values after the confirm prompt: they adopt the screen as COTRN02C sends it back (the
+// resolved account, the reformatted amount and the F5-copied values) except the card. The server
+// masks every card it returns, so card_num keeps the card as keyed and the next ENTER never sends
+// a masked value; the resolved card is shown masked through servedCard instead. Only the add's
+// INITIALIZE-ALL-FIELDS blanks every field.
 function ValuesAfterScreen(
     current: AddFieldValues,
     served: TransactionAddFields | undefined,
@@ -340,6 +346,31 @@ function ValuesAfterScreen(
         return { ...EMPTY_FIELDS, ...served };
     }
     return { ...current, ...served, card_num: current.card_num };
+}
+
+// The card COTRN02C moved into CARDNINI (XREF-CARD-NUM for an account key), masked by the server,
+// shown until either key is edited; the add's INITIALIZE-ALL-FIELDS blanks it.
+function ServedCardAfterScreen(
+    current: string,
+    served: TransactionAddFields | undefined,
+    isAdded: boolean,
+): string {
+    if (isAdded) {
+        return "";
+    }
+    if (served === undefined) {
+        return current;
+    }
+    return served.card_num ?? "";
+}
+
+// The inputs show the keyed values, with the resolved masked card in place of the keyed card
+// while there is one.
+function DisplayedValues(values: AddFieldValues, servedCard: string): AddFieldValues {
+    if (servedCard === "") {
+        return values;
+    }
+    return { ...values, card_num: servedCard };
 }
 
 // A 200 is the confirm prompt (red, as WS-ERR-FLG is set) or the green added literal.
@@ -368,24 +399,23 @@ function FeedbackFromError(feedback: CompleteScreenFeedback): AddFeedback {
 function ShowResponse(response: TransactionAddResponse, setters: AddScreenSetters): void {
     const isAdded = IsAddedResponse(response);
     setters.setValues((current) => ValuesAfterScreen(current, response.fields, isAdded));
+    setters.setServedCard((current) => ServedCardAfterScreen(current, response.fields, isAdded));
     setters.setFeedback(FeedbackAfterResponse(response, isAdded));
 }
 
 // Only an axios error is a legacy outcome; anything else is a defect and propagates. A legacy
-// body re-sends the screen in its fields key; without one the keyed values stay shown.
+// error body carries only message, info_message, field_errors and cursor_field, so the page keeps
+// its own keyed values and any resolved card it shows.
 function ShowFailure(error: unknown, setters: AddScreenSetters): void {
     if (!axios.isAxiosError(error)) {
         throw error;
     }
-    const body = LegacyErrorBody<TransactionAddResponse>(error);
-    if (body !== null) {
-        setters.setValues((current) => ValuesAfterScreen(current, body.fields, false));
-    }
     setters.setFeedback(FeedbackFromError(ToScreenFeedback(error)));
 }
 
-// One helper for ENTER and F5. The form is updated from its latest state, so the card number
-// keyed while the call runs is kept.
+// One helper for ENTER and F5. The request sends the keyed values, the card as keyed rather than
+// the masked card shown; at the server a non-blank account, such as the one the prompt resolved,
+// takes precedence over the card. The form is updated from its latest state.
 async function SubmitAdd(
     action: TransactionAddAction,
     values: AddFieldValues,
@@ -415,6 +445,7 @@ function HandleCopyLast(values: AddFieldValues, setters: AddScreenSetters): void
 // F4 (CLEAR-CURRENT-SCREEN) reads no file, so it never reaches the server.
 function HandleClear(setters: AddScreenSetters): void {
     setters.setValues(EMPTY_FIELDS);
+    setters.setServedCard("");
     setters.setFeedback(ClearedFeedback());
 }
 
@@ -422,14 +453,14 @@ function HandleBack(router: AppRouter): void {
     router.push(MENU_ROUTE);
 }
 
-// The keyed text goes into the form unchanged: no trimming, case folding or filtering. The BMS
-// LENGTH, as maxLength, is the only input limit.
-function HandleFieldChange(
-    setValues: Dispatch<SetStateAction<AddFieldValues>>,
-    name: AddFieldName,
-    value: string,
-): void {
-    setValues((current) => ({ ...current, [name]: value }));
+// The keyed text goes into the form unchanged: no trimming, case folding or filtering, so an edit
+// of the shown masked card is kept as the text now in the field. The BMS LENGTH, as maxLength, is
+// the only input limit. Editing either key drops the resolved card, which belonged to them.
+function HandleFieldChange(setters: AddScreenSetters, name: AddFieldName, value: string): void {
+    setters.setValues((current) => ({ ...current, [name]: value }));
+    if (KEY_FIELD_NAMES.includes(name)) {
+        setters.setServedCard("");
+    }
 }
 
 // The map's legend, in its order: ENTER=Continue  F3=Back  F4=Clear  F5=Copy Last Tran. ENTER, F4
@@ -495,21 +526,36 @@ function useTransactionAddKeys({ values, isBusy, setters }: AddKeyInputs) {
     return keys;
 }
 
-function useTransactionAdd(): AddScreenModel {
+// The keyed values, the resolved masked card, the message line and the busy flag, with one stable
+// set of setters.
+function useAddScreenState() {
     const [values, setValues] = useState<AddFieldValues>(EMPTY_FIELDS);
+    const [servedCard, setServedCard] = useState("");
     const [feedback, setFeedback] = useState<AddFeedback>(ClearedFeedback);
     const [isBusy, setIsBusy] = useState(false);
-    const setters = useMemo<AddScreenSetters>(() => ({ setValues, setFeedback, setIsBusy }), []);
+    const setters = useMemo<AddScreenSetters>(
+        () => ({ setValues, setServedCard, setFeedback, setIsBusy }),
+        [],
+    );
+    return { values, servedCard, feedback, isBusy, setters };
+}
+
+// The keys send the keyed values; the inputs show them with the resolved masked card.
+function useTransactionAdd(): AddScreenModel {
+    const { values, servedCard, feedback, isBusy, setters } = useAddScreenState();
     const inputsRef = useRef<AddInputElements>({});
-    usePendingMessage(setFeedback);
+    usePendingMessage(setters.setFeedback);
     useCursorFocus(inputsRef, feedback);
     const keys = useTransactionAddKeys({ values, isBusy, setters });
-    const onFieldChange = useCallback((name: AddFieldName, value: string) => {
-        HandleFieldChange(setValues, name, value);
-    }, []);
+    const onFieldChange = useCallback(
+        (name: AddFieldName, value: string) => HandleFieldChange(setters, name, value),
+        [setters],
+    );
+    const shownValues = useMemo(() => DisplayedValues(values, servedCard), [values, servedCard]);
+    const { fieldErrors } = feedback;
     const form = useMemo<AddFieldBinding>(
-        () => ({ values, fieldErrors: feedback.fieldErrors, inputsRef, onFieldChange }),
-        [values, feedback.fieldErrors, onFieldChange],
+        () => ({ values: shownValues, fieldErrors, inputsRef, onFieldChange }),
+        [shownValues, fieldErrors, onFieldChange],
     );
     return { form, feedback, isBusy, keys };
 }

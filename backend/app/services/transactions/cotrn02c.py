@@ -9,9 +9,11 @@ the same ENTER flow, key edits included.
 
 The edits run in first-failure mode on the text exactly as keyed: every failing branch ends in
 SEND-TRNADD-SCREEN, whose EXEC CICS RETURN (lines 530-534) ends the task, so the first failure
-is the only message. Its error body carries ``fields``, the map as the program sends it back:
-the key the xref read resolved, the amount reformatted to ``+99999999.99`` and any copied
-values, with the card number masked.
+is the only message. Its error body is the four standard legacy keys only (message,
+info_message, field_errors, cursor_field), and the client keeps the screen as keyed. Only the
+200 confirm prompt re-sends the map in ``fields``, as the program sends it back: the key the
+xref read resolved, the amount reformatted to ``+99999999.99`` and any values F5 copied, with
+the card number masked.
 
 The add is one TRANSACT write unit (core.database.WriteUnit): the TRAN-ID allocation, which is
 the STARTBR HIGH-VALUES / READPREV / ADD 1 of lines 444-449, and the WRITE share its
@@ -43,7 +45,6 @@ from app.core.errors import (
     HTTP_NOT_FOUND,
     HTTP_RECORD_CHANGED,
     DuplicateKeyError,
-    LegacyErrorDetails,
     LegacyMessageError,
     LogFileCondition,
     RepositoryError,
@@ -149,9 +150,6 @@ NUMERIC_FIELD_PATTERN = re.compile(r"[0-9]+")
 AMOUNT_FORMAT_PATTERN = re.compile(r"[+-][0-9]{8}\.[0-9]{2}")
 # Lines 354-358 (and 369-373) on positions (1:4), (5:1), (6:2), (8:1) and (9:2).
 DATE_FORMAT_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-
-# The key of the screen fields beside the four standard keys of a legacy error body.
-SCREEN_BODY_KEY = "fields"
 
 # COTRN2AI field (ScreenFields attribute) -> TransactionAddFields attribute, which is the JSON
 # key and the cursor_field name that replaces MOVE -1 TO <field>L.
@@ -367,45 +365,33 @@ def FromRequest(fields: TransactionAddFields) -> ScreenFields:
     )
 
 
-def DisplayedCardNumber(cardNum: str) -> str:
-    """Return a 16-digit card number masked, and any other card field text as keyed."""
-    if IsNumericField(cardNum, CARD_NUM_LENGTH):
-        return MaskCardNumber(cardNum)
-    return cardNum
-
-
 def ToResponseFields(screen: ScreenFields) -> TransactionAddFields:
     """Return the map as SEND-TRNADD-SCREEN sends it back, with the card number masked.
 
-    A full card number never leaves the server. Masking is safe for the dialogue: the account
-    the xref read resolved is sent back too, and a non-blank account takes precedence over the
-    card on the next ENTER, as in VALIDATE-INPUT-KEY-FIELDS.
+    Any non-blank card field text, whatever its length or characters, leaves the server only as
+    MaskCardNumber returns it: twelve asterisks plus the last four characters of the trimmed
+    text. A blank field stays blank. Masking is safe for the dialogue: the account the xref read
+    resolved is sent back too, and a non-blank account takes precedence over the card on the
+    next ENTER, as in VALIDATE-INPUT-KEY-FIELDS.
     """
     values = {
         fieldName: getattr(screen, attributeName)
         for attributeName, fieldName in SCREEN_FIELD_NAMES.items()
     }
-    values[CARD_NUM_FIELD] = DisplayedCardNumber(screen.cardNum)
+    values[CARD_NUM_FIELD] = MaskCardNumber(screen.cardNum)
     return TransactionAddFields(**values)
 
 
-def ScreenError(
-    screen: ScreenFields, message: str, cursorField: str, httpStatus: int
-) -> LegacyMessageError:
-    """Return the error of one failing branch: its literal, cursor and status, plus the map.
+def ScreenError(message: str, cursorField: str, httpStatus: int) -> LegacyMessageError:
+    """Return the error of one failing branch: its literal, cursor and status.
 
     Statuses: 400 for edits and the invalid confirm value, 404 for the NOTFND literals, 409 for
     DUPKEY/DUPREC and 503 for the WHEN OTHER file literals, batch-window refusals included.
-    The body's ``fields`` re-sends the screen as COTRN02C leaves it (resolved key, reformatted
-    amount, copied values). Callers ``raise`` it, chaining any repository error.
+    The body is the four standard legacy keys only (message, info_message, field_errors,
+    cursor_field); the screen stays as the client keyed it. Callers ``raise`` it, chaining any
+    repository error.
     """
-    screenBody = {SCREEN_BODY_KEY: ToResponseFields(screen).model_dump(mode="json")}
-    return LegacyMessageError(
-        message,
-        field=cursorField,
-        httpStatus=httpStatus,
-        details=LegacyErrorDetails(extraBody=screenBody),
-    )
+    return LegacyMessageError(message, field=cursorField, httpStatus=httpStatus)
 
 
 def NumvalKey(keyText: str, keyLength: int) -> str:
@@ -424,18 +410,16 @@ async def ResolveKeyField(context: OnlineContext, screen: ScreenFields, keyPath:
     keyText = getattr(screen, keyPath.keyAttribute)
     cursorField = CursorField(keyPath.keyAttribute)
     if not IsNumericField(keyText, keyPath.keyLength):
-        raise ScreenError(screen, keyPath.notNumericMessage, cursorField, HTTP_EDIT_FAILURE)
+        raise ScreenError(keyPath.notNumericMessage, cursorField, HTTP_EDIT_FAILURE)
     keyValue = NumvalKey(keyText, keyPath.keyLength)
     setattr(screen, keyPath.keyAttribute, keyValue)
     try:
         xref = await keyPath.lookup(CardXrefRepository(context), keyValue)
     except RepositoryError as error:
         LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
-        raise ScreenError(
-            screen, keyPath.lookupFailedMessage, cursorField, HTTP_FILE_ERROR
-        ) from error
+        raise ScreenError(keyPath.lookupFailedMessage, cursorField, HTTP_FILE_ERROR) from error
     if xref is None:
-        raise ScreenError(screen, keyPath.notFoundMessage, cursorField, HTTP_NOT_FOUND)
+        raise ScreenError(keyPath.notFoundMessage, cursorField, HTTP_NOT_FOUND)
     setattr(screen, keyPath.filledAttribute, xref[keyPath.filledColumn])
 
 
@@ -450,9 +434,7 @@ async def ValidateInputKeyFields(context: OnlineContext, screen: ScreenFields) -
     elif not IsBlank(screen.cardNum):
         await ResolveKeyField(context, screen, CARD_KEY_PATH)
     else:
-        raise ScreenError(
-            screen, ACCOUNT_OR_CARD_REQUIRED_MESSAGE, ACCT_ID_FIELD, HTTP_EDIT_FAILURE
-        )
+        raise ScreenError(ACCOUNT_OR_CARD_REQUIRED_MESSAGE, ACCT_ID_FIELD, HTTP_EDIT_FAILURE)
 
 
 def CheckPresence(screen: ScreenFields) -> None:
@@ -461,7 +443,7 @@ def CheckPresence(screen: ScreenFields) -> None:
         if IsBlank(getattr(screen, requiredField.attributeName)):
             message = REQUIRED_FIELD_TEMPLATE.format(label=requiredField.label)
             cursorField = CursorField(requiredField.attributeName)
-            raise ScreenError(screen, message, cursorField, HTTP_EDIT_FAILURE)
+            raise ScreenError(message, cursorField, HTTP_EDIT_FAILURE)
 
 
 def CheckNumeric(screen: ScreenFields, numericField: NumericField) -> None:
@@ -469,14 +451,14 @@ def CheckNumeric(screen: ScreenFields, numericField: NumericField) -> None:
     fieldText = getattr(screen, numericField.attributeName)
     if not IsNumericField(fieldText, numericField.length):
         cursorField = CursorField(numericField.attributeName)
-        raise ScreenError(screen, numericField.message, cursorField, HTTP_EDIT_FAILURE)
+        raise ScreenError(numericField.message, cursorField, HTTP_EDIT_FAILURE)
 
 
 def CheckAmountFormat(screen: ScreenFields) -> None:
     """Port the amount EVALUATE (lines 339-351): sign, 8 digits, point, 2 digits."""
     amountText = screen.amount.ljust(AMOUNT_LENGTH, FIELD_PADDING)
     if AMOUNT_FORMAT_PATTERN.fullmatch(amountText) is None:
-        raise ScreenError(screen, AMOUNT_FORMAT_MESSAGE, AMOUNT_FIELD, HTTP_EDIT_FAILURE)
+        raise ScreenError(AMOUNT_FORMAT_MESSAGE, AMOUNT_FIELD, HTTP_EDIT_FAILURE)
 
 
 def CheckDateFormat(screen: ScreenFields, dateField: DateField) -> None:
@@ -484,7 +466,7 @@ def CheckDateFormat(screen: ScreenFields, dateField: DateField) -> None:
     dateText = getattr(screen, dateField.attributeName).ljust(DATE_FIELD_LENGTH, FIELD_PADDING)
     if DATE_FORMAT_PATTERN.fullmatch(dateText) is None:
         cursorField = CursorField(dateField.attributeName)
-        raise ScreenError(screen, dateField.formatMessage, cursorField, HTTP_EDIT_FAILURE)
+        raise ScreenError(dateField.formatMessage, cursorField, HTTP_EDIT_FAILURE)
 
 
 def NormaliseAmount(screen: ScreenFields) -> None:
@@ -504,7 +486,7 @@ def CheckDateValid(screen: ScreenFields, dateField: DateField) -> None:
         return
     if result.messageNumber != CEEDAYS_MSG_UNSUPPORTED_RANGE:
         cursorField = CursorField(dateField.attributeName)
-        raise ScreenError(screen, dateField.invalidMessage, cursorField, HTTP_EDIT_FAILURE)
+        raise ScreenError(dateField.invalidMessage, cursorField, HTTP_EDIT_FAILURE)
 
 
 def ValidateInputDataFields(screen: ScreenFields) -> None:
@@ -581,17 +563,17 @@ async def WriteNewTransaction(context: OnlineContext, screen: ScreenFields) -> s
             await repository.InsertTransaction(unit, BuildTransactionValues(screen, tranId))
     except DuplicateKeyError as error:
         raise ScreenError(
-            screen, DUPLICATE_TRAN_ID_MESSAGE, ACCT_ID_FIELD, DUPLICATE_TRAN_ID_STATUS
+            DUPLICATE_TRAN_ID_MESSAGE, ACCT_ID_FIELD, DUPLICATE_TRAN_ID_STATUS
         ) from error
     except RepositoryError as error:
         operation = WRITE_OPERATION if tranId else BROWSE_BACKWARD_OPERATION
         LogFileCondition(LOGGER, TRANSACTION_ID, operation, error)
         message = ADD_FAILED_MESSAGE if tranId else TRAN_LOOKUP_FAILED_MESSAGE
-        raise ScreenError(screen, message, ACCT_ID_FIELD, HTTP_FILE_ERROR) from error
+        raise ScreenError(message, ACCT_ID_FIELD, HTTP_FILE_ERROR) from error
     except TimestampFormatError as error:
         # A year-0000 date passes CSUTLDTC (CEEDAYS 2513) but no TIMESTAMP(6) value holds it,
         # so the record cannot be written: the WRITE's WHEN OTHER outcome, nothing stored.
-        raise ScreenError(screen, ADD_FAILED_MESSAGE, ACCT_ID_FIELD, HTTP_FILE_ERROR) from error
+        raise ScreenError(ADD_FAILED_MESSAGE, ACCT_ID_FIELD, HTTP_FILE_ERROR) from error
     return tranId
 
 
@@ -632,7 +614,7 @@ async def ProcessEnterKey(context: OnlineContext, screen: ScreenFields) -> Trans
             cursor_field=CONFIRM_FIELD,
             fields=ToResponseFields(screen),
         )
-    raise ScreenError(screen, CONFIRM_INVALID_MESSAGE, CONFIRM_FIELD, HTTP_EDIT_FAILURE)
+    raise ScreenError(CONFIRM_INVALID_MESSAGE, CONFIRM_FIELD, HTTP_EDIT_FAILURE)
 
 
 def FitField(text: str, length: int) -> str:
@@ -680,9 +662,7 @@ async def CopyLastTranData(context: OnlineContext, screen: ScreenFields) -> Tran
         lastRecord = await TransactionRepository(context).GetHighestTransaction()
     except RepositoryError as error:
         LogFileCondition(LOGGER, TRANSACTION_ID, BROWSE_BACKWARD_OPERATION, error)
-        raise ScreenError(
-            screen, TRAN_LOOKUP_FAILED_MESSAGE, ACCT_ID_FIELD, HTTP_FILE_ERROR
-        ) from error
+        raise ScreenError(TRAN_LOOKUP_FAILED_MESSAGE, ACCT_ID_FIELD, HTTP_FILE_ERROR) from error
     copiedFields = EMPTY_RECORD_FIELDS if lastRecord is None else CopiedFields(lastRecord)
     for attributeName, value in copiedFields.items():
         setattr(screen, attributeName, value)
@@ -698,8 +678,8 @@ async def AddTransaction(
     fields exactly as keyed.
 
     Raises:
-        LegacyMessageError: the first failing edit or file condition, with the screen in its
-            body's ``fields``.
+        LegacyMessageError: the first failing edit or file condition, with the four standard
+            body keys only; the screen comes back in ``fields`` on the 200 confirm prompt alone.
     """
     screen = FromRequest(request)
     if request.action == TransactionAddAction.COPY_LAST:
