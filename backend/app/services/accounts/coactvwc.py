@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from app.core.database import RecoverRequestSession
 from app.core.dependencies import OnlineContext
 from app.core.errors import (
     HTTP_EDIT_FAILURE,
@@ -255,10 +256,13 @@ async def ReadAccountChain(context: OnlineContext, acctId: str) -> AccountReadRe
     ``acctId`` is the validated 11-digit key. A failed cross-reference read ends the chain
     (``IF FLG-ACCTFILTER-NOT-OK``). A failed account read does not: the
     DID-NOT-FIND-ACCT-IN-ACCTDAT test is dead because its SET is commented out (line 792), so
-    the customer of the cross-reference is still read. Against the real schema an account or
-    customer NOTFND after a found cross-reference cannot happen, because ``xref.card_xref``
-    has foreign keys to both masters; those branches are reached only with stubbed
-    repositories. Only RepositoryError is caught; FileNotOpenError from the batch window is one.
+    the customer of the cross-reference is still read. After an account file error the request
+    session's transaction is recovered first, so CUSTDAT is read independently, as CICS files
+    fail independently: a NORMAL customer read keeps the ACCTDAT message, and only a CUSTDAT
+    failure replaces it. Against the real schema an account or customer NOTFND after a found
+    cross-reference cannot happen, because ``xref.card_xref`` has foreign keys to both masters;
+    those branches are reached only with stubbed repositories. Only RepositoryError is caught;
+    FileNotOpenError from the batch window is one.
     """
     readResult = AccountReadResult(acctId=acctId)
     await ReadXrefStep(context, readResult)
@@ -285,12 +289,17 @@ async def ReadXrefStep(context: OnlineContext, readResult: AccountReadResult) ->
 
 
 async def ReadAccountStep(context: OnlineContext, readResult: AccountReadResult) -> None:
-    """Port of 9300-GETACCTDATA-BYACCT (lines 774-820): READ DATASET(ACCTDAT) by account."""
+    """Port of 9300-GETACCTDATA-BYACCT (lines 774-820): READ DATASET(ACCTDAT) by account.
+
+    A WHEN OTHER failure (lines 809-816) can leave the request session's transaction aborted
+    or its connection lost, so the session is recovered before 9400 reads CUSTDAT on it.
+    """
     try:
         account = await AccountRepository(context).GetAccount(readResult.acctId)
     except RepositoryError as error:
         readResult.acctFilterOk = False
         readResult.SetUnconditional(FileErrorFor(ACCOUNT_FILE_NAME, error), HTTP_FILE_ERROR)
+        await RecoverRequestSession(context.session)
         return
     if account is None:
         readResult.acctFilterOk = False

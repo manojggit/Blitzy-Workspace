@@ -9,8 +9,10 @@ cancellation or the death of the process, just as SYNCPOINT ROLLBACK in COACTUPC
 0.6.10 and 0.6.12.
 
 Reads that lock nothing (keyed reads, browses, AIX lookups) run on the request session that
-GetSession yields. A record's READ UPDATE and its WRITE, REWRITE or DELETE run inside one
-WriteUnit, on a pooled connection of its own:
+GetSession yields. A read that fails there leaves the session's transaction unusable, so a
+service that goes on to read another file first calls RecoverRequestSession. A record's READ
+UPDATE and its WRITE, REWRITE or DELETE run inside one WriteUnit, on a pooled connection of its
+own:
 
 - CAUP (COACTUPC) opens the ACCTDAT unit and then the CUSTDAT unit, locking both records
   before either rewrite; the account unit commits first.
@@ -179,6 +181,24 @@ async def DiscardUnitTransaction(connection: AsyncConnection) -> None:
         await connection.rollback()
     except UNIT_FAILURES:
         await connection.invalidate()
+
+
+async def RecoverRequestSession(session: AsyncSession) -> None:
+    """End the request session's read-only transaction after a read on it failed.
+
+    A SELECT that fails on the server aborts the transaction, and PostgreSQL refuses every
+    later statement in it with SQLSTATE 25P02; a dropped connection leaves the session pending
+    rollback. A service whose legacy program reads another file after such a failure calls
+    this first, because CICS files fail independently. The session never writes, so the
+    rollback discards nothing, and the batch-window lock stays held on its own connection
+    (core.locks). When the rollback itself fails, the session is invalidated, so its next read
+    opens a fresh connection. The rollback failure is not raised, so the caller keeps the file
+    condition of the read that failed.
+    """
+    try:
+        await session.rollback()
+    except UNIT_FAILURES:
+        await session.invalidate()
 
 
 @asynccontextmanager
