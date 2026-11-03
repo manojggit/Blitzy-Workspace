@@ -34,7 +34,7 @@ from app.services.cards import cocrdupc
 if TYPE_CHECKING:
     from app.core.config import Settings
 
-# The keys the screen token carries; the router's path value is a placeholder after fetch.
+# The keys the screen token carries; a fetched token holds only on the path of its own card.
 ACCT_ID = "00000000004"
 CARD_NUM = "0000000000007788"
 MASKED_CARD_NUM = "************7788"
@@ -82,7 +82,8 @@ CCUP_ERROR_BODY_KEYS = {
     "state",
     "screen_token",
 }
-ROUTE_CARD_KEY = "placeholder"
+# The {cardNum} path of every request: the token's card, typed as CARDSID holds it.
+ROUTE_CARD_KEY = CARD_NUM
 
 BEFORE_IMAGE = cocrdupc.BeforeImage(
     cvv=OLD_CVV, name=OLD_NAME, year=OLD_YEAR, month=OLD_MONTH, day=OLD_DAY, status=OLD_STATUS

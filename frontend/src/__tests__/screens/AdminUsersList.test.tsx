@@ -703,12 +703,17 @@ interface PageStatusCase {
     statusText: string;
 }
 
-// The first entry's page: ten users, or an empty table's STARTBR NOTFND page 1.
+// The first entry's page: ten users, a single user, or an empty table's STARTBR NOTFND page 1.
 const PAGE_STATUS_CASES: readonly PageStatusCase[] = [
     {
         rowsShown: "ten rows",
         firstPage: BuildListResponse(),
         statusText: "Page: 1, 10 users shown, TESTUSR0 to TESTUSR9",
+    },
+    {
+        rowsShown: "one row",
+        firstPage: BuildListResponse({ rows: OTHER_PAGE_ROWS.slice(0, 1) }),
+        statusText: "Page: 1, 1 user shown, TESTUSRA to TESTUSRA",
     },
     {
         rowsShown: "no rows",

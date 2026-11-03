@@ -19,6 +19,7 @@ from enum import StrEnum
 from pydantic import BaseModel, Field
 
 from app.schemas.common import (
+    QUERY_PAGE_NUMBER,
     Direction,
     LegacyErrorResponse,
     PageState,
@@ -65,14 +66,15 @@ class UserListQuery(QueryModel):
             "for ENTER and the first entry, which browse from searchUserId (PROCESS-ENTER-KEY)."
         ),
     )
-    page: int = Field(
+    page: QUERY_PAGE_NUMBER = Field(
         default=0,
         ge=0,
         le=MAX_CU00_PAGE_NUMBER,
         alias="page",
         description=(
             "The page number shown when the key was pressed (CDEMO-CU00-PAGE-NUM PIC 9(08)), "
-            "0 to 99999999; 0 before the first page. F7 on page 1 or 0 answers "
+            "an integer from 0 to 99999999 in decimal digits only; 0 before the first page. "
+            "F7 on page 1 or 0 answers "
             "'You are already at the top of the page...'. F8 reads after startKey from any "
             "page and keeps the low-order eight digits, so page 99999999 is followed by 0."
         ),

@@ -17,6 +17,7 @@ from typing import Annotated, Any
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     GetJsonSchemaHandler,
@@ -145,6 +146,34 @@ def MoneyAmount(intDigits: int) -> Any:
     amounts never use it: they arrive as ``ScreenText``.
     """
     return Annotated[Decimal, Field(max_digits=intDigits + 2, decimal_places=2)]
+
+
+def RequireUnsignedDigits(value: object) -> object:
+    """Return ``value`` unchanged when it is an ``int`` or text of ASCII decimal digits only.
+
+    It guards the ``page`` query parameter of CCLI, CT00 and CU00, which a client sends back as
+    the page number it was shown. A non-bool ``int`` passes, because an omitted query value is
+    the ``int`` default and services and tests build query models by attribute name. Digit text,
+    leading zeros included, is left for the ``int`` validation and the ``ge``/``le`` bounds of
+    the field.
+
+    Raises:
+        ValueError: ``value`` is a bool, or text holding anything but ``0``-``9`` (a sign, a
+            blank, a decimal point, a digit separator, a non-ASCII digit, or nothing at all).
+            Pydantic reports it and FastAPI answers 422. The message never echoes the input.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return value
+    raise ValueError("page number must be an unsigned integer in decimal digits")
+
+
+# The page number of a list query (CCLI, CT00 and CU00 ``page``). Query text is the only form a
+# query page arrives in, so strict mode, which refuses all text, cannot apply; the digit check
+# of RequireUnsignedDigits replaces it, refusing what lax int would coerce (true, " 1 ", "+1",
+# "1.0", "1_0"). The JSON schema stays type integer; each use site declares ge and le in Field.
+QUERY_PAGE_NUMBER = Annotated[int, BeforeValidator(RequireUnsignedDigits)]
 
 
 class UpdateAction(StrEnum):

@@ -115,6 +115,14 @@ interface CallRecorder {
     mock: { invocationCallOrder: number[] };
 }
 
+// F3 with nothing fetched: the query the screen opens with, and where the save then returns.
+interface BlankExitCase {
+    query: string;
+    destination: string;
+    opener: string;
+    route: string;
+}
+
 type TriggerMode = "click" | "key";
 
 // [literal, HTTP status, message-line severity]; HTTP 200 is a resolved call.
@@ -138,6 +146,9 @@ const NEWEST_LAST_NAME = "Newest";
 // A fresh random 8-character value per run (PASSWD LENGTH=8), so no password is in the test.
 const NEW_PASSWORD = randomBytes(4).toString("hex");
 const BLANK_USER_ID = " ";
+// A hand-typed userId query longer than CDEMO-CU02-USR-SELECTED PIC X(08); its first 8
+// characters are TEST_USER_ID.
+const OVER_LONG_USER_ID_QUERY = `${TEST_USER_ID}XYZ`;
 // A second user COUSR00C can select, with details unlike the first user's.
 const OTHER_USER_ID = "TESTUSR2";
 const OTHER_FIRST_NAME = "Other";
@@ -159,6 +170,23 @@ const UNABLE_TO_UPDATE_MESSAGE = "Unable to Update User...";
 // F3 returns to CDEMO-FROM-PROGRAM (COUSR00C) or else COADM01C; F12 always to COADM01C.
 const USER_LIST_ROUTE = "/admin/users";
 const ADMIN_MENU_ROUTE = "/admin";
+
+// The userId query's presence, whatever its value, stands for CDEMO-FROM-PROGRAM = COUSR00C; an
+// empty value selects no user (CDEMO-CU02-USR-SELECTED blank), so nothing is fetched first.
+const BLANK_EXIT_CASES: readonly BlankExitCase[] = [
+    {
+        query: "",
+        destination: "COADM01C (/admin)",
+        opener: "no list opened it",
+        route: ADMIN_MENU_ROUTE,
+    },
+    {
+        query: "userId=",
+        destination: "COUSR00C (/admin/users)",
+        opener: "the list sent an empty userId",
+        route: USER_LIST_ROUTE,
+    },
+];
 
 // The BMS INITIAL labels of USRIDIN, FNAME, LNAME, PASSWD and USRTYPE.
 const USER_ID_LABEL = "Enter User ID:";
@@ -586,6 +614,19 @@ describe("COUSR02C first entry from COUSR00C", () => {
     });
 });
 
+describe("COUSR02C first entry with a userId query longer than USRIDIN", () => {
+    it("COUSR02C fills USRIDIN with, and fetches, the query's first 8 characters", async () => {
+        mockSearchParams = new URLSearchParams({ userId: OVER_LONG_USER_ID_QUERY });
+        mockFetchUser.mockRejectedValue(LegacyRejection(USER_NOT_FOUND_MESSAGE, HTTP_NOT_FOUND));
+        RenderScreen();
+        await ExpectAlert(USER_NOT_FOUND_MESSAGE, "error");
+        await WaitForIdle();
+        expect(mockFetchUser).toHaveBeenCalledTimes(1);
+        ExpectFetchOf(TEST_USER_ID);
+        expect(FieldInput(USER_ID_LABEL)).toHaveValue(TEST_USER_ID);
+    });
+});
+
 // Every arrival with another CDEMO-CU02-USR-SELECTED is a fresh first entry, as every XCTL is.
 describe("COUSR02C same-route push that selects another user", () => {
     it("COUSR02C fetches the newly selected user and PF5 saves that user", async () => {
@@ -717,15 +758,24 @@ describe("COUSR02C PF3 return target (CDEMO-FROM-PROGRAM)", () => {
         expect(mockUpdateUser).toHaveBeenCalledWith(TEST_USER_ID, UNEDITED_REQUEST);
         expect(screen.queryByText(NO_CHANGE_MESSAGE)).toBeNull();
     });
+});
 
-    it("COUSR02C PF3 saves, then returns to COADM01C (/admin) when no list opened it", async () => {
-        mockUpdateUser.mockRejectedValue(LegacyRejection(USER_ID_EMPTY_MESSAGE, HTTP_BAD_REQUEST));
-        const view = RenderScreen();
-        await Trigger(view, SAVE_AND_EXIT_ACTION, "key");
-        await ExpectNavigationTo(ADMIN_MENU_ROUTE);
-        expect(mockUpdateUser).toHaveBeenCalledWith(BLANK_USER_ID, BLANK_REQUEST);
-        expect(FirstCallOrder(mockUpdateUser)).toBeLessThan(FirstCallOrder(mockRouterPush));
-    });
+describe("COUSR02C PF3 return target with no user fetched (CDEMO-FROM-PROGRAM)", () => {
+    it.each(BLANK_EXIT_CASES)(
+        "COUSR02C PF3 saves, then returns to $destination when $opener",
+        async ({ query, route }) => {
+            mockSearchParams = new URLSearchParams(query);
+            mockUpdateUser.mockRejectedValue(
+                LegacyRejection(USER_ID_EMPTY_MESSAGE, HTTP_BAD_REQUEST),
+            );
+            const view = RenderScreen();
+            await Trigger(view, SAVE_AND_EXIT_ACTION, "key");
+            await ExpectNavigationTo(route);
+            expect(mockFetchUser).not.toHaveBeenCalled();
+            expect(mockUpdateUser).toHaveBeenCalledWith(BLANK_USER_ID, BLANK_REQUEST);
+            expect(FirstCallOrder(mockUpdateUser)).toBeLessThan(FirstCallOrder(mockRouterPush));
+        },
+    );
 });
 
 describe("COUSR02C PF12 (back to COADM01C)", () => {

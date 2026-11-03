@@ -4,9 +4,10 @@ The CAUP account update, served as ``GET /api/v1/accounts/{acctId}/edit``
 (``FetchAccountForEdit``) and ``PUT /api/v1/accounts/{acctId}`` (``ProcessAccountUpdate``, one
 ENTER, F5 or F12). The ``screen_token`` replaces the COMMAREA extension ACCT-UPDATE-SCREEN-DATA:
 the ACUP-CHANGE-ACTION state, the account and customer keys, the ACUP-OLD-* before-image and,
-once validated, the ACUP-NEW-* values. A missing, forged or expired token is DETAILS_NOT_FETCHED.
-Only the fields the token's state leaves editable are read from the request; every protected
-value comes from the token, as a protected 3270 field returns only what was sent to it:
+once validated, the ACUP-NEW-* values. A missing, forged or expired token, or one issued for
+another account than the path ``acctId``, is DETAILS_NOT_FETCHED. Only the fields the token's
+state leaves editable are read from the request; every protected value comes from the token, as
+a protected 3270 field returns only what was sent to it:
 
 ========================  =====================  ======================  ======================
 State before              Fields read            ENTER                   F5 save / F12 cancel
@@ -1686,6 +1687,21 @@ def NormaliseAction(action: UpdateAction, screenState: UpdateScreenState) -> Upd
     return UpdateAction.ENTER
 
 
+def BindStateToPath(updateState: AccountUpdateState, acctId: str) -> AccountUpdateState:
+    """Return the decoded state when its token was issued for the path account.
+
+    A FETCHED_STATES token acts on its own account key, so it is kept only when the path
+    ``acctId``, padded to 11 characters, is that key; a token issued for another account is
+    invalid and restarts the flow as DETAILS_NOT_FETCHED, reading and writing nothing of it.
+    DETAILS_NOT_FETCHED, CHANGES_DONE and CHANGES_FAILED act on no token key and are kept.
+    """
+    if updateState.screenState not in FETCHED_STATES:
+        return updateState
+    if acctId.ljust(ACCOUNT_KEY_LENGTH) == updateState.acctId:
+        return updateState
+    return NOT_FETCHED_STATE
+
+
 async def FetchAccountForEdit(context: OnlineContext, acctId: str) -> AccountScreen:
     """Serve ``GET /accounts/{acctId}/edit``: a fresh CAUP entry, ENTER with the path key.
 
@@ -1704,11 +1720,13 @@ async def ProcessAccountUpdate(
 ) -> AccountScreen:
     """Port of 0000-MAIN (lines 859-1004): one ENTER, F5 or F12 on the COACTUP screen.
 
-    The state comes from ``request.screen_token``. In DETAILS_NOT_FETCHED the key is
-    ``request.fields.acct_id`` when it is not empty, otherwise the path ``acctId``, so a bare
-    ``PUT /accounts/{id}`` with ``action: "enter"`` fetches ``{id}``. In every other state the
-    key comes from the token and the path is ignored. After CHANGES_DONE or CHANGES_FAILED any
-    key returns the empty key screen without reading.
+    The state comes from ``request.screen_token``, bound to the path by BindStateToPath: a
+    fetched-state token issued for another account than the path ``acctId`` is
+    DETAILS_NOT_FETCHED. In DETAILS_NOT_FETCHED the key is ``request.fields.acct_id`` when it
+    is not empty, otherwise the path ``acctId``, so a bare ``PUT /accounts/{id}`` with
+    ``action: "enter"`` fetches ``{id}``. In the fetched states the key is the token's, which
+    the path names. After CHANGES_DONE or CHANGES_FAILED any key returns the empty key screen
+    without reading.
 
     Raises:
         LegacyMessageError: 400 for a key or field edit failure or no change, 404 for a
@@ -1716,7 +1734,7 @@ async def ProcessAccountUpdate(
             503 for a file error or a failed rewrite. Each body carries the screen ``fields``,
             ``state`` and ``screen_token``.
     """
-    updateState = DecodeUpdateState(request.screen_token, context)
+    updateState = BindStateToPath(DecodeUpdateState(request.screen_token, context), acctId)
     screenState = updateState.screenState
     action = NormaliseAction(request.action, screenState)
     if screenState in FINISHED_STATES:

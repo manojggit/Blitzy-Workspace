@@ -42,9 +42,9 @@ CARD_NUM_LENGTH = 16
 # key holding "/" sent as %2F and kept in one segment by LosslessKeyRoute) must reach the
 # services' ``Card number not provided`` and ``CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT
 # NUMBER`` edits rather than a 422 or a framework 404. A longer value is a ``card_ref`` token,
-# checked for length only, so on the GET routes cocrdslc.DecodeCardKey refuses a garbled one and
-# the service answers ``Did not find cards for this search condition``; the PUT route never
-# decodes it.
+# checked for length only, so cocrdslc.DecodeCardKey refuses a garbled one and the service
+# answers ``Did not find cards for this search condition``. The PUT route decodes the path only
+# to bind a fetched screen_token to its card.
 CARD_KEY_PATH = Annotated[
     ScreenTextOrToken(CARD_NUM_LENGTH, CARD_REF_MAX_LENGTH),
     Path(
@@ -147,9 +147,11 @@ async def FetchCardForEdit(
         "Runs one step of the ENTER (enter), F5 (save) and F12 (cancel) state machine on the "
         "state carried by screen_token: enter validates, save writes the validated values and "
         "cancel re-reads the card. Error bodies carry the screen fields, state and screen_token. "
-        "The cardNum path is the route identity only: the keys come from fields before the "
-        "fetch and from screen_token afterwards, so the path value, a card_ref included, is "
-        "not decoded."
+        "Before the fetch the keys come from fields and the cardNum path is not read. "
+        "Afterwards they come from screen_token, which holds only for the card the cardNum "
+        "path names (a typed card number or a card_ref); a token for another card restarts "
+        "the flow at DETAILS_NOT_FETCHED and writes nothing, and an invalid or expired "
+        "card_ref path is a 404 Did not find cards for this search condition."
     ),
     responses=LegacyErrorResponses(400, 401, 403, 404, 409, 423, 503),
 )

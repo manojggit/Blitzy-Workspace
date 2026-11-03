@@ -355,10 +355,11 @@ async def HandleRequestValidationError(
     Every request FastAPI's validation rejects arrives here: malformed JSON; a wrong JSON type
     or null; an invalid enum value on a non-screen field (an ``action``, a paging
     ``direction``, the user-fetch ``screen``, the CR00 report type or export format); a missing
-    export format; a negative page number, or a CU00 page wider than its PIC 9(08); a list or
-    opaque token over its maximum length; and screen text over its BMS field length or outside
-    the code-page-037 repertoire, which a 3270 terminal could never send (AAP 0.6.4). The legacy
-    type, sign, range and format edits run in the services, never here.
+    export format; a page number that is not an unsigned integer (a bool, a float, or query
+    text other than decimal digits) or is wider than its PIC (CT00 and CU00 9(08), CCLI 9(1));
+    a list or opaque token over its maximum length; and screen text over its BMS field length or
+    outside the code-page-037 repertoire, which a 3270 terminal could never send (AAP 0.6.4).
+    The legacy type, sign, range and format edits run in the services, never here.
 
     The body is ``app.schemas.common.LegacyValidationErrorResponse``, which app.main declares
     as the 422 response of every operation FastAPI validates: FastAPI's ``detail`` list, each

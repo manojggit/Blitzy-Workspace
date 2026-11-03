@@ -41,12 +41,17 @@ const TRANSACTION_ID = "CU02";
 const PROGRAM_NAME = "COUSR02C";
 const SCREEN_TITLE = "Update User";
 
-// F3 returns to CDEMO-FROM-PROGRAM: the user list (COUSR00C) that opened this screen with a
-// selected user, otherwise the admin menu (COADM01C). F12 always returns to the admin menu.
+// F3 returns to CDEMO-FROM-PROGRAM: the user list (COUSR00C) whenever the userId query parameter
+// is present, whatever its value, otherwise the admin menu (COADM01C). COUSR02C tests
+// CDEMO-FROM-PROGRAM and CDEMO-CU02-USR-SELECTED as separate COMMAREA fields, so the parameter's
+// presence stands for the first and its value for the second. F12 always returns to the admin
+// menu.
 const USER_LIST_ROUTE = "/admin/users";
 const ADMIN_MENU_ROUTE = "/admin";
 // CDEMO-CU02-USR-SELECTED: the user COUSR00C selected with U.
 const USER_ID_QUERY_KEY = "userId";
+// USRIDIN LENGTH=8, the PIC X(08) of CDEMO-CU02-USR-SELECTED.
+const USER_ID_LENGTH = 8;
 
 // An empty USRIDIN travels as SPACES, which the server answers with "User ID can NOT be empty...".
 const BLANK_USER_ID = " ";
@@ -138,7 +143,7 @@ interface UserUpdateScreenProps {
 
 // USRIDIN sits above the map's row of asterisks; the user details sit below it.
 const KEY_FIELD_DEFINITIONS: readonly FieldDefinition[] = [
-    { name: "user_id", label: "Enter User ID:", maxLength: 8, autoComplete: "off" },
+    { name: "user_id", label: "Enter User ID:", maxLength: USER_ID_LENGTH, autoComplete: "off" },
 ];
 // The name and type fields hold another user's record, so the browser never autofills them.
 // The stored password is a bcrypt hash, so PASSWD is never prefilled; left blank it keeps the
@@ -485,7 +490,7 @@ function useUserUpdate(userId: string | null): UserUpdateModel {
         SetFeedback: setFeedback,
         SetIsBusy: setIsBusy,
         router,
-        openedFromList: !IsMissingQueryValue(userId),
+        openedFromList: userId !== null,
         fetchControllerRef: useRef<AbortController | null>(null),
     };
     useInitialFetch(context, userId);
@@ -574,13 +579,28 @@ function UserUpdateScreen({ selectedUserId }: UserUpdateScreenProps) {
     );
 }
 
+// CDEMO-CU02-USR-SELECTED is PIC X(08), so only the first 8 characters of a longer userId query
+// value fill USRIDIN and are fetched; the text is otherwise kept exactly as given. Characters are
+// counted as code points, so a surrogate pair is never split into text the path encoding refuses.
+function SelectedUserIdOf(queryValue: string | null): string | null {
+    if (queryValue === null) {
+        return null;
+    }
+    return Array.from(queryValue).slice(0, USER_ID_LENGTH).join("");
+}
+
 // Each arrival with another selected user is a fresh COUSR02C first entry, as every XCTL is, so
 // the screen state starts over whenever the userId query parameter changes. The discarded
 // screen's unmount aborts a fetch still in flight for the previous user, so its answer never
-// reaches the new one.
+// reaches the new one. The key is the raw query value, so every change of it re-enters.
 function UserUpdateEntry() {
-    const selectedUserId = useSearchParams().get(USER_ID_QUERY_KEY);
-    return <UserUpdateScreen key={selectedUserId ?? ""} selectedUserId={selectedUserId} />;
+    const userIdQueryValue = useSearchParams().get(USER_ID_QUERY_KEY);
+    return (
+        <UserUpdateScreen
+            key={userIdQueryValue ?? ""}
+            selectedUserId={SelectedUserIdOf(userIdQueryValue)}
+        />
+    );
 }
 
 // useSearchParams needs a Suspense boundary, or the static build cannot prerender the route.

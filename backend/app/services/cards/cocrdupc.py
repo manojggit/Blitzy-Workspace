@@ -4,9 +4,10 @@ The CCUP card update, served as ``GET /api/v1/cards/{cardNum}/edit?acctId`` (``F
 the entry from the card list) and ``PUT /api/v1/cards/{cardNum}`` (``ProcessCardUpdate``, one
 ENTER, F5 or F12). The ``screen_token`` replaces the COMMAREA extension WS-THIS-PROGCOMMAREA:
 the CCUP-CHANGE-ACTION state, both keys, the CCUP-OLD-* before-image and, once validated, the
-CCUP-NEW-* values. An invalid or expired token is DETAILS_NOT_FETCHED. The service reads from
-the request only the fields the token's state leaves editable, as a protected 3270 field
-returns only what was sent to it:
+CCUP-NEW-* values. An invalid or expired token, or one issued for another card than the
+``{cardNum}`` path names, is DETAILS_NOT_FETCHED. The service reads from the request only the
+fields the token's state leaves editable, as a protected 3270 field returns only what was sent
+to it:
 
 ======================  ====================  =================  ===========  =============
 State before            Fields read           ENTER              F5 save      F12 cancel
@@ -59,6 +60,7 @@ from app.services.cards.cocrdslc import (
     ACCT_ID_FIELD,
     CARD_NOT_FOUND_MESSAGE,
     CARD_NUM_FIELD,
+    CARD_NUM_LENGTH,
     PROMPT_FOR_KEYS_INFO,
     READ_OPERATION,
     BuildFileErrorMessage,
@@ -366,19 +368,53 @@ async def ProcessCardUpdate(
 ) -> CardScreen:
     """Port of 0000-MAIN (lines 366-543): one ENTER, F5 or F12 on the COCRDUP screen.
 
-    ``cardKey`` is the route identity only: the keys come from the request fields before
-    fetch and from the screen token afterwards, so the router may pass a placeholder.
+    ``cardKey`` is the ``{cardNum}`` path value, a keyed card number or a ``card_ref`` token.
+    Before fetch the keys come from the request fields and the path is not read; afterwards
+    they come from the screen token, which BindStateToPath accepts only for the card the
+    path names.
 
     Raises:
-        LegacyMessageError: 400 for an edit failure or no change, 404 for a card not found,
-            409 for a record changed since fetch, 423 for a record lock, and 503 for a failed
-            rewrite or a CARDDAT read error. Each body carries the screen ``fields``,
-            ``state`` and ``screen_token``.
+        LegacyMessageError: 400 for an edit failure or no change, 404 for a card not found
+            or, once details are fetched, an invalid or expired ``card_ref`` path, 409 for a
+            record changed since fetch, 423 for a record lock, and 503 for a failed rewrite or
+            a CARDDAT read error. Each body carries the screen ``fields``, ``state`` and
+            ``screen_token``.
     """
-    state = DecodeUpdateToken(request.screen_token, context.settings) or NOT_FETCHED_STATE
+    tokenState = DecodeUpdateToken(request.screen_token, context.settings) or NOT_FETCHED_STATE
+    state = BindStateToPath(tokenState, cardKey, context.settings)
     action = NormaliseAction(request.action, state.stateCode)
     handler = SelectHandler(state.stateCode, action)
     return await handler(context, state, request.fields)
+
+
+def BindStateToPath(state: CardUpdateState, cardKey: str, settings: "Settings") -> CardUpdateState:
+    """Return ``state`` when the ``{cardNum}`` path names its card, NOT_FETCHED_STATE for another.
+
+    A token issued for another card than the path names is treated as invalid, so a token
+    replayed on another card's path restarts the flow and never reads or rewrites its card.
+    Only FETCHED_STATES are bound, as only they read or rewrite the token's card; for the
+    other states the path is not read, and done and failed states reset whatever the path.
+    The path names only the card: the PUT route carries no account key. It is decoded as
+    cocrdslc.DecodeCardKey decodes it, a keyed card number or a ``card_ref`` token, and both
+    card texts are compared space-padded to CARDSID's 16 characters.
+
+    Raises:
+        LegacyMessageError: 404 ``Did not find cards for this search condition`` when the path
+            of a fetched state is an invalid or expired ``card_ref``, or one carrying no card
+            key, as FetchCardForEdit answers it. Nothing is read; the body carries the
+            not-fetched key screen with blank keys, so neither the token's card nor the path
+            token is echoed.
+    """
+    if state.stateCode not in FETCHED_STATES:
+        return state
+    cardText = DecodeCardKey(cardKey, settings)
+    if cardText is None:
+        reply = ReadFailureReply(("", ""), CARD_NOT_FOUND_MESSAGE, (ACCT_ID_FIELD, CARD_NUM_FIELD))
+        raise ScreenError(reply, STATUS_NOT_FOUND, settings)
+    pathCard = PadScreenText(cardText, CARD_NUM_LENGTH)
+    if pathCard != PadScreenText(state.cardNum, CARD_NUM_LENGTH):
+        return NOT_FETCHED_STATE
+    return state
 
 
 def NormaliseAction(action: UpdateAction, stateCode: str) -> UpdateAction:

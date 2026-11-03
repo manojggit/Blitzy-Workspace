@@ -330,7 +330,8 @@ class AccountUpdateRequest(BaseModel):
     The service reads from ``fields`` only the fields the token's state leaves editable and
     takes every protected value from ``screen_token``, as a protected 3270 field returns only
     what was sent to it. The path ``acctId`` and ``fields.acct_id`` both reach the service,
-    which decides per state which key applies.
+    which decides per state which key applies. A ``screen_token`` issued for another account
+    than the path ``acctId`` is treated as DETAILS_NOT_FETCHED.
     """
 
     action: UpdateAction = Field(
@@ -344,7 +345,8 @@ class AccountUpdateRequest(BaseModel):
         default="",
         description=(
             "The screen_token of the previous AccountScreen; empty on the first request. A "
-            "forged or expired token is treated as DETAILS_NOT_FETCHED, restarting the flow."
+            "forged or expired token, or one issued for another account than the path acctId, "
+            "is treated as DETAILS_NOT_FETCHED, restarting the flow."
         ),
     )
     fields: AccountScreenFields = Field(

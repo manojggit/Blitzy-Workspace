@@ -58,8 +58,10 @@ const SEARCH_MAX_LENGTH = 8;
 const SEARCH_LABEL = "Search User ID:";
 const PAGE_LABEL = "Page:";
 // The polite page status, built from the screen's own Page:, row and user ID fields so that no
-// ERRMSG literal is invented or changed: "Page: 2, 10 users shown, QAUSR006 to QAUSR015".
+// ERRMSG literal is invented or changed: "Page: 2, 10 users shown, QAUSR006 to QAUSR015", and
+// for a single row "Page: 4, 1 user shown, 1A to 1A".
 const SHOWN_COUNT_SUFFIX = "users shown";
+const SINGLE_SHOWN_COUNT_SUFFIX = "user shown";
 const STATUS_PART_SEPARATOR = ", ";
 const SHOWN_RANGE_SEPARATOR = " to ";
 // The JSON name the server gives USRIDIN in cursor_field and field_errors.
@@ -149,12 +151,18 @@ function IsBlank(text: string): boolean {
     return text.trim() === BLANK_TEXT;
 }
 
+// The row count with its noun: singular for one row, plural for none or several.
+function ShownCountText(rowCount: number): string {
+    const countSuffix = rowCount === 1 ? SINGLE_SHOWN_COUNT_SUFFIX : SHOWN_COUNT_SUFFIX;
+    return `${rowCount} ${countSuffix}`;
+}
+
 // The shown page's number, row count and first and last user IDs; blank before any page shows.
 function PageStatusText(rows: readonly UserListRow[], page?: number): string {
     if (page === undefined) {
         return BLANK_TEXT;
     }
-    const statusParts = [`${PAGE_LABEL} ${page}`, `${rows.length} ${SHOWN_COUNT_SUFFIX}`];
+    const statusParts = [`${PAGE_LABEL} ${page}`, ShownCountText(rows.length)];
     const firstRow = rows[0];
     const lastRow = rows[rows.length - 1];
     if (firstRow !== undefined && lastRow !== undefined) {

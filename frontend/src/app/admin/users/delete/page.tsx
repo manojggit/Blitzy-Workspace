@@ -53,6 +53,8 @@ const SCREEN_IDENTITY = {
 const USER_LIST_ROUTE = "/admin/users";
 const ADMIN_MENU_ROUTE = ADMIN_HOME_ROUTE;
 const USER_ID_QUERY_KEY = "userId";
+// USRIDIN LENGTH=8, the PIC X(08) of CDEMO-CU03-USR-SELECTED.
+const USER_ID_LENGTH = 8;
 
 // A blank USRIDIN travels as SPACES, so COUSR03C itself answers "User ID can NOT be empty...".
 const BLANK_USER_ID = " ";
@@ -150,7 +152,7 @@ const USER_ID_FIELD: UserDeleteFieldName = "user_id";
 const USER_ID_FIELD_DEFINITION: FieldDefinition = {
     name: USER_ID_FIELD,
     label: "Enter User ID:",
-    maxLength: 8,
+    maxLength: USER_ID_LENGTH,
     isEditable: true,
 };
 
@@ -574,17 +576,24 @@ function UserDeleteScreen(props: UserDeleteScreenProps) {
     );
 }
 
+// CDEMO-CU03-USR-SELECTED is PIC X(08), so only the first 8 characters of a longer userId query
+// value fill USRIDIN and are fetched; the text is otherwise kept exactly as given. Characters are
+// counted as code points, so a surrogate pair is never split into text the path encoding refuses.
+function SelectedUserIdOf(queryValue: string): string {
+    return Array.from(queryValue).slice(0, USER_ID_LENGTH).join("");
+}
+
 // Each arrival with another selected user is a fresh COUSR03C first entry, as every XCTL is, so
 // the screen state starts over whenever the userId query parameter changes. The discarded
 // screen's unmount aborts a fetch still in flight for the previous user, so its answer never
-// reaches the new one.
+// reaches the new one. The key is the raw query value, so every change of it re-enters.
 function UserDeleteEntry() {
     const searchParams = useSearchParams();
-    const selectedUserId = searchParams.get(USER_ID_QUERY_KEY) ?? "";
+    const userIdQueryValue = searchParams.get(USER_ID_QUERY_KEY) ?? "";
     return (
         <UserDeleteScreen
-            key={selectedUserId}
-            selectedUserId={selectedUserId}
+            key={userIdQueryValue}
+            selectedUserId={SelectedUserIdOf(userIdQueryValue)}
             cameFromList={searchParams.has(USER_ID_QUERY_KEY)}
         />
     );

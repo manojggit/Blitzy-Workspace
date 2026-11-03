@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.schemas.common import (
     CARD_REF_MAX_LENGTH,
+    QUERY_PAGE_NUMBER,
     SCREEN_TOKEN_MAX_LENGTH,
     START_KEY_MAX_LENGTH,
     Direction,
@@ -33,6 +34,9 @@ from app.schemas.common import (
 )
 
 CARD_LIST_PAGE_SIZE = 7
+# WS-CA-SCREEN-NUM PIC 9(1) (cbl/COCRDLIC.cbl line 237): no COMMAREA holds a larger page.
+CCLI_PAGE_NUMBER_DIGITS = 1
+MAX_CCLI_PAGE_NUMBER = 10**CCLI_PAGE_NUMBER_DIGITS - 1
 
 
 class CardListQuery(QueryModel):
@@ -74,11 +78,15 @@ class CardListQuery(QueryModel):
             "which re-reads the page shown from startKey."
         ),
     )
-    page: int = Field(
+    page: QUERY_PAGE_NUMBER = Field(
         default=0,
         ge=0,
+        le=MAX_CCLI_PAGE_NUMBER,
         alias="page",
-        description="The page number shown, replacing the COMMAREA WS-CA-SCREEN-NUM counter.",
+        description=(
+            "The page number shown, replacing the COMMAREA WS-CA-SCREEN-NUM counter (PIC 9(1)): "
+            "an integer from 0 to 9 in decimal digits only."
+        ),
     )
     selections: list[ScreenText(1)] = Field(
         default_factory=list,
@@ -293,8 +301,9 @@ class CardUpdateRequest(BaseModel):
     screen_token: OpaqueToken(SCREEN_TOKEN_MAX_LENGTH) = Field(
         default="",
         description=(
-            "The screen_token of the last CardScreen; a missing, forged or expired token "
-            "restarts the flow at DETAILS_NOT_FETCHED."
+            "The screen_token of the last CardScreen; a missing, forged or expired token, or "
+            "one issued for another card than the cardNum path names, restarts the flow at "
+            "DETAILS_NOT_FETCHED."
         ),
     )
     fields: CardScreenFields = Field(

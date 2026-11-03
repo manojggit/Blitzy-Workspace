@@ -102,7 +102,9 @@ interface BackCase {
     method: PressMethod;
     origin: string;
     route: string;
-    isFromList: boolean;
+    // The query string the screen opens with, and how many fetches its first entry makes.
+    query: string;
+    fetchCount: number;
 }
 
 interface LiteralCase {
@@ -143,6 +145,9 @@ const TEST_USER_ID = "TESTUSR1";
 const OTHER_USER_ID = "TESTUSR2";
 // USRIDIN as keyed: mixed case with an embedded space, never trimmed or case-folded.
 const TYPED_USER_ID = "tstUsr 9";
+// A hand-typed userId query longer than CDEMO-CU03-USR-SELECTED PIC X(08); its first 8
+// characters are TEST_USER_ID.
+const OVER_LONG_USER_ID_QUERY = `${TEST_USER_ID}XYZ`;
 const PRESS_PF5_MESSAGE = "Press PF5 key to delete this user ...";
 const DELETED_MESSAGE = "User TESTUSR1 has been deleted ...";
 const OTHER_DELETED_MESSAGE = "User TESTUSR2 has been deleted ...";
@@ -228,13 +233,16 @@ const FIELD_CASES: readonly FieldCase[] = [
     { label: USER_TYPE_LABEL, maxLength: 1, isReadOnly: true },
 ];
 
-// F3 returns to CDEMO-FROM-PROGRAM (COUSR00C) when the list opened the screen, else COADM01C.
-const BACK_CASES: readonly BackCase[] = [
-    { method: "click", origin: "COUSR00C", route: USER_LIST_PATH, isFromList: true },
-    { method: "key", origin: "COUSR00C", route: USER_LIST_PATH, isFromList: true },
-    { method: "click", origin: "COADM01C", route: ADMIN_MENU_PATH, isFromList: false },
-    { method: "key", origin: "COADM01C", route: ADMIN_MENU_PATH, isFromList: false },
+// F3 returns to CDEMO-FROM-PROGRAM (COUSR00C) whenever the userId query is present, even empty
+// (CDEMO-CU03-USR-SELECTED blank, so nothing is fetched), else to COADM01C.
+const BACK_ORIGINS: readonly Omit<BackCase, "method">[] = [
+    { origin: "COUSR00C", route: USER_LIST_PATH, query: `userId=${TEST_USER_ID}`, fetchCount: 1 },
+    { origin: "COUSR00C (empty userId)", route: USER_LIST_PATH, query: "userId=", fetchCount: 0 },
+    { origin: "COADM01C", route: ADMIN_MENU_PATH, query: "", fetchCount: 0 },
 ];
+const BACK_CASES: readonly BackCase[] = BACK_ORIGINS.flatMap((backOrigin) =>
+    PRESS_METHODS.map((method) => ({ ...backOrigin, method })),
+);
 
 // Every literal COUSR03C sends, with the status the backend answers it with and its BMS colour.
 const LITERAL_CASES: readonly LiteralCase[] = [
@@ -622,6 +630,22 @@ describe("COUSR03C first entry from COUSR00C (CDEMO-CU03-USR-SELECTED)", () => {
     });
 });
 
+describe("COUSR03C first entry with a userId query longer than USRIDIN", () => {
+    it("COUSR03C shows, fetches and deletes only the query's first 8 characters", async () => {
+        mockSearchParams = new URLSearchParams({ userId: OVER_LONG_USER_ID_QUERY });
+        const notFound = BuildErrorBody({ message: NOT_FOUND_MESSAGE });
+        mockFetchUser.mockRejectedValue(BuildAxiosError(HTTP_NOT_FOUND, notFound));
+        const user = RenderScreen();
+        await ExpectAlert(NOT_FOUND_MESSAGE, "error");
+        expect(mockFetchUser).toHaveBeenCalledTimes(1);
+        ExpectFetchOf(TEST_USER_ID);
+        expect(ShownValues()).toEqual({ ...EMPTY_SCREEN_VALUES, user_id: TEST_USER_ID });
+        await PressFunction(user, "F5", "key");
+        await ExpectAlert(DELETED_MESSAGE, "success");
+        expect(mockDeleteUser).toHaveBeenCalledWith(TEST_USER_ID);
+    });
+});
+
 // Every arrival with another CDEMO-CU03-USR-SELECTED is a fresh first entry, as every XCTL is.
 describe("COUSR03C same-route push that selects another user", () => {
     it("COUSR03C fetches the newly selected user and PF5 deletes that user", async () => {
@@ -796,11 +820,14 @@ describe("COUSR03C PF12 cancel (RETURN-TO-PREV-SCREEN to COADM01C)", () => {
 describe("COUSR03C PF3 back (RETURN-TO-PREV-SCREEN to CDEMO-FROM-PROGRAM)", () => {
     it.each(BACK_CASES)(
         "COUSR03C PF3 by $method from $origin returns to $route without deleting",
-        async ({ method, route, isFromList }) => {
-            const user = isFromList ? await RenderFromList() : RenderScreen();
+        async ({ method, route, query, fetchCount }) => {
+            mockSearchParams = new URLSearchParams(query);
+            const user = RenderScreen();
+            await ExpectIdle();
             await PressFunction(user, "F3", method);
             expect(mockRouterPush).toHaveBeenCalledTimes(1);
             expect(mockRouterPush).toHaveBeenCalledWith(route);
+            expect(mockFetchUser).toHaveBeenCalledTimes(fetchCount);
             expect(mockDeleteUser).not.toHaveBeenCalled();
         },
     );

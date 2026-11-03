@@ -79,7 +79,8 @@ async def FetchAccountForEdit(acctId: ACCOUNT_ID_PATH, context: REGULAR_CONTEXT)
     description=(
         "Runs one step of the ENTER (enter: validate), F5 (save, only after validation) and "
         "F12 (cancel) state machine on the state carried by screen_token, and returns the next "
-        "screen state with the legacy message, field_errors and cursor_field."
+        "screen state with the legacy message, field_errors and cursor_field. A screen_token "
+        "issued for another account than the path acctId is treated as DETAILS_NOT_FETCHED."
     ),
     responses=LegacyErrorResponses(400, 401, 403, 404, 409, 423, 503),
 )

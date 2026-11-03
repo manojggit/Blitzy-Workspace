@@ -23,6 +23,7 @@ wire names through their aliases.
 from pydantic import BaseModel, Field
 
 from app.schemas.common import (
+    QUERY_PAGE_NUMBER,
     Direction,
     MoneyAmount,
     PageState,
@@ -33,6 +34,9 @@ from app.schemas.common import (
 
 # The ten list rows of the COTRN00 map (SEL0001-SEL0010, TRNID01-TRNID10).
 TRANSACTION_LIST_PAGE_SIZE = 10
+# CDEMO-CT00-PAGE-NUM PIC 9(08) (cbl/COTRN00C.cbl line 65): no COMMAREA holds a larger page.
+CT00_PAGE_NUMBER_DIGITS = 8
+MAX_CT00_PAGE_NUMBER = 10**CT00_PAGE_NUMBER_DIGITS - 1
 
 
 class TransactionListQuery(QueryModel):
@@ -76,11 +80,15 @@ class TransactionListQuery(QueryModel):
         alias="direction",
         description="Paging direction: forward (F8, READNEXT) or backward (F7, READPREV).",
     )
-    page: int = Field(
+    page: QUERY_PAGE_NUMBER = Field(
         default=0,
         ge=0,
+        le=MAX_CT00_PAGE_NUMBER,
         alias="page",
-        description="The page number currently shown (CDEMO-CT00-PAGE-NUM); 0 before the first.",
+        description=(
+            "The page number currently shown (CDEMO-CT00-PAGE-NUM PIC 9(08)): an integer from 0 "
+            "to 99999999 in decimal digits only; 0 before the first."
+        ),
     )
 
 
@@ -184,10 +192,17 @@ class TransactionSelectionRequest(BaseModel):
             "raw TRAN-ID of at most 16 code-page-037 characters."
         ),
     )
+    # A JSON body value, unlike the query pages (QUERY_PAGE_NUMBER), so strict mode applies: a
+    # bool, numeric string, float or null is a 422.
     page: int = Field(
         default=0,
+        strict=True,
         ge=0,
-        description="The page number shown (CDEMO-CT00-PAGE-NUM).",
+        le=MAX_CT00_PAGE_NUMBER,
+        description=(
+            "The page number shown (CDEMO-CT00-PAGE-NUM PIC 9(08)): a JSON integer from 0 to "
+            "99999999."
+        ),
     )
 
 
