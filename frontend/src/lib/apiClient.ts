@@ -3,17 +3,30 @@
 // to the user's own menu (COSGN00C: type A to COADM01C, any other type to COMEN01C), and the BMS
 // ERRMSG line contract. The common types mirror backend/app/schemas/common.py; the abend text is
 // COACTUPC ABEND-ROUTINE (CSMSG02Y ABEND-MSG).
-import axios, { type AxiosError } from "axios";
+import axios, { type AxiosError, type AxiosResponse } from "axios";
+
+function StripTrailingSlashes(origin: string): string {
+    let end = origin.length;
+    while (end > 0 && origin[end - 1] === "/") {
+        end -= 1;
+    }
+    return origin.slice(0, end);
+}
 
 // The backend origin only. The property is written out literally so that Next.js inlines it into
-// the client bundle at build time.
-export const API_BASE_URL: string = process.env.NEXT_PUBLIC_API_URL ?? "";
+// the client bundle at build time. A trailing "/" is dropped, so every path below starts with the
+// backend's API_V1_PREFIX exactly, never "//api/v1".
+export const API_BASE_URL: string = StripTrailingSlashes(process.env.NEXT_PUBLIC_API_URL ?? "");
 export const API_V1_PATH = "/api/v1";
+// The root of every call, the bare /auth/me lookup included.
+export const API_V1_URL = API_BASE_URL + API_V1_PATH;
 
-// Longer than the backend's own bound on a statement (by default DB_CONNECT_TIMEOUT_SECONDS 10
-// plus DB_COMMAND_TIMEOUT_SECONDS 30), so the client never abandons work the server may still
-// finish, yet a stalled response still ends. It is a code constant because the frontend reads
-// only NEXT_PUBLIC_API_URL from the environment.
+// Longer than the backend's bounds on a connection attempt and on one statement (by default
+// DB_CONNECT_TIMEOUT_SECONDS 10 and DB_COMMAND_TIMEOUT_SECONDS 30), yet a stalled response still
+// ends. Those bounds do not cover a whole request, which can run several statements, so a timed-out
+// call, a write especially, has an unknown outcome: the server may still have committed it. No
+// call is therefore retried automatically. It is a code constant because the frontend reads only
+// NEXT_PUBLIC_API_URL from the environment.
 export const REQUEST_TIMEOUT_MILLISECONDS = 60000;
 
 // The session cookie travels on every call; no token, role or credential is held client-side, and
@@ -22,7 +35,7 @@ export const REQUEST_TIMEOUT_MILLISECONDS = 60000;
 // rejects with an axios error without a response, which the interceptor rejects unchanged and
 // ToScreenFeedback shows as the abend text, as it does a network failure.
 export const API_CLIENT = axios.create({
-    baseURL: API_BASE_URL + API_V1_PATH,
+    baseURL: API_V1_URL,
     withCredentials: true,
     timeout: REQUEST_TIMEOUT_MILLISECONDS,
 });
@@ -41,32 +54,41 @@ const HOME_ROUTES: readonly string[] = [DEFAULT_HOME_ROUTE, ADMIN_HOME_ROUTE];
 // Their 401 bodies carry the sign-on literals (Wrong Password. Try again ...), which the sign-on
 // page shows instead of being redirected.
 const UNREDIRECTED_AUTH_PATHS = ["/auth/login", "/auth/logout"] as const;
-const CURRENT_USER_URL = API_BASE_URL + API_V1_PATH + "/auth/me";
+const CURRENT_USER_URL = API_V1_URL + "/auth/me";
 
 const HTTP_UNAUTHORIZED = 401;
 const HTTP_FORBIDDEN = 403;
 const HTTP_INTERNAL_SERVER_ERROR = 500;
 
 // The ERRMSG and INFOMSG lines and the cursor of a screen response (common.ScreenFeedback).
+// Every key has a server default, so the wire may omit any of them.
 export interface ScreenFeedback {
-    message: string;
-    info_message: string;
-    field_errors: string[];
-    cursor_field: string | null;
+    message?: string;
+    info_message?: string;
+    field_errors?: string[];
+    cursor_field?: string | null;
 }
 
-// The error body of every non-2xx legacy outcome (common.LegacyErrorResponse).
-export type LegacyErrorResponse = ScreenFeedback;
+// The feedback a page shows: every line present, an absent key filled with its empty value, the
+// server's text verbatim and a null cursor kept.
+export type CompleteScreenFeedback = Required<ScreenFeedback>;
+
+// The error body of every non-2xx legacy outcome (common.LegacyErrorResponse). Only message is
+// required on the wire; the other keys may be absent.
+export interface LegacyErrorResponse extends ScreenFeedback {
+    message: string;
+}
 
 export interface MessageResponse {
     message: string;
 }
 
-// The paging position of the CCLI, CT00 and CU00 lists (common.PageState).
+// The paging position of the CCLI, CT00 and CU00 lists (common.PageState). Every key has a
+// server default, so the wire may omit any of them.
 export interface PageState {
-    page: number;
-    first_key: string;
-    last_key: string;
+    page?: number;
+    first_key?: string;
+    last_key?: string;
 }
 
 // Decimal amounts arrive as JSON strings and are never parsed to a floating-point number.
@@ -103,11 +125,6 @@ export interface OutcomeFlags {
     isCompletedWrite: boolean;
 }
 
-// A body whose message is a string; the other standard keys may be absent.
-interface LegacyBody extends Partial<LegacyErrorResponse> {
-    message: string;
-}
-
 // The DOMException names of a browser that refuses storage (SecurityError, raised even by reading
 // window.sessionStorage) or has no room left in it (QuotaExceededError).
 const STORAGE_FAILURE_NAMES: readonly string[] = ["SecurityError", "QuotaExceededError"];
@@ -117,6 +134,9 @@ const STORAGE_FAILURE_NAMES: readonly string[] = ["SecurityError", "QuotaExceede
 let recordedHomeRoute: string | null = null;
 // The /auth/me lookup in flight, shared by every refusal that arrives while it runs.
 let homeRouteLookup: Promise<string> | null = null;
+// Advances whenever a session ends (sign-off or a new login), so a refusal that began under an
+// earlier session neither stores its message nor navigates.
+let sessionGeneration = 0;
 
 // Storage is optional here, so a refusal leaves only what the page holds in memory. Any other
 // error is a defect and propagates.
@@ -220,15 +240,25 @@ export function GetHomeRoute(): string {
     return RecordedHomeRoute() ?? DEFAULT_HOME_ROUTE;
 }
 
-// Sign-off also abandons a lookup in flight, so its answer is never recorded for the next user.
-export function ClearHomeRoute(): void {
+// Ends the session: every refusal still waiting on its home route becomes obsolete, and the lookup
+// in flight is abandoned so its answer is never recorded for the next user. Recording a home route
+// (SetHomeRoute, or a lookup keeping its own answer) is not a new session, so a refusal waiting
+// while the session context records the route still returns to it.
+function InvalidatePendingRefusals(): void {
+    sessionGeneration += 1;
     homeRouteLookup = null;
+}
+
+// Sign-off, and a successful login (HandleResponse): the previous user's refusals and home route
+// never reach the next user.
+export function ClearHomeRoute(): void {
+    InvalidatePendingRefusals();
     ForgetHomeRoute();
 }
 
 // A 422 body carries FastAPI's detail list beside empty legacy keys. Its input is structurally
 // malformed, which a 3270 terminal could never send, so it is not a legacy outcome.
-function IsLegacyBody(body: unknown): body is LegacyBody {
+function IsLegacyBody(body: unknown): body is LegacyErrorResponse {
     if (typeof body !== "object" || body === null || "detail" in body) {
         return false;
     }
@@ -236,7 +266,7 @@ function IsLegacyBody(body: unknown): body is LegacyBody {
 }
 
 // Rethrows anything that is not an axios error; null means the outcome is the abend text.
-function LegacyBodyOf(error: unknown): LegacyBody | null {
+function LegacyBodyOf(error: unknown): LegacyErrorResponse | null {
     if (!axios.isAxiosError(error)) {
         throw error;
     }
@@ -248,7 +278,7 @@ function LegacyBodyOf(error: unknown): LegacyBody | null {
 }
 
 // The server's text is kept verbatim; only an absent key gets its empty value.
-function FeedbackFromBody(body: LegacyBody): ScreenFeedback {
+function FeedbackFromBody(body: LegacyErrorResponse): CompleteScreenFeedback {
     return {
         message: body.message,
         info_message: body.info_message ?? "",
@@ -259,7 +289,7 @@ function FeedbackFromBody(body: LegacyBody): ScreenFeedback {
 
 // The legacy feedback of a failed call. A 500, a network failure or a non-legacy body shows the
 // abend text, because the backend registers no catch-all handler.
-export function ToScreenFeedback(error: unknown): ScreenFeedback {
+export function ToScreenFeedback(error: unknown): CompleteScreenFeedback {
     const body = LegacyBodyOf(error);
     if (body === null) {
         return { message: ABEND_MESSAGE, info_message: "", field_errors: [], cursor_field: "" };
@@ -268,13 +298,16 @@ export function ToScreenFeedback(error: unknown): ScreenFeedback {
 }
 
 // The whole legacy error body, with the extra keys of a screen such as state, screen_token or
-// fields; null when ToScreenFeedback would show the abend text.
-export function LegacyErrorBody<T extends ScreenFeedback>(error: unknown): T | null {
+// fields and the standard keys completed as ToScreenFeedback completes them; null when
+// ToScreenFeedback would show the abend text.
+export function LegacyErrorBody<T extends LegacyErrorResponse>(
+    error: unknown,
+): (T & CompleteScreenFeedback) | null {
     const body = LegacyBodyOf(error);
     if (body === null) {
         return null;
     }
-    return { ...body, ...FeedbackFromBody(body) } as T;
+    return { ...body, ...FeedbackFromBody(body) } as T & CompleteScreenFeedback;
 }
 
 function HandleUnauthorized(error: AxiosError): void {
@@ -290,7 +323,9 @@ function HandleUnauthorized(error: AxiosError): void {
 
 // A next_route that is not a home route sends the user to the main menu and is not recorded. A
 // home route is recorded only while its lookup is still current, so an answer that arrives after
-// sign-off is not kept. The bare axios call keeps the interceptor from re-entering itself.
+// sign-off or a new login is not kept. Keeping its own answer leaves waiting refusals current; the
+// session generation alone decides whether they act. The bare axios call keeps the interceptor
+// from re-entering itself.
 async function FetchServerHomeRoute(isCurrent: () => boolean): Promise<string> {
     const { data } = await axios.get<{ next_route?: unknown } | null>(CURRENT_USER_URL, {
         withCredentials: true,
@@ -319,7 +354,7 @@ async function LookUpHomeRoute(isCurrent: () => boolean): Promise<string> {
     }
 }
 
-// The lookup stops being current when it settles, or when ClearHomeRoute abandons it.
+// The lookup stops being current when it settles, or when the session ends and abandons it.
 function StartHomeRouteLookup(): Promise<string> {
     const isCurrent = (): boolean => homeRouteLookup === lookup;
     const lookup: Promise<string> = LookUpHomeRoute(isCurrent).finally(() => {
@@ -341,13 +376,16 @@ async function ResolveHomeRoute(): Promise<string> {
 }
 
 // A refusal returns to the user's own menu, which shows the server message. On the menu itself
-// nothing is stored or reloaded: the page shows its own error, and a reload would loop.
+// nothing is stored or reloaded: the page shows its own error, and a reload would loop. A refusal
+// whose session ended while its home route was resolved (sign-off or a new login) is obsolete, so
+// it neither stores its message nor navigates.
 async function HandleForbidden(error: AxiosError): Promise<void> {
     if (typeof window === "undefined") {
         return;
     }
+    const refusalGeneration = sessionGeneration;
     const homeRoute = await ResolveHomeRoute();
-    if (window.location.pathname === homeRoute) {
+    if (refusalGeneration !== sessionGeneration || window.location.pathname === homeRoute) {
         return;
     }
     const body: unknown = error.response?.data;
@@ -370,7 +408,29 @@ export async function HandleResponseError(error: unknown): Promise<never> {
     return Promise.reject(error);
 }
 
-API_CLIENT.interceptors.response.use((response) => response, HandleResponseError);
+// A 2xx answer to POST /auth/login, matched on the path as the 401 exemptions are.
+const LOGIN_METHOD = "post";
+const LOGIN_PATH = "/auth/login";
+const HTTP_SUCCESS_FIRST = 200;
+const HTTP_SUCCESS_END = 300;
+
+function IsSuccessfulLogin({ config, status }: AxiosResponse): boolean {
+    const isSuccess = status >= HTTP_SUCCESS_FIRST && status < HTTP_SUCCESS_END;
+    const url = config.url ?? "";
+    return isSuccess && config.method?.toLowerCase() === LOGIN_METHOD && url.endsWith(LOGIN_PATH);
+}
+
+// The interceptor's success path. A successful login replaces the identity, so the previous
+// user's refusals and home route are dropped; the session context then records the new user's
+// route. Every response is returned unchanged.
+export function HandleResponse(response: AxiosResponse): AxiosResponse {
+    if (IsSuccessfulLogin(response)) {
+        ClearHomeRoute();
+    }
+    return response;
+}
+
+API_CLIENT.interceptors.response.use(HandleResponse, HandleResponseError);
 
 // The one severity rule for every page; the page decides whether its response completed a write.
 export function SeverityForOutcome({ isError, isCompletedWrite }: OutcomeFlags): MessageSeverity {
