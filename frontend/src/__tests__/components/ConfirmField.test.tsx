@@ -31,10 +31,24 @@ const ERROR_STATE_CASES: readonly ErrorStateCase[] = [
     { errorState: "error omitted", ariaInvalid: "false" },
 ];
 
+interface DisabledStateCase {
+    disabledState: string;
+    disabled?: boolean;
+    isEnabled: boolean;
+}
+
+// The keyboard lock while a page's call runs: set freezes the field, false or omitted keys it.
+const DISABLED_STATE_CASES: readonly DisabledStateCase[] = [
+    { disabledState: "disabled set", disabled: true, isEnabled: false },
+    { disabledState: "disabled false", disabled: false, isEnabled: true },
+    { disabledState: "disabled omitted", isEnabled: true },
+];
+
 interface ConfirmRenderOptions {
     label?: string;
     onChange?: (value: string) => void;
     error?: boolean;
+    disabled?: boolean;
     inputRef?: Ref<HTMLInputElement>;
 }
 
@@ -51,6 +65,7 @@ function RenderConfirm(options: ConfirmRenderOptions = {}): HTMLInputElement {
             value=""
             onChange={options.onChange ?? jest.fn()}
             error={options.error}
+            disabled={options.disabled}
             inputRef={options.inputRef}
         />,
     );
@@ -82,6 +97,20 @@ describe("ConfirmField keystrokes", () => {
         expect(onChange).toHaveBeenCalledTimes(1);
         expect(onChange).toHaveBeenCalledWith(keystroke);
     });
+});
+
+describe("ConfirmField keyboard lock", () => {
+    it.each(DISABLED_STATE_CASES)(
+        "COBIL00 CONFIRM with $disabledState takes keystrokes: $isEnabled",
+        async ({ disabled, isEnabled }) => {
+            const user = userEvent.setup();
+            const onChange = jest.fn();
+            const input = RenderConfirm({ onChange, disabled });
+            expect(input.disabled).toBe(!isEnabled);
+            await user.type(input, "Y");
+            expect(onChange).toHaveBeenCalledTimes(isEnabled ? 1 : 0);
+        },
+    );
 });
 
 describe("ConfirmField error state and focus target", () => {

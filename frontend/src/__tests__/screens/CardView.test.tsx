@@ -120,8 +120,7 @@ const DETAIL_LABELS: readonly string[] = [
     EXPIRY_YEAR_LABEL,
 ];
 
-// F3 returns to the calling program: COCRDLIC after a list selection, otherwise the main menu.
-const CARD_LIST_ROUTE = "/cards";
+// F3 returns to the main menu, whether the menu or a card list selection opened the screen.
 const MENU_ROUTE = "/menu";
 
 // The field names cocrdslc.py sends in field_errors and cursor_field.
@@ -524,16 +523,13 @@ describe("COCRDSLC ENTER after a COCRDLIC selection on /cards/view", () => {
 });
 
 describe("COCRDSLC F3 after a COCRDLIC selection on /cards/view", () => {
-    it.each(EXIT_ACTIONS)(
-        "COCRDSLC F3 by %s returns to the card list /cards",
-        async (_, action) => {
-            const user = RenderFromCardList();
-            await ExpectAlert(DETAILS_SHOWN_INFO, "info");
-            await action(user);
-            expect(mockRouterPush).toHaveBeenCalledTimes(1);
-            expect(mockRouterPush).toHaveBeenCalledWith(CARD_LIST_ROUTE);
-        },
-    );
+    it.each(EXIT_ACTIONS)("COCRDSLC F3 by %s returns to the main menu /menu", async (_, action) => {
+        const user = RenderFromCardList();
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        await action(user);
+        expect(mockRouterPush).toHaveBeenCalledTimes(1);
+        expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
+    });
 });
 
 describe("COCRDSLC PF keys from the main menu on /cards/view", () => {

@@ -6,11 +6,13 @@ COACTUPC/COCRDUPC, and CICS RESP/RESP2 file conditions (e.g. COACTVWC
 
 Every error body this module builds carries the four standard legacy keys ``message``,
 ``info_message``, ``field_errors`` and ``cursor_field``. The CAUP and CCUP screens add their
-screen keys, and the 422 body of a structurally invalid request adds FastAPI's ``detail`` list
-(``loc``, ``msg`` and ``type`` only) beside them. A JSON body FastAPI cannot parse at all, such
-as one that is not valid UTF-8, gets the same 422 body as malformed JSON. The CSMSG02Y abend
-work area has no counterpart here: no catch-all handler is registered, so an unexpected error is
-FastAPI's 500 and the frontend shows ``UNEXPECTED ABEND OCCURRED.``.
+screen keys, the CT00 and CU00 invalid-selection refusals add their list page's ``rows``,
+``page``, ``first_key`` and ``last_key`` (CT00 also ``search_cleared``), and the 422 body of a
+structurally invalid request adds FastAPI's ``detail`` list (``loc``, ``msg`` and ``type``
+only) beside them. A JSON body FastAPI cannot parse at all, such as one that is not valid UTF-8,
+gets the same 422 body as malformed JSON. The CSMSG02Y abend work area has no counterpart here:
+no catch-all handler is registered, so an unexpected error is FastAPI's 500 and the frontend
+shows ``UNEXPECTED ABEND OCCURRED.``.
 
 ``LogFileCondition`` replaces the ``DISPLAY 'RESP:' WS-RESP-CD 'REAS:' WS-REAS-CD`` of the
 ``WHEN OTHER`` branches: every service logs a file condition it answers with a literal through
@@ -83,9 +85,10 @@ class LegacyErrorDetails:
     ``fieldErrors`` lists every failing field in source order, as the all-field edit mode of
     COACTVWC, COACTUPC, COCRDLIC, COCRDSLC and COCRDUPC keeps each failing field's flag.
     ``extraBody`` adds keys beside the four standard ones, such as the CAUP and CCUP screen
-    ``fields``, ``state`` and ``screen_token``. Its values must already be JSON-ready (for
-    example ``model_dump(mode="json")``): the body is sent without ``jsonable_encoder``, which
-    would turn ``Decimal`` amounts into floats.
+    ``fields``, ``state`` and ``screen_token``, or the ``rows``, ``page``, ``first_key`` and
+    ``last_key`` of a CT00 or CU00 invalid-selection refusal. Its values must already be
+    JSON-ready (for example ``model_dump(mode="json")``): the body is sent without
+    ``jsonable_encoder``, which would turn ``Decimal`` amounts into floats.
     """
 
     infoMessage: str = ""

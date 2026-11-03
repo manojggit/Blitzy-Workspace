@@ -36,9 +36,11 @@ import {
 } from "@/lib/api/transactions";
 import {
     Direction,
+    LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
     ToScreenFeedback,
+    type LegacyErrorResponse,
     type MessageSeverity,
     type PageState,
 } from "@/lib/apiClient";
@@ -95,9 +97,19 @@ interface ListScreen {
     feedback: ListFeedback;
 }
 
+// A 400 body: the four legacy keys, beside which an invalid selection code adds the page the
+// browse built and whether that browse blanked TRNIDIN. The non-numeric search key's body carries
+// the four keys only.
+interface ListRefusalBody extends LegacyErrorResponse, PageState {
+    rows?: TransactionListRow[];
+    search_cleared?: boolean;
+}
+
 type ListRequest = () => Promise<TransactionSelectionResponse>;
 
-type ListOutcome = { response: TransactionSelectionResponse } | { feedback: ListFeedback };
+type ListOutcome =
+    | { response: TransactionSelectionResponse }
+    | { screenUpdate: SetStateAction<ListScreen>; searchCleared: boolean };
 
 interface ListUpdaters {
     setScreen: Dispatch<SetStateAction<ListScreen>>;
@@ -170,8 +182,9 @@ function FeedbackFromResponse(response: TransactionListResponse): ListFeedback {
     };
 }
 
-// The 503 file-error literal (Unable to lookup transaction...), or the abend text that
-// ToScreenFeedback gives a 500 or a network failure.
+// The 400 edit-failure literals (Invalid selection. Valid value is S, Tran ID must be
+// Numeric ...), the 503 file-error literal (Unable to lookup transaction...), or the abend text
+// that ToScreenFeedback gives a 500 or a network failure.
 function FeedbackFromError(error: unknown): ListFeedback {
     const feedback = ToScreenFeedback(error);
     return {
@@ -192,6 +205,23 @@ function ScreenFromResponse(response: TransactionListResponse): ListScreen {
     };
 }
 
+// The 400 of an invalid selection code shows the page the browse built, as COTRN00C sends the
+// rebuilt map under the literal, and reports whether that browse blanked TRNIDIN. Every other
+// failure, the four-key 400 of a non-numeric search key included, re-sends the map as it stood,
+// so the rows, paging keys and search text stay.
+function RefusalOutcome(error: unknown): ListOutcome {
+    const feedback = FeedbackFromError(error);
+    const body = LegacyErrorBody<ListRefusalBody>(error);
+    if (body === null || body.rows === undefined) {
+        return { screenUpdate: (screen) => ({ ...screen, feedback }), searchCleared: false };
+    }
+    const { rows, page, first_key, last_key } = body;
+    return {
+        screenUpdate: { rows, pageState: { page, first_key, last_key }, feedback },
+        searchCleared: body.search_cleared === true,
+    };
+}
+
 // Only axios errors are screen outcomes; any other error is a defect and propagates.
 async function SettleRequest(request: ListRequest): Promise<ListOutcome> {
     try {
@@ -200,19 +230,19 @@ async function SettleRequest(request: ListRequest): Promise<ListOutcome> {
         if (!axios.isAxiosError(error)) {
             throw error;
         }
-        return { feedback: FeedbackFromError(error) };
+        return RefusalOutcome(error);
     }
 }
 
-// A failed call re-sends the map as it stood, so the rows, paging keys and search text stay. The
-// selection codes are cleared after every answer, so no code carries over onto the rows of
-// another page. The search text is blanked only when the server reports search_cleared.
+// A 200 answer is a route or a list page; a rejected call updates the screen as its body allows.
+// The selection codes are cleared after every answer, so no code carries over onto the rows of
+// another page. The search text is blanked only when the answer reports search_cleared.
 function ApplyOutcome(outcome: ListOutcome, updaters: ListUpdaters): void {
     updaters.setIsBusy(false);
     updaters.setSelectionCodes({});
-    if ("feedback" in outcome) {
-        const { feedback } = outcome;
-        updaters.setScreen((screen) => ({ ...screen, feedback }));
+    if ("screenUpdate" in outcome) {
+        updaters.setScreen(outcome.screenUpdate);
+        ApplySearchCleared(outcome.searchCleared, updaters);
         return;
     }
     const { response } = outcome;
@@ -221,7 +251,12 @@ function ApplyOutcome(outcome: ListOutcome, updaters: ListUpdaters): void {
         return;
     }
     updaters.setScreen(ScreenFromResponse(response));
-    if (response.search_cleared === true) {
+    ApplySearchCleared(response.search_cleared === true, updaters);
+}
+
+// COTRN00C's MOVE SPACE TO TRNIDINO: an answer that blanked TRNIDIN empties the search field.
+function ApplySearchCleared(searchCleared: boolean, updaters: ListUpdaters): void {
+    if (searchCleared) {
         updaters.setSearchTranId("");
     }
 }
@@ -468,9 +503,10 @@ function useTransactionList(): TransactionListView {
 
 // The typed TRNIDIN text is sent unchanged: the server, not the page, decides whether it is
 // blank, numeric or a TRAN-ID to browse from, and whether COTRN00C's MOVE SPACE TO TRNIDINO
-// blanked the field. An answer with search_cleared empties it, so the next ENTER browses from
-// the lowest key; any other answer, or a failed call, keeps the text as keyed. The field is
-// read-only while a request is out, as the 3270 keyboard lock, so no text keyed meanwhile is lost.
+// blanked the field. An answer with search_cleared, the 400 of an invalid selection code
+// included, empties it, so the next ENTER browses from the lowest key; any other answer or
+// failed call keeps the text as keyed. The field is read-only while a request is out, as the
+// 3270 keyboard lock, so no text keyed meanwhile is lost.
 function SearchField({ view }: ListViewProps) {
     return (
         <TextField

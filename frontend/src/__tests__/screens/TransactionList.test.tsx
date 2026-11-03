@@ -84,11 +84,26 @@ interface PagingCase {
     query: TransactionListQuery;
 }
 
-// A literal, the key whose answer carries it, and the HTTP status of that answer.
+// The list page fields of a 200 answer, which an invalid-selection 400 adds to the legacy keys.
+type ListPageBody = Pick<
+    TransactionListResponse,
+    "rows" | "page" | "first_key" | "last_key" | "search_cleared"
+>;
+
+// A literal, the key whose answer carries it, the HTTP status of that answer, and the list page
+// a rejection's body adds to the four legacy keys.
 interface LiteralCase {
     literal: string;
     key: ListKey;
     status: number;
+    refusedPage?: ListPageBody;
+}
+
+// An edit failure, the list page its 400 body carries, if any, and the F8 query sent after it.
+interface RefusalPagingCase {
+    literal: string;
+    refusedPage?: ListPageBody;
+    query: TransactionListQuery;
 }
 
 // A key pressed over typed search text, the search_cleared and literal of its 200 answer, and
@@ -122,6 +137,7 @@ const SELECTED_ROW_NUMBER = 3;
 const SELECTED_TRAN_ID = "0000000000000003";
 const VIEW_ROUTE = `/transactions/view?tranId=${SELECTED_TRAN_ID}`;
 const HTTP_OK = 200;
+const HTTP_EDIT_FAILURE = 400;
 
 // The legend ENTER=Continue  F3=Back  F7=Backward  F8=Forward, as FunctionKeyBar labels it.
 const KEY_BUTTON_NAMES: Readonly<Record<ListKey, string>> = {
@@ -185,18 +201,41 @@ const PAGING_CASES: readonly PagingCase[] = [
     { key: "F7", mode: "key", query: BACKWARD_QUERY },
 ];
 
-// Every CT00 literal arrives in a 200 list page; only a TRANSACT file condition is a 503. The
-// COTRN00 ERRMSG field is COLOR=RED and COTRN00C never sets its colour, so each shows as an error.
+// The page a browse from a blank search key builds: rows 1-10 on page 1, as first entry shows,
+// with TRNIDIN blanked as every browse that pages on blanks it.
+const FIRST_LIST_PAGE: ListPageBody = {
+    rows: BuildRows(),
+    page: 1,
+    first_key: FIRST_KEY,
+    last_key: LAST_KEY,
+    search_cleared: true,
+};
+
+// The paging literals arrive in a 200 list page. The two edit failures are 400s: the invalid
+// selection carries the re-browsed page, the non-numeric search key the four legacy keys only.
+// A TRANSACT file condition is a 503. The COTRN00 ERRMSG field is COLOR=RED and COTRN00C never
+// sets its colour, so each shows as an error.
 const LITERAL_CASES: readonly LiteralCase[] = [
     { literal: TOP_ALREADY, key: "F7", status: HTTP_OK },
     { literal: BOTTOM_ALREADY, key: "F8", status: HTTP_OK },
     { literal: AT_TOP, key: "ENTER", status: HTTP_OK },
     { literal: REACHED_BOTTOM, key: "F8", status: HTTP_OK },
     { literal: REACHED_TOP, key: "F7", status: HTTP_OK },
-    { literal: INVALID_SELECTION, key: "ENTER", status: HTTP_OK },
-    { literal: NUMERIC_SEARCH, key: "ENTER", status: HTTP_OK },
+    {
+        literal: INVALID_SELECTION,
+        key: "ENTER",
+        status: HTTP_EDIT_FAILURE,
+        refusedPage: FIRST_LIST_PAGE,
+    },
+    { literal: NUMERIC_SEARCH, key: "ENTER", status: HTTP_EDIT_FAILURE },
     { literal: LOOKUP_FAILED, key: "F8", status: 503 },
     { literal: ABEND, key: "F7", status: 500 },
+];
+
+// Non-numeric TRNIDIN text travels as typed, neither case-folded nor trimmed.
+const NON_NUMERIC_SEARCH_CASES: readonly [string, string][] = [
+    ["letters", "abc"],
+    ["digits around a space", "12 34"],
 ];
 
 // COTRN00C blanks TRNIDIN after ENTER with a numeric key and after an F8 that pages on, and keeps
@@ -273,9 +312,15 @@ function BuildAxiosError(status: number, body: LegacyErrorResponse): AxiosError 
     );
 }
 
-// The body of LegacyMessageError(field=search_tran_id), which the TRANSACT lookup failure raises.
+// The body of LegacyMessageError(field=search_tran_id), which the TRANSACT lookup failure and
+// both edit failures raise.
 function BuildSearchErrorBody(message: string): LegacyErrorResponse {
     return BuildErrorBody({ message, field_errors: [SEARCH_FIELD], cursor_field: SEARCH_FIELD });
+}
+
+// A rejection whose body adds the list page, if any, to the four legacy keys.
+function BuildRefusal(status: number, literal: string, refusedPage?: ListPageBody): AxiosError {
+    return BuildAxiosError(status, { ...BuildSearchErrorBody(literal), ...refusedPage });
 }
 
 function RenderScreen(): UserEvent {
@@ -366,12 +411,14 @@ async function ExpectAlert(text: string, severity: MessageSeverity): Promise<voi
     expect(alert).toHaveClass(ALERT_COLOR_CLASSES[severity]);
 }
 
-// A 200 answer carries the literal over the shown page; any other status rejects the call.
-function OutcomeFor({ literal, status }: LiteralCase): Promise<TransactionSelectionResponse> {
+// A 200 answer carries the literal over the shown page; any other status rejects the call, its
+// body adding the case's list page, if any, to the four legacy keys.
+function OutcomeFor(literalCase: LiteralCase): Promise<TransactionSelectionResponse> {
+    const { literal, status, refusedPage } = literalCase;
     if (status === HTTP_OK) {
         return Promise.resolve(BuildListResponse({ message: literal }));
     }
-    return Promise.reject(BuildAxiosError(status, BuildSearchErrorBody(literal)));
+    return Promise.reject(BuildRefusal(status, literal, refusedPage));
 }
 
 // ENTER with no Sel code: no selection, the search key as typed, and the shown page's keys.
@@ -405,6 +452,25 @@ const FOUND_PAGE: Partial<TransactionListResponse> = {
     first_key: TranIdFor(FOUND_FIRST_ROW_NUMBER),
     last_key: TranIdFor(FOUND_FIRST_ROW_NUMBER + PAGE_SIZE - 1),
 };
+
+// The page F8 shows after the first: rows 11-20 on page 2.
+const SECOND_PAGE: ListPageBody = { rows: BuildRows(11), page: 2 };
+// The page an invalid-selection 400 carries after a search: rows 13-22, back on page 1, with
+// TRNIDIN blanked, as the invalid code sets no ERR-FLG.
+const REBROWSED_PAGE: ListPageBody = { ...FOUND_PAGE, page: 1, search_cleared: true };
+const REBROWSED_FORWARD_QUERY: TransactionListQuery = {
+    startKey: FOUND_PAGE.last_key,
+    firstKey: FOUND_PAGE.first_key,
+    direction: Direction.FORWARD,
+    page: 1,
+};
+
+// After a non-numeric search key F8 pages from the keys the page kept; after an invalid
+// selection code, from the keys of the page its 400 carried.
+const REFUSAL_PAGING_CASES: readonly RefusalPagingCase[] = [
+    { literal: NUMERIC_SEARCH, query: FORWARD_QUERY },
+    { literal: INVALID_SELECTION, refusedPage: REBROWSED_PAGE, query: REBROWSED_FORWARD_QUERY },
+];
 
 beforeEach(() => {
     mockListTransactions.mockReset();
@@ -470,19 +536,67 @@ describe("COTRN00C ENTER with an S selection and a search key", () => {
     );
 });
 
+// The four-key 400 leaves the list unchanged; ENTER is clicked, so the focus on TRNIDIN comes
+// from cursor_field rather than from the typing.
 describe("COTRN00C ENTER with a non-numeric search key", () => {
-    it("COTRN00C ENTER sends the search key raw and keeps the rows shown", async () => {
+    it.each(NON_NUMERIC_SEARCH_CASES)(
+        "COTRN00C ENTER with %s answered 400 keeps the list, marks TRNIDIN and keeps its text",
+        async (_caseName, searchKey) => {
+            const user = await RenderFirstPage();
+            const refusal = BuildRefusal(HTTP_EDIT_FAILURE, NUMERIC_SEARCH);
+            mockSelectTransactions.mockRejectedValueOnce(refusal);
+            await user.type(SearchField(), searchKey);
+            await PressKey(user, "ENTER", "button");
+            await ExpectAlert(NUMERIC_SEARCH, "error");
+            ExpectSearchOnlyRequest(searchKey);
+            expect(ShownTranIds()).toEqual(TranIdsFrom(1));
+            expect(screen.getByText("1")).toBeVisible();
+            expect(SearchField()).toHaveAttribute("aria-invalid", "true");
+            expect(SearchField()).toHaveFocus();
+            expect(SearchField()).toHaveValue(searchKey);
+            expect(mockRouterPush).not.toHaveBeenCalled();
+        },
+    );
+});
+
+// The map offers only S, so the 400 stands for the server's verdict on a code it was sent; the
+// browse restarted from the search key, so the page number returns from 2 to 1, and its
+// search_cleared blanks TRNIDIN.
+describe("COTRN00C ENTER answered 400 with an invalid selection code", () => {
+    it("COTRN00C invalid selection shows the re-browsed page under the red literal", async () => {
         const user = await RenderFirstPage();
-        const answer = BuildListResponse({ message: NUMERIC_SEARCH, page: 0 });
-        mockSelectTransactions.mockResolvedValueOnce(answer);
-        await user.type(SearchField(), "abc");
-        await PressKey(user, "ENTER", "key");
-        await ExpectAlert(NUMERIC_SEARCH, "error");
-        ExpectSearchOnlyRequest("abc");
-        expect(ShownTranIds()).toEqual(TranIdsFrom(1));
-        expect(SearchField()).toHaveValue("abc");
-        expect(mockRouterPush).not.toHaveBeenCalled();
+        mockListTransactions.mockResolvedValueOnce(BuildListResponse(SECOND_PAGE));
+        await PressKey(user, "F8", "button");
+        await screen.findByText("2");
+        const refusal = BuildRefusal(HTTP_EDIT_FAILURE, INVALID_SELECTION, REBROWSED_PAGE);
+        mockSelectTransactions.mockRejectedValueOnce(refusal);
+        await user.type(SearchField(), SEARCH_KEY);
+        await PressKey(user, "ENTER", "button");
+        await ExpectAlert(INVALID_SELECTION, "error");
+        expect(ShownTranIds()).toEqual(TranIdsFrom(FOUND_FIRST_ROW_NUMBER));
+        expect(screen.getByText("1")).toBeVisible();
+        expect(SearchField()).toHaveAttribute("aria-invalid", "true");
+        expect(SearchField()).toHaveFocus();
+        expect(SearchField()).toHaveValue("");
     });
+});
+
+describe("COTRN00C F8 after an edit failure", () => {
+    it.each(REFUSAL_PAGING_CASES)(
+        "COTRN00C F8 after $literal pages from the keys shown",
+        async ({ literal, refusedPage, query }) => {
+            const user = await RenderFirstPage();
+            const refusal = BuildRefusal(HTTP_EDIT_FAILURE, literal, refusedPage);
+            mockSelectTransactions.mockRejectedValueOnce(refusal);
+            await PressKey(user, "ENTER", "button");
+            await ExpectAlert(literal, "error");
+            const pagingAnswer = BuildListResponse({ message: BOTTOM_ALREADY });
+            mockListTransactions.mockResolvedValueOnce(pagingAnswer);
+            await PressKey(user, "F8", "button");
+            await screen.findByText(BOTTOM_ALREADY);
+            expect(mockListTransactions).toHaveBeenLastCalledWith(query);
+        },
+    );
 });
 
 describe("COTRN00C TRNIDIN after an answer", () => {

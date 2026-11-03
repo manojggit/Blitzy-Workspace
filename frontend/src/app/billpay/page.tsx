@@ -22,7 +22,6 @@ import { MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { PayBill, type BillPayResponse } from "@/lib/api/billpay";
 import {
-    LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
     ToScreenFeedback,
@@ -49,6 +48,8 @@ const FIELD_STACK_STYLE: SxProps<Theme> = { maxWidth: "sm" };
 type BillPayInputName = "acct_id" | "confirm";
 
 const INPUT_NAMES: readonly BillPayInputName[] = ["acct_id", "confirm"];
+// ACTIDIN carries the BMS IC attribute.
+const FIRST_INPUT_NAME: BillPayInputName = "acct_id";
 
 interface BillPayFormState {
     acctId: string;
@@ -109,6 +110,7 @@ interface BillPayFieldsProps {
 interface KeyedInputProps {
     value: string;
     isInvalid: boolean;
+    isKeyboardLocked: boolean;
     onValueChange: (value: string) => void;
     inputRef: RefObject<HTMLInputElement | null>;
 }
@@ -141,12 +143,12 @@ function IsInputName(name: string | null): name is BillPayInputName {
     return INPUT_NAMES.some((inputName) => inputName === name);
 }
 
-// Replaces MOVE -1 TO <field>L: the input the server names takes the cursor; any other name,
-// or none, leaves the focus where it is.
+// Replaces MOVE -1 TO <field>L: the input the server names takes the cursor. Any other name, or
+// none (the abend text), puts it on ACTIDIN, the map's IC field, because the keyboard lock took
+// the focus from whatever held it while the call ran.
 function FocusCursorField(inputs: BillPayInputElements, cursorField: string | null): void {
-    if (IsInputName(cursorField)) {
-        inputs[cursorField]?.focus();
-    }
+    const focusedInput = IsInputName(cursorField) ? cursorField : FIRST_INPUT_NAME;
+    inputs[focusedInput]?.focus();
 }
 
 // The N/n answer runs CLEAR-CURRENT-SCREEN, which the server sends back with every field and
@@ -170,7 +172,8 @@ function FormAfterResponse(response: BillPayResponse, form: BillPayFormState): B
     };
 }
 
-// Only a written payment is a completed write, shown green as COBIL00C sets DFHGREEN.
+// ERRMSG is COLOR=RED, and only WRITE-TRANSACT-FILE NORMAL moves DFHGREEN to ERRMSGC: a written
+// payment shows green, and the confirm prompt sent with HTTP 200 stays red.
 function FeedbackAfterResponse(response: BillPayResponse): BillPayFeedback {
     if (IsClearedScreen(response)) {
         return ClearedFeedback();
@@ -178,7 +181,7 @@ function FeedbackAfterResponse(response: BillPayResponse): BillPayFeedback {
     const isCompletedWrite = response.tran_id !== null;
     return {
         message: response.message,
-        severity: SeverityForOutcome({ isError: false, isCompletedWrite }),
+        severity: SeverityForOutcome({ isError: !isCompletedWrite, isCompletedWrite }),
         infoMessage: "",
         fieldErrors: [],
         cursorField: response.cursor_field,
@@ -198,34 +201,24 @@ function FeedbackFromError(error: unknown): BillPayFeedback {
     };
 }
 
-// A legacy error body carries CURBAL as the server sent it. Without that key the balance shown
-// is kept, as the FSET CURBAL field kept its value.
-function FormUpdateFromError(error: unknown): SetStateAction<BillPayFormState> {
-    const body = LegacyErrorBody<BillPayResponse>(error);
-    if (body === null || !("current_balance" in body)) {
-        return (form) => form;
-    }
-    const currentBalance = body.current_balance;
-    return (form) => ({ ...form, currentBalance });
-}
-
-// Only an axios error is a legacy outcome; anything else is a defect and propagates.
+// Only an axios error is a legacy outcome; anything else is a defect and propagates. The legacy
+// error body holds only the four standard keys, so the form is left as sent: the FSET CURBAL
+// field and the keyed fields keep what the screen showed.
 function ShowFailure(error: unknown, setters: BillPayScreenSetters): void {
     if (!isAxiosError(error)) {
         throw error;
     }
-    setters.setForm(FormUpdateFromError(error));
     setters.setFeedback(FeedbackFromError(error));
 }
 
 // ENTER: both inputs reach COBIL00C exactly as keyed, because the program runs its blank, Y/y,
-// N/n and invalid-value edits on the raw text. The form is updated from its latest state, so
-// nothing keyed while the call runs is lost.
+// N/n and invalid-value edits on the raw text. The keyboard stays locked until the answer is
+// applied, so the answer always lands on the form that was sent.
 async function SubmitBillPay(form: BillPayFormState, setters: BillPayScreenSetters) {
     setters.setIsBusy(true);
     try {
         const response = await PayBill({ acct_id: form.acctId, confirm: form.confirm });
-        setters.setForm((current) => FormAfterResponse(response, current));
+        setters.setForm(FormAfterResponse(response, form));
         setters.setFeedback(FeedbackAfterResponse(response));
     } catch (error) {
         ShowFailure(error, setters);
@@ -240,21 +233,24 @@ function ClearScreen(setters: BillPayScreenSetters): void {
     setters.setFeedback(ClearedFeedback());
 }
 
-// The map's legend, in its order: ENTER=Continue  F3=Back  F4=Clear.
+// The map's legend, in its order: ENTER=Continue  F3=Back  F4=Clear. ENTER and F4 wait for the
+// running call, so a Clear can never be undone by a late answer; F3 still leaves the screen.
 function BuildKeyDefinitions(actions: BillPayKeyActions): FunctionKeyDefinition[] {
     return [
         { key: "ENTER", label: "Continue", onPress: actions.onContinue, disabled: actions.isBusy },
         { key: "F3", label: "Back", onPress: actions.onBack },
-        { key: "F4", label: "Clear", onPress: actions.onClear },
+        { key: "F4", label: "Clear", onPress: actions.onClear, disabled: actions.isBusy },
     ];
 }
 
-// The keyed character goes into the form unchanged: no trimming, case folding or filtering.
+// The keyed character goes into the form unchanged: no trimming, case folding or filtering. The
+// field is locked while the call runs, as the 3270 keyboard is.
 function BindKeyedInput(screen: BillPayScreenModel, name: BillPayInputName): KeyedInputProps {
     const formField = FORM_FIELD_OF_INPUT[name];
     return {
         value: screen.form[formField],
         isInvalid: screen.feedback.fieldErrors.includes(name),
+        isKeyboardLocked: screen.isBusy,
         onValueChange: (value) => screen.setForm((current) => ({ ...current, [formField]: value })),
         inputRef: screen.inputRefs[name],
     };
@@ -316,7 +312,8 @@ function useBillPayScreen(): BillPayScreenModel {
     return { form, feedback, isBusy, inputRefs, keys, setForm };
 }
 
-function AccountIdField({ value, isInvalid, onValueChange, inputRef }: KeyedInputProps) {
+function AccountIdField(props: KeyedInputProps) {
+    const { value, isInvalid, isKeyboardLocked, onValueChange, inputRef } = props;
     const { label, maxLength } = FIELD_DEFINITIONS.acct_id;
     return (
         <TextField
@@ -324,6 +321,7 @@ function AccountIdField({ value, isInvalid, onValueChange, inputRef }: KeyedInpu
             value={value}
             onChange={(event) => onValueChange(event.target.value)}
             error={isInvalid}
+            disabled={isKeyboardLocked}
             variant="outlined"
             size="small"
             inputRef={inputRef}
@@ -346,13 +344,15 @@ function CurrentBalanceDisplay({ currentBalance }: CurrentBalanceDisplayProps) {
     );
 }
 
-function PaymentConfirmField({ value, isInvalid, onValueChange, inputRef }: KeyedInputProps) {
+function PaymentConfirmField(props: KeyedInputProps) {
+    const { value, isInvalid, isKeyboardLocked, onValueChange, inputRef } = props;
     return (
         <ConfirmField
             label={FIELD_DEFINITIONS.confirm.label}
             value={value}
             onChange={onValueChange}
             error={isInvalid}
+            disabled={isKeyboardLocked}
             inputRef={inputRef}
         />
     );

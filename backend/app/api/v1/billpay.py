@@ -6,9 +6,10 @@ definition of ``csd/CARDDEMO.CSD`` and ENTER on map COBIL00.
 CB00 serves regular users (any type other than exactly ``A``) through ``GetRegularContext``,
 which refuses an admin with 403 and an empty message. A POST without an allow-listed Origin is
 refused with 403 by ``core.middleware.OriginGuard`` before it reaches the handler. The service
-owns every edit, literal and write; its failures are raised as ``LegacyMessageError``, carrying
-the current balance, and serialised by ``app.core.errors``. Screen text breaking its BMS LENGTH
-or the code-page-037 repertoire is a 422.
+owns every edit, literal and write; its failures are raised as ``LegacyMessageError`` and
+serialised by ``app.core.errors`` as the four-key legacy error body, while the current balance
+travels only on the HTTP 200 screen. Screen text breaking its BMS LENGTH or the code-page-037
+repertoire is a 422.
 """
 
 from typing import Annotated

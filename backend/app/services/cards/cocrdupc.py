@@ -379,7 +379,7 @@ async def ProcessCardUpdate(
         LegacyMessageError: 400 for an edit failure or no change, 404 for a card not found,
             409 for a record changed since fetch, 423 for a record lock, and 503 for a failed
             rewrite or a CARDDAT read error. Each body carries the screen ``fields``,
-            ``state``, ``screen_token`` and ``card_ref``.
+            ``state`` and ``screen_token``.
     """
     state = DecodeUpdateToken(request.screen_token, context.settings) or NOT_FETCHED_STATE
     action = NormaliseAction(request.action, state.stateCode)
@@ -445,11 +445,11 @@ def ScreenFieldsOf(reply: ScreenReply) -> CardScreenFields:
 def ScreenError(reply: ScreenReply, httpStatus: int, settings: "Settings") -> LegacyMessageError:
     """Return the error carrying a reply's message and its whole screen.
 
-    The screen ``fields``, ``state``, ``screen_token`` and ``card_ref`` ride beside the four
-    standard keys, so the page keeps the state machine running on a 4xx or 5xx response.
+    The screen ``fields``, ``state`` and ``screen_token`` ride beside the four standard keys,
+    so the page keeps the state machine running on a 4xx or 5xx response.
     """
     screenBody = BuildScreen(reply, settings).model_dump(
-        mode="json", include={"fields", "state", "screen_token", "card_ref"}
+        mode="json", include={"fields", "state", "screen_token"}
     )
     return LegacyMessageError(
         reply.message,
@@ -466,9 +466,9 @@ async def ResetScreen(
 ) -> CardScreen:
     """Port of WHEN CCUP-CHANGES-OKAYED-AND-DONE / CCUP-CHANGES-FAILED (lines 517-528).
 
-    The input is discarded and the empty key screen is sent with the key prompt. The source
-    returns a session that came from the card list to COCRDLIC instead (lines 436-439); here
-    the page's F3 returns to the list.
+    The input is discarded and the empty key screen is sent with the key prompt, for every key
+    and whatever the caller. The source returns a session that came from the card list to
+    COCRDLIC instead (lines 436-439); here F3 returns to the main menu.
     """
     return BuildScreen(ScreenReply(NOT_FETCHED_STATE, PROMPT_FOR_KEYS_INFO), context.settings)
 

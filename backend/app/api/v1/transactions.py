@@ -10,11 +10,12 @@ Origin is refused with 403 by ``core.middleware.OriginGuard`` before it reaches 
 Each handler makes one awaited call to the service that ports its program and returns the
 service's model. Legacy outcomes are raised by the services as ``LegacyMessageError`` and
 serialised by ``app.core.errors`` as the four standard keys; screen text breaking its BMS
-LENGTH or the code-page-037 repertoire is a 422. Every CT00 screen outcome, the paging
-literals and ``Tran ID must be Numeric ...`` included, is a 200 list response, so the list and
-selection routes declare only the 503 file error besides the session and role refusals. The
-routes are ``LosslessKeyRoute`` routes, so ``/{tranId}`` receives a TRAN-ID holding ``/`` as
-one value.
+LENGTH or the code-page-037 repertoire is a 422. A CT00 paging literal is a 200 list response.
+The CT00 edit failures are 400s: ``Tran ID must be Numeric ...`` with the four standard keys
+only, as the list is left unchanged, and an invalid selection code the browse leaves on ERRMSG
+with the browsed page's ``rows``, ``page``, ``first_key``, ``last_key`` and ``search_cleared``.
+The routes are ``LosslessKeyRoute`` routes, so ``/{tranId}`` receives a TRAN-ID holding ``/``
+as one value.
 """
 
 from typing import Annotated
@@ -55,15 +56,18 @@ ROUTER = APIRouter(prefix="/transactions", tags=["transactions"], route_class=Lo
     summary="CT00 / COTRN00C: list transactions (10 per page)",
     description=(
         "Without a startKey, the browse starts at the first TRAN-ID greater than or equal to "
-        "searchTranId, in EBCDIC order. A page's first_key or last_key is sent back unchanged "
-        "as startKey with direction backward (F7) or forward (F8)."
+        "searchTranId, in EBCDIC order, as page 1. A non-numeric searchTranId is a 400 "
+        "'Tran ID must be Numeric ...' with the four standard keys only, leaving the list "
+        "unchanged; on an empty file it answers 'You are at the top of the page...' instead. "
+        "A page's first_key or last_key is sent back unchanged as startKey with direction "
+        "backward (F7) or forward (F8); every paging literal is a 200 list response."
     ),
-    responses=LegacyErrorResponses(401, 403, 503),
+    responses=LegacyErrorResponses(400, 401, 403, 503),
 )
 async def ListTransactions(
     query: Annotated[TransactionListQuery, Query()], context: REGULAR_CONTEXT
 ) -> TransactionListResponse:
-    """Return one COTRN00 page of at most 10 transactions with its paging or edit literal."""
+    """Return one COTRN00 page of at most 10 transactions, or raise its 400 or 503 outcome."""
     return await cotrn00c.ListTransactions(context, query)
 
 
@@ -73,15 +77,18 @@ async def ListTransactions(
     summary="CT00 / COTRN00C: process transaction list selection",
     description=(
         "The first row with a selection code decides: S opens the Transaction View through "
-        "route. Any other code gives the invalid-selection literal with the list browsed "
-        "again from search_tran_id."
+        "route. Any other code sets the invalid-selection literal and the list is browsed "
+        "again from search_tran_id. When that literal stays, the answer is a 400 whose body "
+        "adds the browsed page's rows, page, first_key and last_key; when the browse replaces "
+        "it with a paging literal, the page is a 200. With any code but S, a non-numeric "
+        "search_tran_id is the four-key 400 'Tran ID must be Numeric ...'."
     ),
-    responses=LegacyErrorResponses(401, 403, 503),
+    responses=LegacyErrorResponses(400, 401, 403, 503),
 )
 async def SelectTransaction(
     selectionRequest: TransactionSelectionRequest, context: REGULAR_CONTEXT
 ) -> TransactionSelectionResponse:
-    """Return the route of a valid S selection, or the re-browsed list page."""
+    """Return a valid S selection's route or the re-browsed page, or raise its 400 or 503."""
     return await cotrn00c.ProcessTransactionSelection(context, selectionRequest)
 
 

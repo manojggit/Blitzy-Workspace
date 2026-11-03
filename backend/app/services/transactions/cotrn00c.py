@@ -16,18 +16,27 @@ backward page; otherwise F8 answers ``You are already at the bottom of the page.
 that finds nothing sets NEXT-PAGE-NO over a page it leaves in place, so its response carries
 last_key HIGH-VALUES, after which no record follows.
 
-Rows not rebuilt. Where COTRN00C re-sends the received map with only ERRMSG changed (F7 on page
-1, F8 with no page after the last key, a non-numeric search, a STARTBR NOTFND), the service
-re-reads the page shown from its first key, because every screen outcome is a 200 list
-response that replaces the client's rows. An F8 sent without ``firstKey`` re-reads the 10
-records ending at the last key shown instead.
+Rows not rebuilt. Where COTRN00C re-sends the received map with only a paging literal changed
+on ERRMSG (F7 on page 1, F8 with no page after the last key, a STARTBR NOTFND), the service
+re-reads the page shown from its first key, because those outcomes are 200 list responses that
+replace the client's rows. An F8 sent without ``firstKey`` re-reads the 10 records ending at
+the last key shown instead.
 
-Every list response puts the cursor on search_tran_id (MOVE -1 TO TRNIDINL on every path); the
-map shows ERRMSG in red. Only a TRANSACT file condition, the batch window's NOTOPEN included,
-is 503 ``Unable to lookup transaction...``. The program blanks TRNIDIN whenever the body of
+Edit failures are 400s. A non-numeric search key answers ``Tran ID must be Numeric ...`` with
+the four standard keys only: ERR-FLG leaves the list unchanged, so the client keeps its rows,
+page number and search text. An invalid selection code whose literal the browse leaves on
+ERRMSG answers ``Invalid selection. Valid value is S`` with the browsed page's ``rows``,
+``page``, ``first_key``, ``last_key`` and ``search_cleared`` beside the four keys. A literal the
+browse sets in its place, a paging literal or the STARTBR NOTFND of a non-numeric search on an
+empty TRANSACT, is a 200.
+
+Every response puts the cursor on search_tran_id (MOVE -1 TO TRNIDINL on every path); the map
+shows ERRMSG in red. A TRANSACT file condition, the batch window's NOTOPEN included, is 503
+``Unable to lookup transaction...``. The program blanks TRNIDIN whenever the body of
 PROCESS-PAGE-FORWARD runs (lines 228, 325): after ENTER with a blank or numeric key, STARTBR
-NOTFND included, and after an F8 that pages on; the response says so in ``search_cleared``. It
-keeps TRNIDIN after a non-numeric search, every F7 and an F8 refusal.
+NOTFND and an invalid selection code included, and after an F8 that pages on; the response
+says so in ``search_cleared``. It keeps TRNIDIN after a non-numeric search, every F7 and an F8
+refusal.
 
 Legacy paths with no code here: EIBCALEN = 0 (back to sign-on) is the RequireRegular session
 guard; PF3 (XCTL COMEN01C) is frontend navigation; other AID keys cannot reach the server;
@@ -43,7 +52,14 @@ from typing import Any
 from urllib.parse import urlencode
 
 from app.core.dependencies import OnlineContext
-from app.core.errors import HTTP_FILE_ERROR, LegacyMessageError, LogFileCondition, RepositoryError
+from app.core.errors import (
+    HTTP_EDIT_FAILURE,
+    HTTP_FILE_ERROR,
+    LegacyErrorDetails,
+    LegacyMessageError,
+    LogFileCondition,
+    RepositoryError,
+)
 from app.core.messages import (
     ALREADY_AT_BOTTOM_MESSAGE,
     ALREADY_AT_TOP_MESSAGE,
@@ -103,6 +119,10 @@ TRAN_ID_NOT_NUMERIC_MESSAGE = "Tran ID must be Numeric ..."
 # 683), lower-case "t" as in the source; the batch window's NOTOPEN reaches them too.
 TRAN_LOOKUP_FAILED_MESSAGE = "Unable to lookup transaction..."
 LOOKUP_ERROR_STATUS = HTTP_FILE_ERROR
+# The non-numeric search key and an invalid selection code left on ERRMSG are edit failures.
+EDIT_FAILURE_STATUS = HTTP_EDIT_FAILURE
+# The TransactionListResponse fields an invalid-selection 400 carries beside the four keys.
+LIST_PAGE_BODY_FIELDS = {"rows", "page", "first_key", "last_key", "search_cleared"}
 # MOVE SPACES TO WS-MESSAGE (MAIN-PARA line 102): a page with no literal has a blank line.
 NO_MESSAGE = ""
 # PROCESS-ENTER-KEY moves 0 to CDEMO-CT00-PAGE-NUM before PROCESS-PAGE-FORWARD (line 224).
@@ -153,13 +173,15 @@ async def ListTransactions(
             F8 and ENTER need to return the shown rows when the program leaves them in place.
 
     Returns:
-        The page of at most 10 transactions, its page number and keys, and the ERRMSG literal
-        the key leaves (any of the five paging literals or ``Tran ID must be Numeric ...``),
-        or an empty message.
+        The page of at most 10 transactions, its page number and keys, and the paging literal
+        the key leaves, or an empty message. A non-numeric search on an empty TRANSACT answers
+        ``You are at the top of the page...`` on page 0 with no rows, as its STARTBR is NOTFND.
 
     Raises:
-        LegacyMessageError: 503 ``Unable to lookup transaction...`` while the batch window
-            holds TRANSACT or on a database failure.
+        LegacyMessageError: 400 ``Tran ID must be Numeric ...`` with the four standard keys
+            only, for a non-numeric search key that leaves the list unchanged; 503
+            ``Unable to lookup transaction...`` while the batch window holds TRANSACT or on a
+            database failure.
     """
     repository = TransactionRepository(context)
     page = _NormalisedPage(query.page)
@@ -195,10 +217,15 @@ async def ProcessTransactionSelection(
 
     Returns:
         The route of a valid selection with empty list fields, or ``route`` None with the
-        re-browsed page, or the unchanged page, and its message.
+        re-browsed page, or the unchanged page, and the paging literal that replaced any
+        invalid-selection literal, or an empty message.
 
     Raises:
-        LegacyMessageError: 503 ``Unable to lookup transaction...`` while the batch window
+        LegacyMessageError: 400 ``Invalid selection. Valid value is S`` when the browse leaves
+            that literal on ERRMSG, its body adding the browsed page's ``rows``, ``page``,
+            ``first_key`` and ``last_key``; 400 ``Tran ID must be Numeric ...`` with the four
+            standard keys only for a non-numeric search key, which wins over an invalid code
+            as ERR-FLG does; 503 ``Unable to lookup transaction...`` while the batch window
             holds TRANSACT or on a database failure.
     """
     selection = _FindFirstSelection(request.selections)
@@ -209,6 +236,8 @@ async def ProcessTransactionSelection(
         state.message = INVALID_SELECTION_MESSAGE
     repository = TransactionRepository(context)
     await _ProcessEnterKey(repository, state, request.search_tran_id)
+    if state.message == INVALID_SELECTION_MESSAGE:
+        raise _InvalidSelectionRefusal(state)
     return _BuildListResponse(state, TransactionSelectionResponse)
 
 
@@ -289,20 +318,23 @@ async def _ProcessEnterKey(
 
 
 async def _ProcessNonNumericSearch(repository: TransactionRepository, state: ListState) -> None:
-    """A non-numeric search key: ``Tran ID must be Numeric ...`` over the unchanged rows.
+    """A non-numeric search key: the 400 ``Tran ID must be Numeric ...``, the list unchanged.
 
-    The program still moves 0 to CDEMO-CT00-PAGE-NUM (line 224) and issues the STARTBR of
-    PROCESS-PAGE-FORWARD (line 281) from TRAN-ID as no MOVE has set it (LOW-VALUES) before
-    ERR-FLG skips the rest. The map keeps the page number it showed, but the response carries
-    the 0 the COMMAREA holds, so the next F7 answers ``You are already at the top of the
-    page...`` as it does in the program. On an empty TRANSACT that STARTBR is NOTFND, whose
-    ``You are at the top of the page...`` replaces the message (lines 605-611).
+    ERR-FLG skips the rebuild of the page (lines 209-217, 283), so the body carries the four
+    standard keys only and the client keeps the rows and page number it shows. The literal
+    wins over an invalid selection code. The program still moves 0 to CDEMO-CT00-PAGE-NUM
+    (line 224) and issues the STARTBR of PROCESS-PAGE-FORWARD (line 281) from TRAN-ID as no
+    MOVE has set it (LOW-VALUES). On an empty TRANSACT that STARTBR is NOTFND, whose
+    ``You are at the top of the page...`` replaces the literal (lines 605-611): that outcome is
+    a 200 list on page 0 with no rows, as the file holds none.
     """
-    state.message = TRAN_ID_NOT_NUMERIC_MESSAGE
+    if not await _TransactFileIsEmpty(repository):
+        raise LegacyMessageError(
+            TRAN_ID_NOT_NUMERIC_MESSAGE, field=SEARCH_CURSOR_FIELD, httpStatus=EDIT_FAILURE_STATUS
+        )
+    state.message = AT_TOP_OF_PAGE_MESSAGE
     state.page = ENTER_BASE_PAGE
-    await _RereadShownPage(repository, state)
-    if not state.rows and await _TransactFileIsEmpty(repository):
-        state.message = AT_TOP_OF_PAGE_MESSAGE
+    _ShowRows(state, [])
 
 
 async def _TransactFileIsEmpty(repository: TransactionRepository) -> bool:
@@ -408,8 +440,8 @@ def _ApplyBackwardRows(state: ListState, records: Sequence[dict[str, Any]]) -> N
 async def _RereadShownPage(repository: TransactionRepository, state: ListState) -> None:
     """Read again the page a re-sent map leaves shown: 10 TRAN-IDs from the first key shown.
 
-    Every outcome replaces the client's rows, so the rows the program leaves on the map are
-    read back. A blank first key means no page is shown.
+    A 200 list response replaces the client's rows, so the rows the program leaves on the map
+    are read back. A blank first key means no page is shown.
     """
     records: list[dict[str, Any]] | None = []
     if not _IsBlank(state.firstKey):
@@ -465,6 +497,24 @@ def _TransactionDate(record: Mapping[str, Any]) -> str:
     """
     origTs = EncodeTimestamp(record["orig_ts"], record["orig_ts_format"])
     return f"{origTs[MONTH_SLICE]}/{origTs[DAY_SLICE]}/{origTs[YEAR_DIGITS_SLICE]}"
+
+
+def _InvalidSelectionRefusal(state: ListState) -> LegacyMessageError:
+    """Return the 400 of an invalid selection code the browsed page still shows on ERRMSG.
+
+    The edit failure rides on the page the browse built: the body adds its ``rows``, ``page``,
+    ``first_key``, ``last_key`` and ``search_cleared`` beside the four standard keys, dumped as
+    JSON so each ``tran_amt`` stays a decimal string, never a float. The invalid code sets no
+    ERR-FLG, so the browse blanked TRNIDIN as every forward browse does.
+    """
+    listPage = _BuildListResponse(state, TransactionListResponse)
+    pageBody = listPage.model_dump(mode="json", include=LIST_PAGE_BODY_FIELDS)
+    return LegacyMessageError(
+        INVALID_SELECTION_MESSAGE,
+        field=SEARCH_CURSOR_FIELD,
+        httpStatus=EDIT_FAILURE_STATUS,
+        details=LegacyErrorDetails(extraBody=pageBody),
+    )
 
 
 def _BuildListResponse[ResponseModel: TransactionListResponse](

@@ -12,6 +12,10 @@ lines:
     transfers to COTRN01C (lines 186-195), an F8 refusal (lines 269-274), and every F7, as
     PROCESS-PF7-KEY and PROCESS-PAGE-BACKWARD (lines 234-252, 333-376) never move to TRNIDINO.
 
+The two edit failures answer 400: the invalid selection code's body reports the blanking in its
+``search_cleared``, and the non-numeric key's four-key body carries none, so the page keeps
+TRNIDIN as keyed.
+
 app.services.transactions.cotrn00c's TransactionRepository is replaced by a stub whose browses
 are AsyncMocks, so no database is needed.
 """
@@ -25,6 +29,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.core.dependencies import OnlineContext
+from app.core.errors import LegacyMessageError
 from app.schemas.transactions import (
     TransactionListQuery,
     TransactionListResponse,
@@ -168,13 +173,14 @@ async def PageBackwardFromFirstPage(context: OnlineContext) -> TransactionListRe
 
 
 class KeyPress(NamedTuple):
-    """A COTRN00 key, the stub's forward and backward browse answers, and the outcome."""
+    """A COTRN00 key, the stub's browse answers, the outcome, and whether it is an edit failure."""
 
     pressKey: Callable[[OnlineContext], Awaitable[TransactionListResponse]]
     forwardRecords: list[dict[str, Any]] | None
     backwardRecords: list[dict[str, Any]] | None
     expectedMessage: str
     expectedSearchCleared: bool
+    isEditFailure: bool = False
 
 
 # Ten page rows and the look-ahead READNEXT, so no ENDFILE literal replaces the message. F8's
@@ -191,9 +197,16 @@ KEY_PRESSES = [
     KeyPress(FirstEntry, PAGE_WITH_LOOK_AHEAD, None, NO_MESSAGE, True),
     KeyPress(EnterNumericSearch, SEARCH_PAGE_WITH_LOOK_AHEAD, None, NO_MESSAGE, True),
     KeyPress(EnterNumericSearch, None, None, AT_TOP_OF_PAGE_MESSAGE, True),
-    KeyPress(EnterNonNumericSearch, SHOWN_PAGE_RECORDS, None, TRAN_ID_NOT_NUMERIC_MESSAGE, False),
     KeyPress(
-        EnterInvalidSelection, SEARCH_PAGE_WITH_LOOK_AHEAD, None, INVALID_SELECTION_MESSAGE, True
+        EnterNonNumericSearch, SHOWN_PAGE_RECORDS, None, TRAN_ID_NOT_NUMERIC_MESSAGE, False, True
+    ),
+    KeyPress(
+        EnterInvalidSelection,
+        SEARCH_PAGE_WITH_LOOK_AHEAD,
+        None,
+        INVALID_SELECTION_MESSAGE,
+        True,
+        True,
     ),
     KeyPress(EnterViewSelection, None, None, NO_MESSAGE, False),
     KeyPress(PageForward, NEXT_PAGE_AFTER_LAST_KEY, None, NO_MESSAGE, True),
@@ -215,11 +228,25 @@ KEY_PRESS_IDS = [
 ]
 
 
+async def PressAndRead(keyPress: KeyPress) -> tuple[str, bool]:
+    """Press the key; return the literal and ``search_cleared`` of its page or 400 body.
+
+    A body without ``search_cleared``, the non-numeric key's four keys, leaves TRNIDIN as keyed.
+    """
+    if not keyPress.isEditFailure:
+        response = await keyPress.pressKey(BuildContext())
+        return response.message, response.search_cleared
+    with pytest.raises(LegacyMessageError) as raised:
+        await keyPress.pressKey(BuildContext())
+    body = raised.value.Body()
+    return body["message"], body.get("search_cleared", False)
+
+
 @pytest.mark.parametrize("keyPress", KEY_PRESSES, ids=KEY_PRESS_IDS)
 async def test_search_cleared_reports_trnidin_blanking(transactionRepository, keyPress):
     """``search_cleared`` is true exactly where COTRN00C moves SPACE to TRNIDINO."""
     transactionRepository.BrowseForward.return_value = keyPress.forwardRecords
     transactionRepository.BrowseBackward.return_value = keyPress.backwardRecords
-    response = await keyPress.pressKey(BuildContext())
-    assert response.message == keyPress.expectedMessage
-    assert response.search_cleared is keyPress.expectedSearchCleared
+    message, searchCleared = await PressAndRead(keyPress)
+    assert message == keyPress.expectedMessage
+    assert searchCleared is keyPress.expectedSearchCleared

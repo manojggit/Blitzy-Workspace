@@ -4,10 +4,13 @@
 // A property is optional exactly where its Pydantic field has a default, as the OpenAPI document
 // marks it. Every screen field travels as typed, never trimmed, padded or case-folded: the server
 // runs the search-key edit, the 10-row paging, the S selection, every CT02 first-failure edit, the
-// F5 copy of the last transaction and the TRAN-ID allocation on the raw text. CT00 literals arrive
-// in a 200 list page; every CT01 and CT02 failure reaches the caller as a rejected call. The CT01
-// TRAN-ID path key goes through EncodePathKey, which gives only a blank, "." or ".." key the one
-// trailing space the server's space padding ignores.
+// F5 copy of the last transaction and the TRAN-ID allocation on the raw text. CT00 paging literals
+// arrive in a 200 list page; its two edit failures are rejected calls with 400: a non-numeric
+// search key with the four legacy keys only, an invalid selection code with the re-browsed page's
+// rows, page, first_key, last_key and search_cleared beside them. Every CT01 and CT02 failure
+// reaches the caller as a rejected call. The CT01 TRAN-ID path key goes through EncodePathKey,
+// which gives only a blank, "." or ".." key the one trailing space the server's space padding
+// ignores.
 import {
     API_CLIENT,
     EncodePathKey,

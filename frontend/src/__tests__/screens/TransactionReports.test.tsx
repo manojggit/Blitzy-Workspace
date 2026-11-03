@@ -2,8 +2,8 @@
 // page /reports/transactions.
 import { alertClasses, tableCellClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
-import userEvent, { type UserEvent } from "@testing-library/user-event";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent, { PointerEventsCheckLevel, type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
     AxiosHeaders,
@@ -169,6 +169,11 @@ const CUSTOM_DATE_PARTS: DatePartValues = {
     endMm: "12",
     endDd: " 5",
     endYyyy: "2022",
+};
+// CUSTOM chosen and every date part keyed; each keyboard-lock case adds the CONFIRM it keys.
+const CUSTOM_KEYED_QUERY: ReportQuery = {
+    reportType: ReportType.CUSTOM,
+    ...CUSTOM_DATE_PARTS,
 };
 
 // Every text field of the map left blank.
@@ -362,6 +367,67 @@ const LITERAL_CASES: readonly LiteralCase[] = [
     },
 ];
 
+// One ENTER made with the Custom criteria and the CONFIRM value keyed, the answer CORPT00C gives
+// it while the keyboard is locked, and the control that then takes the cursor.
+interface LockedCallCase {
+    answer: string;
+    confirm: string;
+    outcome: LiteralCase;
+    FocusedControl: () => HTMLElement;
+}
+
+const LOCKED_CALL_CASES: readonly LockedCallCase[] = [
+    {
+        answer: "the blank-confirm prompt",
+        confirm: "",
+        outcome: PromptOutcome("Please confirm to print the Custom report..."),
+        FocusedControl: ConfirmInput,
+    },
+    {
+        answer: "a date edit failure",
+        confirm: "",
+        outcome: EditFailure(START_MONTH_INVALID_MESSAGE, "startMm"),
+        FocusedControl: () => DatePartInput(START_MONTH_PART),
+    },
+    {
+        answer: "the submitted report",
+        confirm: "Y",
+        outcome: SubmittedOutcome("Custom report submitted for printing ...", REPORT_LINES),
+        FocusedControl: MonthlyButton,
+    },
+    // Confirm N clears every field and the message (INITIALIZE-ALL-FIELDS).
+    {
+        answer: "the confirm N reset",
+        confirm: "N",
+        outcome: {
+            literal: "",
+            status: HTTP_OK,
+            severity: "info",
+            cursorField: "reportType",
+            lines: [],
+        },
+        FocusedControl: MonthlyButton,
+    },
+    // An error body that names no cursor_field puts the cursor on MONTHLY, the map's IC field.
+    {
+        answer: "a 503 naming no cursor_field",
+        confirm: "Y",
+        outcome: {
+            literal: "Unable to Write TDQ (JOBS)...",
+            status: HTTP_SERVICE_UNAVAILABLE,
+            severity: "error",
+            cursorField: "",
+            lines: [],
+        },
+        FocusedControl: MonthlyButton,
+    },
+];
+
+interface PendingReport {
+    Answer: (response: TransactionReportResponse) => void;
+    Fail: (error: unknown) => void;
+}
+
 const SEVERITY_CLASSES: Readonly<Record<MessageSeverity, string>> = {
     error: alertClasses.colorError,
     success: alertClasses.colorSuccess,
@@ -529,19 +595,54 @@ function BuildAxiosError(status: number, body: LegacyErrorResponse): AxiosError 
     return new AxiosError("Request failed", code, config, null, response);
 }
 
-function MockReportOutcome({ literal, status, cursorField, lines }: LiteralCase): void {
-    if (status === HTTP_OK) {
-        mockFetchTransactionReport.mockResolvedValue(
-            BuildReportResponse({ message: literal, cursor_field: cursorField, lines: [...lines] }),
-        );
-        return;
-    }
+// The 200 body of an outcome.
+function OutcomeResponse({ literal, cursorField, lines }: LiteralCase): TransactionReportResponse {
+    return BuildReportResponse({ message: literal, cursor_field: cursorField, lines: [...lines] });
+}
+
+// The rejection of a non-2xx outcome; a blank cursor field is a body that names none.
+function OutcomeError({ literal, status, cursorField }: LiteralCase): AxiosError {
     const errorBody = BuildErrorBody({
         message: literal,
-        field_errors: [cursorField],
+        field_errors: cursorField === "" ? [] : [cursorField],
         cursor_field: cursorField,
     });
-    mockFetchTransactionReport.mockRejectedValue(BuildAxiosError(status, errorBody));
+    return BuildAxiosError(status, errorBody);
+}
+
+function MockReportOutcome(literalCase: LiteralCase): void {
+    if (literalCase.status === HTTP_OK) {
+        mockFetchTransactionReport.mockResolvedValue(OutcomeResponse(literalCase));
+        return;
+    }
+    mockFetchTransactionReport.mockRejectedValue(OutcomeError(literalCase));
+}
+
+// The next FetchTransactionReport call stays pending until the test answers or fails it.
+function DeferReport(): PendingReport {
+    const pending: PendingReport = { Answer: () => undefined, Fail: () => undefined };
+    mockFetchTransactionReport.mockImplementationOnce(
+        () =>
+            new Promise<TransactionReportResponse>((resolve, reject) => {
+                pending.Answer = resolve;
+                pending.Fail = reject;
+            }),
+    );
+    return pending;
+}
+
+// Settles the pending call inside act, so the page applies the outcome before the assertions.
+async function SettleOutcome(
+    pendingReport: PendingReport,
+    literalCase: LiteralCase,
+): Promise<void> {
+    await act(async () => {
+        if (literalCase.status === HTTP_OK) {
+            pendingReport.Answer(OutcomeResponse(literalCase));
+        } else {
+            pendingReport.Fail(OutcomeError(literalCase));
+        }
+    });
 }
 
 // The message line's one alert: its raw text and its MUI severity colour class.
@@ -565,6 +666,11 @@ function ConfirmInput(): HTMLElement {
 
 function ReportTypeButton(label: string): HTMLElement {
     return screen.getByRole("button", { name: label });
+}
+
+// MONTHLY, the map's IC field.
+function MonthlyButton(): HTMLElement {
+    return ReportTypeButton(MONTHLY_LABEL);
 }
 
 function ReportTypeGroup(): HTMLElement {
@@ -692,6 +798,46 @@ async function WaitForRequestEnd(): Promise<void> {
     await waitFor(() => expect(screen.queryByRole("progressbar")).not.toBeInTheDocument());
 }
 
+// The three report types, the six date parts and CONFIRM, in map order.
+function CriteriaControls(): HTMLElement[] {
+    return [
+        ...REPORT_TYPE_LABELS.map((label) => ReportTypeButton(label)),
+        ...DATE_PARTS.map((part) => DatePartInput(part)),
+        ConfirmInput(),
+    ];
+}
+
+// The 3270 keyboard lock: every criteria control and ENTER are frozen, F3 still leaves.
+function ExpectKeyboardLocked(): void {
+    for (const control of CriteriaControls()) {
+        expect(control).toBeDisabled();
+    }
+    expect(screen.getByRole("button", { name: ENTER_KEY.buttonName })).toBeDisabled();
+    expect(screen.getByRole("button", { name: F3_KEY.buttonName })).toBeEnabled();
+}
+
+// Each keyed field is blank or full to its BMS LENGTH, so each edit deletes the last character
+// before typing; an unlocked field would change.
+const LOCKED_EDIT_KEYS = "{Backspace}9";
+
+// Clicks, typing and the physical ENTER while the call runs change nothing on the criteria that
+// were sent. A disabled MUI button sets pointer-events: none, which user-event refuses by default.
+async function TryToEditWhileLocked(confirmSent: string): Promise<void> {
+    const lockedUser = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
+    await lockedUser.click(ReportTypeButton(YEARLY_LABEL));
+    for (const control of [...DATE_PARTS.map((part) => DatePartInput(part)), ConfirmInput()]) {
+        await lockedUser.type(control, LOCKED_EDIT_KEYS);
+    }
+    await PressKey(lockedUser, ENTER_KEY.keyName);
+    expect(ReportTypeButton(CUSTOM_LABEL)).toHaveAttribute("aria-pressed", "true");
+    expect(ReportTypeButton(YEARLY_LABEL)).toHaveAttribute("aria-pressed", "false");
+    for (const part of DATE_PARTS) {
+        expect(DatePartInput(part)).toHaveValue(CUSTOM_DATE_PARTS[part.queryKey]);
+    }
+    expect(ConfirmInput()).toHaveValue(confirmSent);
+    expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
+}
+
 beforeEach(() => {
     mockSearchParams = new URLSearchParams();
     window.sessionStorage.clear();
@@ -816,6 +962,32 @@ it("CORPT00C flags every field_errors part and focuses cursor_field", async () =
     expect(DatePartInput(START_YEAR_PART)).toHaveAttribute("aria-invalid", "false");
     await waitFor(() => expect(DatePartInput(START_MONTH_PART)).toHaveFocus());
 });
+
+// Nothing keyed while the call runs reaches the screen, so the answer always applies to the
+// criteria that were sent; it unlocks them in the render that puts the cursor on its control.
+it.each(LOCKED_CALL_CASES)(
+    "CORPT00C locks the criteria while ENTER runs; $answer unlocks them and places the cursor",
+    async ({ confirm, outcome, FocusedControl }) => {
+        const pendingReport = DeferReport();
+        const user = await RenderScreen();
+        await user.click(ReportTypeButton(CUSTOM_LABEL));
+        await FillDateParts(user, CUSTOM_DATE_PARTS);
+        // user-event rejects an empty text, so a Backspace on the blank field leads every value.
+        await user.type(ConfirmInput(), `{Backspace}${confirm}`);
+        await PressScreenKey(user, ENTER_KEY, "key");
+        ExpectKeyboardLocked();
+        await TryToEditWhileLocked(confirm);
+        await SettleOutcome(pendingReport, outcome);
+        expect(screen.queryByRole("alert")?.textContent ?? "").toBe(outcome.literal);
+        for (const control of CriteriaControls()) {
+            expect(control).toBeEnabled();
+        }
+        expect(screen.getByRole("button", { name: ENTER_KEY.buttonName })).toBeEnabled();
+        expect(FocusedControl()).toHaveFocus();
+        expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
+        expect(mockFetchTransactionReport).toHaveBeenCalledWith({ ...CUSTOM_KEYED_QUERY, confirm });
+    },
+);
 
 it.each(FLAGGED_REPORT_TYPE_CASES)(
     "CORPT00C marks the Report type group invalid after $name",

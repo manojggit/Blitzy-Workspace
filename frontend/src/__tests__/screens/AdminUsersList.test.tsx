@@ -90,7 +90,7 @@ const mockSelectUsers = jest.mocked(SelectUsers);
 
 type ListKey = Extract<PfKey, "ENTER" | "F3" | "F7" | "F8">;
 type Trigger = "button" | "key";
-type ErrorBody = LegacyErrorResponse & PageState;
+type ErrorBody = LegacyErrorResponse & Pick<UserListResponse, "rows" | keyof PageState>;
 
 // The legend ENTER=Continue  F3=Back  F7=Backward  F8=Forward as FunctionKeyBar names it.
 const KEY_BUTTON_NAMES: Readonly<Record<ListKey, string>> = {
@@ -103,6 +103,9 @@ const TRIGGERS: readonly Trigger[] = ["button", "key"];
 
 const SCREEN_TITLE = "List Users";
 const SEARCH_LABEL = "Search User ID:";
+const PAGE_LABEL = "Page:";
+// MUI renders a blank Select value as one zero-width space.
+const ZERO_WIDTH_SPACE = "\u200b";
 // USRIDIN LENGTH=8 (USRIDINI PIC X(8)).
 const SEARCH_MAX_LENGTH = "8";
 // The JSON name of USRIDIN in cursor_field and field_errors.
@@ -177,6 +180,18 @@ function BuildListResponse(overrides: Partial<UserListResponse> = {}): UserListR
     };
 }
 
+// ENTER's STARTBR NOTFND page (_SearchNotFound in services/users/cousr00c.py): page 1, the
+// shown rows read again, and a blank last key, from which F8 answers NEXT-PAGE-NO.
+const NOT_FOUND_PAGE: Partial<UserListResponse> = { page: 1, last_key: "" };
+// The re-browsed page an invalid-selection 400 body adds to the four standard keys.
+const REBROWSED_LAST_KEY = "rebrowsed-last-key";
+const REBROWSED_PAGE: Partial<UserListResponse> = {
+    rows: OTHER_PAGE_ROWS,
+    page: 1,
+    first_key: "rebrowsed-first-key",
+    last_key: REBROWSED_LAST_KEY,
+};
+
 // The legacy error body a COUSR00C refusal carries: the cursor and the error on USRIDIN.
 function BuildErrorBody(overrides: Partial<ErrorBody> = {}): ErrorBody {
     return {
@@ -204,11 +219,17 @@ function BuildAxiosError(status: number, body: unknown): AxiosError {
     );
 }
 
-// Every shown row in display order with its code: blank for every row but the chosen one.
-function ExpectedSelections(chosen?: Required<UserSelection>): UserSelection[] {
-    return FIRST_PAGE_ROWS.map((row) => ({
+interface ChosenCode {
+    rowNumber: number;
+    code: string;
+}
+
+// Every shown row in display order beside the code at its screen position: blank for every row
+// but the chosen one.
+function ExpectedSelections(rows: readonly UserListRow[], chosen?: ChosenCode): UserSelection[] {
+    return rows.map((row, index) => ({
         user_id: row.user_id,
-        selection: row.user_id === chosen?.user_id ? chosen.selection : "",
+        selection: index + 1 === chosen?.rowNumber ? chosen.code : "",
     }));
 }
 
@@ -279,6 +300,24 @@ function BodyRowTexts(): string[][] {
 
 function RowTextsOf(rows: readonly UserListRow[]): string[][] {
     return rows.map((row) => [row.user_id, row.first_name, row.last_name, row.user_type]);
+}
+
+// The code each shown row's SELnnnn field displays, top to bottom, a blank as "".
+function ShownSelectionCodes(): string[] {
+    return screen
+        .getAllByRole("combobox")
+        .map((field) => (field.textContent ?? "").replaceAll(ZERO_WIDTH_SPACE, ""));
+}
+
+// The page's own polite status, told apart from MessageLine's live region by its Page: text.
+function PageStatusRegion(): HTMLElement {
+    const pageStatus = screen
+        .getAllByRole("status")
+        .find((region) => region.textContent?.startsWith(PAGE_LABEL));
+    if (pageStatus === undefined) {
+        throw new Error("No page status region is shown");
+    }
+    return pageStatus;
 }
 
 beforeEach(() => {
@@ -383,7 +422,10 @@ it.each(SELECTION_ROUTE_CASES)(
         await user.type(SearchField(), SEARCH_TEXT);
         await TriggerKey(user, "ENTER", trigger);
         const expectedRequest: UserSelectionRequest = {
-            selections: ExpectedSelections({ user_id: TEST_USER_ID, selection: code }),
+            selections: ExpectedSelections(FIRST_PAGE_ROWS, {
+                rowNumber: SELECTED_ROW_NUMBER,
+                code,
+            }),
             search_user_id: SEARCH_TEXT,
         };
         expect(mockSelectUsers).toHaveBeenCalledWith(expectedRequest);
@@ -398,7 +440,7 @@ it("COUSR00C ENTER sends the search key as typed and shows the page browsed from
     await user.type(SearchField(), RAW_SEARCH_TEXT);
     await PressKey(user, "ENTER");
     const expectedRequest: UserSelectionRequest = {
-        selections: ExpectedSelections(),
+        selections: ExpectedSelections(FIRST_PAGE_ROWS),
         search_user_id: RAW_SEARCH_TEXT,
     };
     expect(mockSelectUsers).toHaveBeenCalledWith(expectedRequest);
@@ -454,19 +496,24 @@ interface LiteralCase {
     literal: string;
     key: "ENTER" | "F7" | "F8";
     status: number;
-    page?: number;
+    listPage?: Partial<UserListResponse>;
 }
 
 // Each literal on the path services/users/cousr00c.py answers it: a 200 page carrying it, or
 // a refusal whose body carries it.
 const LITERAL_CASES: readonly LiteralCase[] = [
-    // PROCESS-ENTER-KEY WHEN OTHER: the list is re-browsed and answered with the literal.
-    { literal: INVALID_SELECTION, key: "ENTER", status: HTTP_OK },
+    // PROCESS-ENTER-KEY WHEN OTHER: an edit failure whose 400 body carries the re-browsed page.
+    {
+        literal: INVALID_SELECTION,
+        key: "ENTER",
+        status: HTTP_BAD_REQUEST,
+        listPage: REBROWSED_PAGE,
+    },
     // READNEXT ENDFILE on the last page.
     { literal: REACHED_BOTTOM, key: "ENTER", status: HTTP_OK },
     { literal: REACHED_BOTTOM, key: "F8", status: HTTP_OK },
-    // ENTER's STARTBR NOTFND, its body carrying page 0.
-    { literal: AT_TOP_OF_PAGE, key: "ENTER", status: HTTP_BAD_REQUEST, page: 0 },
+    // ENTER's STARTBR NOTFND: page 1 with the shown rows read again and a blank last key.
+    { literal: AT_TOP_OF_PAGE, key: "ENTER", status: HTTP_OK, listPage: NOT_FOUND_PAGE },
     { literal: ALREADY_AT_BOTTOM, key: "F8", status: HTTP_BAD_REQUEST },
     { literal: ALREADY_AT_TOP, key: "F7", status: HTTP_BAD_REQUEST },
     { literal: AT_TOP_OF_PAGE, key: "F7", status: HTTP_BAD_REQUEST },
@@ -476,11 +523,11 @@ const LITERAL_CASES: readonly LiteralCase[] = [
     { literal: UNABLE_TO_LOOKUP_USER, key: "F8", status: HTTP_SERVICE_UNAVAILABLE },
 ];
 
-function OutcomeOf({ literal, status, page }: LiteralCase): Promise<UserListResponse> {
+function OutcomeOf({ literal, status, listPage }: LiteralCase): Promise<UserListResponse> {
     if (status === HTTP_OK) {
-        return Promise.resolve(BuildListResponse({ message: literal }));
+        return Promise.resolve(BuildListResponse({ ...listPage, message: literal }));
     }
-    const body = BuildErrorBody({ message: literal, page });
+    const body = BuildErrorBody({ ...listPage, message: literal });
     return Promise.reject(BuildAxiosError(status, body));
 }
 
@@ -513,16 +560,144 @@ it("COUSR00C F8 answered 500 shows the abend text and keeps the rows", async () 
     expect(BodyRowTexts()).toEqual(RowTextsOf(FIRST_PAGE_ROWS));
 });
 
-it("COUSR00C ENTER STARTBR NOTFND shows page 0, keeps the rows and blanks USRIDIN", async () => {
-    const user = await RenderLoadedScreen();
-    const body = BuildErrorBody({ message: AT_TOP_OF_PAGE, page: 0 });
-    mockSelectUsers.mockRejectedValueOnce(BuildAxiosError(HTTP_BAD_REQUEST, body));
+// Both ENTER outcomes start from page 2, so the page-1 reset of every ENTER search shows.
+async function RenderSecondPage(): Promise<UserEvent> {
+    mockListUsers.mockResolvedValueOnce(BuildListResponse({ page: SHOWN_PAGE }));
+    return RenderLoadedScreen();
+}
+
+it("COUSR00C ENTER STARTBR NOTFND shows page 1 with the rows read again and refuses F8", async () => {
+    const user = await RenderSecondPage();
+    const notFound = BuildListResponse({ ...NOT_FOUND_PAGE, message: AT_TOP_OF_PAGE });
+    mockSelectUsers.mockResolvedValueOnce(notFound);
     await user.type(SearchField(), SEARCH_TEXT);
     await PressKey(user, "ENTER");
     await ExpectAlert(AT_TOP_OF_PAGE, ERRMSG_SEVERITY);
-    expect(screen.getByText("Page: 0")).toBeVisible();
+    expect(screen.getByText("Page: 1")).toBeVisible();
     expect(SearchField()).toHaveValue("");
     expect(BodyRowTexts()).toEqual(RowTextsOf(FIRST_PAGE_ROWS));
+    const refusal = BuildErrorBody({ message: ALREADY_AT_BOTTOM });
+    mockListUsers.mockRejectedValueOnce(BuildAxiosError(HTTP_BAD_REQUEST, refusal));
+    await PressKey(user, "F8");
+    const expectedQuery: UserListQuery = { startKey: "", direction: Direction.FORWARD, page: 1 };
+    expect(mockListUsers).toHaveBeenLastCalledWith(expectedQuery);
+    await ExpectAlert(ALREADY_AT_BOTTOM, ERRMSG_SEVERITY);
+});
+
+// SEL0003 shows TESTUSR2 on the first page and TESTUSRC on the other page.
+const KEPT_CODE_ROW = 3;
+// F8 from the re-browsed page an invalid-selection 400 body carries.
+const REBROWSED_F8_QUERY: UserListQuery = {
+    startKey: REBROWSED_LAST_KEY,
+    direction: Direction.FORWARD,
+    page: 1,
+};
+
+// The server alone validates codes, so its invalid-selection 400 is mocked whatever is chosen.
+it("COUSR00C ENTER invalid-selection 400 shows its body's page and keeps the codes", async () => {
+    const user = await RenderSecondPage();
+    const body = BuildErrorBody({ ...REBROWSED_PAGE, message: INVALID_SELECTION });
+    mockSelectUsers.mockRejectedValueOnce(BuildAxiosError(HTTP_BAD_REQUEST, body));
+    await ChooseSelection(user, KEPT_CODE_ROW, "D");
+    await user.type(SearchField(), SEARCH_TEXT);
+    await PressKey(user, "ENTER");
+    await ExpectAlert(INVALID_SELECTION, ERRMSG_SEVERITY);
+    expect(BodyRowTexts()).toEqual(RowTextsOf(OTHER_PAGE_ROWS));
+    expect(screen.getByText("Page: 1")).toBeVisible();
+    expect(SearchField()).toHaveValue("");
+    expect(SearchField()).toHaveAttribute("aria-invalid", "true");
+    expect(SearchField()).toHaveFocus();
+    expect(ShownSelectionCodes()).toEqual(["", "", "D"]);
+    await PressKey(user, "F8");
+    expect(mockListUsers).toHaveBeenLastCalledWith(REBROWSED_F8_QUERY);
+});
+
+it("COUSR00C keeps a code at its row across F8 and sends it beside the user shown there", async () => {
+    const user = await RenderLoadedScreen();
+    await ChooseSelection(user, KEPT_CODE_ROW, "U");
+    mockListUsers.mockResolvedValueOnce(BuildListResponse({ rows: OTHER_PAGE_ROWS, page: 2 }));
+    await PressKey(user, "F8");
+    await ExpectKeysReady();
+    expect(BodyRowTexts()).toEqual(RowTextsOf(OTHER_PAGE_ROWS));
+    expect(ShownSelectionCodes()).toEqual(["", "", "U"]);
+    const route = "/admin/users/update?userId=TESTUSRC";
+    mockSelectUsers.mockResolvedValueOnce({ route });
+    await TriggerKey(user, "ENTER", "button");
+    const expectedRequest: UserSelectionRequest = {
+        selections: ExpectedSelections(OTHER_PAGE_ROWS, { rowNumber: KEPT_CODE_ROW, code: "U" }),
+        search_user_id: "",
+    };
+    expect(mockSelectUsers).toHaveBeenCalledWith(expectedRequest);
+    expect(mockRouterPush).toHaveBeenCalledWith(route);
+});
+
+// A refusal or a file error re-sends the screen with every SELnnnn field as it was typed.
+const CODE_KEEPING_CASES: readonly LiteralCase[] = [
+    { literal: ALREADY_AT_BOTTOM, key: "F8", status: HTTP_BAD_REQUEST },
+    { literal: UNABLE_TO_LOOKUP_USER, key: "F8", status: HTTP_SERVICE_UNAVAILABLE },
+    { literal: UNABLE_TO_LOOKUP_USER, key: "ENTER", status: HTTP_SERVICE_UNAVAILABLE },
+];
+
+it.each(CODE_KEEPING_CASES)(
+    "COUSR00C $key answered $status keeps the chosen code at its row for the next ENTER",
+    async (literalCase) => {
+        const user = await RenderLoadedScreen();
+        const chosen: ChosenCode = { rowNumber: KEPT_CODE_ROW, code: "D" };
+        await ChooseSelection(user, chosen.rowNumber, chosen.code);
+        ArrangeOutcome(literalCase);
+        await TriggerKey(user, literalCase.key, "button");
+        await ExpectAlert(literalCase.literal, ERRMSG_SEVERITY);
+        const selections = ExpectedSelections(FIRST_PAGE_ROWS, chosen);
+        expect(ShownSelectionCodes()).toEqual(selections.map((row) => row.selection));
+        mockSelectUsers.mockResolvedValueOnce({ route: "/admin/users/delete?userId=TESTUSR2" });
+        await TriggerKey(user, "ENTER", "button");
+        expect(mockSelectUsers).toHaveBeenLastCalledWith({ selections, search_user_id: "" });
+    },
+);
+
+interface PageStatusCase {
+    rowsShown: string;
+    firstPage: UserListResponse;
+    statusText: string;
+}
+
+// The first entry's page: ten users, or an empty table's STARTBR NOTFND page 1.
+const PAGE_STATUS_CASES: readonly PageStatusCase[] = [
+    {
+        rowsShown: "ten rows",
+        firstPage: BuildListResponse(),
+        statusText: "Page: 1, 10 users shown, TESTUSR0 to TESTUSR9",
+    },
+    {
+        rowsShown: "no rows",
+        firstPage: BuildListResponse({ rows: [], first_key: "", last_key: "" }),
+        statusText: "Page: 1, 0 users shown",
+    },
+];
+
+it.each(PAGE_STATUS_CASES)(
+    "COUSR00C first entry with $rowsShown announces '$statusText' in a hidden polite status",
+    async ({ firstPage, statusText }) => {
+        mockListUsers.mockResolvedValueOnce(firstPage);
+        await RenderLoadedScreen();
+        const pageStatus = PageStatusRegion();
+        expect(pageStatus.textContent).toBe(statusText);
+        expect(pageStatus).toHaveAttribute("aria-live", "polite");
+        expect(pageStatus).toHaveAttribute("aria-atomic", "true");
+        expect(pageStatus).toHaveStyle({ position: "absolute", width: "1px", overflow: "hidden" });
+        expect(screen.getByText("Page: 1")).toBeVisible();
+        expect(screen.queryByRole("alert")).toBeNull();
+    },
+);
+
+it("COUSR00C F8 changes the page status and leaves the ERRMSG line to the server", async () => {
+    const user = await RenderLoadedScreen();
+    const nextPage = BuildListResponse({ rows: OTHER_PAGE_ROWS, page: 2, message: REACHED_BOTTOM });
+    mockListUsers.mockResolvedValueOnce(nextPage);
+    await PressKey(user, "F8");
+    await ExpectAlert(REACHED_BOTTOM, ERRMSG_SEVERITY);
+    expect(PageStatusRegion().textContent).toBe("Page: 2, 3 users shown, TESTUSRA to TESTUSRC");
+    expect(within(PageStatusRegion()).queryByRole("alert")).toBeNull();
 });
 
 // A refusal that sets ERR-FLG re-sends the screen as it was, the typed search key included.

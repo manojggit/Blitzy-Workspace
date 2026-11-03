@@ -68,8 +68,7 @@ const YEAR_MAX_LENGTH = 4;
 const SEARCH_KEY_LABEL = "Search Cards";
 const EXIT_KEY_LABEL = "Exit";
 
-// F3 returns to the calling program: COCRDLIC after a list selection, otherwise the main menu.
-const CARD_LIST_ROUTE = "/cards";
+// F3 returns to the main menu, whether the menu or a card list selection opened the screen.
 const MENU_ROUTE = "/menu";
 
 // The COMMAREA keys a card list selection hands over; cardRef is an opaque card_ref token.
@@ -459,8 +458,8 @@ function useScreenFunctionKeys(inputs: ScreenKeyInputs): FunctionKeyList {
         void RunLookup(LookupKeysFor({ cardRef, acctId }, { acctText, cardText }));
     }, [RunLookup, cardRef, acctId, acctText, cardText]);
     const handleExit = useCallback(() => {
-        router.push(cardRef !== "" ? CARD_LIST_ROUTE : MENU_ROUTE);
-    }, [router, cardRef]);
+        router.push(MENU_ROUTE);
+    }, [router]);
     return useMemo(
         () => BuildFunctionKeys(handleSearch, handleExit, isBusy),
         [handleSearch, handleExit, isBusy],

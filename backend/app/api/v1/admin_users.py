@@ -66,8 +66,10 @@ ROUTER = APIRouter(prefix="/admin/users", tags=["admin-users"], route_class=Loss
     summary="CU00 / COUSR00C: list users (10 per page)",
     description=(
         "Without a direction, the browse starts at the first user ID greater than or equal to "
-        "searchUserId, in EBCDIC order. A page's first_key or last_key is sent back as startKey "
-        "with direction backward (F7) or forward (F8)."
+        "searchUserId, in EBCDIC order, as page 1. A search finding no such user ID answers "
+        "'You are at the top of the page...' on page 1 with no rows and a blank last_key, from "
+        "which F8 is refused. A page's first_key or last_key is sent back as startKey with "
+        "direction backward (F7) or forward (F8); a paging key that reads no row is a 400."
     ),
     responses=LegacyErrorResponses(400, 401, 403, 503),
 )
@@ -84,15 +86,18 @@ async def ListUsers(
     summary="CU00 / COUSR00C: process user list selection",
     description=(
         "The first row with a selection code decides: U opens the update screen and D the "
-        "delete screen through route. Any other code gives the invalid-selection literal with "
-        "the list browsed again from search_user_id."
+        "delete screen through route. Any other code sets the invalid-selection literal and "
+        "the list is browsed again from search_user_id. When that literal stays, the answer is "
+        "a 400 whose body adds the browsed page's rows, page, first_key and last_key; when the "
+        "browse replaces it with a paging literal, the page is a 200. A search finding no user "
+        "ID answers page 1 with the shown rows read again from the first row's user_id."
     ),
     responses=LegacyErrorResponses(400, 401, 403, 503),
 )
 async def SelectUser(
     selectionRequest: UserSelectionRequest, context: ADMIN_CONTEXT
 ) -> UserSelectionResponse:
-    """Return the route of a valid U or D selection, or the re-browsed list page."""
+    """Return a valid U or D selection's route or the re-browsed page, or raise its 400 or 503."""
     return await cousr00c.ProcessUserSelection(context, selectionRequest)
 
 

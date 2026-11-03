@@ -262,9 +262,9 @@ const LITERAL_CASES: readonly LiteralCase[] = [
     },
 ];
 
-// F3 returns to CDEMO-FROM-PROGRAM: COTRN00C after a CT00 selection, otherwise COMEN01C.
+// F3 returns to the main menu (COMEN01C), whether the menu or a CT00 selection opened the screen.
 const BACK_CASES: readonly BackCase[] = PRESS_MODES.flatMap((mode) => [
-    { mode, origin: "a CT00 selection", tranId: TEST_TRAN_ID, route: TRANSACTION_LIST_ROUTE },
+    { mode, origin: "a CT00 selection", tranId: TEST_TRAN_ID, route: MAIN_MENU_ROUTE },
     { mode, origin: "the main menu", tranId: "", route: MAIN_MENU_ROUTE },
 ]);
 

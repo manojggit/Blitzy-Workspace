@@ -49,7 +49,7 @@ import {
     type MessageSeverity,
     type ScreenFeedback,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import { useFunctionKeys, type FunctionKeyDefinition, type PfKey } from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CCUP";
 const PROGRAM_NAME = "COCRDUPC";
@@ -57,10 +57,10 @@ const PROGRAM_NAME = "COCRDUPC";
 const SCREEN_TITLE = "Update Credit Card Details";
 const EXPIRY_DATE_LABEL = "Expiry Date       :";
 const EXPIRY_SEPARATOR = "/";
-const CARDS_LIST_ROUTE = "/cards";
 const MENU_ROUTE = "/menu";
 const CARD_REF_QUERY_KEY = "cardRef";
 const ACCT_ID_QUERY_KEY = "acctId";
+const YES_NO_HELPER_TEXT = "Y/N";
 
 // The PF-key legend "ENTER=Process F3=Exit" (FKEYS) and "F5=Save F12=Cancel" (FKEYSC).
 const ENTER_LABEL = "Process";
@@ -90,6 +90,7 @@ interface CardFieldDefinition {
     name: RenderedFieldName;
     label: string;
     maxLength: number;
+    helperText?: string;
     inputMode?: "numeric";
 }
 
@@ -101,7 +102,12 @@ const CARD_UPDATE_FIELDS: Readonly<Record<RenderedFieldName, CardFieldDefinition
     acct_id: { name: "acct_id", label: "Account Number    :", maxLength: 11 },
     card_num: { name: "card_num", label: "Card Number       :", maxLength: 16 },
     embossed_name: { name: "embossed_name", label: "Name on card      :", maxLength: 50 },
-    active_status: { name: "active_status", label: "Card Active Y/N   :", maxLength: 1 },
+    active_status: {
+        name: "active_status",
+        label: "Card Active Y/N   :",
+        maxLength: 1,
+        helperText: YES_NO_HELPER_TEXT,
+    },
     expiry_month: {
         name: "expiry_month",
         label: "Expiry Month",
@@ -154,13 +160,6 @@ const EDITABLE_FIELDS_BY_STATE: Readonly<Record<UpdateScreenState, readonly Card
         [UpdateScreenState.CHANGES_FAILED]: KEY_FIELD_NAMES,
     });
 
-// Lines 435-440: once the change is done or has failed, a session that came from the card list
-// (CDEMO-LAST-MAPSET = COCRDLI) goes back to COCRDLIC on its next key, as PF3 does.
-const LIST_RETURN_STATES: readonly UpdateScreenState[] = [
-    UpdateScreenState.CHANGES_DONE,
-    UpdateScreenState.CHANGES_FAILED,
-];
-
 // What the COMMAREA kept between two CCUP tasks: the CCUP-CHANGE-ACTION state, the encrypted
 // screen_token and card_ref the server sends back unchanged, and the map fields as last shown
 // or keyed. It lives in React state only; neither token is ever stored, decoded or logged.
@@ -207,13 +206,11 @@ interface ScreenStore {
 
 // The 4xx and 5xx CCUP bodies carry the screen beside the standard legacy keys.
 type CardErrorBody = LegacyErrorResponse &
-    Partial<Pick<CardScreen, "fields" | "state" | "screen_token" | "card_ref">>;
+    Partial<Pick<CardScreen, "fields" | "state" | "screen_token">>;
 
 type CardRequest = () => Promise<CardScreen>;
 
 type RequestRunner = (request: CardRequest) => void;
-
-type AppRouter = ReturnType<typeof useRouter>;
 
 type InputRefMap = Partial<Record<CardFieldName, HTMLInputElement | null>>;
 
@@ -230,14 +227,12 @@ type FieldChangeHandler = (change: FieldChange) => void;
 
 interface ActionContext {
     model: CardUpdateModel;
-    openedFromList: boolean;
     runRequest: RequestRunner;
-    router: AppRouter;
 }
 
 interface KeyInputs {
     model: CardUpdateModel;
-    openedFromList: boolean;
+    isBusy: boolean;
     runRequest: RequestRunner;
 }
 
@@ -326,7 +321,9 @@ function BuildEditableFields(
     return editableFields;
 }
 
-// Responses mask CARDSID, so the keys the user typed stay on screen while they remain editable.
+// Responses mask CARDSID, so a key edit or not-found answer during key entry keeps the keys the
+// user typed. Every other response shows the server's fields, among them the empty key screen
+// that discards the input after a done or failed change.
 function MergeScreenFields(
     previous: CardUpdateModel,
     nextState: UpdateScreenState,
@@ -337,7 +334,8 @@ function MergeScreenFields(
     }
     const fields = { ...EMPTY_CARD_FIELDS, ...screenFields };
     const keepsTypedKeys =
-        IsEditable(previous.state, CARD_NUM_FIELD) && IsEditable(nextState, CARD_NUM_FIELD);
+        previous.state === UpdateScreenState.DETAILS_NOT_FETCHED &&
+        nextState === UpdateScreenState.DETAILS_NOT_FETCHED;
     if (!keepsTypedKeys) {
         return fields;
     }
@@ -368,10 +366,6 @@ function ApplyCardScreen(previous: CardUpdateModel, screen: Partial<CardScreen>)
 // "Card number not provided".
 function ResolveCardKey(model: CardUpdateModel): string {
     return model.cardRef ?? model.fields.card_num;
-}
-
-function ShouldReturnToList(openedFromList: boolean, state: UpdateScreenState): boolean {
-    return openedFromList && LIST_RETURN_STATES.includes(state);
 }
 
 // Typing a card number while the keys are editable replaces the card the list handed over.
@@ -448,13 +442,10 @@ function ShowPendingMessage(setters: ScreenSetters): void {
 }
 
 // ENTER, F5 and F12 on COCRDUP. Every key reaches the server, whose state machine processes a
-// save or cancel its state does not allow as ENTER (lines 413-424).
+// save or cancel its state does not allow as ENTER (lines 413-424), and answers any key after a
+// done or failed change with the empty key screen, whichever screen opened this one.
 function HandleAction(action: UpdateAction, context: ActionContext): void {
     const { model, runRequest } = context;
-    if (ShouldReturnToList(context.openedFromList, model.state)) {
-        context.router.push(CARDS_LIST_ROUTE);
-        return;
-    }
     const request: CardUpdateRequest = {
         action,
         screen_token: model.screenToken,
@@ -463,14 +454,21 @@ function HandleAction(action: UpdateAction, context: ActionContext): void {
     runRequest(() => UpdateCard(ResolveCardKey(model), request));
 }
 
-// The FKEYS and FKEYSC legend. F5 and F12 are always offered rather than dimmed by the FKEYSC
-// attribute, because the server owns which key is valid in each state.
-function BuildFunctionKeys(handlers: KeyHandlers): FunctionKeyDefinition[] {
+// The FKEYS and FKEYSC legend. F5 and F12 are offered in every state rather than dimmed by the
+// FKEYSC attribute, because the server owns which key is valid in each state. ENTER, F5 and F12
+// each send a request, so they are disabled while one is in flight; F3 only navigates.
+function BuildFunctionKeys(handlers: KeyHandlers, isBusy: boolean): FunctionKeyDefinition[] {
+    const requestKey = (key: PfKey, label: string, action: UpdateAction) => ({
+        key,
+        label,
+        onPress: () => handlers.onAction(action),
+        disabled: isBusy,
+    });
     return [
-        { key: "ENTER", label: ENTER_LABEL, onPress: () => handlers.onAction(UpdateAction.ENTER) },
+        requestKey("ENTER", ENTER_LABEL, UpdateAction.ENTER),
         { key: "F3", label: EXIT_LABEL, onPress: handlers.onExit },
-        { key: "F5", label: SAVE_LABEL, onPress: () => handlers.onAction(UpdateAction.SAVE) },
-        { key: "F12", label: CANCEL_LABEL, onPress: () => handlers.onAction(UpdateAction.CANCEL) },
+        requestKey("F5", SAVE_LABEL, UpdateAction.SAVE),
+        requestKey("F12", CANCEL_LABEL, UpdateAction.CANCEL),
     ];
 }
 
@@ -546,20 +544,19 @@ function useCursorFocus(feedback: ScreenFeedbackView, inputRefs: RefObject<Input
     }, [feedback, inputRefs]);
 }
 
-// PF3 returns to the caller: the card list when it opened the page, else the main menu.
+// PF3 returns to the main menu, whether the menu or the card list opened the page.
 function useScreenFunctionKeys(inputs: KeyInputs): readonly FunctionKeyDefinition[] {
     const router = useRouter();
-    const { model, openedFromList, runRequest } = inputs;
+    const { model, isBusy, runRequest } = inputs;
     const onAction = useCallback(
-        (action: UpdateAction) =>
-            HandleAction(action, { model, openedFromList, runRequest, router }),
-        [model, openedFromList, runRequest, router],
+        (action: UpdateAction) => HandleAction(action, { model, runRequest }),
+        [model, runRequest],
     );
-    const onExit = useCallback(
-        () => router.push(openedFromList ? CARDS_LIST_ROUTE : MENU_ROUTE),
-        [router, openedFromList],
+    const onExit = useCallback(() => router.push(MENU_ROUTE), [router]);
+    return useMemo(
+        () => BuildFunctionKeys({ onAction, onExit }, isBusy),
+        [onAction, onExit, isBusy],
     );
-    return useMemo(() => BuildFunctionKeys({ onAction, onExit }), [onAction, onExit]);
 }
 
 // Each input registers its element, so a response can move the cursor to it.
@@ -596,8 +593,7 @@ function useCardUpdateScreen(): CardUpdateScreenModel {
     const registry = useInputRegistry();
     useEntryFetch(entry, runRequest, store.setters);
     useCursorFocus(store.feedback, registry.inputRefs);
-    const openedFromList = entry.cardRef !== null;
-    const keys = useScreenFunctionKeys({ model: store.model, openedFromList, runRequest });
+    const keys = useScreenFunctionKeys({ model: store.model, isBusy: store.isBusy, runRequest });
     useFunctionKeys(keys);
     const view = useFieldView(store, registry.registerInput);
     return { view, keys, isBusy: store.isBusy, feedback: store.feedback };
@@ -642,6 +638,7 @@ function CardTextField(props: CardTextFieldProps) {
             value={props.value}
             variant={readOnly ? "filled" : "outlined"}
             error={props.error}
+            helperText={definition.helperText}
             inputRef={props.inputRef}
             onChange={(event) => props.onChange(event.target.value)}
             slotProps={FieldSlotProps(definition, readOnly)}

@@ -2,7 +2,7 @@
 // COCOM01Y, COTTL01Y, CSDAT01Y, CSMSG01Y
 "use client";
 
-import { Grid, TextField, Typography } from "@mui/material";
+import { Box, Grid, TextField, Typography } from "@mui/material";
 import { isAxiosError } from "axios";
 import { useRouter } from "next/navigation";
 import {
@@ -16,6 +16,7 @@ import {
     type SetStateAction,
 } from "react";
 
+import { VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
@@ -52,6 +53,11 @@ const SCREEN_TITLE = "List Users";
 const SEARCH_MAX_LENGTH = 8;
 const SEARCH_LABEL = "Search User ID:";
 const PAGE_LABEL = "Page:";
+// The polite page status, built from the screen's own Page:, row and user ID fields so that no
+// ERRMSG literal is invented or changed: "Page: 2, 10 users shown, QAUSR006 to USER0003".
+const SHOWN_COUNT_SUFFIX = "users shown";
+const STATUS_PART_SEPARATOR = ", ";
+const SHOWN_RANGE_SEPARATOR = " to ";
 // The JSON name the server gives USRIDIN in cursor_field and field_errors.
 const SEARCH_FIELD = "search_user_id";
 const ALLOWED_SELECTION_CODES = ["U", "D"] as const;
@@ -63,6 +69,8 @@ const LIST_COLUMNS: SelectionColumn[] = [
     { field: "user_type", header: "Type" },
 ];
 const SELECTION_INSTRUCTION = "Type 'U' to Update or 'D' to Delete a User from the list";
+// SEL0001-SEL0010: one selection code field per screen row.
+const SELECTION_FIELD_COUNT = 10;
 // PF3 moves COADM01C to CDEMO-TO-PROGRAM.
 const ADMIN_MENU_ROUTE = "/admin";
 const BLANK_TEXT = "";
@@ -75,11 +83,12 @@ const LIST_MESSAGE_SEVERITY: MessageSeverity = SeverityForOutcome({
 type FieldRefs = Partial<Record<string, HTMLInputElement | null>>;
 type PageRouter = ReturnType<typeof useRouter>;
 
-// The COUSR00 screen the page holds. Selection codes are keyed by the user ID of their row.
+// The COUSR00 screen the page holds. selectionCodes holds SEL0001-SEL0010 by screen position,
+// index 0 being row 1, whichever user each row shows.
 interface ListScreenState {
     rows: readonly UserListRow[];
     pageState: PageState;
-    selectionCodes: Readonly<Record<string, string>>;
+    selectionCodes: readonly string[];
     searchText: string;
     feedback: CompleteScreenFeedback;
     isBusy: boolean;
@@ -92,8 +101,8 @@ interface ScreenActions {
     router: PageRouter;
 }
 
-// The body of ENTER's STARTBR NOTFND refusal, which carries page 0 beside the legacy keys.
-type EnterRefusalBody = LegacyErrorResponse & PageState;
+// The body of ENTER's invalid-selection 400: the four legacy keys plus the re-browsed page.
+type EnterRefusalBody = LegacyErrorResponse & Pick<UserListResponse, "rows" | keyof PageState>;
 
 const EMPTY_FEEDBACK: CompleteScreenFeedback = {
     message: BLANK_TEXT,
@@ -102,12 +111,18 @@ const EMPTY_FEEDBACK: CompleteScreenFeedback = {
     cursor_field: BLANK_TEXT,
 };
 
+// Every SELnnnn field blank, as the first entry's MOVE LOW-VALUES TO COUSR0AO leaves them.
+const BLANK_SELECTION_CODES: readonly string[] = Array.from(
+    { length: SELECTION_FIELD_COUNT },
+    () => BLANK_TEXT,
+);
+
 // The keys stay locked until the first entry's browse answers, as the 3270 keyboard stays
 // locked until the first SEND MAP arrives.
 const INITIAL_SCREEN: ListScreenState = {
     rows: [],
     pageState: {},
-    selectionCodes: {},
+    selectionCodes: BLANK_SELECTION_CODES,
     searchText: BLANK_TEXT,
     feedback: EMPTY_FEEDBACK,
     isBusy: true,
@@ -122,6 +137,20 @@ function IsBlank(text: string): boolean {
     return text.trim() === BLANK_TEXT;
 }
 
+// The shown page's number, row count and first and last user IDs; blank before any page shows.
+function PageStatusText(rows: readonly UserListRow[], page?: number): string {
+    if (page === undefined) {
+        return BLANK_TEXT;
+    }
+    const statusParts = [`${PAGE_LABEL} ${page}`, `${rows.length} ${SHOWN_COUNT_SUFFIX}`];
+    const firstRow = rows[0];
+    const lastRow = rows[rows.length - 1];
+    if (firstRow !== undefined && lastRow !== undefined) {
+        statusParts.push(`${firstRow.user_id}${SHOWN_RANGE_SEPARATOR}${lastRow.user_id}`);
+    }
+    return statusParts.join(STATUS_PART_SEPARATOR);
+}
+
 function FeedbackOf(response: UserListResponse): CompleteScreenFeedback {
     return {
         ...EMPTY_FEEDBACK,
@@ -130,11 +159,12 @@ function FeedbackOf(response: UserListResponse): CompleteScreenFeedback {
     };
 }
 
-// A shown page replaces the rows, keys and message. Its selection codes start blank: a code
-// belongs to the user it was chosen for, whereas a 3270 SELnnnn field kept its text by screen
-// position and would have offered it against whichever user the new page put there. A browse
-// that PROCESS-PAGE-FORWARD runs to its end also blanks USRIDIN (MOVE SPACE TO USRIDINO): the
-// first entry, ENTER and F8. F7's PROCESS-PAGE-BACKWARD leaves the typed search text.
+// A shown page replaces the rows, keys and message and leaves every selection code at its
+// screen position: SEL0001-SEL0010 are FSET UNPROT fields that INITIALIZE-USER-DATA and
+// POPULATE-USER-DATA never touch (cbl/COUSR00C.cbl lines 384-500), so a typed code is sent back
+// beside whichever user the new page puts on its row. A browse that PROCESS-PAGE-FORWARD runs to
+// its end also blanks USRIDIN (MOVE SPACE TO USRIDINO): the first entry, ENTER and F8. F7's
+// PROCESS-PAGE-BACKWARD leaves the typed search text.
 function ShownPageUpdate(
     response: UserListResponse,
     blanksSearch: boolean,
@@ -145,7 +175,7 @@ function ShownPageUpdate(
         last_key: response.last_key,
     };
     const rows = response.rows ?? [];
-    const shownPage = { rows, pageState, selectionCodes: {}, feedback: FeedbackOf(response) };
+    const shownPage = { rows, pageState, feedback: FeedbackOf(response) };
     return blanksSearch ? { ...shownPage, searchText: BLANK_TEXT } : shownPage;
 }
 
@@ -157,30 +187,27 @@ function FailureFeedback(error: unknown): CompleteScreenFeedback {
     return ToScreenFeedback(error);
 }
 
-// A failed ENTER keeps the rows and keys and clears the selection codes. Its STARTBR NOTFND
-// refusal carries page 0 and sets no ERR-FLG, so the browse still ends by blanking USRIDIN; a
-// file error sets ERR-FLG and leaves the search text.
+// A failed ENTER leaves every selection code where it was typed. The invalid-selection 400
+// carries the re-browsed page: that literal sets no ERR-FLG, so PROCESS-PAGE-FORWARD shows the
+// page and PROCESS-ENTER-KEY blanks USRIDIN (cbl/COUSR00C.cbl lines 210-232). Any other failure,
+// such as a file error that sets ERR-FLG, keeps the rows, keys and typed search text.
 function EnterFailureUpdate(error: unknown): SetStateAction<ListScreenState> {
     const feedback = FailureFeedback(error);
-    const refusedPage = LegacyErrorBody<EnterRefusalBody>(error)?.page;
-    if (refusedPage === undefined) {
-        return (current) => ({ ...current, feedback, selectionCodes: {} });
+    const refusalBody = LegacyErrorBody<EnterRefusalBody>(error);
+    if (refusalBody?.rows === undefined) {
+        return (current) => ({ ...current, feedback });
     }
-    return (current) => ({
-        ...current,
-        feedback,
-        selectionCodes: {},
-        searchText: BLANK_TEXT,
-        pageState: { ...current.pageState, page: refusedPage },
-    });
+    const browsedPage = ShownPageUpdate(refusalBody, true);
+    return (current) => ({ ...current, ...browsedPage, feedback });
 }
 
-// Every shown row in display order with its code as chosen, blank included: the server takes
-// the first non-blank code, as PROCESS-ENTER-KEY's EVALUATE TRUE does.
+// Every shown row in display order beside the code at its screen position, blank included, as
+// PROCESS-ENTER-KEY reads SELnnnnI beside USRIDnnI and its EVALUATE TRUE takes the first
+// non-blank code (cbl/COUSR00C.cbl lines 152-180).
 function ToSelections(screen: ListScreenState): UserSelection[] {
-    return screen.rows.map((row) => ({
+    return screen.rows.map((row, position) => ({
         user_id: row.user_id,
-        selection: screen.selectionCodes[row.user_id] ?? BLANK_TEXT,
+        selection: screen.selectionCodes[position] ?? BLANK_TEXT,
     }));
 }
 
@@ -207,7 +234,8 @@ function PageQuery(pageState: PageState, direction: Direction): UserListQuery {
     return { startKey, direction, page: pageState.page };
 }
 
-// A refused page keeps the rows and codes on the screen, as the SEND without ERASE did.
+// A refused page keeps the rows, keys and selection codes on the screen, as
+// SEND-USRLST-SCREEN's SEND without ERASE did (cbl/COUSR00C.cbl lines 522-543).
 async function HandlePage(
     actions: ScreenActions,
     screen: ListScreenState,
@@ -271,23 +299,27 @@ function BuildKeys(actions: ScreenActions, screen: ListScreenState): FunctionKey
     ];
 }
 
+// Each row is keyed by its screen position, the SELnnnn field it shows, never by its user.
 function ToSelectionRows(screen: ListScreenState): SelectionRow[] {
-    return screen.rows.map((row) => ({
-        rowKey: row.user_id,
+    return screen.rows.map((row, position) => ({
+        rowKey: String(position),
         cells: {
             user_id: row.user_id,
             first_name: row.first_name,
             last_name: row.last_name,
             user_type: row.user_type,
         },
-        selectedCode: screen.selectionCodes[row.user_id] ?? BLANK_TEXT,
+        selectedCode: screen.selectionCodes[position] ?? BLANK_TEXT,
     }));
 }
 
-function WithSelectionCode(rowKey: string, code: string): SetStateAction<ListScreenState> {
+// Only the user changes a selection code, and only at the position it is typed.
+function WithSelectionCode(position: number, code: string): SetStateAction<ListScreenState> {
     return (current) => ({
         ...current,
-        selectionCodes: { ...current.selectionCodes, [rowKey]: code },
+        selectionCodes: current.selectionCodes.map((shownCode, index) =>
+            index === position ? code : shownCode,
+        ),
     });
 }
 
@@ -338,12 +370,17 @@ function useUserList(): UserListModel {
 interface UserSearchBarProps {
     searchText: string;
     page?: number;
+    pageStatus: string;
     hasError: boolean;
     inputRef: Ref<HTMLInputElement>;
     onSearchChange: (searchText: string) => void;
 }
 
-type SearchFieldProps = Omit<UserSearchBarProps, "page">;
+type SearchFieldProps = Omit<UserSearchBarProps, "page" | "pageStatus">;
+
+interface PageStatusProps {
+    statusText: string;
+}
 
 // USRIDIN: free text sent as typed; the server's ported edits are its only check.
 function SearchField(props: SearchFieldProps) {
@@ -366,9 +403,25 @@ function SearchField(props: SearchFieldProps) {
     );
 }
 
+// A visually hidden live region of its own, apart from MessageLine's, so every new page is
+// announced to assistive technology even when its ERRMSG line is empty.
+function PageStatus({ statusText }: PageStatusProps) {
+    return (
+        <Box
+            component="span"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            sx={VISUALLY_HIDDEN_STYLE}
+        >
+            {statusText}
+        </Box>
+    );
+}
+
 // Row 4's Page: indicator sits beside the row-6 search field. It shows the number without the
 // zero padding PAGENUM got from CDEMO-CU00-PAGE-NUM 9(08), as the modernized layout shows it.
-function UserSearchBar({ page, ...searchFieldProps }: UserSearchBarProps) {
+function UserSearchBar({ page, pageStatus, ...searchFieldProps }: UserSearchBarProps) {
     return (
         <Grid container spacing={4} sx={{ alignItems: "center" }}>
             <Grid size={{ xs: 12, md: 6 }}>
@@ -378,6 +431,7 @@ function UserSearchBar({ page, ...searchFieldProps }: UserSearchBarProps) {
                 <Typography variant="bodyLarge" component="p">
                     {`${PAGE_LABEL} ${page ?? BLANK_TEXT}`}
                 </Typography>
+                <PageStatus statusText={pageStatus} />
             </Grid>
         </Grid>
     );
@@ -395,7 +449,9 @@ function UserRows({ screen, setScreen }: UserRowsProps) {
                 columns={LIST_COLUMNS}
                 rows={ToSelectionRows(screen)}
                 allowedCodes={ALLOWED_SELECTION_CODES}
-                onSelectionChange={(rowKey, code) => setScreen(WithSelectionCode(rowKey, code))}
+                onSelectionChange={(rowKey, code) =>
+                    setScreen(WithSelectionCode(Number(rowKey), code))
+                }
             />
             <Typography variant="bodyLarge" component="p">
                 {SELECTION_INSTRUCTION}
@@ -410,6 +466,7 @@ function UserListBody({ screen, setScreen, searchInputRef }: UserListBodyProps) 
             <UserSearchBar
                 searchText={screen.searchText}
                 page={screen.pageState.page}
+                pageStatus={PageStatusText(screen.rows, screen.pageState.page)}
                 hasError={screen.feedback.field_errors.includes(SEARCH_FIELD)}
                 inputRef={searchInputRef}
                 onSearchChange={(searchText) => PatchScreen(setScreen, { searchText })}

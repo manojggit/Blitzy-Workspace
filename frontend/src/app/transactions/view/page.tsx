@@ -48,8 +48,8 @@ const BLANK_TRAN_ID = " ";
 // COBOL SPACES: only blanks make a key empty, so the text itself is never trimmed.
 const BLANK_TEXT_PATTERN = /^ *$/;
 
-// F3 returns to CDEMO-FROM-PROGRAM (COTRN00C after a CT00 selection) or to COMEN01C; F5 XCTLs
-// to COTRN00C.
+// F3 returns to the main menu (COMEN01C), whether the menu or a CT00 selection opened the
+// screen; F5 XCTLs to COTRN00C.
 const TRANSACTION_LIST_ROUTE = "/transactions";
 const MAIN_MENU_ROUTE = "/menu";
 
@@ -426,16 +426,12 @@ function useTransactionView(initialTranId: string): TransactionView {
     };
 }
 
-function useViewFunctionKeys(
-    view: TransactionView,
-    initialTranId: string,
-): readonly FunctionKeyDefinition[] {
+function useViewFunctionKeys(view: TransactionView): readonly FunctionKeyDefinition[] {
     const router = useRouter();
-    const backRoute = IsBlank(initialTranId) ? MAIN_MENU_ROUTE : TRANSACTION_LIST_ROUTE;
     const functionKeys = BuildFunctionKeys({
         isBusy: view.screen.isBusy,
         onFetch: () => view.Fetch(view.tranIdText),
-        onBack: () => router.push(backRoute),
+        onBack: () => router.push(MAIN_MENU_ROUTE),
         onClear: view.Clear,
         onBrowse: () => router.push(TRANSACTION_LIST_ROUTE),
     });
@@ -542,7 +538,7 @@ function ViewContent({ view, functionKeys }: ViewContentProps) {
 
 function TransactionViewScreen({ initialTranId }: TransactionViewScreenProps) {
     const view = useTransactionView(initialTranId);
-    const functionKeys = useViewFunctionKeys(view, initialTranId);
+    const functionKeys = useViewFunctionKeys(view);
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}

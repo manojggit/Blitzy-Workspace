@@ -9,8 +9,10 @@ The payment runs every step of lines 210-235 whatever the earlier steps returned
 does: the cross-reference read, the TRAN-ID allocation, the WRITE, the COMPUTE and the REWRITE.
 Each failing step records its literal and the last literal recorded is the response, so a
 duplicate-key WRITE still reduces and rewrites the balance, and a failed REWRITE after a good
-WRITE keeps the transaction. The account write unit is held from the READ UPDATE to the REWRITE,
-while the transaction is allocated, inserted and committed in a unit of its own first.
+WRITE keeps the transaction. A failed TRAN-ID allocation leaves the record without a key, so its
+WRITE fails and the COMPUTE and the REWRITE still run. The account write unit is held from the
+READ UPDATE to the REWRITE, while the transaction is allocated, inserted and committed in a unit
+of its own first.
 
 Legacy paths with no code here: ``EIBCALEN = 0`` is the session guard and its 401; PF3
 (``XCTL`` to the menu) and PF4 (CLEAR-CURRENT-SCREEN) are frontend navigation and form clearing;
@@ -35,7 +37,6 @@ from app.core.errors import (
     HTTP_NOT_FOUND,
     HTTP_RECORD_CHANGED,
     DuplicateKeyError,
-    LegacyErrorDetails,
     LegacyMessageError,
     LogFileCondition,
     RecordNotFoundError,
@@ -116,7 +117,6 @@ MONEY_DEC_DIGITS = 2
 ZERO_BALANCE = Decimal(0)
 BALANCE_COLUMN = "curr_balance"
 CARD_NUM_COLUMN = "card_num"
-CURRENT_BALANCE_BODY_KEY = "current_balance"
 
 # The status of a screen sent without ERR-FLG set; anything from 400 up is a legacy error body.
 HTTP_OK = 200
@@ -176,7 +176,7 @@ def EditScreenInput(request: BillPayRequest) -> PaymentState | None:
     or checked for digits, so any other text is simply not found.
     """
     if IsBlank(request.acct_id):
-        RaiseScreenError(ACCT_ID_EMPTY_MESSAGE, CURSOR_ACCT_ID, HTTP_EDIT_FAILURE, None)
+        RaiseScreenError(ACCT_ID_EMPTY_MESSAGE, CURSOR_ACCT_ID, HTTP_EDIT_FAILURE)
     acctId = request.acct_id.rstrip(FIELD_PADDING)
     if request.confirm in CONFIRM_YES_VALUES:
         return PaymentState(acctId=acctId, payRequested=True)
@@ -184,7 +184,7 @@ def EditScreenInput(request: BillPayRequest) -> PaymentState | None:
         return None
     if IsBlank(request.confirm):
         return PaymentState(acctId=acctId, payRequested=False)
-    RaiseScreenError(INVALID_CONFIRM_MESSAGE, CURSOR_CONFIRM, HTTP_EDIT_FAILURE, None)
+    RaiseScreenError(INVALID_CONFIRM_MESSAGE, CURSOR_CONFIRM, HTTP_EDIT_FAILURE)
 
 
 async def ProcessAccount(context: OnlineContext, state: PaymentState) -> None:
@@ -218,9 +218,7 @@ def HandleAccountUnitError(state: PaymentState, error: RepositoryError) -> None:
     """
     if not state.rewriteStarted:
         LogFileCondition(LOGGER, TRANSACTION_ID, READ_UPDATE_OPERATION, error)
-        raise ScreenError(
-            ACCOUNT_LOOKUP_FAILED_MESSAGE, CURSOR_ACCT_ID, HTTP_FILE_ERROR, None
-        ) from error
+        raise ScreenError(ACCOUNT_LOOKUP_FAILED_MESSAGE, CURSOR_ACCT_ID, HTTP_FILE_ERROR) from error
     if isinstance(error, RecordNotFoundError):
         RecordMessage(state, ACCOUNT_NOT_FOUND_MESSAGE, HTTP_NOT_FOUND)
         return
@@ -241,7 +239,7 @@ async def ReadAccountForUpdate(
     """
     account = await accountRepository.GetAccountForUpdate(accountUnit, state.acctId)
     if account is None:
-        RaiseScreenError(ACCOUNT_NOT_FOUND_MESSAGE, CURSOR_ACCT_ID, HTTP_NOT_FOUND, None)
+        RaiseScreenError(ACCOUNT_NOT_FOUND_MESSAGE, CURSOR_ACCT_ID, HTTP_NOT_FOUND)
     state.account = account
     state.screenBalance = account[BALANCE_COLUMN]
 
@@ -252,12 +250,10 @@ def CheckBalanceAndConfirm(state: PaymentState) -> None:
     The prompt sets no ERR-FLG: it is a screen sent with HTTP 200 and the balance.
 
     Raises:
-        LegacyMessageError: 400 ``You have nothing to pay...``, with the balance shown.
+        LegacyMessageError: 400 ``You have nothing to pay...``.
     """
     if state.screenBalance <= ZERO_BALANCE:
-        RaiseScreenError(
-            NOTHING_TO_PAY_MESSAGE, CURSOR_ACCT_ID, HTTP_EDIT_FAILURE, state.screenBalance
-        )
+        RaiseScreenError(NOTHING_TO_PAY_MESSAGE, CURSOR_ACCT_ID, HTTP_EDIT_FAILURE)
     if not state.payRequested:
         RecordMessage(state, CONFIRM_PAYMENT_MESSAGE, HTTP_OK, CURSOR_CONFIRM)
 
@@ -270,14 +266,13 @@ async def RunPaymentSequence(
 ) -> None:
     """The ``IF CONF-PAY-YES`` branch (lines 210-235): every step runs, the last literal wins.
 
-    Only a failed TRAN-ID allocation ends the sequence early. The transaction unit commits
-    before the COMPUTE, and the account unit commits when ProcessAccount leaves it.
+    No ERR-FLG test sits between the steps, so no failure skips a later one. The transaction
+    unit commits before the COMPUTE, and the account unit commits when ProcessAccount leaves it.
     """
     await LookupXref(context, state)
     # MOVE ACCT-CURR-BAL TO TRAN-AMT: S9(10)V99 into S9(09)V99 drops the high-order digit.
     state.tranAmt = StoreInto(state.account[BALANCE_COLUMN], TRAN_AMT_INT_DIGITS, MONEY_DEC_DIGITS)
-    if not await WritePaymentTransaction(context, state):
-        return
+    await WritePaymentTransaction(context, state)
     ReduceBalance(state)
     state.rewriteStarted = True
     await RewriteAccount(accountRepository, accountUnit, state)
@@ -301,45 +296,58 @@ async def LookupXref(context: OnlineContext, state: PaymentState) -> None:
     state.xrefCardNum = xref[CARD_NUM_COLUMN]
 
 
-async def WritePaymentTransaction(context: OnlineContext, state: PaymentState) -> bool:
+async def WritePaymentTransaction(context: OnlineContext, state: PaymentState) -> None:
     """STARTBR/READPREV/ENDBR, ADD 1 and WRITE-TRANSACT-FILE (lines 212-233, 441-547).
 
     The TRAN-ID is allocated and the record inserted in one TRANSACT unit, committed on exit.
-    The error is handled outside the unit, after its rollback, because a failed statement
-    aborts the unit's transaction. Returns False only when the allocation failed.
+    The WRITE is attempted whatever the allocation returned. A failed allocation leaves the
+    record without a key, so its WRITE fails as well. A failed WRITE is handled outside the
+    unit, after its rollback, because a failed statement aborts the unit's transaction.
     """
     transactionRepository = TransactionRepository(context)
     try:
         async with WriteUnit(context.engine, TRANSACTION_FILE_NAME) as transactionUnit:
-            state.tranId = await transactionRepository.AllocateNextTranId(transactionUnit)
+            await AllocatePaymentTranId(transactionRepository, transactionUnit, state)
             await transactionRepository.InsertTransaction(
                 transactionUnit, BuildPaymentRecord(state, CurrentTimestamp())
             )
     except RepositoryError as error:
-        return HandleTransactionWriteError(state, error)
+        HandleTransactionWriteError(state, error)
+        return
     RecordPaymentSuccess(state)
-    return True
 
 
-def HandleTransactionWriteError(state: PaymentState, error: RepositoryError) -> bool:
-    """Record the literal of a failed allocation or WRITE; return whether the sequence goes on.
+async def AllocatePaymentTranId(
+    transactionRepository: TransactionRepository,
+    transactionUnit: AsyncConnection,
+    state: PaymentState,
+) -> None:
+    """STARTBR HIGH-VALUES, READPREV, ENDBR and ADD 1 (lines 212-217) into ``state.tranId``.
 
-    A failed WRITE (DUPKEY/DUPREC lines 533-539, WHEN OTHER lines 540-546) lets the COMPUTE
-    and the REWRITE run.
+    A failed browse is the STARTBR or READPREV ``WHEN OTHER`` branch (lines 460-466, 489-495):
+    it records ``Unable to lookup Transaction...`` and the sequence goes on, with ``tranId``
+    left unset. No TRAN-ID is made up, so the record's WRITE then fails in its own right.
     """
-    if state.tranId is None:
-        # READPREV WHEN OTHER leaves TRAN-ID at the HIGH-VALUES of line 212, so the ADD 1 TO
-        # WS-TRAN-ID-NUM of lines 216-217 meets non-numeric data and abends the task before
-        # lines 218-235 run: nothing is written and this is the only literal sent.
+    try:
+        state.tranId = await transactionRepository.AllocateNextTranId(transactionUnit)
+    except RepositoryError as error:
         LogFileCondition(LOGGER, TRANSACTION_ID, BROWSE_BACKWARD_OPERATION, error)
         RecordMessage(state, TRANSACTION_LOOKUP_FAILED_MESSAGE, HTTP_FILE_ERROR)
-        return False
+
+
+def HandleTransactionWriteError(state: PaymentState, error: RepositoryError) -> None:
+    """Record the literal of a failed WRITE; the COMPUTE and the REWRITE still run after it.
+
+    DUPKEY/DUPREC (lines 533-539) gives ``Tran ID already exist...``. Any other condition
+    (WHEN OTHER, lines 540-546) gives ``Unable to Add Bill pay Transaction...``: a TRANSACT
+    unit that cannot open or commit, and the WRITE of a record a failed allocation left
+    without a key, included.
+    """
     if isinstance(error, DuplicateKeyError):
         RecordMessage(state, TRAN_ID_EXISTS_MESSAGE, HTTP_RECORD_CHANGED)
-        return True
+        return
     LogFileCondition(LOGGER, TRANSACTION_ID, WRITE_OPERATION, error)
     RecordMessage(state, ADD_PAYMENT_FAILED_MESSAGE, HTTP_FILE_ERROR)
-    return True
 
 
 def BuildPaymentRecord(state: PaymentState, timestamp: datetime) -> dict[str, Any]:
@@ -417,18 +425,18 @@ def RecordMessage(
 
 
 def BuildOutcome(state: PaymentState) -> BillPayResponse:
-    """The final SEND-BILLPAY-SCREEN (line 242): the last literal recorded, with CURBAL.
+    """The final SEND-BILLPAY-SCREEN (line 242): the last literal recorded.
 
-    CURBAL shows the balance read unless INITIALIZE-ALL-FIELDS cleared the screen.
+    A screen sent with HTTP 200 carries CURBAL, the balance read unless INITIALIZE-ALL-FIELDS
+    cleared the screen. A failure is the standard four-key legacy error body.
 
     Raises:
         LegacyMessageError: when the last literal recorded is a failure (404, 409 or 503).
     """
-    balance = None if state.screenCleared else state.screenBalance
     if state.messageStatus >= ERROR_STATUS_FLOOR:
-        RaiseScreenError(state.message, state.cursorField, state.messageStatus, balance)
+        RaiseScreenError(state.message, state.cursorField, state.messageStatus)
     return BillPayResponse(
-        current_balance=balance,
+        current_balance=None if state.screenCleared else state.screenBalance,
         message=state.message,
         cursor_field=state.cursorField,
         tran_id=state.tranId,
@@ -440,25 +448,15 @@ def ClearedScreenResponse() -> BillPayResponse:
     return BillPayResponse(current_balance=None, message="", cursor_field=CURSOR_ACCT_ID)
 
 
-def ScreenError(
-    message: str, field: str, httpStatus: int, balance: Decimal | None
-) -> LegacyMessageError:
-    """Return the legacy error of a screen sent with ERR-FLG set, carrying CURBAL."""
-    details = LegacyErrorDetails(extraBody={CURRENT_BALANCE_BODY_KEY: FormatBalance(balance)})
-    return LegacyMessageError(message, field=field, httpStatus=httpStatus, details=details)
+def ScreenError(message: str, field: str, httpStatus: int) -> LegacyMessageError:
+    """Return the legacy error of a screen sent with ERR-FLG set: the four standard keys only."""
+    return LegacyMessageError(message, field=field, httpStatus=httpStatus)
 
 
-def RaiseScreenError(
-    message: str, field: str, httpStatus: int, balance: Decimal | None
-) -> NoReturn:
-    """Raise the legacy error of a screen sent with ERR-FLG set, carrying CURBAL.
+def RaiseScreenError(message: str, field: str, httpStatus: int) -> NoReturn:
+    """Raise the legacy error of a screen sent with ERR-FLG set: the four standard keys only.
 
     Raises:
         LegacyMessageError: always, with ``message``, the cursor ``field`` and ``httpStatus``.
     """
-    raise ScreenError(message, field, httpStatus, balance)
-
-
-def FormatBalance(balance: Decimal | None) -> str | None:
-    """Return CURBAL as the JSON string MoneyAmount serialises to (``str``), or None."""
-    return None if balance is None else str(balance)
+    raise ScreenError(message, field, httpStatus)

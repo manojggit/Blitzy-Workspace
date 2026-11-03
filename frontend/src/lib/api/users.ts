@@ -4,7 +4,10 @@
 // A property is optional exactly where its Pydantic field has a default, as the OpenAPI document
 // marks it. Every screen field travels as typed, never trimmed or case-folded: the server runs the
 // programs' presence checks, the U/D selection, the 10-row paging and the hashed-password change
-// detection on the raw text, and every legacy outcome reaches the caller as a rejected call.
+// detection on the raw text, and every legacy refusal reaches the caller as a rejected call.
+// On COUSR00, an invalid selection code is a rejected call whose 400 body carries the re-browsed
+// page (rows, page, first_key, last_key), and a search finding no user ID is a 200 page 1 with
+// a blank last_key, from which F8 is refused.
 import { API_CLIENT, EncodePathKey, type Direction, type PageState } from "@/lib/apiClient";
 
 const USERS_PATH = "/admin/users";
@@ -57,7 +60,10 @@ export interface UserSelectionRequest {
     search_user_id?: string;
 }
 
-// A route for a valid U or D selection; null when the list keys carry the re-browsed page.
+// A route for a valid U or D selection; null when the list keys carry the re-browsed page. An
+// invalid selection code is never this response: it is a rejected call whose 400 body carries
+// the re-browsed page. A search finding no user ID is this response on page 1, with the shown
+// rows read again and a blank last_key.
 export interface UserSelectionResponse extends UserListResponse {
     route?: string | null;
 }

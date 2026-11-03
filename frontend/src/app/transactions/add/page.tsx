@@ -266,6 +266,9 @@ interface AddKeyActions {
 interface AddFieldBinding {
     values: AddFieldValues;
     fieldErrors: readonly string[];
+    // True while a call runs: every input is locked, as the 3270 keyboard is, so the answer
+    // always applies to the form that was sent.
+    isBusy: boolean;
     inputsRef: RefObject<AddInputElements>;
     onFieldChange: (name: AddFieldName, value: string) => void;
 }
@@ -306,12 +309,12 @@ function IsInputName(name: string | null): name is AddFieldName {
     return INPUT_NAMES.some((inputName) => inputName === name);
 }
 
-// Replaces MOVE -1 TO <field>L: the input the server names takes the cursor; any other name, or
-// none, leaves the focus where it is.
+// Replaces MOVE -1 TO <field>L: the input the server names takes the cursor. Any other name, or
+// none (the abend text), puts it on ACTIDIN, the map's IC field, because the keyboard lock took
+// the focus from whatever held it while the call ran.
 function FocusCursorField(inputs: AddInputElements, cursorField: string | null): void {
-    if (IsInputName(cursorField)) {
-        inputs[cursorField]?.focus();
-    }
+    const focusedInput = IsInputName(cursorField) ? cursorField : FIRST_FIELD;
+    inputs[focusedInput]?.focus();
 }
 
 // The flat COTRN02 body: the key pressed beside the 14 fields exactly as keyed, because every
@@ -415,7 +418,8 @@ function ShowFailure(error: unknown, setters: AddScreenSetters): void {
 
 // One helper for ENTER and F5. The request sends the keyed values, the card as keyed rather than
 // the masked card shown; at the server a non-blank account, such as the one the prompt resolved,
-// takes precedence over the card. The form is updated from its latest state.
+// takes precedence over the card. Every input stays locked until the answer is applied, so the
+// form it updates is the form that was sent.
 async function SubmitAdd(
     action: TransactionAddAction,
     values: AddFieldValues,
@@ -554,8 +558,8 @@ function useTransactionAdd(): AddScreenModel {
     const shownValues = useMemo(() => DisplayedValues(values, servedCard), [values, servedCard]);
     const { fieldErrors } = feedback;
     const form = useMemo<AddFieldBinding>(
-        () => ({ values: shownValues, fieldErrors, inputsRef, onFieldChange }),
-        [shownValues, fieldErrors, onFieldChange],
+        () => ({ values: shownValues, fieldErrors, isBusy, inputsRef, onFieldChange }),
+        [shownValues, fieldErrors, isBusy, onFieldChange],
     );
     return { form, feedback, isBusy, keys };
 }
@@ -578,7 +582,7 @@ function StaticFieldProps(definition: AddFieldDefinition): TextFieldProps {
 }
 
 // No form element: useFunctionKeys handles ENTER from any input, and a native submit would add a
-// second action.
+// second action. The field is locked while the call runs.
 function AddTextField({ definition, form }: AddTextFieldProps) {
     const { name } = definition;
     const { inputsRef } = form;
@@ -588,6 +592,7 @@ function AddTextField({ definition, form }: AddTextFieldProps) {
             value={form.values[name]}
             onChange={(event) => form.onFieldChange(name, event.target.value)}
             error={form.fieldErrors.includes(name)}
+            disabled={form.isBusy}
             inputRef={(element: HTMLInputElement | null) => {
                 inputsRef.current[name] = element;
             }}
@@ -647,6 +652,7 @@ function TransactionConfirmField({ form }: FieldGroupProps) {
             value={form.values.confirm}
             onChange={(value) => form.onFieldChange(CONFIRM_FIELD, value)}
             error={form.fieldErrors.includes(CONFIRM_FIELD)}
+            disabled={form.isBusy}
             inputRef={(element: HTMLInputElement | null) => {
                 inputsRef.current[CONFIRM_FIELD] = element;
             }}

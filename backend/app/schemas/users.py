@@ -46,9 +46,10 @@ class UserListQuery(QueryModel):
         alias="startKey",
         description=(
             "Read only with a direction: the shown page's first_key (direction backward, F7) "
-            "or last_key (direction forward, F8). An empty or blank key on F8 answers "
-            "'You are already at the bottom of the page...'. A raw user ID of at most 8 "
-            "characters, which may hold spaces or any code-page-037 character."
+            "or last_key (direction forward, F8). An empty or blank key on F8 is NEXT-PAGE-NO, "
+            "the blank last_key of a search that found no user ID, and answers "
+            "'You are already at the bottom of the page...' before any read. A raw user ID of "
+            "at most 8 characters, which may hold spaces or any code-page-037 character."
         ),
     )
     direction: Direction | None = Field(
@@ -64,10 +65,10 @@ class UserListQuery(QueryModel):
         ge=0,
         alias="page",
         description=(
-            "The page number shown when the key was pressed (CDEMO-CU00-PAGE-NUM). 0 is the "
-            "screen an ENTER left when no user ID was at or after the search key, from which "
-            "F8 answers 'You are already at the bottom of the page...' and F7 "
-            "'You are already at the top of the page...'."
+            "The page number shown when the key was pressed (CDEMO-CU00-PAGE-NUM); 0 before "
+            "the first page. F7 on page 1 or 0 answers "
+            "'You are already at the top of the page...'. F8 reads after startKey from any "
+            "page."
         ),
     )
 
@@ -95,8 +96,9 @@ class UserListResponse(PageState):
     message: str = Field(
         default="",
         description=(
-            "The ERRMSG line, verbatim: a paging literal or "
-            "'Invalid selection. Valid values are U and D'; empty for none."
+            "The ERRMSG line, verbatim: a paging literal, or empty for none. "
+            "'Invalid selection. Valid values are U and D' is never a 200 message: it is "
+            "the 400 edit failure of POST /admin/users/selection."
         ),
     )
     cursor_field: str | None = Field(
@@ -127,7 +129,11 @@ class UserSelectionRequest(BaseModel):
     selections: list[UserSelection] = Field(
         default_factory=list,
         max_length=10,
-        description="The rows of the shown page with their selection codes; at most 10.",
+        description=(
+            "Every row of the shown page with its selection code, in screen order; at most 10. "
+            "The first row's user_id is the first key shown, from which the rows are read "
+            "again when the search finds no user ID."
+        ),
     )
     search_user_id: ScreenText(8) = Field(
         default="",
@@ -136,7 +142,12 @@ class UserSelectionRequest(BaseModel):
 
 
 class UserSelectionResponse(UserListResponse):
-    """The COUSR00 ENTER outcome (COUSR00C, CU00): a route, or the re-browsed page."""
+    """The COUSR00 ENTER outcome (COUSR00C, CU00): a route, or the re-browsed page.
+
+    An invalid selection code the re-browsed page still shows is not this model: it is a 400
+    whose body adds that page's ``rows``, ``page``, ``first_key`` and ``last_key`` to the four
+    standard keys.
+    """
 
     route: str | None = Field(
         default=None,

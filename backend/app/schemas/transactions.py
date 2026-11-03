@@ -46,8 +46,9 @@ class TransactionListQuery(QueryModel):
         alias="searchTranId",
         description=(
             "TRNIDIN search key as keyed, up to 16 characters. Blank starts at the lowest "
-            "TRAN-ID; non-numeric text returns 'Tran ID must be Numeric ...'; otherwise the "
-            "browse starts at the first TRAN-ID greater than or equal to it."
+            "TRAN-ID; non-numeric text is the 400 'Tran ID must be Numeric ...', leaving the "
+            "list unchanged ('You are at the top of the page...' on an empty file); otherwise "
+            "the browse starts at the first TRAN-ID greater than or equal to it, as page 1."
         ),
     )
     start_key: ScreenText(16) = Field(
@@ -65,8 +66,8 @@ class TransactionListQuery(QueryModel):
         description=(
             "The shown page's first_key (CDEMO-CT00-TRNID-FIRST), sent with direction forward: "
             "with a startKey (F8) and with an empty one (a search). When COTRN00C re-sends the "
-            "screen with its rows unchanged (F8 with no page after the last key, a non-numeric "
-            "search, a search that finds nothing), the service re-reads those rows from it. "
+            "screen with its rows unchanged (F8 with no page after the last key, a search that "
+            "finds nothing), the service re-reads those rows from it. "
             "A raw TRAN-ID of at most 16 code-page-037 characters; empty when no page is shown."
         ),
     )
@@ -120,9 +121,9 @@ class TransactionListResponse(PageState):
     message: str = Field(
         default="",
         description=(
-            "The ERRMSG line, verbatim: one of the five paging literals, "
-            "'Invalid selection. Valid value is S' or 'Tran ID must be Numeric ...'; empty for "
-            "none."
+            "The ERRMSG line, verbatim: one of the five paging literals, or empty for none. "
+            "'Invalid selection. Valid value is S' and 'Tran ID must be Numeric ...' are never "
+            "200 messages: they are 400 edit failures."
         ),
     )
     cursor_field: str | None = Field(
@@ -179,8 +180,8 @@ class TransactionSelectionRequest(BaseModel):
         default="",
         description=(
             "TRAN-ID of the first row shown (CDEMO-CT00-TRNID-FIRST), so the service can "
-            "return the unchanged list when the search key is non-numeric. A raw TRAN-ID of at "
-            "most 16 code-page-037 characters."
+            "read the shown rows again when the search finds no TRAN-ID at or after its key. A "
+            "raw TRAN-ID of at most 16 code-page-037 characters."
         ),
     )
     page: int = Field(
@@ -195,7 +196,10 @@ class TransactionSelectionResponse(TransactionListResponse):
 
     A valid ``S`` selection sets ``route``, replacing the XCTL to COTRN01C, and leaves
     ``search_cleared`` false. Otherwise ``route`` is null and the inherited list fields carry
-    the re-browsed page, its message and whether TRNIDIN was blanked.
+    the re-browsed page, its message and whether TRNIDIN was blanked. Neither edit failure is
+    this model. An invalid selection code the browsed page still shows is a 400 whose body adds
+    that page's ``rows``, ``page``, ``first_key``, ``last_key`` and ``search_cleared`` to the
+    four standard keys; a non-numeric search key is a 400 with the four keys only.
     """
 
     route: str | None = Field(

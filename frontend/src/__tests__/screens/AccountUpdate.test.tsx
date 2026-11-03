@@ -364,6 +364,8 @@ const CANCEL_KEY: UpdateKey = {
     action: UpdateAction.CANCEL,
 };
 const EXIT_KEY: FunctionKey = { buttonName: "Exit (F3)", key: "F3" };
+// The keys that send a PUT, as opposed to F3, which only navigates.
+const REQUEST_KEYS: readonly UpdateKey[] = [ENTER_KEY, SAVE_KEY, CANCEL_KEY];
 const INPUT_METHODS: readonly InputMethod[] = ["click", "key"];
 // ENTER, F5 and F12, each by its on-screen button and by its physical key.
 const ACTION_KEY_CASES: readonly ActionKeyCase[] = [ENTER_KEY, SAVE_KEY, CANCEL_KEY].flatMap(
@@ -780,6 +782,29 @@ async function SendsTokenOfLatestResponse(): Promise<void> {
     });
 }
 
+function ExpectRequestKeysEnabled(isEnabled: boolean): void {
+    for (const requestKey of REQUEST_KEYS) {
+        const button = screen.getByRole("button", { name: requestKey.buttonName });
+        expect(button).toHaveProperty("disabled", !isEnabled);
+    }
+}
+
+// The PUT stays in flight until the test settles it: meanwhile ENTER, F5 and F12 are disabled
+// and ignore their physical key, while F3 stays available.
+async function DisablesRequestKeysWhileBusy(updateKey: UpdateKey): Promise<void> {
+    const user = await RenderInState(UpdateScreenState.SHOW_DETAILS);
+    let settleUpdate: (accountScreen: AccountScreen) => void = () => undefined;
+    mockUpdateAccount.mockReturnValueOnce(new Promise((resolve) => (settleUpdate = resolve)));
+    await user.click(screen.getByRole("button", { name: updateKey.buttonName }));
+    ExpectRequestKeysEnabled(false);
+    expect(screen.getByRole("button", { name: EXIT_KEY.buttonName })).toBeEnabled();
+    await PressKey(updateKey.key);
+    expect(mockUpdateAccount).toHaveBeenCalledTimes(1);
+    await act(async () => settleUpdate(BuildAccountScreen(UpdateScreenState.SHOW_DETAILS)));
+    await WaitForIdle();
+    ExpectRequestKeysEnabled(true);
+}
+
 async function AdoptsScreenOfErrorBody(adoptionCase: AdoptionCase): Promise<void> {
     const user = await RenderInState(UpdateScreenState.CHANGES_OK_NOT_CONFIRMED);
     const errorScreen = BuildAccountScreen(adoptionCase.adoptedState, {
@@ -893,6 +918,10 @@ describe("COACTUPC /accounts/update actions", () => {
     it("COACTUPC ENTER with a blank ACCTSID reaches the key edit", SendsBlankKeyToKeyEdit);
     it("COACTUPC sends keyed text unchanged to TEST-NUMVAL-C", SendsKeyedTextUnchanged);
     it("COACTUPC F5 sends the screen_token of the latest response", SendsTokenOfLatestResponse);
+    it.each(REQUEST_KEYS)(
+        "COACTUPC $key disables ENTER, F5 and F12 but not F3 until its PUT settles",
+        DisablesRequestKeysWhileBusy,
+    );
     it.each(INPUT_METHODS)("COACTUPC F3 by %s returns to /menu without a PUT", ExitsToMainMenu);
 });
 

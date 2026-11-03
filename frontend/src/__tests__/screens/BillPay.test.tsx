@@ -3,7 +3,7 @@
 // and cbl/COBIL00C.cbl; field prompts and lengths from bms/COBIL00.bms.
 import { alertClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
@@ -20,7 +20,6 @@ import {
     SIGN_ON_ROUTE,
     type LegacyErrorResponse,
     type MessageSeverity,
-    type MoneyAmount,
 } from "@/lib/apiClient";
 import type { SessionContextValue } from "@/lib/session";
 
@@ -30,11 +29,6 @@ type MapKey = "ENTER" | "F3" | "F4";
 
 type KeyMethod = "button" | "physical key";
 
-// Every CB00 legacy error body carries CURBAL beside the four standard keys.
-interface BillPayErrorBody extends LegacyErrorResponse {
-    current_balance: MoneyAmount | null;
-}
-
 interface LiteralCase {
     request: BillPayRequest;
     status: number;
@@ -42,6 +36,11 @@ interface LiteralCase {
     severity: MessageSeverity;
     cursorField: BillPayInputName;
     tranId: string | null;
+}
+
+interface PendingPayBill {
+    Answer: (response: BillPayResponse) => void;
+    Fail: (error: unknown) => void;
 }
 
 const mockRouterPush = jest.fn();
@@ -117,7 +116,6 @@ const KEY_METHODS: readonly KeyMethod[] = ["button", "physical key"];
 const TEST_ACCOUNT_ID = "00000000004";
 const UNKNOWN_ACCOUNT_ID = "99999999999";
 const TEST_BALANCE = "194.00";
-const ZERO_BALANCE = "0.00";
 const TEST_TRAN_ID = "0000000000000002";
 
 // cbl/COBIL00C.cbl lines 161-543, as the cobil00c.py module constants hold them.
@@ -172,6 +170,8 @@ function ErrorCase(
 }
 
 // Every literal COBIL00C sends: first-failure edits, file conditions, the prompt and the payment.
+// ERRMSG is COLOR=RED, so the prompt sent with HTTP 200 is red too; only the written payment
+// moves DFHGREEN to ERRMSGC.
 const LITERAL_CASES: readonly LiteralCase[] = [
     ErrorCase(HTTP_EDIT_FAILURE, ACCT_ID_EMPTY_MESSAGE, "acct_id", BLANK_REQUEST),
     ErrorCase(HTTP_EDIT_FAILURE, INVALID_CONFIRM_MESSAGE, "confirm", INVALID_CONFIRM_REQUEST),
@@ -187,7 +187,7 @@ const LITERAL_CASES: readonly LiteralCase[] = [
         request: PROMPT_REQUEST,
         status: HTTP_OK,
         message: CONFIRM_PAYMENT_MESSAGE,
-        severity: "info",
+        severity: "error",
         cursorField: "confirm",
         tranId: null,
     },
@@ -201,6 +201,21 @@ const LITERAL_CASES: readonly LiteralCase[] = [
     },
 ];
 
+// Errors keyed on the prompt screen: an invalid answer, and a duplicate TRAN-ID after Y.
+const INVALID_CONFIRM_CASE = ErrorCase(
+    HTTP_EDIT_FAILURE,
+    INVALID_CONFIRM_MESSAGE,
+    "confirm",
+    INVALID_CONFIRM_REQUEST,
+);
+const DUPLICATE_TRAN_ID_CASE = ErrorCase(
+    HTTP_RECORD_CHANGED,
+    TRAN_ID_EXISTS_MESSAGE,
+    "acct_id",
+    PAY_REQUEST,
+);
+const KEPT_BALANCE_CASES: readonly LiteralCase[] = [INVALID_CONFIRM_CASE, DUPLICATE_TRAN_ID_CASE];
+
 // The confirmation prompt by default: CURBAL shown, the cursor on CONFIRM, nothing written.
 function BuildBillPayResponse(overrides: Partial<BillPayResponse> = {}): BillPayResponse {
     return {
@@ -212,13 +227,13 @@ function BuildBillPayResponse(overrides: Partial<BillPayResponse> = {}): BillPay
     };
 }
 
-function BuildErrorBody(overrides: Partial<BillPayErrorBody> = {}): BillPayErrorBody {
+// A CB00 legacy error body holds exactly the four standard keys; CURBAL is not among them.
+function BuildErrorBody(overrides: Partial<LegacyErrorResponse> = {}): LegacyErrorResponse {
     return {
         message: "",
         info_message: "",
         field_errors: [],
         cursor_field: "",
-        current_balance: null,
         ...overrides,
     };
 }
@@ -235,9 +250,19 @@ function BuildAxiosError(status: number, body: unknown): AxiosError {
     return new AxiosError("Request failed", code, config, undefined, response);
 }
 
-// A written payment ran INITIALIZE-ALL-FIELDS, so its screen carries no CURBAL; an error body
-// names its one failing field, as COBIL00C edits in first-failure mode.
-function MockOutcome({ status, message, cursorField, tranId }: LiteralCase): void {
+// An error body names its one failing field, as COBIL00C edits in first-failure mode.
+function FailureOf({ status, message, cursorField }: LiteralCase): AxiosError {
+    const body = BuildErrorBody({
+        message,
+        field_errors: [cursorField],
+        cursor_field: cursorField,
+    });
+    return BuildAxiosError(status, body);
+}
+
+// A written payment ran INITIALIZE-ALL-FIELDS, so its screen carries no CURBAL.
+function MockOutcome(literalCase: LiteralCase): void {
+    const { status, message, cursorField, tranId } = literalCase;
     if (status === HTTP_OK) {
         const balance = tranId === null ? TEST_BALANCE : null;
         const overrides = { message, cursor_field: cursorField, tran_id: tranId };
@@ -246,12 +271,7 @@ function MockOutcome({ status, message, cursorField, tranId }: LiteralCase): voi
         );
         return;
     }
-    const body = BuildErrorBody({
-        message,
-        field_errors: [cursorField],
-        cursor_field: cursorField,
-    });
-    mockPayBill.mockRejectedValue(BuildAxiosError(status, body));
+    mockPayBill.mockRejectedValue(FailureOf(literalCase));
 }
 
 function RenderScreen(): UserEvent {
@@ -324,7 +344,45 @@ async function ShowConfirmPrompt(user: UserEvent): Promise<void> {
     mockPayBill.mockResolvedValueOnce(BuildBillPayResponse());
     await KeyRequest(user, PROMPT_REQUEST);
     await UseMapKey(user, "ENTER", "button");
-    await ExpectAlert(CONFIRM_PAYMENT_MESSAGE, "info");
+    await ExpectAlert(CONFIRM_PAYMENT_MESSAGE, "error");
+}
+
+// The next PayBill call stays pending until the test answers or fails it through these handles.
+function DeferPayBill(): PendingPayBill {
+    const pending: PendingPayBill = { Answer: () => undefined, Fail: () => undefined };
+    mockPayBill.mockImplementationOnce(
+        () =>
+            new Promise<BillPayResponse>((resolve, reject) => {
+                pending.Answer = resolve;
+                pending.Fail = reject;
+            }),
+    );
+    return pending;
+}
+
+// Settles the pending call inside act, so the page applies the outcome before the assertions.
+async function Settle(settleCall: () => void): Promise<void> {
+    await act(async () => {
+        settleCall();
+    });
+}
+
+// The 3270 keyboard lock: ACTIDIN, CONFIRM, ENTER and F4 are frozen, F3 still leaves.
+function ExpectKeyboardLocked(): void {
+    expect(InputOf("acct_id")).toBeDisabled();
+    expect(InputOf("confirm")).toBeDisabled();
+    expect(screen.getByRole("button", { name: MAP_KEYS.ENTER.button })).toBeDisabled();
+    expect(screen.getByRole("button", { name: MAP_KEYS.F4.button })).toBeDisabled();
+    expect(screen.getByRole("button", { name: MAP_KEYS.F3.button })).toBeEnabled();
+}
+
+// Typing and the physical F4 while the call runs change nothing on the screen that was sent.
+async function TryToEditWhileLocked(user: UserEvent, confirmSent: string): Promise<void> {
+    await user.type(InputOf("acct_id"), UNKNOWN_ACCOUNT_ID);
+    await user.type(InputOf("confirm"), "N");
+    await PressKey(user, MAP_KEYS.F4.key);
+    expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID);
+    expect(InputOf("confirm")).toHaveValue(confirmSent);
 }
 
 beforeEach(() => {
@@ -368,7 +426,7 @@ it("COBIL00C ENTER key with a blank CONFIRM shows CURBAL and the confirm prompt"
     const user = RenderScreen();
     await KeyRequest(user, PROMPT_REQUEST);
     await PressKey(user, MAP_KEYS.ENTER.key);
-    await ExpectAlert(CONFIRM_PAYMENT_MESSAGE, "info");
+    await ExpectAlert(CONFIRM_PAYMENT_MESSAGE, "error");
     expect(mockPayBill).toHaveBeenCalledWith({ acct_id: TEST_ACCOUNT_ID, confirm: "" });
     expect(BalanceField()).toHaveValue(TEST_BALANCE);
     expect(InputOf("confirm")).toHaveFocus();
@@ -381,7 +439,7 @@ it.each(KEY_METHODS)(
         const user = RenderScreen();
         await KeyRequest(user, { acct_id: TEST_ACCOUNT_ID, confirm: "y" });
         await UseMapKey(user, "ENTER", method);
-        await ExpectAlert(CONFIRM_PAYMENT_MESSAGE, "info");
+        await ExpectAlert(CONFIRM_PAYMENT_MESSAGE, "error");
         expect(mockPayBill).toHaveBeenCalledTimes(1);
         expect(mockPayBill).toHaveBeenCalledWith({ acct_id: TEST_ACCOUNT_ID, confirm: "y" });
     },
@@ -400,20 +458,58 @@ it.each(LITERAL_CASES)(
     },
 );
 
-it("COBIL00C nothing to pay keeps CURBAL from the error body", async () => {
-    const body = BuildErrorBody({
-        message: NOTHING_TO_PAY_MESSAGE,
-        field_errors: ["acct_id"],
-        cursor_field: "acct_id",
-        current_balance: ZERO_BALANCE,
-    });
-    mockPayBill.mockRejectedValue(BuildAxiosError(HTTP_EDIT_FAILURE, body));
+// CURBAL is ASKIP,FSET: an error body carries no balance, so the screen keeps the one shown.
+it.each(KEPT_BALANCE_CASES)(
+    "COBIL00C $status $message keeps the CURBAL shown and the keyed fields",
+    async (literalCase) => {
+        const user = RenderScreen();
+        await ShowConfirmPrompt(user);
+        MockOutcome(literalCase);
+        await KeyInto(user, "confirm", literalCase.request.confirm ?? "");
+        await UseMapKey(user, "ENTER", "button");
+        await ExpectAlert(literalCase.message, "error");
+        expect(mockPayBill).toHaveBeenLastCalledWith(literalCase.request);
+        expect(BalanceField()).toHaveValue(TEST_BALANCE);
+        expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID);
+        expect(InputOf("confirm")).toHaveValue(literalCase.request.confirm);
+    },
+);
+
+// The account typed while the call runs cannot reach the screen, so the balance shown always
+// belongs to the account that was sent; the unlocked CONFIRM then takes the cursor.
+it("COBIL00C keyboard lock: nothing is keyed while PayBill runs", async () => {
+    const pendingPayBill = DeferPayBill();
     const user = RenderScreen();
     await KeyRequest(user, PROMPT_REQUEST);
     await UseMapKey(user, "ENTER", "button");
-    await ExpectAlert(NOTHING_TO_PAY_MESSAGE, "error");
-    expect(BalanceField()).toHaveValue(ZERO_BALANCE);
+    ExpectKeyboardLocked();
+    await TryToEditWhileLocked(user, "");
+    await Settle(() => pendingPayBill.Answer(BuildBillPayResponse()));
+    await ExpectAlert(CONFIRM_PAYMENT_MESSAGE, "error");
+    expect(InputOf("acct_id")).toBeEnabled();
+    expect(InputOf("confirm")).toBeEnabled();
+    expect(InputOf("confirm")).toHaveFocus();
+    expect(BalanceField()).toHaveValue(TEST_BALANCE);
     expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID);
+    expect(mockPayBill).toHaveBeenCalledTimes(1);
+});
+
+// F4 cannot clear while the call runs, so a late answer never repaints a cleared screen; the
+// cursor goes to the field the error names once the keyboard unlocks.
+it("COBIL00C PF4 is locked while PayBill runs, so its answer applies to the screen sent", async () => {
+    const user = RenderScreen();
+    await ShowConfirmPrompt(user);
+    const pendingPayBill = DeferPayBill();
+    await KeyInto(user, "confirm", "Y");
+    await UseMapKey(user, "ENTER", "button");
+    ExpectKeyboardLocked();
+    await TryToEditWhileLocked(user, "Y");
+    await Settle(() => pendingPayBill.Fail(FailureOf(DUPLICATE_TRAN_ID_CASE)));
+    await ExpectAlert(TRAN_ID_EXISTS_MESSAGE, "error");
+    expect(mockPayBill).toHaveBeenLastCalledWith(PAY_REQUEST);
+    expect(BalanceField()).toHaveValue(TEST_BALANCE);
+    expect(InputOf("acct_id")).toHaveFocus();
+    expect(screen.getByRole("button", { name: MAP_KEYS.F4.button })).toBeEnabled();
 });
 
 it("COBIL00C payment written: INITIALIZE-ALL-FIELDS blanks every field", async () => {
@@ -448,6 +544,7 @@ it("COBIL00C N answer: CLEAR-CURRENT-SCREEN blanks every field and the message",
     expect(InputOf("acct_id")).toHaveFocus();
 });
 
+// The abend names no field, so the unlocked keyboard puts the cursor on ACTIDIN (BMS IC).
 it("COBIL00C unexpected 500 shows the CSMSG02Y abend text", async () => {
     mockPayBill.mockRejectedValue(
         BuildAxiosError(HTTP_INTERNAL_SERVER_ERROR, "Internal Server Error"),
@@ -457,6 +554,7 @@ it("COBIL00C unexpected 500 shows the CSMSG02Y abend text", async () => {
     await UseMapKey(user, "ENTER", "button");
     await ExpectAlert(ABEND_MESSAGE_TEXT, "error");
     expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID);
+    expect(InputOf("acct_id")).toHaveFocus();
 });
 
 it("COBIL00C field_errors mark every named field and the cursor goes to cursor_field", async () => {

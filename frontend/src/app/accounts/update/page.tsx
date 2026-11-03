@@ -39,7 +39,7 @@ import {
     type MessageSeverity,
     type ScreenFeedback,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import { useFunctionKeys, type FunctionKeyDefinition, type PfKey } from "@/lib/useFunctionKeys";
 
 type AccountFieldName = keyof AccountScreenFields;
 
@@ -486,14 +486,21 @@ function HandleAction(action: UpdateAction, context: ActionContext): void {
     runRequest(() => UpdateAccount(accountKey, request));
 }
 
-// The FKEYS legend ENTER=Process F3=Exit, with F5=Save and F12=Cancel always offered: the
-// server processes a save or cancel its state does not allow as ENTER.
-function BuildFunctionKeys(handlers: KeyHandlers): FunctionKeyDefinition[] {
+// The FKEYS legend ENTER=Process F3=Exit, with F5=Save and F12=Cancel offered in every state: the
+// server processes a save or cancel its state does not allow as ENTER. ENTER, F5 and F12 each
+// send a request, so they are disabled while one is in flight; F3 only navigates.
+function BuildFunctionKeys(handlers: KeyHandlers, isBusy: boolean): FunctionKeyDefinition[] {
+    const requestKey = (key: PfKey, label: string, action: UpdateAction) => ({
+        key,
+        label,
+        onPress: () => handlers.onAction(action),
+        disabled: isBusy,
+    });
     return [
-        { key: "ENTER", label: "Process", onPress: () => handlers.onAction(UpdateAction.ENTER) },
+        requestKey("ENTER", "Process", UpdateAction.ENTER),
         { key: "F3", label: "Exit", onPress: handlers.onExit },
-        { key: "F5", label: "Save", onPress: () => handlers.onAction(UpdateAction.SAVE) },
-        { key: "F12", label: "Cancel", onPress: () => handlers.onAction(UpdateAction.CANCEL) },
+        requestKey("F5", "Save", UpdateAction.SAVE),
+        requestKey("F12", "Cancel", UpdateAction.CANCEL),
     ];
 }
 
@@ -562,14 +569,18 @@ function useCursorFocus(store: ScreenStore, inputRefs: RefObject<InputRefMap>) {
     }, [feedback, model.state, inputRefs]);
 }
 
-function useFunctionKeyDefinitions(model: ScreenModel, runRequest: RequestRunner) {
+function useFunctionKeyDefinitions(store: ScreenStore, runRequest: RequestRunner) {
     const router = useRouter();
+    const { model, isBusy } = store;
     const onAction = useCallback(
         (action: UpdateAction) => HandleAction(action, { model, runRequest }),
         [model, runRequest],
     );
     const onExit = useCallback(() => router.push(MENU_ROUTE), [router]);
-    return useMemo(() => BuildFunctionKeys({ onAction, onExit }), [onAction, onExit]);
+    return useMemo(
+        () => BuildFunctionKeys({ onAction, onExit }, isBusy),
+        [onAction, onExit, isBusy],
+    );
 }
 
 // Each input registers its element, so a response can move the cursor to it.
@@ -610,7 +621,7 @@ function useAccountUpdateScreen(): AccountUpdateScreenModel {
     const acctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY);
     useEntryRequest(acctId, runRequest, store.setters);
     useCursorFocus(store, registry.inputRefs);
-    const keys = useFunctionKeyDefinitions(store.model, runRequest);
+    const keys = useFunctionKeyDefinitions(store, runRequest);
     const view = useFieldView(store, registry);
     return { view, keys, isBusy: store.isBusy, feedback: store.feedback };
 }

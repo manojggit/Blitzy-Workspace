@@ -390,7 +390,8 @@ interface FunctionKeyHandlers {
 }
 
 // ENTER=Continue  F3=Back, the map's whole legend. ENTER is inactive while a request runs, as the
-// 3270 keyboard stays locked until the program answers, so one ENTER is one request.
+// 3270 keyboard stays locked until the program answers, so one ENTER is one request; the criteria
+// fields are locked with it (ReportCriteriaSection). F3 still leaves the screen.
 function BuildFunctionKeys({
     onEnter,
     onBack,
@@ -577,6 +578,7 @@ function useReportForm(): ReportForm {
 interface ReportTypeSelectorProps {
     value: ReportType | null;
     onChange: ReportTypeSetter;
+    disabled: boolean;
     firstButtonRef: Ref<HTMLButtonElement>;
     // The server names reportType in cursor_field or field_errors.
     isFlagged: boolean;
@@ -620,14 +622,14 @@ function FlaggedSelectorProps(isFlagged: boolean): Partial<ToggleButtonGroupProp
 // clears the choice, as blanking the field did, so the no-selection literal stays reachable.
 function ReportTypeSelector(props: ReportTypeSelectorProps) {
     const orientation = useSelectorOrientation();
-    const handleChange = (_event: MouseEvent<HTMLElement>, next: ReportType | null): void => {
+    const handleChange = (_event: MouseEvent<HTMLElement>, next: ReportType | null): void =>
         props.onChange(next);
-    };
     return (
         <ToggleButtonGroup
             exclusive
             value={props.value}
             orientation={orientation}
+            disabled={props.disabled}
             onChange={handleChange}
             aria-label={REPORT_TYPE_GROUP_LABEL}
             {...FlaggedSelectorProps(props.isFlagged)}
@@ -656,10 +658,12 @@ interface DatePartInputProps {
     value: string;
     onChange: TextInputSetter;
     isFlagged: boolean;
+    disabled: boolean;
     inputRef: RefCallback<HTMLElement>;
 }
 
-function DatePartInput({ part, value, onChange, isFlagged, inputRef }: DatePartInputProps) {
+function DatePartInput(props: DatePartInputProps) {
+    const { part, value, onChange, isFlagged, disabled, inputRef } = props;
     return (
         <TextField
             label={part.label}
@@ -668,6 +672,7 @@ function DatePartInput({ part, value, onChange, isFlagged, inputRef }: DatePartI
                 onChange(part.name, event.target.value)
             }
             error={isFlagged}
+            disabled={disabled}
             variant="outlined"
             size="small"
             fullWidth
@@ -683,6 +688,7 @@ interface DatePartsFieldProps {
     inputs: ReportInputs;
     onChange: TextInputSetter;
     errorFields: readonly string[];
+    disabled: boolean;
     bindRef: FieldRefBinder;
 }
 
@@ -697,6 +703,7 @@ function DatePartsRow(props: DatePartsFieldProps) {
                         value={props.inputs[part.name]}
                         onChange={props.onChange}
                         isFlagged={props.errorFields.includes(part.name)}
+                        disabled={props.disabled}
                         inputRef={props.bindRef(part.name)}
                     />
                 </Grid>
@@ -745,6 +752,7 @@ function DateRangeFields({ form, errorFields }: ReportFieldsProps) {
             inputs={form.inputs}
             onChange={form.setTextInput}
             errorFields={errorFields}
+            disabled={form.isBusy}
             bindRef={form.bindRef}
         />
     ));
@@ -757,6 +765,7 @@ function ReportConfirmField({ form, errorFields }: ReportFieldsProps) {
             value={form.inputs.confirm}
             onChange={(value) => form.setTextInput("confirm", value)}
             error={errorFields.includes("confirm")}
+            disabled={form.isBusy}
             inputRef={form.bindRef("confirm")}
         />
     );
@@ -766,7 +775,9 @@ interface ReportFormSectionProps {
     form: ReportForm;
 }
 
-// The report type, both date ranges and the confirm flag, in map order.
+// The report type, both date ranges and the confirm flag, in map order. All of them are locked
+// while the request runs, as the 3270 keyboard is until CORPT00C answers, so the answer always
+// applies to the criteria that were sent; it unlocks them in the render that places the cursor.
 function ReportCriteriaSection({ form }: ReportFormSectionProps) {
     const errorFields = FlaggedFields(form.feedback);
     return (
@@ -774,6 +785,7 @@ function ReportCriteriaSection({ form }: ReportFormSectionProps) {
             <ReportTypeSelector
                 value={form.inputs.reportType}
                 onChange={form.setReportType}
+                disabled={form.isBusy}
                 firstButtonRef={form.bindRef("reportType")}
                 isFlagged={errorFields.includes("reportType")}
             />
