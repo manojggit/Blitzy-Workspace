@@ -49,6 +49,15 @@ const ADMIN_USERS_URL = "/admin/users";
 const CHANGES_FAILED_INFO = "Changes unsuccessful. Please try again";
 // COMEN01C keeps the trailing space of its literal (cbl/COMEN01C.cbl line 140).
 const ADMIN_ONLY_MESSAGE = "No access - Admin Only option... ";
+// The agreed bound on every call, pinned here rather than read back from the client. It must stay
+// a finite whole number of milliseconds longer than one backend statement (the backend's default
+// DB_COMMAND_TIMEOUT_SECONDS is 30), because axios reads 0 as no bound at all.
+const AGREED_REQUEST_TIMEOUT_MILLISECONDS = 60000;
+const BACKEND_STATEMENT_TIMEOUT_MILLISECONDS = 30000;
+const EXPECTED_LOOKUP_OPTIONS = {
+    withCredentials: true,
+    timeout: AGREED_REQUEST_TIMEOUT_MILLISECONDS,
+};
 
 function BuildRequestConfig(url: string, method = "get"): InternalAxiosRequestConfig {
     return { url, method, headers: new AxiosHeaders() };
@@ -76,6 +85,13 @@ function BuildAxiosError(status: number, body: unknown, url: string): AxiosError
 
 function BuildNetworkError(url: string): AxiosError {
     return new AxiosError("Network Error", AxiosError.ERR_NETWORK, BuildRequestConfig(url));
+}
+
+// What axios raises for a call that outlives its timeout: the call's own config and no response,
+// with ECONNABORTED, or ETIMEDOUT under transitional.clarifyTimeoutError.
+function BuildTimeoutError(code: string, config = BuildRequestConfig(ACCOUNT_URL)): AxiosError {
+    const message = `timeout of ${AGREED_REQUEST_TIMEOUT_MILLISECONDS}ms exceeded`;
+    return new AxiosError(message, code, config);
 }
 
 function BuildLegacyBody(
@@ -144,6 +160,23 @@ const ABEND_CASES: readonly { label: string; error: AxiosError }[] = [
     { label: "502 proxy page", error: BuildAxiosError(502, "<html>Bad Gateway</html>", "/cards") },
     { label: "422 detail list", error: BuildAxiosError(422, VALIDATION_BODY, "/transactions") },
     { label: "network failure", error: BuildNetworkError("/billpay") },
+    { label: "timeout", error: BuildTimeoutError(AxiosError.ECONNABORTED) },
+];
+
+// The client's default and the exported constant, each held to the pinned bound and to the
+// backend's statement bound.
+const CONFIGURED_TIMEOUT_CASES: readonly { source: string; timeout: number | undefined }[] = [
+    { source: "API_CLIENT.defaults.timeout", timeout: API_CLIENT.defaults.timeout },
+    { source: "REQUEST_TIMEOUT_MILLISECONDS", timeout: REQUEST_TIMEOUT_MILLISECONDS },
+];
+
+// A timed-out read and a timed-out write, under both codes axios gives a timeout. A write's outcome
+// is then unknown, since the server may still commit it, so neither is ever sent again.
+const TIMEOUT_CASES: readonly { method: string; code: string }[] = [
+    { method: "get", code: AxiosError.ECONNABORTED },
+    { method: "get", code: AxiosError.ETIMEDOUT },
+    { method: "put", code: AxiosError.ECONNABORTED },
+    { method: "put", code: AxiosError.ETIMEDOUT },
 ];
 
 // Only a call abandoned through its signal is a cancellation; every other failure keeps its
@@ -225,9 +258,36 @@ const LOOKUP_CASES: readonly {
     { nextRoute: undefined, currentPath: "/cards", navigates: true, storedRoute: null },
 ];
 
-const LOOKUP_FAILURE_CASES: readonly { currentPath: string; navigates: boolean }[] = [
-    { currentPath: "/cards", navigates: true },
-    { currentPath: DEFAULT_HOME_ROUTE, navigates: false },
+const LOOKUP_FAILURE_CASES: readonly {
+    failure: string;
+    error: AxiosError;
+    currentPath: string;
+    navigates: boolean;
+}[] = [
+    {
+        failure: "network failure",
+        error: BuildNetworkError(CURRENT_USER_URL),
+        currentPath: "/cards",
+        navigates: true,
+    },
+    {
+        failure: "network failure",
+        error: BuildNetworkError(CURRENT_USER_URL),
+        currentPath: DEFAULT_HOME_ROUTE,
+        navigates: false,
+    },
+    {
+        failure: "timeout",
+        error: BuildTimeoutError(AxiosError.ECONNABORTED, BuildRequestConfig(CURRENT_USER_URL)),
+        currentPath: "/cards",
+        navigates: true,
+    },
+    {
+        failure: "timeout",
+        error: BuildTimeoutError(AxiosError.ETIMEDOUT, BuildRequestConfig(CURRENT_USER_URL)),
+        currentPath: DEFAULT_HOME_ROUTE,
+        navigates: false,
+    },
 ];
 
 const SESSION_END_CASES = [
@@ -368,8 +428,39 @@ it("sends the session cookie on every call under /api/v1 (COMMAREA identity)", (
     expect(String(API_CLIENT.defaults.baseURL).endsWith(API_V1_PATH)).toBe(true);
     expect(API_CLIENT.defaults.baseURL).toBe(API_V1_URL);
     expect(API_CLIENT.defaults.withCredentials).toBe(true);
-    expect(API_CLIENT.defaults.timeout).toBe(REQUEST_TIMEOUT_MILLISECONDS);
 });
+
+it.each(CONFIGURED_TIMEOUT_CASES)(
+    "$source is the agreed 60 s bound, a whole number longer than one backend statement",
+    ({ timeout }) => {
+        expect(timeout).toBe(AGREED_REQUEST_TIMEOUT_MILLISECONDS);
+        expect(Number.isSafeInteger(timeout)).toBe(true);
+        expect(timeout).toBeGreaterThan(BACKEND_STATEMENT_TIMEOUT_MILLISECONDS);
+    },
+);
+
+it.each(TIMEOUT_CASES)(
+    "API_CLIENT $method sends the bound; its $code timeout rejects once, unretried, as the abend",
+    async ({ method, code }) => {
+        const adapter = jest.fn((config: InternalAxiosRequestConfig) =>
+            Promise.reject(BuildTimeoutError(code, config)),
+        );
+        const timedOutCall = API_CLIENT.request({ url: ACCOUNT_URL, method, adapter });
+        const rejection: unknown = await timedOutCall.then(
+            () => undefined,
+            (error: unknown) => error,
+        );
+        expect(adapter).toHaveBeenCalledTimes(1);
+        await expect(adapter.mock.results[0]?.value).rejects.toBe(rejection);
+        const sentTimeout = expect.objectContaining({
+            timeout: AGREED_REQUEST_TIMEOUT_MILLISECONDS,
+        });
+        expect(adapter).toHaveBeenCalledWith(sentTimeout);
+        ExpectNoRefusalEffects();
+        expect(ToScreenFeedback(rejection)).toStrictEqual(ABEND_FEEDBACK);
+        expect(IsCancelledRequest(rejection)).toBe(false);
+    },
+);
 
 it.each(ORIGIN_CASES)("backend origin %p roots every call at one /api/v1", async (origin) => {
     const expectedRoot = BACKEND_ORIGIN + API_V1_PATH;
@@ -454,7 +545,7 @@ it.each(LOOKUP_CASES)(
         expect(TakePendingMessage()).toBe(navigates ? ADMIN_ONLY_MESSAGE : "");
         expect(window.sessionStorage.getItem(HOME_ROUTE_KEY)).toBe(storedRoute);
         expect(lookupSpy).toHaveBeenCalledTimes(1);
-        const lookupOptions = expect.objectContaining({ withCredentials: true });
+        const lookupOptions = expect.objectContaining(EXPECTED_LOOKUP_OPTIONS);
         expect(lookupSpy).toHaveBeenCalledWith(CURRENT_USER_URL, lookupOptions);
     },
 );
@@ -473,13 +564,16 @@ it("403 refusals arriving together share one /auth/me lookup", async () => {
 });
 
 it.each(LOOKUP_FAILURE_CASES)(
-    "403 whose /auth/me lookup fails returns to the main menu (on $currentPath)",
-    async ({ currentPath, navigates }) => {
-        jest.spyOn(axios, "get").mockRejectedValue(BuildNetworkError(CURRENT_USER_URL));
+    "403 whose /auth/me lookup fails ($failure) asks once and returns to /menu (on $currentPath)",
+    async ({ error, currentPath, navigates }) => {
+        const lookupSpy = jest.spyOn(axios, "get").mockRejectedValue(error);
         window.history.pushState({}, "", currentPath);
         await ExpectRejectedUnchanged(BuildAxiosError(403, ADMIN_ONLY_BODY, ADMIN_USERS_URL));
         expect(NavigationWasAttempted(consoleErrorSpy)).toBe(navigates);
         expect(window.sessionStorage.getItem(HOME_ROUTE_KEY)).toBeNull();
+        expect(lookupSpy).toHaveBeenCalledTimes(1);
+        const lookupOptions = expect.objectContaining(EXPECTED_LOOKUP_OPTIONS);
+        expect(lookupSpy).toHaveBeenCalledWith(CURRENT_USER_URL, lookupOptions);
     },
 );
 

@@ -10,6 +10,7 @@ import type * as ApiClientModule from "@/lib/apiClient";
 import {
     ClearHomeRoute,
     HOME_ROUTE_KEY,
+    RedirectToSignOn,
     SetHomeRoute,
     SIGN_ON_ROUTE,
     type ReadOptions,
@@ -18,23 +19,35 @@ import { SessionProvider, useSession, type SessionContextValue } from "@/lib/ses
 
 jest.mock("@/lib/api/auth");
 
-// The real home-route bookkeeping still runs; the wrappers only record the calls session.tsx makes.
+// The real home-route bookkeeping and sign-on navigation still run; the wrappers only record the
+// calls session.tsx makes.
 jest.mock("@/lib/apiClient", () => {
     const actual = jest.requireActual<typeof ApiClientModule>("@/lib/apiClient");
     return {
         ...actual,
         SetHomeRoute: jest.fn(actual.SetHomeRoute),
         ClearHomeRoute: jest.fn(actual.ClearHomeRoute),
+        RedirectToSignOn: jest.fn(actual.RedirectToSignOn),
     };
 });
 
 const fetchCurrentUserMock = jest.mocked(FetchCurrentUser);
 const setHomeRouteMock = jest.mocked(SetHomeRoute);
 const clearHomeRouteMock = jest.mocked(ClearHomeRoute);
+const redirectToSignOnMock = jest.mocked(RedirectToSignOn);
 
 const MAIN_MENU_ROUTE = "/menu";
 const ADMIN_MENU_ROUTE = "/admin";
+const CURRENT_USER_PATH = "/auth/me";
 const HTTP_UNAUTHORIZED = 401;
+const HTTP_FORBIDDEN = 403;
+const HTTP_NOT_FOUND = 404;
+const HTTP_INTERNAL_SERVER_ERROR = 500;
+const HTTP_SERVICE_UNAVAILABLE = 503;
+
+// jsdom implements no navigation: every window.location.assign is reported through
+// console.error, because window.location cannot be mocked under jsdom 26.
+const NAVIGATION_NOT_IMPLEMENTED = "Not implemented: navigation";
 
 // Eight characters, the CDEMO-USER-ID PIC X(08) width.
 const TEST_USER_ID = "TESTUSR1";
@@ -97,27 +110,149 @@ const MOUNT_READ_CASES: readonly MountReadCase[] = [
     { path: MAIN_MENU_ROUTE, reads: 1, expectedUser: REGULAR_USER },
 ];
 
+// How every /auth/me read fails, on the page the provider mounts on, and the sign-on navigation
+// that failure leads to.
+interface MountFailureCase {
+    caseName: string;
+    path: string;
+    error: Error;
+    reads: number;
+    redirects: number;
+}
+
+interface RefreshFailureCase {
+    caseName: string;
+    path: string;
+    error: AxiosError;
+    reads: number;
+}
+
+const NETWORK_ERROR = BuildNoResponseError(AxiosError.ERR_NETWORK);
+
+// Off the sign-on page, a first read that nothing else answers (no answer, a timeout, a 5xx or
+// another status) goes to sign-on once, and is never retried. A 401 or 403 is the apiClient
+// interceptor's to route, and a cancellation is discarded. The sign-on page reads nothing, so it
+// never redirects to itself, even with the backend unreachable.
+const MOUNT_FAILURE_CASES: readonly MountFailureCase[] = [
+    {
+        caseName: "no answer (ERR_NETWORK)",
+        path: MAIN_MENU_ROUTE,
+        error: NETWORK_ERROR,
+        reads: 1,
+        redirects: 1,
+    },
+    {
+        caseName: "a timeout (ECONNABORTED)",
+        path: MAIN_MENU_ROUTE,
+        error: BuildNoResponseError(AxiosError.ECONNABORTED),
+        reads: 1,
+        redirects: 1,
+    },
+    {
+        caseName: "a timeout (ETIMEDOUT)",
+        path: MAIN_MENU_ROUTE,
+        error: BuildNoResponseError(AxiosError.ETIMEDOUT),
+        reads: 1,
+        redirects: 1,
+    },
+    {
+        caseName: "a 500",
+        path: MAIN_MENU_ROUTE,
+        error: BuildResponseError(HTTP_INTERNAL_SERVER_ERROR),
+        reads: 1,
+        redirects: 1,
+    },
+    {
+        caseName: "a 503",
+        path: MAIN_MENU_ROUTE,
+        error: BuildResponseError(HTTP_SERVICE_UNAVAILABLE),
+        reads: 1,
+        redirects: 1,
+    },
+    {
+        caseName: "a 404",
+        path: MAIN_MENU_ROUTE,
+        error: BuildResponseError(HTTP_NOT_FOUND),
+        reads: 1,
+        redirects: 1,
+    },
+    {
+        caseName: "a 401",
+        path: MAIN_MENU_ROUTE,
+        error: BuildResponseError(HTTP_UNAUTHORIZED),
+        reads: 1,
+        redirects: 0,
+    },
+    {
+        caseName: "a 403",
+        path: MAIN_MENU_ROUTE,
+        error: BuildResponseError(HTTP_FORBIDDEN),
+        reads: 1,
+        redirects: 0,
+    },
+    {
+        caseName: "a cancellation",
+        path: MAIN_MENU_ROUTE,
+        error: new CanceledError(),
+        reads: 1,
+        redirects: 0,
+    },
+    { caseName: "no answer", path: SIGN_ON_ROUTE, error: NETWORK_ERROR, reads: 0, redirects: 0 },
+];
+
+// RefreshSession reports a missing user to its caller and never navigates, whether it reads the
+// user after a login on the sign-on page or re-reads it on any other page.
+const REFRESH_FAILURE_CASES: readonly RefreshFailureCase[] = [
+    { caseName: "no answer", path: SIGN_ON_ROUTE, error: NETWORK_ERROR, reads: 1 },
+    {
+        caseName: "a 503",
+        path: SIGN_ON_ROUTE,
+        error: BuildResponseError(HTTP_SERVICE_UNAVAILABLE),
+        reads: 1,
+    },
+    { caseName: "no answer", path: MAIN_MENU_ROUTE, error: NETWORK_ERROR, reads: 2 },
+    {
+        caseName: "a 500",
+        path: MAIN_MENU_ROUTE,
+        error: BuildResponseError(HTTP_INTERNAL_SERVER_ERROR),
+        reads: 2,
+    },
+];
+
 // jsdom's starting URL, restored after a test moves to another page.
 const jsdomStartUrl = window.location.href;
+// The console.error each test's spy forwards every report but jsdom's navigation reports to.
+const unpatchedConsoleError = console.error.bind(console);
 
 let capturedSession: SessionContextValue | null = null;
+let consoleErrorSpy: jest.SpyInstance;
 
-function BuildUnauthorizedError(): AxiosError {
-    const config: InternalAxiosRequestConfig = { url: "/auth/me", headers: new AxiosHeaders() };
+function BuildCurrentUserConfig(): InternalAxiosRequestConfig {
+    return { url: CURRENT_USER_PATH, headers: new AxiosHeaders() };
+}
+
+// An /auth/me answer with an error status, coded as axios's settle codes it: a bad request below
+// 500, a bad response from 500 on.
+function BuildResponseError(status: number): AxiosError {
+    const config = BuildCurrentUserConfig();
     const response = {
-        status: HTTP_UNAUTHORIZED,
+        status,
         data: { message: "", info_message: "", field_errors: [], cursor_field: null },
         statusText: "",
         headers: {},
         config,
     };
-    return new AxiosError(
-        "Request failed",
-        AxiosError.ERR_BAD_REQUEST,
-        config,
-        undefined,
-        response,
-    );
+    const code =
+        status < HTTP_INTERNAL_SERVER_ERROR
+            ? AxiosError.ERR_BAD_REQUEST
+            : AxiosError.ERR_BAD_RESPONSE;
+    return new AxiosError("Request failed", code, config, undefined, response);
+}
+
+// An /auth/me call that got no answer at all: a network failure (ERR_NETWORK) or a timeout
+// (ECONNABORTED, or ETIMEDOUT under axios's clarifyTimeoutError).
+function BuildNoResponseError(code: string): AxiosError {
+    return new AxiosError("Request failed", code, BuildCurrentUserConfig());
 }
 
 function SessionConsumer({ onValue }: SessionConsumerProps): ReactElement {
@@ -188,6 +323,38 @@ function DeferCurrentUser(): (user: CurrentUserResponse) => void {
     return (user) => {
         resolveUser(user);
     };
+}
+
+// The rejecter of the first /auth/me read, which stays pending until the test fails it, whatever
+// its signal; every later read answers REGULAR_USER.
+function DeferFirstReadFailure(): (error: AxiosError) => void {
+    let rejectUser: (error: AxiosError) => void = () => undefined;
+    const pendingRead = new Promise<CurrentUserResponse>((_resolve, reject) => {
+        rejectUser = reject;
+    });
+    fetchCurrentUserMock.mockReturnValueOnce(pendingRead).mockResolvedValue(REGULAR_USER);
+    return (error) => {
+        rejectUser(error);
+    };
+}
+
+function IsNavigationReport(report: unknown): boolean {
+    const text = report instanceof Error ? report.message : String(report);
+    return text.includes(NAVIGATION_NOT_IMPLEMENTED);
+}
+
+// jsdom's navigation reports are counted, not printed. Every other report still prints, so an
+// act() warning stays visible.
+function ReportUnlessNavigation(...reports: unknown[]): void {
+    if (!IsNavigationReport(reports[0])) {
+        unpatchedConsoleError(...reports);
+    }
+}
+
+// The window.location.assign calls jsdom reported during this test.
+function NavigationAttempts(): number {
+    const reports: unknown[][] = consoleErrorSpy.mock.calls;
+    return reports.filter((report) => IsNavigationReport(report[0])).length;
 }
 
 async function RenderSignedOnSession(user: CurrentUserResponse): Promise<SessionContextValue> {
@@ -279,13 +446,47 @@ const ABANDONED_READ_CASES: readonly AbandonedReadCase[] = [
     },
 ];
 
+// The first read fails with no answer only after it was abandoned, so it changes nothing: the
+// read that replaced it, if any, alone decides the session.
+const ABANDONED_FIRST_READ_CASES: readonly AbandonedReadCase[] = [
+    {
+        caseName: "a newer RefreshSession",
+        Abandon: (session) => {
+            void session.RefreshSession();
+        },
+        expectedUser: REGULAR_USER,
+        expectedIsLoading: false,
+        expectedHomeRoute: MAIN_MENU_ROUTE,
+    },
+    {
+        caseName: "ClearSession (F3 sign-off)",
+        Abandon: (session) => {
+            session.ClearSession();
+        },
+        expectedUser: null,
+        expectedIsLoading: false,
+        expectedHomeRoute: null,
+    },
+    {
+        caseName: "unmounting the provider",
+        Abandon: (_session, view) => {
+            view.unmount();
+        },
+        expectedUser: null,
+        expectedIsLoading: true,
+        expectedHomeRoute: null,
+    },
+];
+
 beforeEach(() => {
     sessionStorage.clear();
     localStorage.clear();
     capturedSession = null;
+    consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(ReportUnlessNavigation);
 });
 
 afterEach(() => {
+    consoleErrorSpy.mockRestore();
     window.history.replaceState(null, "", jsdomStartUrl);
 });
 
@@ -323,7 +524,7 @@ it("records /admin for type A (COSGN00C CDEMO-USRTYP-ADMIN, XCTL to COADM01C)", 
 });
 
 it("401 from /auth/me leaves no current user (no COMMAREA, EIBCALEN = 0)", async () => {
-    fetchCurrentUserMock.mockRejectedValue(BuildUnauthorizedError());
+    fetchCurrentUserMock.mockRejectedValue(BuildResponseError(HTTP_UNAUTHORIZED));
     RenderSessionConsumer(CaptureSession);
     await WaitForSessionLoaded();
     expect(ShownValue(USER_ID_TEST_ID)).toBe(NO_USER_SHOWN);
@@ -524,3 +725,80 @@ it("on the sign-on page the provider's unsent mount read still aborts a page's r
     expect(ShownValue(USER_ID_TEST_ID)).toBe(NO_USER_SHOWN);
     expect(setHomeRouteMock).not.toHaveBeenCalled();
 });
+
+it.each(MOUNT_FAILURE_CASES)(
+    "mounted on $path, $caseName from /auth/me redirects to sign-on $redirects time(s)",
+    async ({ path, error, reads, redirects }) => {
+        window.history.replaceState(null, "", path);
+        fetchCurrentUserMock.mockRejectedValue(error);
+        RenderSessionConsumer(CaptureSession);
+        await WaitForSessionLoaded();
+        expect(fetchCurrentUserMock).toHaveBeenCalledTimes(reads);
+        expect(redirectToSignOnMock).toHaveBeenCalledTimes(redirects);
+        expect(NavigationAttempts()).toBe(redirects);
+        expect(LatestSession().currentUser).toBeNull();
+        expect(LatestSession().isLoading).toBe(false);
+        expect(setHomeRouteMock).not.toHaveBeenCalled();
+    },
+);
+
+it.each(ABANDONED_FIRST_READ_CASES)(
+    "a first read failing with no answer after $caseName never redirects to sign-on",
+    async ({ Abandon, expectedUser, expectedIsLoading, expectedHomeRoute }) => {
+        window.history.replaceState(null, "", MAIN_MENU_ROUTE);
+        const failFirstRead = DeferFirstReadFailure();
+        const view = RenderSessionConsumer(CaptureSession);
+        act(() => {
+            Abandon(LatestSession(), view);
+        });
+        expect(ReadSignal(0).aborted).toBe(true);
+        await act(async () => {
+            failFirstRead(NETWORK_ERROR);
+        });
+        expect(redirectToSignOnMock).not.toHaveBeenCalled();
+        expect(NavigationAttempts()).toBe(0);
+        expect(LatestSession().currentUser).toEqual(expectedUser);
+        expect(LatestSession().isLoading).toBe(expectedIsLoading);
+        expect(sessionStorage.getItem(HOME_ROUTE_KEY)).toBe(expectedHomeRoute);
+    },
+);
+
+it("StrictMode's effect re-run redirects a first read with no answer to sign-on once", async () => {
+    window.history.replaceState(null, "", MAIN_MENU_ROUTE);
+    fetchCurrentUserMock.mockRejectedValue(NETWORK_ERROR);
+    render(
+        <StrictMode>
+            <SessionProvider>
+                <SessionConsumer />
+            </SessionProvider>
+        </StrictMode>,
+    );
+    await WaitForSessionLoaded();
+    expect(fetchCurrentUserMock).toHaveBeenCalledTimes(2);
+    expect(ReadSignal(0).aborted).toBe(true);
+    expect(ReadSignal(1).aborted).toBe(false);
+    expect(redirectToSignOnMock).toHaveBeenCalledTimes(1);
+    expect(NavigationAttempts()).toBe(1);
+    expect(ShownValue(USER_ID_TEST_ID)).toBe(NO_USER_SHOWN);
+});
+
+it.each(REFRESH_FAILURE_CASES)(
+    "on $path, RefreshSession failing with $caseName gives no user and never redirects",
+    async ({ path, error, reads }) => {
+        window.history.replaceState(null, "", path);
+        fetchCurrentUserMock.mockResolvedValue(REGULAR_USER);
+        RenderSessionConsumer(CaptureSession);
+        await WaitForSessionLoaded();
+        fetchCurrentUserMock.mockRejectedValue(error);
+        let refreshedUser: CurrentUserResponse | null = REGULAR_USER;
+        await act(async () => {
+            refreshedUser = await LatestSession().RefreshSession();
+        });
+        expect(refreshedUser).toBeNull();
+        expect(fetchCurrentUserMock).toHaveBeenCalledTimes(reads);
+        expect(redirectToSignOnMock).not.toHaveBeenCalled();
+        expect(NavigationAttempts()).toBe(0);
+        expect(LatestSession().currentUser).toBeNull();
+        expect(LatestSession().isLoading).toBe(false);
+    },
+);

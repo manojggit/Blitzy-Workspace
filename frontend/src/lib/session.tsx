@@ -10,8 +10,11 @@
 //
 // The sign-on page has no user before login, so a provider mounted there starts signed out
 // without asking the server, and the page's RefreshSession after a successful login reads the
-// user. A provider mounted on any other page reads /auth/me at once, so a 401 there still reaches
-// the apiClient redirect to sign-on. RefreshSession reads /auth/me on every page.
+// user. A provider mounted on any other page reads /auth/me at once. A 401 there reaches the
+// apiClient redirect to sign-on and a 403 its return to the user's own menu; any other failed call
+// of that first read (no answer, a timeout, a 5xx or another status) goes to sign-on once through
+// the same apiClient redirect, unless the read was abandoned first. RefreshSession reads /auth/me
+// on every page and never navigates, so its caller decides what a missing user means.
 import {
     createContext,
     useCallback,
@@ -28,7 +31,14 @@ import {
 import axios from "axios";
 
 import { FetchCurrentUser, type CurrentUserResponse } from "@/lib/api/auth";
-import { ClearHomeRoute, IsCancelledRequest, SetHomeRoute, SIGN_ON_ROUTE } from "@/lib/apiClient";
+import {
+    ClearHomeRoute,
+    IsCancelledRequest,
+    IsInterceptorRoutedRefusal,
+    RedirectToSignOn,
+    SetHomeRoute,
+    SIGN_ON_ROUTE,
+} from "@/lib/apiClient";
 
 export interface SessionContextValue {
     currentUser: CurrentUserResponse | null;
@@ -73,26 +83,57 @@ const SESSION_CONTEXT = createContext<SessionContextValue | null>(null);
 const LOADING_SESSION_STATE: SessionState = { currentUser: null, isLoading: true };
 const SIGNED_OUT_SESSION_STATE: SessionState = { currentUser: null, isLoading: false };
 
+// As in the apiClient home-route lookup, the route is recorded only while the read is still
+// current.
+async function FetchSessionUser(read: SessionRead): Promise<CurrentUserResponse> {
+    const user = await FetchCurrentUser({ signal: read.signal });
+    if (read.IsCurrent()) {
+        SetHomeRoute(user.next_route);
+    }
+    return user;
+}
+
 // A read the tracker aborted is discarded silently. An axios error (a 401 when signed out, another
-// status, or no response) leaves no known user: the apiClient interceptor already sends a 401 to
-// sign-on, and each page's own calls show their legacy feedback. Any other error is a defect and
-// propagates. As in the apiClient home-route lookup, the route is recorded only while the read is
-// still current.
+// status, or no response) leaves no known user. Any other error is a defect and propagates.
+function NoKnownUser(error: unknown): null {
+    if (IsCancelledRequest(error) || axios.isAxiosError(error)) {
+        return null;
+    }
+    throw error;
+}
+
+// RefreshSession's read never navigates: its caller handles a missing user, and each page's own
+// calls show their legacy feedback.
 async function LoadCurrentUser(read: SessionRead): Promise<CurrentUserResponse | null> {
     try {
-        const user = await FetchCurrentUser({ signal: read.signal });
-        if (read.IsCurrent()) {
-            SetHomeRoute(user.next_route);
-        }
-        return user;
+        return await FetchSessionUser(read);
     } catch (error) {
-        if (IsCancelledRequest(error)) {
-            return null;
+        return NoKnownUser(error);
+    }
+}
+
+// A failure the apiClient interceptor does not already route: an axios error that is neither a
+// cancellation nor a 401 or 403. That is no answer at all (a network failure or a timeout), a 5xx,
+// or any other status.
+function IsUnroutedReadFailure(error: unknown): boolean {
+    if (!axios.isAxiosError(error) || IsCancelledRequest(error)) {
+        return false;
+    }
+    return !IsInterceptorRoutedRefusal(error);
+}
+
+// The provider's first read on any page but sign-on, whose page cannot be used without its user.
+// An unrouted failure sends the browser to sign-on only while the read is still current, so a read
+// abandoned by a newer read, ClearSession or the provider's disposal never navigates. No read is
+// retried.
+async function LoadCurrentUserOrSignOn(read: SessionRead): Promise<CurrentUserResponse | null> {
+    try {
+        return await FetchSessionUser(read);
+    } catch (error) {
+        if (IsUnroutedReadFailure(error) && read.IsCurrent()) {
+            RedirectToSignOn();
         }
-        if (axios.isAxiosError(error)) {
-            return null;
-        }
-        throw error;
+        return NoKnownUser(error);
     }
 }
 
@@ -122,7 +163,7 @@ async function NoUserBeforeLogin(): Promise<null> {
 // Runs in the mount effect, so only in the browser; the page is read from window.location, as
 // the apiClient 401 handler reads it.
 function MountUserLoader(): CurrentUserLoader {
-    return window.location.pathname === SIGN_ON_ROUTE ? NoUserBeforeLogin : LoadCurrentUser;
+    return window.location.pathname === SIGN_ON_ROUTE ? NoUserBeforeLogin : LoadCurrentUserOrSignOn;
 }
 
 // Keeps the user shown. An unchanged flag returns the same state, so React skips the render.

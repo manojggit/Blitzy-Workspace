@@ -441,15 +441,32 @@ export function LegacyErrorBody<T extends LegacyErrorResponse>(
     return { ...body, ...FeedbackFromBody(body) } as T & CompleteScreenFeedback;
 }
 
-function HandleUnauthorized(error: AxiosError): void {
+// The one navigation to sign-on, shared by the 401 handler and the session context's first read.
+// On the server, and on the sign-on page itself, it does nothing, so sign-on never reloads in a
+// loop.
+export function RedirectToSignOn(): void {
     if (typeof window === "undefined" || window.location.pathname === SIGN_ON_ROUTE) {
         return;
     }
+    window.location.assign(SIGN_ON_ROUTE);
+}
+
+// True for an axios error whose status HandleResponseError already acts on: a 401 goes to sign-on
+// and a 403 returns to the user's own menu. A caller never navigates again for such an error.
+export function IsInterceptorRoutedRefusal(error: unknown): boolean {
+    if (!axios.isAxiosError(error)) {
+        return false;
+    }
+    const status = error.response?.status;
+    return status === HTTP_UNAUTHORIZED || status === HTTP_FORBIDDEN;
+}
+
+function HandleUnauthorized(error: AxiosError): void {
     const url = error.config?.url ?? "";
     if (UNREDIRECTED_AUTH_PATHS.some((path) => url.endsWith(path))) {
         return;
     }
-    window.location.assign(SIGN_ON_ROUTE);
+    RedirectToSignOn();
 }
 
 // A next_route that is not a home route sends the user to the main menu and is not recorded. A
