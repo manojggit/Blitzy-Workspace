@@ -19,6 +19,7 @@ import {
     GetHomeRoute,
     HandleResponse,
     HandleResponseError,
+    HOME_ROUTE_ALLOWANCE,
     HOME_ROUTE_KEY,
     LegacyErrorBody,
     PENDING_MESSAGE_KEY,
@@ -28,10 +29,12 @@ import {
     SIGN_ON_ROUTE,
     StorePendingMessage,
     TakePendingMessage,
+    ToAllowedRoute,
     ToScreenFeedback,
     UpdateScreenState,
     type LegacyErrorResponse,
     type MessageSeverity,
+    type RouteAllowance,
 } from "@/lib/apiClient";
 
 // jsdom implements no navigation: every window.location.assign is reported through
@@ -598,6 +601,146 @@ it("any other sessionStorage error is a defect and propagates", () => {
     RefuseSessionStorage(defect);
     expect(() => StorePendingMessage(ADMIN_ONLY_MESSAGE)).toThrow(defect);
     expect(() => TakePendingMessage()).toThrow(defect);
+});
+
+// Allowances shaped like the pages' own: a menu's pathnames, and the CU00 selection pages with the
+// userId that COUSR00C's urlencode puts on them (a blank becomes "+"). The user IDs are fictitious.
+const MENU_ROUTE_ALLOWANCE: RouteAllowance = { pathnames: ["/accounts/view", "/billpay"] };
+const UPDATE_ROUTE = "/admin/users/update";
+const DELETE_ROUTE = "/admin/users/delete";
+const SELECTION_ROUTE_ALLOWANCE: RouteAllowance = {
+    pathnames: [UPDATE_ROUTE, DELETE_ROUTE],
+    queryKey: "userId",
+};
+// Any origin reads the canonical route back the way the target page's useSearchParams does.
+const READ_BACK_ORIGIN = "http://127.0.0.1";
+
+interface AllowedRouteCase {
+    route: string;
+    allowance: RouteAllowance;
+    canonicalRoute: string;
+    userId: string | null;
+}
+
+const ALLOWED_ROUTE_CASES: readonly AllowedRouteCase[] = [
+    { route: "/menu", allowance: HOME_ROUTE_ALLOWANCE, canonicalRoute: "/menu", userId: null },
+    { route: "/admin", allowance: HOME_ROUTE_ALLOWANCE, canonicalRoute: "/admin", userId: null },
+    {
+        route: "/billpay",
+        allowance: MENU_ROUTE_ALLOWANCE,
+        canonicalRoute: "/billpay",
+        userId: null,
+    },
+    {
+        route: `${UPDATE_ROUTE}?userId=TESTUSR1`,
+        allowance: SELECTION_ROUTE_ALLOWANCE,
+        canonicalRoute: `${UPDATE_ROUTE}?userId=TESTUSR1`,
+        userId: "TESTUSR1",
+    },
+    // Python's urlencode and URLSearchParams agree: "+" for a blank and %26 for "&".
+    {
+        route: `${DELETE_ROUTE}?userId=TEST+U%26R`,
+        allowance: SELECTION_ROUTE_ALLOWANCE,
+        canonicalRoute: `${DELETE_ROUTE}?userId=TEST+U%26R`,
+        userId: "TEST U&R",
+    },
+    // Any other spelling of the same value is re-encoded, never passed on as the server wrote it.
+    {
+        route: `${UPDATE_ROUTE}?userId=A%20B&`,
+        allowance: SELECTION_ROUTE_ALLOWANCE,
+        canonicalRoute: `${UPDATE_ROUTE}?userId=A+B`,
+        userId: "A B",
+    },
+    {
+        route: `${UPDATE_ROUTE}?userId=A=B%26C`,
+        allowance: SELECTION_ROUTE_ALLOWANCE,
+        canonicalRoute: `${UPDATE_ROUTE}?userId=A%3DB%26C`,
+        userId: "A=B&C",
+    },
+];
+
+interface RefusedRouteCase {
+    label: string;
+    route: unknown;
+    allowance: RouteAllowance;
+}
+
+function RefusedRoute(route: unknown, allowance = MENU_ROUTE_ALLOWANCE): RefusedRouteCase {
+    return { label: String(JSON.stringify(route)), route, allowance };
+}
+
+const REFUSED_ROUTE_CASES: readonly RefusedRouteCase[] = [
+    ...[null, undefined, 42, true, {}, ["/billpay"], ""].map((route) => RefusedRoute(route)),
+    ...[
+        "//evil.example",
+        "//evil.example/billpay",
+        "https://evil.example/billpay",
+        "javascript:alert(1)",
+        "data:text/html,<p>x</p>",
+        "/\\evil.example",
+        "/billpay\\..",
+        "/billpay/",
+        "/BILLPAY",
+        " /billpay",
+        "/billpay ",
+        "/billpay\n",
+        "/bill\tpay",
+        "/billpay\u0000",
+        "/accounts/../billpay",
+        "/accounts/%2e%2e/billpay",
+        "/billpay/.",
+        "/billpay?x=1",
+        "/billpay?",
+        "/billpay#x",
+        "/billpay?userId=TESTUSR1",
+    ].map((route) => RefusedRoute(route)),
+    ...[
+        UPDATE_ROUTE,
+        `${UPDATE_ROUTE}?`,
+        `${UPDATE_ROUTE}?userId=A&userId=B`,
+        `${UPDATE_ROUTE}?userId=`,
+        `${UPDATE_ROUTE}?userId`,
+        `${UPDATE_ROUTE}?userId=+`,
+        `${UPDATE_ROUTE}?userId=%20%09`,
+        `${UPDATE_ROUTE}?userId=A%00`,
+        `${UPDATE_ROUTE}?other=1`,
+        `${UPDATE_ROUTE}?userId=A&other=1`,
+        `${UPDATE_ROUTE}?userId=A=B&C`,
+        `${UPDATE_ROUTE}?userid=A`,
+        `${UPDATE_ROUTE}?userId=A#x`,
+        `${UPDATE_ROUTE}/?userId=A`,
+        "/admin/users/view?userId=A",
+        "//evil.example?userId=A",
+    ].map((route) => RefusedRoute(route, SELECTION_ROUTE_ALLOWANCE)),
+    ...[
+        "//evil.example",
+        "https://evil.example/menu",
+        "javascript:alert(1)",
+        "/menu/",
+        "/MENU",
+        "/menu?x=1",
+        "/menu#x",
+        " /menu",
+        "/menu\\..",
+    ].map((route) => RefusedRoute(route, HOME_ROUTE_ALLOWANCE)),
+    // A malformed allowance still never yields another origin or a rewritten path.
+    RefusedRoute("//evil.example", { pathnames: ["//evil.example"] }),
+    RefusedRoute("https://evil.example", { pathnames: ["https://evil.example"] }),
+    RefusedRoute("/a/../billpay", { pathnames: ["/a/../billpay"] }),
+    RefusedRoute("http://[", { pathnames: ["http://["] }),
+];
+
+it.each(ALLOWED_ROUTE_CASES)(
+    "ToAllowedRoute accepts $route as $canonicalRoute",
+    ({ route, allowance, canonicalRoute, userId }) => {
+        expect(ToAllowedRoute(route, allowance)).toBe(canonicalRoute);
+        const readBack = new URL(canonicalRoute, READ_BACK_ORIGIN).searchParams.get("userId");
+        expect(readBack).toBe(userId);
+    },
+);
+
+it.each(REFUSED_ROUTE_CASES)("ToAllowedRoute refuses $label", ({ route, allowance }) => {
+    expect(ToAllowedRoute(route, allowance)).toBeNull();
 });
 
 it.each(PATH_KEY_CASES)(

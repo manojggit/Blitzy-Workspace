@@ -779,3 +779,56 @@ it.each(CARRIED_MESSAGE_CASES)(
         expect(window.sessionStorage.getItem(PENDING_MESSAGE_KEY)).toBeNull();
     },
 );
+
+// Routes cousr00c._RouteWithUserId never builds: other sites, a script, another page, the update
+// or delete page without exactly one non-blank userId or with another key, and a non-string.
+const UNEXPECTED_SELECTION_ROUTES: readonly unknown[] = [
+    `https://evil.example/admin/users/update?userId=${TEST_USER_ID}`,
+    `//evil.example/admin/users/update?userId=${TEST_USER_ID}`,
+    "javascript:alert(1)",
+    `/admin/users/add?userId=${TEST_USER_ID}`,
+    "/admin/users/update",
+    "/admin/users/update?userId=",
+    "/admin/users/update?userId=+",
+    `/admin/users/update?userId=${TEST_USER_ID}&userId=TESTUSR2`,
+    `/admin/users/delete?userId=${TEST_USER_ID}&next=//evil.example`,
+    `/admin/users/delete?userId=${TEST_USER_ID}#top`,
+    `/admin/users/update/?userId=${TEST_USER_ID}`,
+    42,
+];
+
+// A 200 selection answer carrying a route its TypeScript type rules out, as unchecked JSON can.
+function SelectionAnswering(route: unknown): UserSelectionResponse {
+    const answer = { route };
+    return answer as UserSelectionResponse;
+}
+
+it.each(UNEXPECTED_SELECTION_ROUTES)(
+    "COUSR00C ENTER answered with route %p shows the abend text and never navigates",
+    async (route) => {
+        const user = await RenderLoadedScreen();
+        mockSelectUsers.mockResolvedValueOnce(SelectionAnswering(route));
+        await ChooseSelection(user, SELECTED_ROW_NUMBER, "U");
+        await user.click(SearchField());
+        await TriggerKey(user, "ENTER", "button");
+        await ExpectAlert(ABEND_MESSAGE, ERRMSG_SEVERITY);
+        await ExpectKeysReady();
+        expect(mockRouterPush).not.toHaveBeenCalled();
+        expect(SearchField()).toHaveFocus();
+        expect(BodyRowTexts()).toEqual(RowTextsOf(FIRST_PAGE_ROWS));
+    },
+);
+
+// COUSR00C's urlencode writes a blank as "+"; another spelling of the same user ID is rebuilt
+// with URLSearchParams before it reaches the router, so the delete page reads the same userId.
+it("COUSR00C ENTER opens the selection route re-encoded, not as the server wrote it", async () => {
+    const user = await RenderLoadedScreen();
+    mockSelectUsers.mockResolvedValueOnce({ route: "/admin/users/delete?userId=TEST%20U%26" });
+    await ChooseSelection(user, SELECTED_ROW_NUMBER, "D");
+    await user.click(SearchField());
+    await PressKey(user, "ENTER");
+    await waitFor(() => {
+        expect(mockRouterPush).toHaveBeenCalledWith("/admin/users/delete?userId=TEST+U%26");
+    });
+    expect(mockRouterPush).toHaveBeenCalledTimes(1);
+});

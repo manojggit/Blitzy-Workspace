@@ -66,6 +66,16 @@ export const HOME_ROUTE_KEY = "carddemo.homeRoute";
 // backend/app/schemas/auth.py. Any other stored or served value never reaches navigation.
 const HOME_ROUTES: readonly string[] = [DEFAULT_HOME_ROUTE, ADMIN_HOME_ROUTE];
 
+// The routes a server answer may navigate to: exactly one of the pathnames, with exactly one
+// queryKey parameter when a queryKey is given and with no query at all otherwise.
+export interface RouteAllowance {
+    readonly pathnames: readonly string[];
+    readonly queryKey?: string;
+}
+
+// The sign-on page's next_route and the recorded home route are checked against this one list.
+export const HOME_ROUTE_ALLOWANCE: RouteAllowance = { pathnames: HOME_ROUTES };
+
 // Their 401 bodies carry the sign-on literals (Wrong Password. Try again ...), which the sign-on
 // page shows instead of being redirected.
 const UNREDIRECTED_AUTH_PATHS = ["/auth/login", "/auth/logout"] as const;
@@ -211,9 +221,98 @@ export function TakePendingMessage(): string {
     return message;
 }
 
-// Exact comparison only: a home route is never trimmed, case-folded or parsed as a URL.
+// Only resolves a route for the same-origin check below; nothing is ever requested from it.
+const ROUTE_PARSE_ORIGIN = "http://route.invalid";
+// Whitespace, control characters, backslashes (which browsers read as "/") and fragments are
+// never part of a route the server answers, so a route holding any of them is refused unparsed.
+const UNSAFE_ROUTE_CHARACTERS = /[\s\p{Cc}\\#]/u;
+const CONTROL_CHARACTERS = /\p{Cc}/u;
+const QUERY_SEPARATOR = "?";
+
+interface RouteParts {
+    pathname: string;
+    query: string | null;
+}
+
+// The text before the first "?", and the text after it, or null when the route has no "?".
+function SplitRoute(route: string): RouteParts {
+    const separatorIndex = route.indexOf(QUERY_SEPARATOR);
+    if (separatorIndex === -1) {
+        return { pathname: route, query: null };
+    }
+    return { pathname: route.slice(0, separatorIndex), query: route.slice(separatorIndex + 1) };
+}
+
+// The value of the query's one parameter, or null when the query names any other key, repeats the
+// key, or gives it a blank value or a control character.
+function AllowedQueryValue(query: string, queryKey: string): string | null {
+    const parameters = new URLSearchParams(query);
+    const value = parameters.get(queryKey);
+    const isSingleKey = Array.from(parameters.keys()).length === 1;
+    if (!isSingleKey || value === null || value.trim() === "" || CONTROL_CHARACTERS.test(value)) {
+        return null;
+    }
+    return value;
+}
+
+// "" for a route with no query that needs none, "?" with the one allowed parameter re-encoded,
+// or null for any other query.
+function CanonicalQuery(query: string | null, queryKey: string | undefined): string | null {
+    if (queryKey === undefined) {
+        return query === null ? "" : null;
+    }
+    const value = query === null ? null : AllowedQueryValue(query, queryKey);
+    if (value === null) {
+        return null;
+    }
+    const parameters = new URLSearchParams();
+    parameters.set(queryKey, value);
+    return QUERY_SEPARATOR + parameters.toString();
+}
+
+// Only a pathname that starts with a single "/" is a path on this origin: "//" names a host, and
+// anything else a scheme or a path relative to the current page.
+function IsOriginPath(pathname: string): boolean {
+    return pathname.startsWith("/") && !pathname.startsWith("//");
+}
+
+// The URL parser has the final word, as a browser would read the route: it must stay on this
+// origin with the pathname unchanged, so no allowed pathname can name another site or be rewritten
+// by a dot segment. A path that starts with a single "/" always parses against a base.
+function StaysOnPathname(route: string, pathname: string): boolean {
+    if (!IsOriginPath(pathname)) {
+        return false;
+    }
+    const resolved = new URL(route, ROUTE_PARSE_ORIGIN);
+    return resolved.origin === ROUTE_PARSE_ORIGIN && resolved.pathname === pathname;
+}
+
+function CanonicalRoute(route: string, allowance: RouteAllowance): string | null {
+    const { pathname, query } = SplitRoute(route);
+    const canonicalQuery = CanonicalQuery(query, allowance.queryKey);
+    if (!allowance.pathnames.includes(pathname) || canonicalQuery === null) {
+        return null;
+    }
+    const canonicalRoute = pathname + canonicalQuery;
+    return StaysOnPathname(canonicalRoute, pathname) ? canonicalRoute : null;
+}
+
+// Every route a server answer names passes through here before it reaches navigation, because a
+// TypeScript type does not check the JSON that arrives. The answer is the canonical same-origin
+// route, rebuilt from the checked parts, or null for a value that is not a string, holds an unsafe
+// character, or is not exactly allowed: the pathname is never trimmed, case-folded or given a
+// trailing "/" or dot segment, and the query is absent without a queryKey, and with one holds
+// exactly that key once with a non-blank value.
+export function ToAllowedRoute(route: unknown, allowance: RouteAllowance): string | null {
+    if (typeof route !== "string" || UNSAFE_ROUTE_CHARACTERS.test(route)) {
+        return null;
+    }
+    return CanonicalRoute(route, allowance);
+}
+
+// Exact comparison only: a home route is never trimmed or case-folded, and carries no query.
 function IsHomeRoute(route: unknown): route is string {
-    return typeof route === "string" && HOME_ROUTES.includes(route);
+    return ToAllowedRoute(route, HOME_ROUTE_ALLOWANCE) !== null;
 }
 
 function ForgetHomeRoute(): void {

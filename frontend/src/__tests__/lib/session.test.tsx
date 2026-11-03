@@ -7,7 +7,7 @@ import { useEffect, type ReactElement } from "react";
 
 import { FetchCurrentUser, type CurrentUserResponse } from "@/lib/api/auth";
 import type * as ApiClientModule from "@/lib/apiClient";
-import { ClearHomeRoute, HOME_ROUTE_KEY, SetHomeRoute } from "@/lib/apiClient";
+import { ClearHomeRoute, HOME_ROUTE_KEY, SetHomeRoute, SIGN_ON_ROUTE } from "@/lib/apiClient";
 import { SessionProvider, useSession, type SessionContextValue } from "@/lib/session";
 
 jest.mock("@/lib/api/auth");
@@ -61,6 +61,23 @@ const NO_USER_SHOWN = "none";
 interface SessionConsumerProps {
     onValue?: (value: SessionContextValue) => void;
 }
+
+interface MountReadCase {
+    path: string;
+    reads: number;
+    expectedUser: CurrentUserResponse | null;
+}
+
+// The page the provider mounts on, with /auth/me answering REGULAR_USER. COSGN00C reads USRSEC
+// only once ENTER is pressed, so the sign-on page has no user to read before login; every other
+// page reads /auth/me at once.
+const MOUNT_READ_CASES: readonly MountReadCase[] = [
+    { path: SIGN_ON_ROUTE, reads: 0, expectedUser: null },
+    { path: MAIN_MENU_ROUTE, reads: 1, expectedUser: REGULAR_USER },
+];
+
+// jsdom's starting URL, restored after a test moves to another page.
+const jsdomStartUrl = window.location.href;
 
 let capturedSession: SessionContextValue | null = null;
 
@@ -153,6 +170,10 @@ beforeEach(() => {
     sessionStorage.clear();
     localStorage.clear();
     capturedSession = null;
+});
+
+afterEach(() => {
+    window.history.replaceState(null, "", jsdomStartUrl);
 });
 
 it("shows no user while /auth/me is pending, then the user it returns", async () => {
@@ -269,4 +290,34 @@ it("stored values never change the server's user type (USRSEC, not the terminal)
     expect(ShownValue(USER_TYPE_TEST_ID)).toBe("U");
     expect(setHomeRouteMock).toHaveBeenCalledWith(MAIN_MENU_ROUTE);
     expect(sessionStorage.getItem(HOME_ROUTE_KEY)).toBe(MAIN_MENU_ROUTE);
+});
+
+it.each(MOUNT_READ_CASES)(
+    "mounted on $path reads /auth/me $reads time(s) and ends loading",
+    async ({ path, reads, expectedUser }) => {
+        window.history.replaceState(null, "", path);
+        fetchCurrentUserMock.mockResolvedValue(REGULAR_USER);
+        RenderSessionConsumer(CaptureSession);
+        await WaitForSessionLoaded();
+        expect(fetchCurrentUserMock).toHaveBeenCalledTimes(reads);
+        expect(setHomeRouteMock).toHaveBeenCalledTimes(reads);
+        expect(LatestSession().currentUser).toEqual(expectedUser);
+        expect(LatestSession().isLoading).toBe(false);
+    },
+);
+
+it("on the sign-on page RefreshSession after login reads /auth/me once", async () => {
+    window.history.replaceState(null, "", SIGN_ON_ROUTE);
+    fetchCurrentUserMock.mockResolvedValue(ADMIN_USER);
+    RenderSessionConsumer(CaptureSession);
+    await WaitForSessionLoaded();
+    let refreshedUser: CurrentUserResponse | null = null;
+    await act(async () => {
+        refreshedUser = await LatestSession().RefreshSession();
+    });
+    expect(refreshedUser).toEqual(ADMIN_USER);
+    expect(fetchCurrentUserMock).toHaveBeenCalledTimes(1);
+    expect(ShownValue(USER_ID_TEST_ID)).toBe(TEST_ADMIN_ID);
+    expect(ShownValue(LOADING_TEST_ID)).toBe("false");
+    expect(setHomeRouteMock).toHaveBeenCalledWith(ADMIN_MENU_ROUTE);
 });

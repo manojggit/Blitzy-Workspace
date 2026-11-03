@@ -13,12 +13,15 @@ import { ScreenShell } from "@/components/ScreenShell";
 import { Logout } from "@/lib/api/auth";
 import { FetchAdminMenu, SelectAdminMenuOption, type MenuOption } from "@/lib/api/menu";
 import {
+    ABEND_MESSAGE,
     SIGN_ON_ROUTE,
     SeverityForOutcome,
     StorePendingMessage,
     TakePendingMessage,
+    ToAllowedRoute,
     ToScreenFeedback,
     type MessageSeverity,
+    type RouteAllowance,
 } from "@/lib/apiClient";
 import { useSession } from "@/lib/session";
 import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
@@ -33,6 +36,11 @@ const OPTION_FIELD = "option";
 const OPTION_LIST_LABEL = "Admin menu options";
 const CONTINUE_LABEL = "Continue";
 const EXIT_LABEL = "Exit";
+// The only pages a selection may open: the routes of the installed options in ADMIN_MENU_OPTIONS
+// (backend/app/services/menu/menu_options.py, COADM02Y); options 5 and 6 have none.
+const ADMIN_MENU_ROUTE_ALLOWANCE: RouteAllowance = {
+    pathnames: ["/admin/users", "/admin/users/add", "/admin/users/update", "/admin/users/delete"],
+};
 
 // ERRMSG is COLOR=RED on the map, so edit failures and carried-over refusals render as errors.
 const ERROR_SEVERITY: MessageSeverity = SeverityForOutcome({
@@ -70,6 +78,10 @@ interface MenuLoadResult {
 
 // A route replaces the XCTL to the option's program; anything else stays on the menu.
 type SelectionOutcome = { route: string } | { screenMessage: ScreenMessage };
+
+// The thank-you literal once the server has cleared the session cookie; otherwise the failure's
+// message, shown while the session stays signed on.
+type SignOffOutcome = { thankYouMessage: string } | { screenMessage: ScreenMessage };
 
 interface BusyTracker {
     isBusy: boolean;
@@ -157,13 +169,28 @@ async function ReadAdminMenu(pendingMessage: ScreenMessage): Promise<MenuLoadRes
     }
 }
 
+// The XCTL to the option's program, only to a page the admin menu offers; any other route is an
+// unexpected answer and stays on the menu with the abend text in red.
+function RouteOutcome(route: unknown): SelectionOutcome {
+    const allowedRoute = ToAllowedRoute(route, ADMIN_MENU_ROUTE_ALLOWANCE);
+    if (allowedRoute === null) {
+        const screenMessage = {
+            message: ABEND_MESSAGE,
+            severity: ERROR_SEVERITY,
+            hasOptionError: false,
+        };
+        return { screenMessage };
+    }
+    return { route: allowedRoute };
+}
+
 // PROCESS-ENTER-KEY: the option text goes to the server raw, which runs the JUSTIFY, zero-fill
 // and NUMERIC edit itself.
 async function SelectOption(optionText: string): Promise<SelectionOutcome> {
     try {
         const response = await SelectAdminMenuOption({ option: optionText });
         if (response.route !== null) {
-            return { route: response.route };
+            return RouteOutcome(response.route);
         }
         const screenMessage = {
             message: response.message,
@@ -176,16 +203,15 @@ async function SelectOption(optionText: string): Promise<SelectionOutcome> {
     }
 }
 
-// The CSMSG01Y thank-you literal, or null when sign-off failed; the session ends either way.
-async function SignOffMessage(): Promise<string | null> {
+// POST /auth/logout clears the HttpOnly session cookie and answers the CSMSG01Y thank-you
+// literal. A failed call may never have reached the server, so its cookie can still be valid and
+// the failure is shown instead of a sign-off.
+async function SignOff(): Promise<SignOffOutcome> {
     try {
         const response = await Logout();
-        return response.message;
+        return { thankYouMessage: response.message };
     } catch (error) {
-        if (!axios.isAxiosError(error)) {
-            throw error;
-        }
-        return null;
+        return { screenMessage: ErrorMessageOf(error) };
     }
 }
 
@@ -199,13 +225,18 @@ async function HandleSelectOption(actions: MenuActions, optionText: string): Pro
     actions.ShowMessage(outcome.screenMessage);
 }
 
-// PF3: XCTL to COSGN00C, which the sign-on page replaces by showing the thank-you literal.
+// PF3: XCTL to COSGN00C, which the sign-on page replaces by showing the thank-you literal. The
+// identity is cleared only after the server confirms the sign-off; a failure stays on the menu
+// with its message, signed on, so F3 can be pressed again.
 async function HandleSignOff(actions: MenuActions): Promise<void> {
-    const signOffMessage = await actions.TrackBusy(SignOffMessage);
-    actions.ClearSession();
-    if (signOffMessage !== null) {
-        StorePendingMessage(signOffMessage);
+    actions.ShowMessage(NO_MESSAGE);
+    const outcome = await actions.TrackBusy(SignOff);
+    if ("screenMessage" in outcome) {
+        actions.ShowMessage(outcome.screenMessage);
+        return;
     }
+    actions.ClearSession();
+    StorePendingMessage(outcome.thankYouMessage);
     actions.router.push(SIGN_ON_ROUTE);
 }
 

@@ -13,13 +13,16 @@ import { ScreenShell } from "@/components/ScreenShell";
 import { Logout } from "@/lib/api/auth";
 import { FetchMainMenu, SelectMainMenuOption, type MenuOption } from "@/lib/api/menu";
 import {
+    ABEND_MESSAGE,
     SeverityForOutcome,
     SIGN_ON_ROUTE,
     StorePendingMessage,
     TakePendingMessage,
+    ToAllowedRoute,
     ToScreenFeedback,
     type MessageSeverity,
     type OutcomeFlags,
+    type RouteAllowance,
 } from "@/lib/apiClient";
 import { useSession } from "@/lib/session";
 import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
@@ -44,6 +47,22 @@ const FAILED_CALL_OUTCOME: OutcomeFlags = { isError: true, isCompletedWrite: fal
 // The selection answer carries no colour. COMEN01C paints the not-installed literal DFHRED; the
 // green coming-soon literal belongs to DUMMY entries, and no active COMEN02Y entry is one.
 const STAYED_ON_MENU_OUTCOME: OutcomeFlags = { isError: true, isCompletedWrite: false };
+// The only pages a selection may open: the routes of the installed options in MAIN_MENU_OPTIONS
+// (backend/app/services/menu/menu_options.py, COMEN02Y); option 11 has none.
+const MAIN_MENU_ROUTE_ALLOWANCE: RouteAllowance = {
+    pathnames: [
+        "/accounts/view",
+        "/accounts/update",
+        "/cards",
+        "/cards/view",
+        "/cards/update",
+        "/transactions",
+        "/transactions/view",
+        "/transactions/add",
+        "/reports/transactions",
+        "/billpay",
+    ],
+};
 
 type MenuRouter = ReturnType<typeof useRouter>;
 
@@ -174,6 +193,17 @@ function StayedOnMenuFeedback(message: string): MenuFeedback {
     };
 }
 
+// A route that is not an installed option's page is an unexpected answer: the abend text in red,
+// as a failed call shows it, with the cursor back on OPTION.
+function UnexpectedRouteFeedback(): MenuFeedback {
+    return {
+        ...NO_FEEDBACK,
+        isError: true,
+        message: ABEND_MESSAGE,
+        severity: SeverityForOutcome(FAILED_CALL_OUTCOME),
+    };
+}
+
 function IsOptionInError(feedback: MenuFeedback): boolean {
     return (
         feedback.cursorField === OPTION_FIELD_NAME ||
@@ -270,13 +300,24 @@ async function RunScreenCall(
     }
 }
 
+// The XCTL to the option's program, only to a page the main menu offers; any other route stays on
+// the menu with the abend text.
+function FollowRoute(context: MenuActionContext, route: unknown): void {
+    const allowedRoute = ToAllowedRoute(route, MAIN_MENU_ROUTE_ALLOWANCE);
+    if (allowedRoute === null) {
+        context.callContext.ShowFeedback(UnexpectedRouteFeedback());
+        return;
+    }
+    context.router.push(allowedRoute);
+}
+
 // PROCESS-ENTER-KEY: the server edits the raw option text and answers with the route replacing the
 // XCTL to the option's program, or with the message the menu shows instead.
 async function SubmitOption(context: MenuActionContext, optionText: string): Promise<void> {
     await RunScreenCall(context.callContext, async () => {
         const response = await SelectMainMenuOption({ option: optionText });
         if (response.route !== null) {
-            context.router.push(response.route);
+            FollowRoute(context, response.route);
             return;
         }
         context.callContext.ShowFeedback(StayedOnMenuFeedback(response.message));

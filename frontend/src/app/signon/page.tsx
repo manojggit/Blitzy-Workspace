@@ -22,8 +22,11 @@ import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components
 import { ScreenShell } from "@/components/ScreenShell";
 import { Login, Logout } from "@/lib/api/auth";
 import {
+    ABEND_MESSAGE,
+    HOME_ROUTE_ALLOWANCE,
     SeverityForOutcome,
     TakePendingMessage,
+    ToAllowedRoute,
     ToScreenFeedback,
     type MessageSeverity,
 } from "@/lib/apiClient";
@@ -34,6 +37,9 @@ const TRANSACTION_ID = "CC00";
 const PROGRAM_NAME = "COSGN00C";
 const SCREEN_TITLE = "This is a Credit Card Demo Application for Mainframe Modernization";
 const INSTRUCTION_TEXT = "Type your User ID and Password, then press ENTER:";
+// The BMS INITIAL texts of the COSGN00 USERID and PASSWD labels, verbatim.
+const USER_ID_LABEL = "User ID     :";
+const PASSWORD_LABEL = "Password    :";
 
 // BMS LENGTH=8 of both USERID and PASSWD.
 const CREDENTIAL_FIELD_LENGTH = 8;
@@ -62,7 +68,7 @@ interface CredentialFieldDefinition {
 const FIELD_DEFINITIONS: readonly CredentialFieldDefinition[] = [
     {
         name: "user_id",
-        label: "User ID",
+        label: USER_ID_LABEL,
         helperText: CREDENTIAL_HELPER_TEXT,
         maxLength: CREDENTIAL_FIELD_LENGTH,
         type: "text",
@@ -70,7 +76,7 @@ const FIELD_DEFINITIONS: readonly CredentialFieldDefinition[] = [
     },
     {
         name: "password",
-        label: "Password",
+        label: PASSWORD_LABEL,
         helperText: CREDENTIAL_HELPER_TEXT,
         maxLength: CREDENTIAL_FIELD_LENGTH,
         type: "password",
@@ -100,6 +106,14 @@ const FRESH_SCREEN_FEEDBACK: SignOnFeedback = {
 
 // A call in flight clears the message line but leaves the cursor where the user put it.
 const PENDING_CALL_FEEDBACK: SignOnFeedback = { ...FRESH_SCREEN_FEEDBACK, cursorField: null };
+
+// A next_route that is not a home route is an unexpected answer: the abend text in red, with the
+// cursor back on USERID as on a fresh screen.
+const UNEXPECTED_ROUTE_FEEDBACK: SignOnFeedback = {
+    ...FRESH_SCREEN_FEEDBACK,
+    message: ABEND_MESSAGE,
+    severity: ERROR_SEVERITY,
+};
 
 interface CredentialState {
     credentials: Credentials;
@@ -165,6 +179,50 @@ function FeedbackFromError(error: unknown): SignOnFeedback {
     };
 }
 
+// Logs out the session a refused login opened; neither its thank-you literal nor its failure is
+// shown. True once the server has confirmed the logout. An axios failure gives false: the cookie
+// the server never cleared may still be valid. Anything else is a defect and propagates.
+async function EndRefusedSession(): Promise<boolean> {
+    try {
+        await Logout();
+        return true;
+    } catch (error) {
+        if (!axios.isAxiosError(error)) {
+            throw error;
+        }
+        return false;
+    }
+}
+
+// The login has already set the session cookie, so a refused sign-on logs it out first. Once the
+// logout is confirmed, the session context forgets any earlier user as well: /signon reached by
+// client-side navigation (Back from a menu) still holds one, and the login replaced its cookie.
+// An unconfirmed logout may leave that session live, so the context reads it back from the server
+// instead of showing a sign-off that did not happen; F3 then retries the sign-off. Either way the
+// sign-on fails with the abend text, PASSWD re-sent empty, and the refused route is never followed.
+async function RefuseSignOn(context: SignOnContext): Promise<void> {
+    const isLoggedOut = await EndRefusedSession();
+    if (isLoggedOut) {
+        context.ClearSession();
+    } else {
+        await context.RefreshSession();
+    }
+    context.form.SetFeedback({ ...UNEXPECTED_ROUTE_FEEDBACK });
+    context.form.ClearPassword();
+}
+
+// The XCTL to COADM01C or COMEN01C, once the session context has read the new user. A next_route
+// that is not exactly a home route is never navigated to: the sign-on is refused instead.
+async function CompleteSignOn(context: SignOnContext, nextRoute: unknown): Promise<void> {
+    const homeRoute = ToAllowedRoute(nextRoute, HOME_ROUTE_ALLOWANCE);
+    if (homeRoute === null) {
+        await RefuseSignOn(context);
+        return;
+    }
+    await context.RefreshSession();
+    context.Navigate(homeRoute);
+}
+
 // ENTER (PROCESS-ENTER-KEY). The values go as typed: the server edits, upper-cases and verifies
 // them, and its next_route replaces the XCTL to COADM01C or COMEN01C. A failed sign-on re-sends
 // PASSWD empty, as the map did.
@@ -175,8 +233,7 @@ async function SubmitSignOn(context: SignOnContext): Promise<void> {
     form.SetBusy(true);
     try {
         const response = await Login({ ...form.credentials });
-        await context.RefreshSession();
-        context.Navigate(response.next_route);
+        await CompleteSignOn(context, response.next_route);
     } catch (error) {
         form.SetFeedback(FeedbackFromError(error));
         form.ClearPassword();

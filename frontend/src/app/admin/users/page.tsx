@@ -26,15 +26,18 @@ import {
     type SelectionRow,
 } from "@/components/SelectionTable";
 import {
+    ABEND_MESSAGE,
     Direction,
     LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
+    ToAllowedRoute,
     ToScreenFeedback,
     type CompleteScreenFeedback,
     type LegacyErrorResponse,
     type MessageSeverity,
     type PageState,
+    type RouteAllowance,
 } from "@/lib/apiClient";
 import {
     ListUsers,
@@ -73,6 +76,13 @@ const SELECTION_INSTRUCTION = "Type 'U' to Update or 'D' to Delete a User from t
 const SELECTION_FIELD_COUNT = 10;
 // PF3 moves COADM01C to CDEMO-TO-PROGRAM.
 const ADMIN_MENU_ROUTE = "/admin";
+// The only pages a U or D selection may open, with the selected user's userId: UPDATE_ROUTE,
+// DELETE_ROUTE and ROUTE_USER_ID_PARAMETER in backend/app/services/users/cousr00c.py (XCTL
+// COUSR02C and COUSR03C).
+const SELECTION_ROUTE_ALLOWANCE: RouteAllowance = {
+    pathnames: ["/admin/users/update", "/admin/users/delete"],
+    queryKey: "userId",
+};
 const BLANK_TEXT = "";
 // COUSR00C never changes ERRMSGC, so every message keeps the map's COLOR=RED.
 const LIST_MESSAGE_SEVERITY: MessageSeverity = SeverityForOutcome({
@@ -211,6 +221,19 @@ function ToSelections(screen: ListScreenState): UserSelection[] {
     }));
 }
 
+// The XCTL to COUSR02C or COUSR03C opens the route rebuilt from its checked pathname and userId,
+// never the server's own text. Any other route is an unexpected answer: the abend text, with the
+// cursor on USRIDIN as every COUSR00C send puts it, and the rows and codes kept.
+function FollowSelectionRoute(actions: ScreenActions, route: unknown): void {
+    const allowedRoute = ToAllowedRoute(route, SELECTION_ROUTE_ALLOWANCE);
+    if (allowedRoute === null) {
+        const feedback = { ...EMPTY_FEEDBACK, message: ABEND_MESSAGE, cursor_field: SEARCH_FIELD };
+        PatchScreen(actions.setScreen, { feedback });
+        return;
+    }
+    actions.router.push(allowedRoute);
+}
+
 // ENTER sends the search key exactly as typed. A U or D selection answers with the route of
 // the update or delete screen, replacing XCTL COUSR02C or COUSR03C.
 async function HandleEnter(actions: ScreenActions, screen: ListScreenState): Promise<void> {
@@ -218,7 +241,7 @@ async function HandleEnter(actions: ScreenActions, screen: ListScreenState): Pro
     try {
         const response = await SelectUsers(request);
         if (response.route) {
-            actions.router.push(response.route);
+            FollowSelectionRoute(actions, response.route);
             return;
         }
         PatchScreen(actions.setScreen, ShownPageUpdate(response, true));

@@ -80,8 +80,9 @@ const SCREEN_TITLE = "This is a Credit Card Demo Application for Mainframe Moder
 const INSTRUCTION_TEXT = "Type your User ID and Password, then press ENTER:";
 const TRANSACTION_TEXT = "Tran: CC00";
 const PROGRAM_TEXT = "Prog: COSGN00C";
-const USER_ID_LABEL = "User ID";
-const PASSWORD_LABEL = "Password";
+// The BMS INITIAL texts, verbatim: the colon and the inner blanks are part of each label.
+const USER_ID_LABEL = "User ID     :";
+const PASSWORD_LABEL = "Password    :";
 const CREDENTIAL_HELPER_TEXT = "(8 Char)";
 const CREDENTIAL_MAX_LENGTH = "8";
 const SIGN_ON_BUTTON = "Sign-on (Enter)";
@@ -253,8 +254,22 @@ async function RenderScreen(): Promise<{ user: UserEvent }> {
     return { user };
 }
 
+// The identity normalizer: the default one collapses the blanks the BMS labels keep.
+function KeepRawText(text: string): string {
+    return text;
+}
+
+function LabelledInput(label: string): HTMLInputElement {
+    return screen.getByLabelText<HTMLInputElement>(label, { normalizer: KeepRawText });
+}
+
+// The raw text of every label element attached to the input.
+function LabelTexts(input: HTMLInputElement): (string | null)[] {
+    return Array.from(input.labels ?? [], (labelElement) => labelElement.textContent);
+}
+
 function CredentialInput(field: CredentialField): HTMLElement {
-    return screen.getByLabelText(CREDENTIAL_LABELS[field]);
+    return LabelledInput(CREDENTIAL_LABELS[field]);
 }
 
 function SignOnButton(): HTMLElement {
@@ -358,6 +373,14 @@ function ExpectSessionRefreshedBeforeNavigation(): void {
     expect(refreshOrder).toBeLessThan(navigationOrder);
 }
 
+// An accepted sign-on keeps the session its login opened: the page reads no user itself, sends no
+// logout, and leaves the session context to RefreshSession.
+function ExpectLoginSessionKept(): void {
+    expect(fetchCurrentUserMock).not.toHaveBeenCalled();
+    expect(logoutMock).not.toHaveBeenCalled();
+    expect(clearSessionMock).not.toHaveBeenCalled();
+}
+
 // The session lives only in the HttpOnly cookie: the page keeps no token, role or password.
 function ExpectNothingStored(): void {
     expect(window.localStorage).toHaveLength(0);
@@ -407,10 +430,11 @@ describe("COSGN00C BMS COSGN00 content", () => {
     });
 
     it.each(CREDENTIAL_FIELD_CASES)(
-        "COSGN00 $label field is LENGTH=8 and of type $inputType",
+        "COSGN00 $label field has its verbatim label, LENGTH=8 and type $inputType",
         async ({ label, inputType }) => {
             await RenderScreen();
-            const input = screen.getByLabelText(label);
+            const input = LabelledInput(label);
+            expect(LabelTexts(input)).toEqual([label]);
             expect(input).toHaveAttribute("maxlength", CREDENTIAL_MAX_LENGTH);
             expect(input).toHaveAttribute("type", inputType);
         },
@@ -469,7 +493,7 @@ describe("COSGN00C XCTL to COADM01C or COMEN01C on /signon", () => {
             expect(refreshSessionMock).toHaveBeenCalledTimes(1);
             ExpectSessionRefreshedBeforeNavigation();
             expect(mockRouterReplace).not.toHaveBeenCalled();
-            expect(fetchCurrentUserMock).not.toHaveBeenCalled();
+            ExpectLoginSessionKept();
         },
     );
 });
@@ -612,5 +636,115 @@ describe("COSGN00C pending sign-off message on /signon", () => {
         await ExpectAlert(THANK_YOU_MESSAGE, "info");
         expect(window.sessionStorage.getItem(PENDING_MESSAGE_KEY)).toBeNull();
         expect(loginMock).not.toHaveBeenCalled();
+    });
+});
+
+// next_route values the backend's Literal["/admin", "/menu"] never sends: other sites, a script,
+// other pages and spellings of a home route that are not exactly it, and a missing route.
+const UNEXPECTED_NEXT_ROUTES: readonly unknown[] = [
+    "https://evil.example/menu",
+    "//evil.example",
+    "javascript:alert(1)",
+    "/admin/users",
+    "/menu/",
+    "/ADMIN",
+    "/menu?next=//evil.example",
+    " /menu",
+    null,
+];
+
+// A 200 sign-on carrying a route its TypeScript type rules out, as unchecked JSON can.
+function SignOnAnswering(nextRoute: unknown): LoginResponse {
+    const answer = { ...REGULAR_SIGN_ON, next_route: nextRoute };
+    return answer as LoginResponse;
+}
+
+const LOGOUT_PATH = "/auth/logout";
+
+// A logout that never reached the server: an axios error with no response.
+function BuildLogoutNetworkError(): AxiosError {
+    const config: InternalAxiosRequestConfig = {
+        url: LOGOUT_PATH,
+        method: "post",
+        headers: new AxiosHeaders(),
+    };
+    return new AxiosError("Network Error", AxiosError.ERR_NETWORK, config);
+}
+
+// The refused screen: no navigation, PASSWD empty, the cursor on USERID. The logout of the session
+// the login opened is sent once, after the login, and its thank-you literal never shows.
+function ExpectSignOnRefused(): void {
+    ExpectNoNavigation();
+    expect(CredentialInput("password")).toHaveValue("");
+    expect(CredentialInput("user_id")).toHaveValue(TEST_USER_ID);
+    expect(CredentialInput("user_id")).toHaveFocus();
+    expect(logoutMock).toHaveBeenCalledTimes(1);
+    const loginOrder = loginMock.mock.invocationCallOrder[0] ?? Infinity;
+    const logoutOrder = logoutMock.mock.invocationCallOrder[0] ?? -Infinity;
+    expect(loginOrder).toBeLessThan(logoutOrder);
+    expect(screen.queryByText(THANK_YOU_MESSAGE)).not.toBeInTheDocument();
+}
+
+// A confirmed logout ends the session: the context forgets any earlier user and reads none.
+function ExpectRefusedSessionLoggedOut(): void {
+    expect(clearSessionMock).toHaveBeenCalledTimes(1);
+    expect(refreshSessionMock).not.toHaveBeenCalled();
+}
+
+// An unconfirmed logout may leave the login's session live: the context is not cleared, and it
+// reads the session back once, after the failed logout.
+function ExpectRefusedSessionRecovered(): void {
+    expect(clearSessionMock).not.toHaveBeenCalled();
+    expect(refreshSessionMock).toHaveBeenCalledTimes(1);
+    const logoutOrder = logoutMock.mock.invocationCallOrder[0] ?? Infinity;
+    const refreshOrder = refreshSessionMock.mock.invocationCallOrder[0] ?? -Infinity;
+    expect(logoutOrder).toBeLessThan(refreshOrder);
+}
+
+// A refused sign-on whose logout never reaches the server; the next logout succeeds.
+async function RefuseSignOnWithFailedLogout(): Promise<void> {
+    loginMock.mockResolvedValue(SignOnAnswering(UNEXPECTED_NEXT_ROUTES[0]));
+    logoutMock.mockRejectedValueOnce(BuildLogoutNetworkError());
+    const { user } = await RenderScreen();
+    await TypeCredentials(user, TYPED_CREDENTIALS);
+    await user.click(SignOnButton());
+    await ExpectAlert(ABEND_MESSAGE, "error");
+    await WaitForIdle();
+}
+
+describe("COSGN00C unexpected next_route on /signon", () => {
+    it.each(UNEXPECTED_NEXT_ROUTES)(
+        "COSGN00C next_route %p ends the login's session, shows the abend text, never navigates",
+        async (nextRoute) => {
+            loginMock.mockResolvedValue(SignOnAnswering(nextRoute));
+            const { user } = await RenderScreen();
+            await TypeCredentials(user, TYPED_CREDENTIALS);
+            await user.click(SignOnButton());
+            await ExpectAlert(ABEND_MESSAGE, "error");
+            await WaitForIdle();
+            ExpectSignOnRefused();
+            ExpectRefusedSessionLoggedOut();
+        },
+    );
+});
+
+describe("COSGN00C unexpected next_route with a failed logout on /signon", () => {
+    it("COSGN00C keeps the unconfirmed session, rereads it and shows the abend text", async () => {
+        await RefuseSignOnWithFailedLogout();
+        ExpectSignOnRefused();
+        ExpectRefusedSessionRecovered();
+    });
+
+    it("COSGN00C F3 retries the sign-off and clears the session once it succeeds", async () => {
+        await RefuseSignOnWithFailedLogout();
+        await PressKey("F3");
+        await ExpectAlert(THANK_YOU_MESSAGE, "info");
+        await WaitForIdle();
+        expect(logoutMock).toHaveBeenCalledTimes(2);
+        expect(clearSessionMock).toHaveBeenCalledTimes(1);
+        expect(refreshSessionMock).toHaveBeenCalledTimes(1);
+        expect(screen.queryByText(ABEND_MESSAGE)).not.toBeInTheDocument();
+        expect(CredentialInput("user_id")).toHaveValue("");
+        ExpectNoNavigation();
     });
 });

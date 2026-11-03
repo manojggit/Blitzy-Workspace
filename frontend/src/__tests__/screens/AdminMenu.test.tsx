@@ -463,14 +463,68 @@ describe("COADM01C PF3 sign-off", () => {
         expect(mockSelectAdminMenuOption).not.toHaveBeenCalled();
         expect(TakePendingMessage()).toBe(THANK_YOU_MESSAGE);
     });
+});
 
-    it("COADM01C F3 still signs off when the sign-off call fails", async () => {
-        mockLogout.mockRejectedValue(BuildAxiosError(500, SERVER_ERROR_BODY));
+interface SignOffFailureCase {
+    cause: string;
+    error: AxiosError;
+    message: string;
+}
+
+// The request never reached the server, so axios rejects without a response.
+function BuildNetworkError(): AxiosError {
+    const config: InternalAxiosRequestConfig = { headers: new AxiosHeaders() };
+    return new AxiosError("Network Error", AxiosError.ERR_NETWORK, config);
+}
+
+// Sign-off calls whose session cookie the server never cleared, each with the message shown.
+const SIGN_OFF_FAILURE_CASES: readonly SignOffFailureCase[] = [
+    {
+        cause: "a 500 without a legacy body",
+        error: BuildAxiosError(500, SERVER_ERROR_BODY),
+        message: ABEND_MESSAGE,
+    },
+    { cause: "a network failure", error: BuildNetworkError(), message: ABEND_MESSAGE },
+    {
+        cause: "a 403 with a legacy body",
+        error: BuildAxiosError(403, BuildErrorBody({ message: ADMIN_ONLY_MESSAGE })),
+        message: ADMIN_ONLY_MESSAGE,
+    },
+];
+
+describe("COADM01C PF3 sign-off failure", () => {
+    it.each(SIGN_OFF_FAILURE_CASES)(
+        "COADM01C F3 after $cause stays signed on and shows $message",
+        async ({ error, message }) => {
+            mockLogout.mockRejectedValue(error);
+            const user = await RenderLoadedScreen();
+            await user.click(screen.getByRole("button", { name: EXIT_BUTTON }));
+            await ExpectAlert(message, "error");
+            await WaitForIdle();
+            expect(mockLogout).toHaveBeenCalledTimes(1);
+            expect(mockClearSession).not.toHaveBeenCalled();
+            expect(mockRouterPush).not.toHaveBeenCalled();
+            expect(TakePendingMessage()).toBe("");
+            expect(OptionField()).toHaveFocus();
+            expect(screen.getByRole("button", { name: EXIT_BUTTON })).toBeEnabled();
+            expect(screen.getByRole("button", { name: CONTINUE_BUTTON })).toBeEnabled();
+        },
+    );
+});
+
+describe("COADM01C PF3 sign-off retry", () => {
+    it("COADM01C F3 pressed again after a failed sign-off signs off to /signon", async () => {
+        mockLogout.mockRejectedValueOnce(BuildNetworkError());
         const user = await RenderLoadedScreen();
         await PressKey(user, "F3");
+        await ExpectAlert(ABEND_MESSAGE, "error");
+        await WaitForIdle();
+        await PressKey(user, "F3");
         await waitFor(() => expect(mockRouterPush).toHaveBeenCalledWith(SIGN_ON_ROUTE));
+        expect(mockLogout).toHaveBeenCalledTimes(2);
         expect(mockClearSession).toHaveBeenCalledTimes(1);
-        expect(TakePendingMessage()).toBe("");
+        expect(TakePendingMessage()).toBe(THANK_YOU_MESSAGE);
+        expect(screen.queryByRole("alert")).toBeNull();
     });
 });
 
@@ -498,4 +552,59 @@ describe("COADM01C 401 session refusal on a selection", () => {
         expect(screen.queryByRole("alert")).toBeNull();
         expect(mockRouterPush).not.toHaveBeenCalled();
     });
+});
+
+// The routes of options 1-4 in menu_options.ADMIN_MENU_OPTIONS.
+const INSTALLED_OPTION_ROUTES: readonly [number, string][] = [
+    [1, USER_LIST_ROUTE],
+    [2, USER_ADD_ROUTE],
+    [3, "/admin/users/update"],
+    [4, "/admin/users/delete"],
+];
+
+// Routes ADMIN_MENU_OPTIONS never answers: other sites, a script, a main-menu page, spellings of
+// an installed page that are not exactly its route, and a non-string.
+const UNEXPECTED_ROUTES: readonly unknown[] = [
+    "https://evil.example/admin/users",
+    "//evil.example",
+    "javascript:alert(1)",
+    "/accounts/view",
+    "/admin/users/",
+    "/admin/Users",
+    "/admin/users?userId=TESTUSR1",
+    {},
+];
+
+// A 200 selection answer carrying a route its TypeScript type rules out, as unchecked JSON can.
+function SelectionAnswering(route: unknown): MenuSelectionResponse {
+    const answer = { route, message: "" };
+    return answer as MenuSelectionResponse;
+}
+
+describe("COADM01C XCTL to the installed admin pages", () => {
+    it.each(INSTALLED_OPTION_ROUTES)("COADM01C option %d opens %s", async (number, route) => {
+        mockSelectAdminMenuOption.mockResolvedValue(BuildRouteResponse(route));
+        const user = await RenderLoadedScreen();
+        await SubmitOption(user, String(number));
+        await waitFor(() => expect(mockRouterPush).toHaveBeenCalledWith(route));
+        expect(mockRouterPush).toHaveBeenCalledTimes(1);
+        expect(mockSelectAdminMenuOption).toHaveBeenCalledWith({ option: String(number) });
+    });
+});
+
+describe("COADM01C unexpected selection route", () => {
+    it.each(UNEXPECTED_ROUTES)(
+        "COADM01C route %p shows the abend text in red and stays on /admin",
+        async (route) => {
+            mockSelectAdminMenuOption.mockResolvedValue(SelectionAnswering(route));
+            const user = await RenderLoadedScreen();
+            await SubmitOption(user, "1");
+            await ExpectAlert(ABEND_MESSAGE, "error");
+            await WaitForIdle();
+            expect(mockRouterPush).not.toHaveBeenCalled();
+            expect(OptionField()).toHaveFocus();
+            expect(OptionField()).toHaveAttribute("aria-invalid", "false");
+            expect(screen.getByRole("button", { name: CONTINUE_BUTTON })).toBeEnabled();
+        },
+    );
 });

@@ -7,6 +7,11 @@
 // and the server decides next_route. This module only reads the current user for the screen
 // header and the choice of menu. It stores no token, password or role, and user_type is passed
 // through as data only.
+//
+// The sign-on page has no user before login, so a provider mounted there starts signed out
+// without asking the server, and the page's RefreshSession after a successful login reads the
+// user. A provider mounted on any other page reads /auth/me at once, so a 401 there still reaches
+// the apiClient redirect to sign-on. RefreshSession reads /auth/me on every page.
 import {
     createContext,
     useCallback,
@@ -23,7 +28,7 @@ import {
 import axios from "axios";
 
 import { FetchCurrentUser, type CurrentUserResponse } from "@/lib/api/auth";
-import { ClearHomeRoute, SetHomeRoute } from "@/lib/apiClient";
+import { ClearHomeRoute, SetHomeRoute, SIGN_ON_ROUTE } from "@/lib/apiClient";
 
 export interface SessionContextValue {
     currentUser: CurrentUserResponse | null;
@@ -49,6 +54,9 @@ interface SessionReadTracker {
     InvalidateReads: () => void;
 }
 
+// Answers one session read; isCurrent reports whether that read is still the latest.
+type CurrentUserLoader = (isCurrent: () => boolean) => Promise<CurrentUserResponse | null>;
+
 const SESSION_CONTEXT = createContext<SessionContextValue | null>(null);
 const LOADING_SESSION_STATE: SessionState = { currentUser: null, isLoading: true };
 const SIGNED_OUT_SESSION_STATE: SessionState = { currentUser: null, isLoading: false };
@@ -70,6 +78,17 @@ async function LoadCurrentUser(isCurrent: () => boolean): Promise<CurrentUserRes
         }
         throw error;
     }
+}
+
+// Before login there is no user to read, so the server is not asked.
+async function NoUserBeforeLogin(): Promise<null> {
+    return null;
+}
+
+// Runs in the mount effect, so only in the browser; the page is read from window.location, as
+// the apiClient 401 handler reads it.
+function MountUserLoader(): CurrentUserLoader {
+    return window.location.pathname === SIGN_ON_ROUTE ? NoUserBeforeLogin : LoadCurrentUser;
 }
 
 // Keeps the user shown. An unchanged flag returns the same state, so React skips the render.
@@ -109,26 +128,36 @@ function useSessionReadTracker(): SessionReadTracker {
 }
 
 // The user stays shown until the answer arrives. A defect ends the loading state, keeps that
-// user, and still rejects to the caller.
+// user, and still rejects to the caller. The mount read starts in the loading state, which the
+// loading flag leaves unchanged, so its state changes only once the loader answers.
+async function ReadSession(
+    setSessionState: Dispatch<SetStateAction<SessionState>>,
+    readTracker: SessionReadTracker,
+    loadUser: CurrentUserLoader,
+): Promise<CurrentUserResponse | null> {
+    const isCurrent = readTracker.BeginRead();
+    setSessionState(LoadingUpdate(true));
+    try {
+        const user = await loadUser(isCurrent);
+        if (isCurrent()) {
+            setSessionState({ currentUser: user, isLoading: false });
+        }
+        return user;
+    } finally {
+        if (isCurrent()) {
+            setSessionState(LoadingUpdate(false));
+        }
+    }
+}
+
 function useRefreshSession(
     setSessionState: Dispatch<SetStateAction<SessionState>>,
     readTracker: SessionReadTracker,
 ): () => Promise<CurrentUserResponse | null> {
-    return useCallback(async () => {
-        const isCurrent = readTracker.BeginRead();
-        setSessionState(LoadingUpdate(true));
-        try {
-            const user = await LoadCurrentUser(isCurrent);
-            if (isCurrent()) {
-                setSessionState({ currentUser: user, isLoading: false });
-            }
-            return user;
-        } finally {
-            if (isCurrent()) {
-                setSessionState(LoadingUpdate(false));
-            }
-        }
-    }, [setSessionState, readTracker]);
+    return useCallback(
+        () => ReadSession(setSessionState, readTracker, LoadCurrentUser),
+        [setSessionState, readTracker],
+    );
 }
 
 function useClearSession(
@@ -148,8 +177,8 @@ function useSessionState(): SessionContextValue {
     const refreshSession = useRefreshSession(setSessionState, readTracker);
     const clearSession = useClearSession(setSessionState, readTracker);
     useEffect(() => {
-        void refreshSession();
-    }, [refreshSession]);
+        void ReadSession(setSessionState, readTracker, MountUserLoader());
+    }, [readTracker]);
     return useMemo(
         () => ({ ...sessionState, RefreshSession: refreshSession, ClearSession: clearSession }),
         [sessionState, refreshSession, clearSession],

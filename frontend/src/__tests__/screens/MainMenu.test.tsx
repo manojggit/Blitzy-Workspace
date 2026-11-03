@@ -452,3 +452,66 @@ it.each(UNAUTHORIZED_CASES)(
         expect(SIGN_ON_ROUTE).toBe("/signon");
     },
 );
+
+// CSMSG02Y ABEND-MSG: the menu's answer to a route no installed option has.
+const ABEND_MESSAGE = "UNEXPECTED ABEND OCCURRED.";
+
+// The routes of options 1-10 in menu_options.MAIN_MENU_OPTIONS, in option order.
+const INSTALLED_OPTION_ROUTES: readonly [number, string][] = [
+    "/accounts/view",
+    "/accounts/update",
+    "/cards",
+    "/cards/view",
+    "/cards/update",
+    "/transactions",
+    "/transactions/view",
+    "/transactions/add",
+    "/reports/transactions",
+    "/billpay",
+].map((route, index) => [index + 1, route]);
+
+// Routes MAIN_MENU_OPTIONS never answers: other sites, a script, an admin page, spellings of an
+// installed page that are not exactly its route, and a non-string.
+const UNEXPECTED_ROUTES: readonly unknown[] = [
+    "https://evil.example/accounts/view",
+    "//evil.example",
+    "javascript:alert(1)",
+    "/admin/users",
+    "/accounts/view/",
+    "/ACCOUNTS/VIEW",
+    "/accounts/view?acctId=00000000001",
+    "/accounts/view#top",
+    42,
+];
+
+// A 200 selection answer carrying a route its TypeScript type rules out, as unchecked JSON can.
+function SelectionAnswering(route: unknown): MenuSelectionResponse {
+    const answer = { route, message: "" };
+    return answer as MenuSelectionResponse;
+}
+
+it.each(INSTALLED_OPTION_ROUTES)("COMEN01C option %d opens its page %s", async (number, route) => {
+    mockSelectMainMenuOption.mockResolvedValue({ route, message: "" });
+    const user = await RenderLoadedScreen();
+    await user.click(OptionButton(number));
+    await waitFor(() => {
+        expect(mockRouterPush).toHaveBeenCalledWith(route);
+    });
+    expect(mockRouterPush).toHaveBeenCalledTimes(1);
+    expect(mockSelectMainMenuOption).toHaveBeenCalledWith({ option: String(number) });
+});
+
+it.each(UNEXPECTED_ROUTES)(
+    "COMEN01C route %p shows the abend text in red and stays on /menu",
+    async (route) => {
+        mockSelectMainMenuOption.mockResolvedValue(SelectionAnswering(route));
+        const user = await RenderLoadedScreen();
+        await user.type(OptionInput(), "1");
+        await user.click(KeyButton(CONTINUE_BUTTON_NAME));
+        await ExpectAlert(ABEND_MESSAGE, "error");
+        await WaitForIdle();
+        expect(mockRouterPush).not.toHaveBeenCalled();
+        expect(OptionInput()).toHaveFocus();
+        expect(KeyButton(CONTINUE_BUTTON_NAME)).toBeEnabled();
+    },
+);
