@@ -54,6 +54,7 @@ The batch suite (batch/tests/conftest.py) uses the same carddemo_test database. 
 run one after the other, never at the same time.
 """
 
+import asyncio
 import contextlib
 import functools
 import logging
@@ -517,8 +518,8 @@ class LoggedInClients:
         self.openClients: list[httpx.AsyncClient] = []
 
     async def LoginAs(self, userType: str) -> SignedOnClient:
-        """Create a user of ``userType``, sign it on, and return its client and user."""
-        user = self.createUser(userType)
+        """Create a ``userType`` user off the event loop, sign it on, return its client and user."""
+        user = await asyncio.to_thread(self.createUser, userType)
         client = BuildClient(self.application)
         self.openClients.append(client)
         credentials = {"user_id": user.userId, "password": user.password}
