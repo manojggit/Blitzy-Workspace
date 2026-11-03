@@ -3,7 +3,9 @@
 Replaces: AIX AWS.M2.CARDDEMO.CARDDATA.VSAM.AIX KEYS(11 16), CARDXREF.VSAM.AIX KEYS(11,25),
     TRANSACT.VSAM.AIX KEYS(26 304) with their PATHs and BLDINDEX steps (jobs CARDFILE,
     XREFFILE, TRANFILE, TRANIDX); the EBCDIC (cp037) key collating sequence of USRSEC, CARDDAT
-    and TRANSACT.
+    and TRANSACT, whose base clusters are AWS.M2.CARDDEMO.{USRSEC,CARDDATA,TRANSACT}.VSAM.KSDS;
+    copybooks CSUSR01Y (SEC-USR-ID), CVACT02Y (CARD-NUM, CARD-ACCT-ID), CVACT03Y (XREF-ACCT-ID,
+    XREF-CUST-ID), CVTRA05Y (TRAN-ID, TRAN-CARD-NUM, TRAN-PROC-TS) and CVTRA06Y (DALYTRAN-ID).
 
 Each NONUNIQUEKEY alternate index becomes a non-unique B-tree index on the same field, and a
 PATH plus BLDINDEX needs no counterpart because PostgreSQL maintains an index on every write.
