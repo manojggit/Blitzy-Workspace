@@ -1,6 +1,6 @@
 // Material Design 3 token theme for CardDemo (AAP 0.5); titles per COTTL01Y.
 import type { CSSProperties } from "react";
-import { createTheme, type CSSObject, type Theme } from "@mui/material/styles";
+import { createTheme, type CSSObject, type SxProps, type Theme } from "@mui/material/styles";
 import type { M3ShapeScale } from "@/theme/m3";
 
 /**
@@ -207,3 +207,20 @@ export const CARD_DEMO_THEME = createTheme({
         MuiAlert: { styleOverrides: { root: { borderRadius: M3_SHAPE_SCALE.small } } },
     },
 });
+
+/**
+ * Keeps text out of sight but in the accessibility tree, so screen readers still read it: the
+ * values of MUI's documented visuallyHidden helper, as an sx style. The 1px sizes and the -1px
+ * margin are strings because sx reads a bare 1 as 100% and a bare margin as theme spacing.
+ */
+export const VISUALLY_HIDDEN_STYLE: SxProps<Theme> = {
+    border: 0,
+    clipPath: "inset(50%)",
+    height: "1px",
+    margin: "-1px",
+    overflow: "hidden",
+    padding: 0,
+    position: "absolute",
+    whiteSpace: "nowrap",
+    width: "1px",
+};

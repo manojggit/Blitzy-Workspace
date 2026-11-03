@@ -14,9 +14,10 @@ import {
     type SetStateAction,
 } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Divider, Grid, TextField, type GridProps } from "@mui/material";
+import { Box, Divider, Grid, TextField, type GridProps } from "@mui/material";
 import axios from "axios";
 
+import { VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { MessageLine, type MessageLineProps } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
@@ -51,6 +52,10 @@ const BLANK_TEXT_PATTERN = /^ *$/;
 // to COTRN00C.
 const TRANSACTION_LIST_ROUTE = "/transactions";
 const MAIN_MENU_ROUTE = "/menu";
+
+// What a screen reader hears once a read fills the display fields. COTRN01C sends a blank ERRMSG
+// for a successful read, so the message line stays empty and this status reports the result.
+const DETAIL_SHOWN_STATUS = "Transaction details displayed";
 
 // TCATCD receives TRAN-CAT-CD PIC 9(04), so the integer code shows zero-padded to 4 digits.
 const CATEGORY_CODE_DIGITS = 4;
@@ -238,6 +243,10 @@ interface DetailFieldsProps {
 
 interface DetailFieldProps extends DetailFieldsProps {
     field: DetailFieldDefinition;
+}
+
+interface DetailStatusProps {
+    isDetailShown: boolean;
 }
 
 interface ViewContentProps {
@@ -486,6 +495,17 @@ function DetailFields({ detail }: DetailFieldsProps) {
     );
 }
 
+// A polite live region that stays rendered while empty. A read clears the display first, so
+// every read that fills it changes the text from empty and is announced once, without reading
+// the thirteen values or moving the cursor off TRNIDIN.
+function DetailStatus({ isDetailShown }: DetailStatusProps) {
+    return (
+        <Box role="status" aria-live="polite" sx={VISUALLY_HIDDEN_STYLE}>
+            {isDetailShown ? DETAIL_SHOWN_STATUS : ""}
+        </Box>
+    );
+}
+
 function MessageLinePropsOf(feedback: ViewFeedback): MessageLineProps {
     return {
         message: feedback.message,
@@ -513,6 +533,7 @@ function ViewContent({ view, functionKeys }: ViewContentProps) {
             />
             <Divider />
             <DetailFields detail={detail} />
+            <DetailStatus isDetailShown={detail !== null} />
             <MessageLine {...MessageLinePropsOf(feedback)} />
             <FunctionKeyBar keys={functionKeys} />
         </>

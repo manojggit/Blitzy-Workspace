@@ -2,7 +2,7 @@
 // Labels and lengths come from bms/COCRDSL.bms; every literal is copied verbatim from
 // backend/app/services/cards/cocrdslc.py, which ports cbl/COCRDSLC.cbl lines 639-760.
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
     AxiosError,
@@ -10,7 +10,7 @@ import {
     type AxiosResponse,
     type InternalAxiosRequestConfig,
 } from "axios";
-import type { ReactNode } from "react";
+import type { ReactElement, ReactNode } from "react";
 
 import CardViewPage from "@/app/cards/view/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
@@ -85,6 +85,9 @@ const mockViewCard = jest.mocked(ViewCard);
 // Test keys only: the card digits are built at runtime, so no card number is written in code.
 const TEST_ACCOUNT_ID = "00000000004";
 const TEST_CARD_REF = "card-ref-1";
+// A second COCRDLIC selection, for an arrival that names another card.
+const OTHER_ACCOUNT_ID = "00000000005";
+const OTHER_CARD_REF = "card-ref-2";
 const TYPED_CARD_NUMBER = "4".repeat(16);
 const MASKED_CARD_NUMBER = "*".repeat(12) + "4312";
 const PAN_PATTERN = /\d{16}/;
@@ -227,6 +230,16 @@ const EXIT_ACTIONS: readonly [string, ScreenAction][] = [
     [EXIT_BUTTON_NAME, (user) => ClickButton(user, EXIT_BUTTON_NAME)],
     ["the F3 key", (user) => PressKey(user, "F3")],
 ];
+// One synchronous ENTER by its button and by its physical key. Two of them inside one act both
+// land before React re-renders the disabled button, so only the page's in-flight guard can
+// refuse the second.
+const SAME_TURN_SEARCH_PRESSES: readonly [string, () => void][] = [
+    [
+        SEARCH_BUTTON_NAME,
+        () => fireEvent.click(screen.getByRole("button", { name: SEARCH_BUTTON_NAME })),
+    ],
+    ["the Enter key", () => fireEvent.keyDown(InputFor(CARD_LABEL), { key: "Enter" })],
+];
 
 // The default normalizer trims and collapses the blanks the COCRDSL labels and literals keep.
 function KeepRawText(text: string): string {
@@ -237,21 +250,39 @@ function InputFor(label: string): HTMLElement {
     return screen.getByLabelText(label, { normalizer: KeepRawText });
 }
 
-function RenderScreen(): ScreenUser {
-    const user = userEvent.setup();
-    render(
+function ScreenTree(): ReactElement {
+    return (
         <ThemeProvider theme={CARD_DEMO_THEME}>
             <CardViewPage />
-        </ThemeProvider>,
+        </ThemeProvider>
     );
+}
+
+// reactStrictMode adds the development double render and double effect run of next dev.
+function RenderScreen(reactStrictMode = false): ScreenUser {
+    const user = userEvent.setup();
+    render(ScreenTree(), { reactStrictMode });
     return user;
 }
 
 // A COCRDLIC selection opens the page with the card_ref token and the account as its query.
-function RenderFromCardList(): ScreenUser {
+function RenderFromCardList(reactStrictMode = false): ScreenUser {
     mockSearchParams = new URLSearchParams({ cardRef: TEST_CARD_REF, acctId: TEST_ACCOUNT_ID });
     mockViewCard.mockResolvedValue(BuildCardDetail());
-    return RenderScreen();
+    return RenderScreen(reactStrictMode);
+}
+
+// Every ViewCard read waits until the test calls the returned release. The executor runs at
+// once, so the resolver is assigned before it is returned. The answer then settles inside the
+// next Testing Library wait, as the page's other answers do.
+function HoldReads(): (detail: CardDetailResponse) => void {
+    let releaseRead: (detail: CardDetailResponse) => void = () => undefined;
+    mockViewCard.mockReturnValue(
+        new Promise<CardDetailResponse>((resolve) => {
+            releaseRead = resolve;
+        }),
+    );
+    return releaseRead;
 }
 
 // The 1200-SETUP-SCREEN-VARS answer for a found card: the number masked and no CVV.
@@ -439,6 +470,32 @@ describe("COCRDSLC entered from the COCRDLIC card list on /cards/view", () => {
     });
 });
 
+describe("COCRDSLC entered from the COCRDLIC card list under StrictMode on /cards/view", () => {
+    it("COCRDSLC reads the selected card once under the StrictMode double effect run", async () => {
+        RenderFromCardList(true);
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        expect(mockViewCard).toHaveBeenCalledTimes(1);
+        expect(mockViewCard).toHaveBeenCalledWith(TEST_CARD_REF, TEST_ACCOUNT_ID);
+    });
+});
+
+describe("COCRDSLC entered again with another COCRDLIC selection on /cards/view", () => {
+    it("COCRDSLC reads a newly selected card while the previous read is pending", async () => {
+        const releaseRead = HoldReads();
+        mockSearchParams = new URLSearchParams({ cardRef: TEST_CARD_REF, acctId: TEST_ACCOUNT_ID });
+        const { rerender } = render(ScreenTree());
+        mockSearchParams = new URLSearchParams({
+            cardRef: OTHER_CARD_REF,
+            acctId: OTHER_ACCOUNT_ID,
+        });
+        rerender(ScreenTree());
+        expect(mockViewCard).toHaveBeenCalledTimes(2);
+        expect(mockViewCard).toHaveBeenLastCalledWith(OTHER_CARD_REF, OTHER_ACCOUNT_ID);
+        releaseRead(BuildCardDetail());
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+    });
+});
+
 describe("COCRDSLC card details from the COCRDLIC card list on /cards/view", () => {
     it("COCRDSLC shows CRDNAME, CRDSTCD, EXPMON and EXPYEAR as read", async () => {
         RenderFromCardList();
@@ -496,6 +553,58 @@ describe("COCRDSLC PF keys from the main menu on /cards/view", () => {
         expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
         expect(mockViewCard).not.toHaveBeenCalled();
     });
+});
+
+describe("COCRDSLC one read at a time from the main menu on /cards/view", () => {
+    it.each(SAME_TURN_SEARCH_PRESSES)(
+        "COCRDSLC ENTER by %s twice in one turn reads the card once",
+        async (_, press) => {
+            const releaseRead = HoldReads();
+            const user = RenderScreen();
+            await TypeKeys(user, TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+            act(() => {
+                press();
+                press();
+            });
+            expect(mockViewCard).toHaveBeenCalledTimes(1);
+            releaseRead(BuildCardDetail());
+            await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+            expect(mockViewCard).toHaveBeenCalledTimes(1);
+        },
+    );
+});
+
+describe("COCRDSLC busy Search Cards key from the main menu on /cards/view", () => {
+    it("COCRDSLC disables Search Cards only while a read is pending", async () => {
+        const releaseRead = HoldReads();
+        const user = RenderScreen();
+        await TypeKeys(user, TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+        await PressKey(user, "Enter");
+        expect(screen.getByRole("button", { name: SEARCH_BUTTON_NAME })).toBeDisabled();
+        expect(screen.getByRole("button", { name: EXIT_BUTTON_NAME })).toBeEnabled();
+        await PressKey(user, "Enter");
+        expect(mockViewCard).toHaveBeenCalledTimes(1);
+        releaseRead(BuildCardDetail());
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        expect(screen.getByRole("button", { name: SEARCH_BUTTON_NAME })).toBeEnabled();
+    });
+});
+
+describe("COCRDSLC F3 during a pending read from the main menu on /cards/view", () => {
+    it.each(EXIT_ACTIONS)(
+        "COCRDSLC F3 by %s returns to /menu while a read is pending",
+        async (_, action) => {
+            const releaseRead = HoldReads();
+            const user = RenderScreen();
+            await TypeKeys(user, TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+            await PressKey(user, "Enter");
+            await action(user);
+            expect(mockRouterPush).toHaveBeenCalledTimes(1);
+            expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
+            releaseRead(BuildCardDetail());
+            await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        },
+    );
 });
 
 describe("COCRDSLC key edits stay on the server on /cards/view", () => {

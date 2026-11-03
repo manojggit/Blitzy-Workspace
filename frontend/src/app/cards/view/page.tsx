@@ -1,6 +1,5 @@
 // Replaces: BMS map COCRDSL, program COCRDSLC (CCDL); copybooks COCRDSL (cpy-bms), CVACT02Y,
 // CVCUS01Y, CVCRD01Y, CSMSG02Y, CSUSR01Y, COCOM01Y, COTTL01Y, CSDAT01Y, CSMSG01Y
-// The header wraps to stay within the MK_Modernization Rule's 100-column line limit.
 "use client";
 
 import {
@@ -144,6 +143,7 @@ interface ScreenKeyInputs {
     entry: EntryKeys;
     typedKeys: TypedKeys;
     RunLookup: LookupRunner;
+    isBusy: boolean;
 }
 
 interface KeyFieldDefinition {
@@ -301,8 +301,9 @@ function WithPendingMessage(previous: LookupState, message: string): LookupState
     return { ...previous, feedback: { ...EMPTY_FEEDBACK, message, severity } };
 }
 
-// Numbers each lookup, so only the latest may update the screen and a slower earlier answer
-// never overwrites a newer one.
+// Numbers each lookup, so an answer updates the screen only while its lookup is the latest: a
+// second check, behind useCardLookup's one-at-a-time guard, that no earlier answer overwrites a
+// newer one.
 function BeginLookup(latestLookupRef: RefObject<number>): () => boolean {
     latestLookupRef.current += 1;
     const lookupNumber = latestLookupRef.current;
@@ -331,9 +332,15 @@ function LookupKeysFor(entry: EntryKeys, typedTexts: TypedTexts): LookupKeys {
     return { cardKey: typedTexts.cardText, acctKey: typedTexts.acctText };
 }
 
-function BuildFunctionKeys(onSearch: () => void, onExit: () => void): FunctionKeyList {
+// The 3270 keyboard locks while the host runs the task, so Search waits for the answer; Exit
+// stays available and leaves at any time.
+function BuildFunctionKeys(
+    onSearch: () => void,
+    onExit: () => void,
+    isBusy: boolean,
+): FunctionKeyList {
     return [
-        { key: "ENTER", label: SEARCH_KEY_LABEL, onPress: onSearch },
+        { key: "ENTER", label: SEARCH_KEY_LABEL, onPress: onSearch, disabled: isBusy },
         { key: "F3", label: EXIT_KEY_LABEL, onPress: onExit },
     ];
 }
@@ -381,12 +388,21 @@ function usePendingMessage(setLookupState: Dispatch<SetStateAction<LookupState>>
     }, [setLookupState]);
 }
 
+// One read at a time, as one CICS task per key press: a lookup asked for while another is in
+// flight is refused at once, before React re-renders the disabled Search key.
 function useCardLookup(): CardLookup {
     const [lookupState, setLookupState] = useState<LookupState>(IDLE_LOOKUP_STATE);
     const latestLookupRef = useRef(0);
+    const isLookupPendingRef = useRef(false);
     const runLookup = useCallback((keys: LookupKeys): Promise<void> => {
+        if (isLookupPendingRef.current) {
+            return Promise.resolve();
+        }
+        isLookupPendingRef.current = true;
         const isLatest = BeginLookup(latestLookupRef);
-        return RunLatestLookup({ keys, IsLatest: isLatest, setLookupState });
+        return RunLatestLookup({ keys, IsLatest: isLatest, setLookupState }).finally(() => {
+            isLookupPendingRef.current = false;
+        });
     }, []);
     usePendingMessage(setLookupState);
     return { lookupState, RunLookup: runLookup };
@@ -413,12 +429,16 @@ function useEntryKeys(): EntryKeys {
     };
 }
 
-// From the card list the card is read at once; from the menu the empty map waits for ENTER.
+// From the card list the card is read once on arrival; from the menu the empty map waits for
+// ENTER. The ref keeps React's development double effect run from reading the card twice.
 function useListEntryLookup({ cardRef, acctId }: EntryKeys, runLookup: LookupRunner): void {
+    const hasReadEntryRef = useRef(false);
     useEffect(() => {
-        if (cardRef !== "") {
-            void runLookup({ cardKey: cardRef, acctKey: acctId });
+        if (hasReadEntryRef.current || cardRef === "") {
+            return;
         }
+        hasReadEntryRef.current = true;
+        void runLookup({ cardKey: cardRef, acctKey: acctId });
     }, [cardRef, acctId, runLookup]);
 }
 
@@ -432,7 +452,7 @@ function useCursorFocus(inputRefs: KeyInputRefs, feedback: CardViewFeedback): vo
 // A typed card number reaches only the API path ViewCard builds: never a route, URL or storage.
 function useScreenFunctionKeys(inputs: ScreenKeyInputs): FunctionKeyList {
     const router = useRouter();
-    const { RunLookup } = inputs;
+    const { RunLookup, isBusy } = inputs;
     const { cardRef, acctId } = inputs.entry;
     const { acctText, cardText } = inputs.typedKeys;
     const handleSearch = useCallback(() => {
@@ -441,7 +461,10 @@ function useScreenFunctionKeys(inputs: ScreenKeyInputs): FunctionKeyList {
     const handleExit = useCallback(() => {
         router.push(cardRef !== "" ? CARD_LIST_ROUTE : MENU_ROUTE);
     }, [router, cardRef]);
-    return useMemo(() => BuildFunctionKeys(handleSearch, handleExit), [handleSearch, handleExit]);
+    return useMemo(
+        () => BuildFunctionKeys(handleSearch, handleExit, isBusy),
+        [handleSearch, handleExit, isBusy],
+    );
 }
 
 function useCardViewScreen(): CardViewScreenModel {
@@ -452,7 +475,7 @@ function useCardViewScreen(): CardViewScreenModel {
     const { detail, feedback, isBusy } = lookupState;
     useListEntryLookup(entry, RunLookup);
     useCursorFocus(inputRefs, feedback);
-    const keys = useScreenFunctionKeys({ entry, typedKeys, RunLookup });
+    const keys = useScreenFunctionKeys({ entry, typedKeys, RunLookup, isBusy });
     const fields = BuildKeyFields({ entry, typedKeys, detail, inputRefs });
     const isListEntry = entry.cardRef !== "";
     const keyFields = { isListEntry, fieldErrors: feedback.fieldErrors, fields };
@@ -559,11 +582,18 @@ function CardViewScreen() {
     );
 }
 
+// Each arrival with another selection is a fresh COCRDSLC first entry, as every XCTL is, so the
+// screen state, its pending read and its one-read guard start over when the query changes.
+function CardViewEntry() {
+    const { cardRef, acctId } = useEntryKeys();
+    return <CardViewScreen key={JSON.stringify([cardRef, acctId])} />;
+}
+
 // useSearchParams needs a Suspense boundary for the static prerender of the route.
 export default function CardViewPage() {
     return (
         <Suspense fallback={null}>
-            <CardViewScreen />
+            <CardViewEntry />
         </Suspense>
     );
 }

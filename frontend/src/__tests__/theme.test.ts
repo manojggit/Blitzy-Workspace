@@ -1,7 +1,7 @@
-// Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME), the Material Design 3 token theme of
-// AAP 0.5.3–0.5.4.
+// Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE), the Material
+// Design 3 token theme of AAP 0.5.3–0.5.4.
 import type { Theme } from "@mui/material/styles";
-import { CARD_DEMO_THEME } from "@/app/theme";
+import { CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 
 type ColourReader = (theme: Theme) => string | undefined;
 
@@ -170,6 +170,20 @@ const SEGMENT_STATE_EXPECTATIONS: readonly SegmentStateExpectation[] = [
     },
 ];
 
+// MUI's documented visuallyHidden helper (@mui/utils/visuallyHidden). The 1px and -1px values are
+// strings: in sx a bare 1 would be 100% and a bare margin would be theme spacing.
+const MUI_VISUALLY_HIDDEN_VALUES = {
+    border: 0,
+    clipPath: "inset(50%)",
+    height: "1px",
+    margin: "-1px",
+    overflow: "hidden",
+    padding: 0,
+    position: "absolute",
+    whiteSpace: "nowrap",
+    width: "1px",
+};
+
 function FontSizeToPixels(value: string | number | undefined): number {
     if (typeof value === "number") {
         return value;
@@ -334,4 +348,10 @@ describe("M3 segmented-button states (gap 0.5.4)", () => {
             expect(ReadSegmentRule(selectorPath)).toMatchObject(expectedStyle);
         },
     );
+});
+
+describe("Visually hidden text", () => {
+    it("VISUALLY_HIDDEN_STYLE carries MUI's visuallyHidden values", () => {
+        expect(VISUALLY_HIDDEN_STYLE).toEqual(MUI_VISUALLY_HIDDEN_VALUES);
+    });
 });

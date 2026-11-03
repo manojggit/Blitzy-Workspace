@@ -103,6 +103,7 @@ interface ListUpdaters {
     setScreen: Dispatch<SetStateAction<ListScreen>>;
     setSelectionCodes: Dispatch<SetStateAction<SelectionCodes>>;
     setIsBusy: Dispatch<SetStateAction<boolean>>;
+    setSearchTranId: Dispatch<SetStateAction<string>>;
     Navigate: (route: string) => void;
 }
 
@@ -111,6 +112,13 @@ type ScreenSetters = Omit<ListUpdaters, "Navigate">;
 interface ListRequestRunner {
     Run: (request: ListRequest) => Promise<void>;
     Invalidate: () => void;
+}
+
+// The number of the latest request, whether one is in flight, and where its answer goes.
+interface RequestRunnerContext {
+    latestRequestRef: RefObject<number>;
+    inFlightRef: RefObject<boolean>;
+    updaters: ListUpdaters;
 }
 
 interface ListRequestInput {
@@ -196,8 +204,9 @@ async function SettleRequest(request: ListRequest): Promise<ListOutcome> {
     }
 }
 
-// A failed call re-sends the map as it stood, so the rows and paging keys stay. The selection
-// codes are cleared after every answer, so no code carries over onto the rows of another page.
+// A failed call re-sends the map as it stood, so the rows, paging keys and search text stay. The
+// selection codes are cleared after every answer, so no code carries over onto the rows of
+// another page. The search text is blanked only when the server reports search_cleared.
 function ApplyOutcome(outcome: ListOutcome, updaters: ListUpdaters): void {
     updaters.setIsBusy(false);
     updaters.setSelectionCodes({});
@@ -212,6 +221,9 @@ function ApplyOutcome(outcome: ListOutcome, updaters: ListUpdaters): void {
         return;
     }
     updaters.setScreen(ScreenFromResponse(response));
+    if (response.search_cleared === true) {
+        updaters.setSearchTranId("");
+    }
 }
 
 // Every shown row with a code, in screen order; the server takes the first, as the EVALUATE
@@ -270,14 +282,15 @@ function BuildListActions(
     };
 }
 
-// The legend ENTER=Continue  F3=Back  F7=Backward  F8=Forward. No key is disabled: the program
-// answers every press, the paging literals included.
-function BuildFunctionKeys(actions: ListActions): FunctionKeyDefinition[] {
+// The legend ENTER=Continue  F3=Back  F7=Backward  F8=Forward. No key is disabled except while a
+// request is out: the program answers every press, the paging literals included, but ENTER, F7
+// and F8 stay locked until it has answered, as the 3270 keyboard does. F3 stays available.
+function BuildFunctionKeys(actions: ListActions, isBusy: boolean): FunctionKeyDefinition[] {
     return [
-        { key: "ENTER", label: "Continue", onPress: actions.HandleEnter },
+        { key: "ENTER", label: "Continue", onPress: actions.HandleEnter, disabled: isBusy },
         { key: "F3", label: "Back", onPress: actions.HandleBack },
-        { key: "F7", label: "Backward", onPress: actions.HandlePageBackward },
-        { key: "F8", label: "Forward", onPress: actions.HandlePageForward },
+        { key: "F7", label: "Backward", onPress: actions.HandlePageBackward, disabled: isBusy },
+        { key: "F8", label: "Forward", onPress: actions.HandlePageForward, disabled: isBusy },
     ];
 }
 
@@ -314,30 +327,45 @@ function ToSelectionRows(
     }));
 }
 
+// The 3270 keyboard stays locked from a press until the program answers. Here ENTER, F7 and F8
+// are disabled while a request is out, and a second request is refused while one is in flight:
+// the disabled keys take effect a render after the press, so a second press in the same frame
+// is stopped by the flag. The flag clears when the request settles, a rethrown defect included.
+// F3 stays enabled; Invalidate discards the pending answer, so it never replaces the screen or
+// navigates away after the screen has been left.
+async function RunExclusive(request: ListRequest, runner: RequestRunnerContext): Promise<void> {
+    if (runner.inFlightRef.current) {
+        return;
+    }
+    runner.inFlightRef.current = true;
+    runner.latestRequestRef.current += 1;
+    const requestNumber = runner.latestRequestRef.current;
+    runner.updaters.setIsBusy(true);
+    try {
+        const outcome = await SettleRequest(request);
+        if (requestNumber === runner.latestRequestRef.current) {
+            ApplyOutcome(outcome, runner.updaters);
+        }
+    } finally {
+        runner.inFlightRef.current = false;
+    }
+}
+
 // React recognises hooks only by the camelCase "use" prefix, so every hook name below is a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 
-// The 3270 keyboard stays locked until the program answers; here only the latest press is
-// answered, so a slower earlier response never replaces a newer page or navigates away.
 function useListRequestRunner(updaters: ListUpdaters): ListRequestRunner {
     const latestRequestRef = useRef(0);
-    return useMemo<ListRequestRunner>(
-        () => ({
-            Run: async (request) => {
-                latestRequestRef.current += 1;
-                const requestNumber = latestRequestRef.current;
-                updaters.setIsBusy(true);
-                const outcome = await SettleRequest(request);
-                if (requestNumber === latestRequestRef.current) {
-                    ApplyOutcome(outcome, updaters);
-                }
-            },
+    const inFlightRef = useRef(false);
+    return useMemo<ListRequestRunner>(() => {
+        const runner: RequestRunnerContext = { latestRequestRef, inFlightRef, updaters };
+        return {
+            Run: (request) => RunExclusive(request, runner),
             Invalidate: () => {
                 latestRequestRef.current += 1;
             },
-        }),
-        [updaters],
-    );
+        };
+    }, [updaters]);
 }
 
 // The updaters never change identity, so the first page is requested once per mount: the
@@ -348,15 +376,16 @@ function useListUpdaters(setters: ScreenSetters): ListUpdaters {
     useEffect(() => {
         routerRef.current = router;
     }, [router]);
-    const { setScreen, setSelectionCodes, setIsBusy } = setters;
+    const { setScreen, setSelectionCodes, setIsBusy, setSearchTranId } = setters;
     return useMemo<ListUpdaters>(
         () => ({
             setScreen,
             setSelectionCodes,
             setIsBusy,
+            setSearchTranId,
             Navigate: (route) => routerRef.current.push(route),
         }),
-        [setScreen, setSelectionCodes, setIsBusy],
+        [setScreen, setSelectionCodes, setIsBusy, setSearchTranId],
     );
 }
 
@@ -377,7 +406,7 @@ function useListState(): ListState {
     const [selectionCodes, setSelectionCodes] = useState<SelectionCodes>({});
     // The first page is requested on mount, so the screen starts busy.
     const [isBusy, setIsBusy] = useState(true);
-    const updaters = useListUpdaters({ setScreen, setSelectionCodes, setIsBusy });
+    const updaters = useListUpdaters({ setScreen, setSelectionCodes, setIsBusy, setSearchTranId });
     const onSelectionChange = useSelectionChange(setSelectionCodes);
     return {
         screen,
@@ -391,15 +420,16 @@ function useListState(): ListState {
 }
 
 function useListKeys(state: ListState, runner: ListRequestRunner): FunctionKeyDefinition[] {
-    const { screen, searchTranId, selectionCodes, updaters } = state;
+    const { screen, searchTranId, selectionCodes, isBusy, updaters } = state;
     return useMemo(() => {
         const input: ListRequestInput = { screen, searchTranId, selectionCodes };
-        return BuildFunctionKeys(BuildListActions(input, runner, updaters));
-    }, [screen, searchTranId, selectionCodes, runner, updaters]);
+        return BuildFunctionKeys(BuildListActions(input, runner, updaters), isBusy);
+    }, [screen, searchTranId, selectionCodes, isBusy, runner, updaters]);
 }
 
 // The first entry (EIBCALEN > 0, not re-entered) browses from the lowest TRAN-ID. Under React
-// Strict Mode the effect runs twice; the ref keeps the pending message the first run took.
+// Strict Mode the effect runs twice: the runner refuses the second browse while the first is in
+// flight, and the ref keeps the pending message the first run took.
 function useFirstPage(runner: ListRequestRunner): void {
     const pendingMessageRef = useRef<string | null>(null);
     useEffect(() => {
@@ -437,9 +467,10 @@ function useTransactionList(): TransactionListView {
 }
 
 // The typed TRNIDIN text is sent unchanged: the server, not the page, decides whether it is
-// blank, numeric or a TRAN-ID to browse from. The response carries no TRNIDIN echo, so the text
-// is kept after every answer instead of being blanked after a forward browse, as COTRN00C's
-// MOVE SPACE TO TRNIDINO does; the next ENTER sends exactly what the field shows.
+// blank, numeric or a TRAN-ID to browse from, and whether COTRN00C's MOVE SPACE TO TRNIDINO
+// blanked the field. An answer with search_cleared empties it, so the next ENTER browses from
+// the lowest key; any other answer, or a failed call, keeps the text as keyed. The field is
+// read-only while a request is out, as the 3270 keyboard lock, so no text keyed meanwhile is lost.
 function SearchField({ view }: ListViewProps) {
     return (
         <TextField
@@ -450,7 +481,7 @@ function SearchField({ view }: ListViewProps) {
             error={view.screen.feedback.fieldErrors.includes(SEARCH_FIELD)}
             inputRef={view.searchInputRef}
             onChange={(event) => view.setSearchTranId(event.target.value)}
-            slotProps={{ htmlInput: { maxLength: SEARCH_FIELD_LENGTH } }}
+            slotProps={{ htmlInput: { maxLength: SEARCH_FIELD_LENGTH, readOnly: view.isBusy } }}
         />
     );
 }

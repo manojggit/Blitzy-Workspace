@@ -24,8 +24,10 @@ records ending at the last key shown instead.
 
 Every list response puts the cursor on search_tran_id (MOVE -1 TO TRNIDINL on every path); the
 map shows ERRMSG in red. Only a TRANSACT file condition, the batch window's NOTOPEN included,
-is 503 ``Unable to lookup transaction...``. The program blanks TRNIDIN after a page it rebuilds
-(lines 228, 325) and keeps it after a non-numeric search.
+is 503 ``Unable to lookup transaction...``. The program blanks TRNIDIN whenever the body of
+PROCESS-PAGE-FORWARD runs (lines 228, 325): after ENTER with a blank or numeric key, STARTBR
+NOTFND included, and after an F8 that pages on; the response says so in ``search_cleared``. It
+keeps TRNIDIN after a non-numeric search, every F7 and an F8 refusal.
 
 Legacy paths with no code here: EIBCALEN = 0 (back to sign-on) is the RequireRegular session
 guard; PF3 (XCTL COMEN01C) is frontend navigation; other AID keys cannot reach the server;
@@ -122,6 +124,8 @@ class ListState:
     ``firstKey`` and ``lastKey`` are CDEMO-CT00-TRNID-FIRST and -TRNID-LAST, ``page`` is
     CDEMO-CT00-PAGE-NUM, and ``message`` is WS-MESSAGE, which each later assignment overwrites
     as the program's MOVEs do. ``rows`` are the TRANSACT records shown, in ascending key order.
+    ``searchCleared`` records MOVE SPACE TO TRNIDINO (lines 228, 325): the map's search field
+    is sent blank.
     """
 
     firstKey: str
@@ -129,6 +133,7 @@ class ListState:
     page: int
     message: str = NO_MESSAGE
     rows: list[dict[str, Any]] = field(default_factory=list)
+    searchCleared: bool = False
 
 
 async def ListTransactions(
@@ -310,13 +315,14 @@ async def _ProcessStartNotFound(repository: TransactionRepository, state: ListSt
     """ENTER's STARTBR NOTFND: no TRAN-ID at or after the search key (lines 605-611, 314-326).
 
     It sets TRANSACT-EOF but not ERR-FLG, so PROCESS-PAGE-FORWARD reads no row, sets
-    NEXT-PAGE-NO and shows page 0 over the unchanged rows. last_key becomes HIGH-VALUES, after
-    which no record follows, so the next F8 answers ``You are already at the bottom of the
-    page...``.
+    NEXT-PAGE-NO and shows page 0 over the unchanged rows with TRNIDIN blanked (line 325).
+    last_key becomes HIGH-VALUES, after which no record follows, so the next F8 answers ``You
+    are already at the bottom of the page...``.
     """
     state.message = AT_TOP_OF_PAGE_MESSAGE
     await _RereadShownPage(repository, state)
     state.lastKey = NO_NEXT_PAGE_KEY
+    state.searchCleared = True
 
 
 async def _ProcessPf8Key(repository: TransactionRepository, state: ListState) -> None:
@@ -365,7 +371,8 @@ def _ApplyForwardRows(state: ListState, records: Sequence[dict[str, Any]]) -> No
     ``records`` holds up to 10 page rows and the look-ahead READNEXT. Without the look-ahead
     the browse reached ENDFILE, whose ``You have reached the bottom of the page...`` replaces
     any earlier message (lines 639-645), and no record follows the last row shown, which is
-    NEXT-PAGE-NO. The page number grows by 1 once a row was read (lines 305-319).
+    NEXT-PAGE-NO. The page number grows by 1 once a row was read (lines 305-319), and TRNIDIN
+    is sent blank (line 325).
     """
     pageRows = list(records[:PAGE_SIZE])
     _ShowRows(state, pageRows)
@@ -373,6 +380,7 @@ def _ApplyForwardRows(state: ListState, records: Sequence[dict[str, Any]]) -> No
         state.page = (state.page + 1) % PAGE_NUMBER_MODULUS
     if len(records) <= PAGE_SIZE:
         state.message = REACHED_BOTTOM_MESSAGE
+    state.searchCleared = True
 
 
 def _ApplyBackwardRows(state: ListState, records: Sequence[dict[str, Any]]) -> None:
@@ -462,7 +470,7 @@ def _TransactionDate(record: Mapping[str, Any]) -> str:
 def _BuildListResponse[ResponseModel: TransactionListResponse](
     state: ListState, responseModel: type[ResponseModel]
 ) -> ResponseModel:
-    """Return the COTRN00 screen: rows, page number, first and last keys, ERRMSG and cursor."""
+    """Return the COTRN00 screen: rows, page number, keys, ERRMSG, cursor and TRNIDIN blanking."""
     return responseModel(
         rows=[_BuildRow(record) for record in state.rows],
         page=state.page,
@@ -470,4 +478,5 @@ def _BuildListResponse[ResponseModel: TransactionListResponse](
         last_key=state.lastKey,
         message=state.message,
         cursor_field=SEARCH_CURSOR_FIELD,
+        search_cleared=state.searchCleared,
     )

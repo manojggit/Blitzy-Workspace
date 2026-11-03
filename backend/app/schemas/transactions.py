@@ -109,6 +109,7 @@ class TransactionListResponse(PageState):
     CDEMO-CT00-TRNID-LAST). Two outcomes differ, as COTRN00C leaves those keys: a backward page
     shorter than 10 rows keeps the first_key it browsed from, and a search that finds nothing
     returns last_key HIGH-VALUES (sixteen U+00FF), after which F8 finds no page.
+    ``search_cleared`` carries the TRNIDIN output: whether the program blanked the search field.
     """
 
     rows: list[TransactionListRow] = Field(
@@ -129,6 +130,15 @@ class TransactionListResponse(PageState):
         description=(
             "Snake_case name of the field that receives focus (search_tran_id), replacing "
             "MOVE -1 TO TRNIDINL; null when the program sets no cursor."
+        ),
+    )
+    search_cleared: bool = Field(
+        default=False,
+        description=(
+            "True when the program blanked TRNIDIN (MOVE SPACE TO TRNIDINO, COTRN00C lines 228 "
+            "and 325): the first entry, ENTER with a blank or numeric search key, and an F8 "
+            "that pages on; the client then shows the search field empty. False when the map "
+            "keeps the text as keyed: a non-numeric search key, every F7 and an F8 refusal."
         ),
     )
 
@@ -183,8 +193,9 @@ class TransactionSelectionRequest(BaseModel):
 class TransactionSelectionResponse(TransactionListResponse):
     """Outcome of ENTER on the Transaction List (COTRN00C, map COTRN00).
 
-    A valid ``S`` selection sets ``route``, replacing the XCTL to COTRN01C. Otherwise
-    ``route`` is null and the inherited list fields carry the re-browsed page and its message.
+    A valid ``S`` selection sets ``route``, replacing the XCTL to COTRN01C, and leaves
+    ``search_cleared`` false. Otherwise ``route`` is null and the inherited list fields carry
+    the re-browsed page, its message and whether TRNIDIN was blanked.
     """
 
     route: str | None = Field(

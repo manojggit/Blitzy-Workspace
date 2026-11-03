@@ -318,9 +318,6 @@ function FieldCells({ definitions, account }: FieldCellsProps) {
 
 // ACCTSID, the map's only unprotected field. Its text is never trimmed, padded or checked here:
 // COACTVWC's key edit runs on the server.
-/* BLITZY [A11Y]: the theme's resting outline on this field measures 1.72:1 against the Paper,
-   below the WCAG 1.4.11 3:1 for UI boundaries. Kept as the system value; flagged for designer
-   review. */
 function AccountIdInput({ screen }: ScreenProps) {
     return (
         <Grid size={HALF_ROW}>

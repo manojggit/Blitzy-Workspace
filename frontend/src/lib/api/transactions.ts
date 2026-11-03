@@ -40,6 +40,8 @@ export interface TransactionListResponse extends PageState {
     rows?: TransactionListRow[];
     message?: string;
     cursor_field?: string | null;
+    // True when COTRN00C blanked TRNIDIN (MOVE SPACE TO TRNIDINO); the Pydantic default is false.
+    search_cleared?: boolean;
 }
 
 // One COTRN00 row as keyed: its TRNIDnn key and its raw SELnnnn code.

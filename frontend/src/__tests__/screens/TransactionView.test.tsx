@@ -49,6 +49,17 @@ interface LiteralCase {
     sentKey: string;
 }
 
+interface StatusRegionPair {
+    detailStatus: HTMLElement;
+    messageLine: HTMLElement;
+}
+
+interface EmptiedStatusCase {
+    action: string;
+    messageText: string;
+    Reach: (user: UserEvent) => Promise<void>;
+}
+
 // Read at render time by the mocked hooks; the "mock" prefix lets the hoisted factories use them.
 const mockRouterPush = jest.fn();
 const mockRouterReplace = jest.fn();
@@ -124,6 +135,8 @@ const TRAN_ID_EMPTY_MESSAGE = "Tran ID can NOT be empty...";
 const TRAN_ID_NOT_FOUND_MESSAGE = "Transaction ID NOT found...";
 const TRAN_LOOKUP_FAILED_MESSAGE = "Unable to lookup Transaction...";
 const ABEND_MESSAGE = "UNEXPECTED ABEND OCCURRED.";
+// The page's own polite status while a record is shown; COTRN01C leaves ERRMSG blank then.
+const DETAIL_SHOWN_STATUS = "Transaction details displayed";
 
 // The row-24 legend: ENTER=Fetch  F3=Back  F4=Clear  F5=Browse Tran.
 const FETCH_KEY: FunctionKeyCase = { keyName: "Enter", buttonName: "Fetch (Enter)" };
@@ -255,6 +268,26 @@ const BACK_CASES: readonly BackCase[] = PRESS_MODES.flatMap((mode) => [
     { mode, origin: "the main menu", tranId: "", route: MAIN_MENU_ROUTE },
 ]);
 
+// Outcomes that take a displayed record off the screen, each starting from a shown record.
+const EMPTIED_STATUS_CASES: readonly EmptiedStatusCase[] = [
+    {
+        action: "a Transaction ID NOT found read",
+        messageText: TRAN_ID_NOT_FOUND_MESSAGE,
+        Reach: async (user) => {
+            const notFound = BuildErrorBody({ message: TRAN_ID_NOT_FOUND_MESSAGE });
+            mockViewTransaction.mockRejectedValue(BuildAxiosError(404, notFound));
+            await TypeTranId(user, MISSING_TRAN_ID);
+            await PressFunctionKey(user, FETCH_KEY, "key");
+            await ExpectAlert(TRAN_ID_NOT_FOUND_MESSAGE, "error");
+        },
+    },
+    {
+        action: "F4 Clear",
+        messageText: "",
+        Reach: (user) => PressFunctionKey(user, CLEAR_KEY, "key"),
+    },
+];
+
 function RenderScreen(): UserEvent {
     const user = userEvent.setup();
     render(
@@ -319,6 +352,27 @@ async function ExpectAlert(text: string, severity: MessageSeverity): Promise<voi
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toBe(text);
     expect(alert).toHaveClass(SEVERITY_CLASSES[severity]);
+}
+
+// CT01 always renders two polite role="status" regions: its own loaded-status region, then the
+// MessageLine's below the display fields.
+function StatusRegions(): StatusRegionPair {
+    const regions = screen.getAllByRole("status");
+    expect(regions).toHaveLength(2);
+    regions.forEach((region) => expect(region).toHaveAttribute("aria-live", "polite"));
+    const [detailStatus, messageLine] = regions as [HTMLElement, HTMLElement];
+    return { detailStatus, messageLine };
+}
+
+// The next read stays pending until the test settles it with the returned function.
+function DeferRead(): (detail: TransactionDetailResponse) => void {
+    let resolveRead: (detail: TransactionDetailResponse) => void = () => undefined;
+    mockViewTransaction.mockReturnValue(
+        new Promise<TransactionDetailResponse>((resolve) => {
+            resolveRead = resolve;
+        }),
+    );
+    return resolveRead;
 }
 
 beforeEach(() => {
@@ -500,5 +554,46 @@ describe("COTRN01C unauthenticated read", () => {
         expect(mockRouterReplace).toHaveBeenCalledTimes(1);
         expect(mockRouterPush).not.toHaveBeenCalled();
         expect(screen.queryByRole("alert")).toBeNull();
+    });
+});
+
+describe("COTRN01C displayed-record status after a read", () => {
+    it("COTRN01C announces a read record in its own status and leaves ERRMSG blank", async () => {
+        const user = RenderScreen();
+        expect(StatusRegions().detailStatus.textContent).toBe("");
+        await TypeTranId(user, TEST_TRAN_ID);
+        await PressFunctionKey(user, FETCH_KEY, "key");
+        await screen.findByDisplayValue(MASKED_CARD_NUMBER);
+        const { detailStatus, messageLine } = StatusRegions();
+        expect(detailStatus.textContent).toBe(DETAIL_SHOWN_STATUS);
+        expect(messageLine.textContent).toBe("");
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(TranIdInput()).toHaveFocus();
+    });
+});
+
+describe("COTRN01C displayed-record status during a read", () => {
+    it("COTRN01C empties the status during a pending read and refills it on arrival", async () => {
+        const user = await RenderFrom(TEST_TRAN_ID);
+        expect(StatusRegions().detailStatus.textContent).toBe(DETAIL_SHOWN_STATUS);
+        const resolveRead = DeferRead();
+        await PressFunctionKey(user, FETCH_KEY, "button");
+        expect(StatusRegions().detailStatus.textContent).toBe("");
+        expect(DetailValues()).toEqual(EMPTY_DETAIL_VALUES);
+        resolveRead(BuildTransactionDetail());
+        await screen.findByDisplayValue(MASKED_CARD_NUMBER);
+        expect(StatusRegions().detailStatus.textContent).toBe(DETAIL_SHOWN_STATUS);
+        expect(TranIdInput()).toHaveFocus();
+    });
+});
+
+describe("COTRN01C displayed-record status once the record leaves the screen", () => {
+    it.each(EMPTIED_STATUS_CASES)("COTRN01C empties the status after $action", async (status) => {
+        const user = await RenderFrom(TEST_TRAN_ID);
+        await status.Reach(user);
+        const { detailStatus, messageLine } = StatusRegions();
+        expect(detailStatus.textContent).toBe("");
+        expect(messageLine.textContent).toBe(status.messageText);
+        expect(DetailValues()).toEqual(EMPTY_DETAIL_VALUES);
     });
 });

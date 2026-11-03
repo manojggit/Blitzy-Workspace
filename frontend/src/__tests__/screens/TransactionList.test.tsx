@@ -1,6 +1,6 @@
 // Screen tests: BMS COTRN00, program COTRN00C (CT00), page /transactions.
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { AxiosError, AxiosHeaders } from "axios";
 import type { ReactNode } from "react";
@@ -22,6 +22,7 @@ import {
     type LegacyErrorResponse,
     type MessageSeverity,
 } from "@/lib/apiClient";
+import { PF_KEY_ACTIONS } from "@/lib/useFunctionKeys";
 
 // Read by the mocked next/navigation hooks at render time; the "mock" prefix lets the hoisted
 // factory use them.
@@ -90,6 +91,15 @@ interface LiteralCase {
     status: number;
 }
 
+// A key pressed over typed search text, the search_cleared and literal of its 200 answer, and
+// the text TRNIDIN shows afterwards.
+interface SearchLifecycleCase {
+    key: ListKey;
+    searchCleared: boolean;
+    literal: string;
+    shownSearch: string;
+}
+
 // The row-4 title and TRNIDIN of bms/COTRN00.bms (LENGTH=16).
 const SCREEN_TITLE = "List Transactions";
 const SEARCH_LABEL = "Search Tran ID:";
@@ -106,6 +116,8 @@ const FIRST_KEY = "first-key-token";
 const LAST_KEY = "last-key-token";
 const MENU_ROUTE = "/menu";
 const SEARCH_KEY = "0000000000000005";
+// A second search key, an exact TRAN-ID of the found page.
+const NEXT_SEARCH_KEY = "0000000000000013";
 const SELECTED_ROW_NUMBER = 3;
 const SELECTED_TRAN_ID = "0000000000000003";
 const VIEW_ROUTE = `/transactions/view?tranId=${SELECTED_TRAN_ID}`;
@@ -150,6 +162,10 @@ const ALERT_COLOR_CLASSES: Readonly<Record<MessageSeverity, string>> = {
 const FIXED_NOW_MILLISECONDS = new Date(2022, 6, 18, 9, 5, 7).getTime();
 
 const PRESS_MODES: readonly PressMode[] = ["button", "key"];
+// The legend keys that send a request; F3 only leaves the screen.
+const REQUEST_KEYS: readonly ListKey[] = ["ENTER", "F7", "F8"];
+// The keys whose answer can blank TRNIDIN through search_cleared.
+const SEARCH_CLEARING_KEYS: readonly ListKey[] = ["ENTER", "F8"];
 
 const FORWARD_QUERY: TransactionListQuery = {
     startKey: LAST_KEY,
@@ -181,6 +197,14 @@ const LITERAL_CASES: readonly LiteralCase[] = [
     { literal: NUMERIC_SEARCH, key: "ENTER", status: HTTP_OK },
     { literal: LOOKUP_FAILED, key: "F8", status: 503 },
     { literal: ABEND, key: "F7", status: 500 },
+];
+
+// COTRN00C blanks TRNIDIN after ENTER with a numeric key and after an F8 that pages on, and keeps
+// it after every F7. The page follows the answer's search_cleared, never the key or the literal.
+const SEARCH_LIFECYCLE_CASES: readonly SearchLifecycleCase[] = [
+    { key: "ENTER", searchCleared: true, literal: REACHED_BOTTOM, shownSearch: "" },
+    { key: "F8", searchCleared: true, literal: REACHED_BOTTOM, shownSearch: "" },
+    { key: "F7", searchCleared: false, literal: TOP_ALREADY, shownSearch: SEARCH_KEY },
 ];
 
 // An exact TRAN-ID and a key between two TRAN-IDs both browse from the first key at or after it.
@@ -295,6 +319,38 @@ async function PressKey(user: UserEvent, key: ListKey, mode: PressMode): Promise
     await user.click(screen.getByRole("button", { name: KEY_BUTTON_NAMES[key] }));
 }
 
+function KeyButton(key: ListKey): HTMLElement {
+    return screen.getByRole("button", { name: KEY_BUTTON_NAMES[key] });
+}
+
+// A physical key press dispatched straight to the window, where useFunctionKeys listens.
+function DispatchKeyDown(key: ListKey): void {
+    const init = { key: PF_KEY_ACTIONS[key], bubbles: true, cancelable: true };
+    window.dispatchEvent(new KeyboardEvent("keydown", init));
+}
+
+// Every ListTransactions and SelectTransactions call, the first entry's included.
+function RequestCount(): number {
+    return mockListTransactions.mock.calls.length + mockSelectTransactions.mock.calls.length;
+}
+
+function ExpectRequestKeysDisabled(isDisabled: boolean): void {
+    for (const key of REQUEST_KEYS) {
+        expect(KeyButton(key)).toHaveProperty("disabled", isDisabled);
+    }
+}
+
+// Presses ENTER, F7 and F8 as physical keys from TRNIDIN and clicks each button. user-event
+// refuses to click a disabled MUI button (pointer-events none), so the click event is fired
+// directly; focus stays in TRNIDIN, where ENTER belongs to the screen.
+async function PressLockedKeys(user: UserEvent): Promise<void> {
+    await user.click(SearchField());
+    for (const key of REQUEST_KEYS) {
+        await PressKey(user, key, "key");
+        fireEvent.click(KeyButton(key));
+    }
+}
+
 // The open menu hides the rest of the screen from the accessibility tree, so the helper waits
 // for it to close.
 async function ChooseSelection(user: UserEvent, rowNumber: number, code: string): Promise<void> {
@@ -330,13 +386,16 @@ function ExpectSearchOnlyRequest(searchKey: string): void {
 }
 
 // ENTER answers through SelectTransactions, F7 and F8 through ListTransactions.
-function MockKeyOutcome(literalCase: LiteralCase): void {
-    const answer = () => OutcomeFor(literalCase);
-    if (literalCase.key === "ENTER") {
+function MockKeyAnswer(key: ListKey, answer: () => Promise<TransactionSelectionResponse>): void {
+    if (key === "ENTER") {
         mockSelectTransactions.mockImplementationOnce(answer);
         return;
     }
     mockListTransactions.mockImplementationOnce(answer);
+}
+
+function MockKeyOutcome(literalCase: LiteralCase): void {
+    MockKeyAnswer(literalCase.key, () => OutcomeFor(literalCase));
 }
 
 // The page the server browses for both SEARCH_CASES: rows 13-22, the first at or after the key.
@@ -426,6 +485,21 @@ describe("COTRN00C ENTER with a non-numeric search key", () => {
     });
 });
 
+describe("COTRN00C TRNIDIN after an answer", () => {
+    it.each(SEARCH_LIFECYCLE_CASES)(
+        "COTRN00C $key answered search_cleared $searchCleared shows TRNIDIN '$shownSearch'",
+        async ({ key, searchCleared, literal, shownSearch }) => {
+            const user = await RenderFirstPage();
+            const answer = BuildListResponse({ message: literal, search_cleared: searchCleared });
+            MockKeyAnswer(key, () => Promise.resolve(answer));
+            await user.type(SearchField(), SEARCH_KEY);
+            await PressKey(user, key, "button");
+            await ExpectAlert(literal, "error");
+            expect(SearchField()).toHaveValue(shownSearch);
+        },
+    );
+});
+
 describe("COTRN00C ENTER browses from the search key", () => {
     it.each(SEARCH_CASES)(
         "COTRN00C ENTER with %s shows the page the server returns",
@@ -489,6 +563,113 @@ describe("COTRN00C F3", () => {
         expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
         expect(mockListTransactions).toHaveBeenCalledTimes(1);
         expect(mockSelectTransactions).not.toHaveBeenCalled();
+    });
+});
+
+// The page a pending F7, F8 or ENTER finally answers with: rows 11-20 as page 2.
+const PENDING_ANSWER = BuildListResponse({ rows: BuildRows(11), page: 2 });
+
+describe("COTRN00C keyboard lock while a request is out", () => {
+    it.each(REQUEST_KEYS)(
+        "COTRN00C %s locks ENTER, F7 and F8 until it is answered",
+        async (key) => {
+            const user = await RenderFirstPage();
+            const { promise, resolve } = Promise.withResolvers<TransactionSelectionResponse>();
+            MockKeyAnswer(key, () => promise);
+            await PressKey(user, key, "button");
+            ExpectRequestKeysDisabled(true);
+            expect(KeyButton("F3")).toBeEnabled();
+            await PressLockedKeys(user);
+            expect(RequestCount()).toBe(2);
+            resolve(PENDING_ANSWER);
+            await screen.findByText(TranIdFor(20));
+            ExpectRequestKeysDisabled(false);
+            expect(RequestCount()).toBe(2);
+        },
+    );
+});
+
+// TRNIDIN is read-only while a request is out: typing into it changes nothing.
+async function ExpectSearchLocked(user: UserEvent, heldText: string): Promise<void> {
+    expect(SearchField()).toHaveAttribute("readonly");
+    await user.type(SearchField(), NEXT_SEARCH_KEY);
+    expect(SearchField()).toHaveValue(heldText);
+}
+
+// Mounts the page with the first browse held open, checks TRNIDIN is locked meanwhile, then
+// answers it with the first page.
+async function RenderFirstPageAfterLock(): Promise<UserEvent> {
+    const { promise, resolve } = Promise.withResolvers<TransactionListResponse>();
+    mockListTransactions.mockReturnValueOnce(promise);
+    const user = RenderScreen();
+    await ExpectSearchLocked(user, "");
+    resolve(BuildListResponse());
+    await screen.findByText(TranIdFor(PAGE_SIZE));
+    return user;
+}
+
+// ENTER over the next search key, answered with the page found from it.
+async function SearchFromNextKey(user: UserEvent): Promise<void> {
+    mockSelectTransactions.mockResolvedValueOnce(BuildListResponse(FOUND_PAGE));
+    await user.type(SearchField(), NEXT_SEARCH_KEY);
+    await PressKey(user, "ENTER", "button");
+    await screen.findByText(TranIdFor(FOUND_FIRST_ROW_NUMBER + PAGE_SIZE - 1));
+}
+
+// The 3270 keyboard is locked from a press until the answer, so no key typed meanwhile can be
+// blanked by that answer's search_cleared; the next ENTER sends the key typed after it.
+describe("COTRN00C TRNIDIN locked while a request is out", () => {
+    it.each(SEARCH_CLEARING_KEYS)(
+        "COTRN00C %s keeps TRNIDIN read-only until its search_cleared answer",
+        async (key) => {
+            const user = await RenderFirstPageAfterLock();
+            const { promise, resolve } = Promise.withResolvers<TransactionSelectionResponse>();
+            MockKeyAnswer(key, () => promise);
+            await user.type(SearchField(), SEARCH_KEY);
+            await PressKey(user, key, "button");
+            await ExpectSearchLocked(user, SEARCH_KEY);
+            resolve(BuildListResponse({ rows: BuildRows(11), search_cleared: true }));
+            await screen.findByText(TranIdFor(20));
+            expect(SearchField()).toHaveValue("");
+            expect(SearchField()).not.toHaveAttribute("readonly");
+            await SearchFromNextKey(user);
+            ExpectSearchOnlyRequest(NEXT_SEARCH_KEY);
+        },
+    );
+});
+
+// Both presses land before React re-renders, so the disabled F8 cannot stop the second one.
+describe("COTRN00C keys pressed twice in one frame", () => {
+    it("COTRN00C two F8 presses in one frame send one request", async () => {
+        await RenderFirstPage();
+        const { promise, resolve } = Promise.withResolvers<TransactionListResponse>();
+        mockListTransactions.mockReturnValueOnce(promise);
+        act(() => {
+            DispatchKeyDown("F8");
+            DispatchKeyDown("F8");
+        });
+        resolve(PENDING_ANSWER);
+        await screen.findByText(TranIdFor(20));
+        expect(mockListTransactions).toHaveBeenCalledTimes(2);
+        expect(mockListTransactions).toHaveBeenLastCalledWith(FORWARD_QUERY);
+    });
+});
+
+describe("COTRN00C F3 while a request is out", () => {
+    it("COTRN00C F3 returns to the main menu and discards the pending answer", async () => {
+        const user = await RenderFirstPage();
+        const { promise, resolve } = Promise.withResolvers<TransactionListResponse>();
+        mockListTransactions.mockReturnValueOnce(promise);
+        await PressKey(user, "F8", "button");
+        await PressKey(user, "F3", "key");
+        expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
+        // A macrotask lets the answer settle and run every continuation of the page's request.
+        await act(async () => {
+            resolve(PENDING_ANSWER);
+            await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+        });
+        expect(ShownTranIds()).toEqual(TranIdsFrom(1));
+        expect(mockRouterPush).toHaveBeenCalledTimes(1);
     });
 });
 
