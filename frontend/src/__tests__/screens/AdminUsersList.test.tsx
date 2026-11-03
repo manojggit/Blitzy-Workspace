@@ -128,8 +128,12 @@ const TEST_USER_ID = "TESTUSR1";
 const SEARCH_TEXT = "TESTUSR";
 // Typed with a leading blank and in lower case: ENTER must send it untrimmed and unfolded.
 const RAW_SEARCH_TEXT = " testusr";
-const FIRST_KEY = "first-key-token";
-const LAST_KEY = "last-key-token";
+// The first and last user IDs each page shows: the first_key and last_key cousr00c._BuildPage
+// answers, which F7 and F8 send back as an at-most-8-character startKey.
+const FIRST_PAGE_FIRST_KEY = "TESTUSR0";
+const FIRST_PAGE_LAST_KEY = "TESTUSR9";
+const OTHER_PAGE_FIRST_KEY = "TESTUSRA";
+const OTHER_PAGE_LAST_KEY = "TESTUSRC";
 
 // cbl/COUSR00C.cbl line 212 (INVALID_SELECTION_MESSAGE in services/users/cousr00c.py).
 const INVALID_SELECTION = "Invalid selection. Valid values are U and D";
@@ -182,27 +186,36 @@ function BuildRows(suffixes: readonly string[]): UserListRow[] {
 const FIRST_PAGE_ROWS = BuildRows(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]);
 const OTHER_PAGE_ROWS = BuildRows(["A", "B", "C"]);
 
-function BuildListResponse(overrides: Partial<UserListResponse> = {}): UserListResponse {
+// The keys cousr00c._BuildPage answers with a page: its first and last user IDs, blank for none.
+function PageKeysOf(rows: readonly UserListRow[]): Pick<PageState, "first_key" | "last_key"> {
     return {
-        rows: FIRST_PAGE_ROWS,
+        first_key: rows[0]?.user_id ?? "",
+        last_key: rows.at(-1)?.user_id ?? "",
+    };
+}
+
+// A 200 page whose keys are its own rows', unless the overrides set them.
+function BuildListResponse(overrides: Partial<UserListResponse> = {}): UserListResponse {
+    const rows = overrides.rows ?? FIRST_PAGE_ROWS;
+    return {
+        rows,
         page: 1,
-        first_key: FIRST_KEY,
-        last_key: LAST_KEY,
+        ...PageKeysOf(rows),
         message: "",
         ...overrides,
     };
 }
 
 // ENTER's STARTBR NOTFND page (_SearchNotFound in services/users/cousr00c.py): page 1, the
-// shown rows read again, and a blank last key, from which F8 answers NEXT-PAGE-NO.
+// shown rows read again with their first key, and a blank last key, from which F8 answers
+// NEXT-PAGE-NO.
 const NOT_FOUND_PAGE: Partial<UserListResponse> = { page: 1, last_key: "" };
-// The re-browsed page an invalid-selection 400 body adds to the four standard keys.
-const REBROWSED_LAST_KEY = "rebrowsed-last-key";
+// The re-browsed page an invalid-selection 400 body adds to the four standard keys, keyed by
+// its own first and last user IDs.
 const REBROWSED_PAGE: Partial<UserListResponse> = {
     rows: OTHER_PAGE_ROWS,
     page: 1,
-    first_key: "rebrowsed-first-key",
-    last_key: REBROWSED_LAST_KEY,
+    ...PageKeysOf(OTHER_PAGE_ROWS),
 };
 
 // The legacy error body a COUSR00C refusal carries: the cursor and the error on USRIDIN.
@@ -470,19 +483,30 @@ interface PageCase {
     direction: Direction;
     resultPage: number;
     searchAfter: string;
+    nextStartKey: string;
 }
 
-// Both keys page from the shown page 2. F8's PROCESS-PAGE-FORWARD runs to its end and blanks
-// USRIDIN; F7's PROCESS-PAGE-BACKWARD leaves the typed search key.
+// Both keys page from the shown page 2: F8 from its last user ID, F7 from its first. Pressed
+// again, each pages from the same end of the page it brought, with that page's number. F8's
+// PROCESS-PAGE-FORWARD runs to its end and blanks USRIDIN; F7's PROCESS-PAGE-BACKWARD leaves
+// the typed search key.
 const SHOWN_PAGE = 2;
 const PAGE_DIRECTIONS: readonly Omit<PageCase, "trigger">[] = [
-    { key: "F8", startKey: LAST_KEY, direction: Direction.FORWARD, resultPage: 3, searchAfter: "" },
+    {
+        key: "F8",
+        startKey: FIRST_PAGE_LAST_KEY,
+        direction: Direction.FORWARD,
+        resultPage: 3,
+        searchAfter: "",
+        nextStartKey: OTHER_PAGE_LAST_KEY,
+    },
     {
         key: "F7",
-        startKey: FIRST_KEY,
+        startKey: FIRST_PAGE_FIRST_KEY,
         direction: Direction.BACKWARD,
         resultPage: 1,
         searchAfter: SEARCH_TEXT,
+        nextStartKey: OTHER_PAGE_FIRST_KEY,
     },
 ];
 const PAGE_CASES: readonly PageCase[] = PAGE_DIRECTIONS.flatMap((pageCase) =>
@@ -490,8 +514,8 @@ const PAGE_CASES: readonly PageCase[] = PAGE_DIRECTIONS.flatMap((pageCase) =>
 );
 
 it.each(PAGE_CASES)(
-    "COUSR00C $key by $trigger browses $direction from $startKey",
-    async ({ key, trigger, startKey, direction, resultPage, searchAfter }) => {
+    "COUSR00C $key by $trigger browses $direction from $startKey, then from $nextStartKey",
+    async ({ key, trigger, startKey, direction, resultPage, searchAfter, nextStartKey }) => {
         mockListUsers.mockResolvedValueOnce(BuildListResponse({ page: SHOWN_PAGE }));
         const user = await RenderLoadedScreen();
         const nextPage = BuildListResponse({ rows: OTHER_PAGE_ROWS, page: resultPage });
@@ -503,6 +527,10 @@ it.each(PAGE_CASES)(
         expect(BodyRowTexts()).toEqual(RowTextsOf(OTHER_PAGE_ROWS));
         expect(screen.getByText(`Page: ${resultPage}`)).toBeVisible();
         expect(SearchField()).toHaveValue(searchAfter);
+        await ExpectKeysReady();
+        await TriggerKey(user, key, trigger);
+        const nextQuery: UserListQuery = { startKey: nextStartKey, direction, page: resultPage };
+        expect(mockListUsers).toHaveBeenLastCalledWith(nextQuery, READ_OPTIONS);
     },
 );
 
@@ -580,7 +608,7 @@ async function RenderSecondPage(): Promise<UserEvent> {
     return RenderLoadedScreen();
 }
 
-it("COUSR00C ENTER STARTBR NOTFND shows page 1 with the rows read again and refuses F8", async () => {
+it("COUSR00C ENTER STARTBR NOTFND shows page 1 with rows read again and refuses F8", async () => {
     const user = await RenderSecondPage();
     const notFound = BuildListResponse({ ...NOT_FOUND_PAGE, message: AT_TOP_OF_PAGE });
     mockSelectUsers.mockResolvedValueOnce(notFound);
@@ -600,9 +628,9 @@ it("COUSR00C ENTER STARTBR NOTFND shows page 1 with the rows read again and refu
 
 // SEL0003 shows TESTUSR2 on the first page and TESTUSRC on the other page.
 const KEPT_CODE_ROW = 3;
-// F8 from the re-browsed page an invalid-selection 400 body carries.
+// F8 from the last user ID of the re-browsed page an invalid-selection 400 body carries.
 const REBROWSED_F8_QUERY: UserListQuery = {
-    startKey: REBROWSED_LAST_KEY,
+    startKey: OTHER_PAGE_LAST_KEY,
     direction: Direction.FORWARD,
     page: 1,
 };
@@ -626,7 +654,7 @@ it("COUSR00C ENTER invalid-selection 400 shows its body's page and keeps the cod
     expect(mockListUsers).toHaveBeenLastCalledWith(REBROWSED_F8_QUERY, READ_OPTIONS);
 });
 
-it("COUSR00C keeps a code at its row across F8 and sends it beside the user shown there", async () => {
+it("COUSR00C keeps a code at its row across F8, sent beside the user shown there", async () => {
     const user = await RenderLoadedScreen();
     await ChooseSelection(user, KEPT_CODE_ROW, "U");
     mockListUsers.mockResolvedValueOnce(BuildListResponse({ rows: OTHER_PAGE_ROWS, page: 2 }));
