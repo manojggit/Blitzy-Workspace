@@ -21,6 +21,10 @@ happens per request. Admin is exactly A; every other stored type (U, u, a, X, ..
 - OnlineContext is the one parameter object services and repositories receive. Every context
   dependency releases the request's shared batch-window lock (core.locks) when the request ends,
   whether it succeeds, fails or is cancelled.
+- GetRegularReportContext serves CR00 alone. Its session comes from core.database
+  GetReportSession, which admits nothing, because the CR00 service takes the request admission
+  only for its reads (core.database.AdmittedReads); every other context is admitted by
+  GetSession for the whole request.
 
 COMEN01C's own admin-only option check (CDEMO-USRTYP-USER, exactly U) is ported in the menu
 service, not here.
@@ -36,7 +40,7 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.config import Settings
-from app.core.database import GetSession
+from app.core.database import GetReportSession, GetSession
 from app.core.errors import HTTP_ACCESS_REFUSED, HTTP_SIGN_ON_FAILURE, LegacyMessageError
 from app.core.locks import LeaveOnlineWindow
 from app.core.messages import ADMIN_ONLY_MESSAGE
@@ -192,6 +196,30 @@ async def GetRegularContext(
 ) -> OnlineContext:
     """Return the context of a regular user; the guard runs before the context.
 
-    Serves CM00, CAVW, CAUP, CCLI, CCDL, CCUP, CT00-CT02, CR00 and CB00.
+    Serves CM00, CAVW, CAUP, CCLI, CCDL, CCUP, CT00-CT02 and CB00.
     """
     return replace(context, user=user)
+
+
+async def GetRegularReportContext(
+    user: Annotated[CurrentUser, Depends(RequireRegular)],
+    request: Request,
+    session: Annotated[AsyncSession, Depends(GetReportSession)],
+    settings: Annotated[Settings, Depends(GetAppSettings)],
+) -> AsyncIterator[OnlineContext]:
+    """Yield the CR00 context of a regular user, whose session holds no request admission.
+
+    The guard is declared first, so a missing cookie gives 401 and an admin 403 before the
+    session is made. The CR00 service admits itself only for its reads, so the request holds
+    no admission while it waits for a report slot or builds the report. The batch-window lock
+    is released at the end, as GetOnlineContext releases it, although CR00 never enters the
+    window. There is no ``except``, so the endpoint's exceptions reach the handlers.
+    """
+    context = OnlineContext(request=request, session=session, settings=settings, user=user)
+    try:
+        yield context
+    finally:
+        # Shielded: under an anyio cancellation every await would be cancelled again, yet the
+        # shared window lock must be released even when the request task is cancelled.
+        with CancelScope(shield=True):
+            await LeaveOnlineWindow(request)

@@ -2,10 +2,20 @@
 
 The CR00 transaction report screen. CORPT00C edited the request and wrote inline JCL to TDQ
 ``JOBS``, which ran ``proc/TRANREPT.prc`` (backup, sort and filter, then CBTRN03C) to print the
-TRANREPT file; here the report is built within the request by ``cbtrn03c.BuildReport`` and
-returned as JSON lines, or rendered as CSV or PDF by ``report_export``. Once the async reads have
-returned, the CPU-bound line building and CSV or PDF rendering run on a bounded worker thread
-(``REPORT_WORKERS``), so the event loop keeps serving other requests while a report is built.
+TRANREPT file; here the report is built within the request by ``cbtrn03c`` and rendered by
+``report_export`` as the screen's JSON (``RenderTransactionReportJson``, which the screen route
+sends) or as a CSV or PDF download (``ExportTransactionReport``). ``RunTransactionReport``
+returns the same screen as a ``TransactionReportResponse`` holding every line.
+
+The edits and the confirmation run first and wait for nothing. A confirmed report then takes one
+of the REPORT_WORKER_LIMIT report slots (``REPORT_SLOTS``) and holds it until it is built and
+rendered, so at most that many fetched row sets are in memory at once. Only its three reads run
+under a request admission (``core.database.AdmittedReads``), which they free, together with the
+session's connection, as soon as they return. The CPU-bound line building, and the JSON, CSV or
+PDF rendering in the same single pass, then run on a report thread, so neither a queued nor a
+running report keeps other online requests waiting. A report whose client has disconnected
+stops at the next check: when its slot is granted, after its reads, and every
+DISCONNECT_CHECK_LINES lines while it is built.
 
 The TRANREPT STEP01R backup of TRANSACT is superseded: this module never writes, deletes or
 archives anything and only reads. CR00 never opened a CLOSEFIL file, so the report is not gated
@@ -22,14 +32,17 @@ POPULATE-HEADER-INFO is the frontend ScreenShell.
 """
 
 import calendar
+import functools
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import MINYEAR, date, datetime
 from typing import Any, NamedTuple
 
-from anyio import CapacityLimiter, to_thread
+from anyio import CapacityLimiter, from_thread, to_thread
+from starlette.requests import Request, empty_receive
 
+from app.core.database import AdmittedReads
 from app.core.dependencies import OnlineContext
 from app.core.errors import (
     HTTP_EDIT_FAILURE,
@@ -42,8 +55,14 @@ from app.repositories.reference_repository import ReferenceRepository
 from app.repositories.transaction_repository import TransactionRepository
 from app.schemas.common import ExportFormat, ReportType
 from app.schemas.reports import ReportLine, ReportQuery, TransactionReportResponse
-from app.services.reports.cbtrn03c import BuildReport, ReportRequestData
-from app.services.reports.report_export import CSV_MEDIA_TYPE, PDF_MEDIA_TYPE, RenderCsv, RenderPdf
+from app.services.reports.cbtrn03c import IterateReport, ReportRequestData
+from app.services.reports.report_export import (
+    CSV_MEDIA_TYPE,
+    PDF_MEDIA_TYPE,
+    RenderCsv,
+    RenderJson,
+    RenderPdf,
+)
 from app.utils.cobol_intrinsics import NumvalC
 from app.utils.date_validation import (
     CEEDAYS_MSG_UNSUPPORTED_RANGE,
@@ -133,6 +152,8 @@ CURSOR_END_YYYY = "endYyyy"
 CURSOR_CONFIRM = "confirm"
 
 EXPORT_FILENAME_TEMPLATE = "TRANREPT_{startDate}_{endDate}.{extension}"
+# The lines of a prompt or a cleared screen, which CORPT00C sends before any report is built.
+NO_REPORT_LINES: tuple[ReportLine, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -150,14 +171,33 @@ class ReportRange:
 
 @dataclass(frozen=True)
 class ReportOutcome:
-    """The CORPT00 screen ENTER produced, and whether it carries a built report.
+    """What the edits and the confirmation of one CORPT00 ENTER decided, before any read.
 
-    ``built`` is False for the confirmation prompt and for the screen a confirmation of N
-    clears; it is True once the report lines were built.
+    ``pendingResponse`` is the confirmation prompt, or the screen a confirmation of N clears;
+    it is None once Y confirms the report over ``reportRange``.
     """
 
-    response: TransactionReportResponse
-    built: bool
+    reportRange: ReportRange
+    pendingResponse: TransactionReportResponse | None
+
+
+@dataclass(frozen=True)
+class ReportJob:
+    """The fetched TRANREPT input a report thread builds from, and the request it serves.
+
+    The reads are over: ``rows`` are the STEP05R output and the two maps the TRANTYPE and
+    TRANCATG records, as ``cbtrn03c.IterateReport`` takes them.
+    """
+
+    request: Request
+    requestData: ReportRequestData
+    rows: Sequence[Mapping[str, Any]]
+    typeDescriptions: Mapping[str, str]
+    categoryDescriptions: Mapping[tuple[str, int], str]
+
+
+class ReportAbandonedError(Exception):
+    """Internal: the report's client has disconnected, so the report is not finished."""
 
 
 class DatePartField(NamedTuple):
@@ -188,7 +228,7 @@ class ReportDateField(NamedTuple):
 class ExportRenderer(NamedTuple):
     """The renderer, media type and file extension of one report download format."""
 
-    render: Callable[[Sequence[ReportLine]], bytes]
+    render: Callable[[Iterable[ReportLine]], bytes]
     mediaType: str
     extension: str
 
@@ -260,13 +300,26 @@ EXPORT_RENDERERS: dict[ExportFormat, ExportRenderer] = {
     ExportFormat.PDF: ExportRenderer(RenderPdf, PDF_MEDIA_TYPE, "pdf"),
 }
 
-# The most worker threads building or rendering reports at once, across all requests. The work
-# is pure Python that holds the GIL, so more threads add no throughput and only compete with the
-# event loop; core.database admission already caps concurrent requests at ADMITTED_REQUEST_LIMIT.
+# The most reports reading, building or rendering at once, across all requests. The work is pure
+# Python that holds the GIL, so more at once adds no throughput and only competes with the event
+# loop; and each report in a slot holds its fetched rows, so the limit also bounds report memory.
 REPORT_WORKER_LIMIT = 2
-# Shared by every report request; created at import, before any event loop runs, so anyio
-# creates the backend limiter on first use.
-REPORT_WORKERS = CapacityLimiter(REPORT_WORKER_LIMIT)
+# The report slots, taken before the reads and held until the report is built and rendered. A
+# report waits for its slot holding no admission and no connection. Created at import, before
+# any event loop runs, so anyio creates the backend limiter on first use.
+REPORT_SLOTS = CapacityLimiter(REPORT_WORKER_LIMIT)
+# The worker threads of the reports in a slot. anyio lends a task one token of a limiter at a
+# time, and the task already holds its REPORT_SLOTS token, so the thread needs a limiter of its
+# own; it is never contended, because only reports in a slot borrow from it.
+REPORT_THREADS = CapacityLimiter(REPORT_WORKER_LIMIT)
+# The report lines a report thread builds between two checks that its client is still connected.
+DISCONNECT_CHECK_LINES = 2000
+# nginx's 499 Client Closed Request, the status of a report stopped because its client
+# disconnected. The client is gone and never receives it, so it shows only in the server log.
+HTTP_CLIENT_CLOSED_REQUEST = 499
+CLIENT_CLOSED_MESSAGE = ""
+# One INFO record per stopped report; it names the transaction only, never the query or a PAN.
+REPORT_ABANDONED_LOG = "%s report stopped: the client disconnected"
 
 
 def CurrentDate() -> date:
@@ -518,7 +571,7 @@ def ReportEndBound(endDate: str) -> date | None:
 
 async def ReadReportRows(
     repository: TransactionRepository, reportRange: ReportRange
-) -> list[dict[str, Any]]:
+) -> Sequence[Mapping[str, Any]]:
     """Return the TRANREPT STEP05R output: transactions in range, in TRAN-CARD-NUM order.
 
     The repository filters on the PROC-TS date and sorts; this read never enters the batch
@@ -531,14 +584,12 @@ async def ReadReportRows(
     return await repository.GetReportTransactions(startBound, endBound)
 
 
-async def BuildReportLines(context: OnlineContext, reportRange: ReportRange) -> list[ReportLine]:
-    """Replace the TDQ job submission (lines 496-535) with the TRANREPT report, built online.
+async def ReadReportJob(context: OnlineContext, reportRange: ReportRange) -> ReportJob:
+    """Run the TRANTYPE, TRANCATG and TRANSACT reads that replace the TDQ job (lines 496-535).
 
-    Only reads run: the STEP01R backup of TRANSACT is superseded. Once the reads have returned,
-    ``BuildReport`` runs over the fetched rows on a ``REPORT_WORKERS`` thread, so building a
-    large report never holds the event loop. ``cbtrn03c.ReportAbendError`` (the CBTRN03C abend
-    999) is deliberately not caught, so it reaches FastAPI's 500 and the page shows the legacy
-    abend text.
+    Only reads run: the STEP01R backup of TRANSACT is superseded. They run under one request
+    admission, which ``AdmittedReads`` frees, after ending the read transaction and returning
+    the session's connection, as soon as they return or fail.
 
     Raises:
         LegacyMessageError: 503 ``Unable to Write TDQ (JOBS)...`` with the cursor on the report
@@ -546,23 +597,117 @@ async def BuildReportLines(context: OnlineContext, reportRange: ReportRange) -> 
     """
     referenceRepository = ReferenceRepository(context)
     try:
-        typeDescriptions = await referenceRepository.GetTypeDescriptions()
-        categoryDescriptions = await referenceRepository.GetCategoryDescriptions()
-        rows = await ReadReportRows(TransactionRepository(context), reportRange)
+        async with AdmittedReads(context.request, context.session):
+            typeDescriptions = await referenceRepository.GetTypeDescriptions()
+            categoryDescriptions = await referenceRepository.GetCategoryDescriptions()
+            rows = await ReadReportRows(TransactionRepository(context), reportRange)
     except RepositoryError as error:
         LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         raise LegacyMessageError(
             UNABLE_TO_WRITE_TDQ_MESSAGE, field=CURSOR_REPORT_TYPE, httpStatus=HTTP_FILE_ERROR
         ) from error
     requestData = ReportRequestData(reportRange.startDate, reportRange.endDate)
-    return await to_thread.run_sync(
-        BuildReport,
-        requestData,
-        rows,
-        typeDescriptions,
-        categoryDescriptions,
-        limiter=REPORT_WORKERS,
-    )
+    return ReportJob(context.request, requestData, rows, typeDescriptions, categoryDescriptions)
+
+
+async def ClientDisconnected(request: Request) -> bool:
+    """Return True once the client of ``request`` has closed its connection.
+
+    A request made without a receive channel, such as a service-level test context, has no
+    client that could disconnect, so it never reports one.
+    """
+    if request.receive is empty_receive:
+        return False
+    return await request.is_disconnected()
+
+
+async def StopIfClientGone(request: Request) -> None:
+    """Raise ReportAbandonedError when the client of ``request`` has disconnected."""
+    if await ClientDisconnected(request):
+        raise ReportAbandonedError
+
+
+def WatchClient(lines: Iterable[ReportLine], request: Request) -> Iterator[ReportLine]:
+    """Yield lines on a report thread, checking the client every DISCONNECT_CHECK_LINES lines.
+
+    Each check runs ``ClientDisconnected`` on the event loop and waits for its answer.
+
+    Raises:
+        ReportAbandonedError: The client has disconnected, so no further line is built.
+    """
+    for lineNumber, line in enumerate(lines, start=1):
+        isCheckLine = lineNumber % DISCONNECT_CHECK_LINES == 0
+        if isCheckLine and from_thread.run(ClientDisconnected, request):
+            raise ReportAbandonedError
+        yield line
+
+
+def JobLines(job: ReportJob) -> Iterator[ReportLine]:
+    """Yield the CBTRN03C lines of ``job`` one at a time, stopping if its client goes away."""
+    lines = IterateReport(job.requestData, job.rows, job.typeDescriptions, job.categoryDescriptions)
+    return WatchClient(lines, job.request)
+
+
+def ListReportLines(job: ReportJob) -> list[ReportLine]:
+    """Build every report line of ``job`` on a report thread, for ``RunTransactionReport``."""
+    return list(JobLines(job))
+
+
+def RenderReportLines(render: Callable[[Iterable[ReportLine]], bytes], job: ReportJob) -> bytes:
+    """Build and render the lines of ``job`` in one pass on a report thread.
+
+    ``render`` reads each line as it is built, so the whole line list never exists.
+    """
+    return render(JobLines(job))
+
+
+async def RunReportJob[WorkResult](
+    context: OnlineContext, reportRange: ReportRange, work: Callable[[ReportJob], WorkResult]
+) -> WorkResult:
+    """Read the confirmed report in a report slot, then run ``work`` over it on a report thread.
+
+    The slot is taken before the reads and held until ``work`` returns, so at most
+    REPORT_WORKER_LIMIT row sets exist at once; the request admission is held for the reads
+    only. A gone client is checked for when the slot is granted, after the reads and while
+    ``work`` builds lines. ``cbtrn03c.ReportAbendError`` (the CBTRN03C abend 999) is
+    deliberately not caught, so it reaches FastAPI's 500 and the page shows the legacy abend.
+
+    Raises:
+        LegacyMessageError: 503 when a read fails, as ``ReadReportJob``; 499
+            (HTTP_CLIENT_CLOSED_REQUEST), logged once at INFO, when the client disconnected.
+    """
+    try:
+        async with REPORT_SLOTS:
+            await StopIfClientGone(context.request)
+            job = await ReadReportJob(context, reportRange)
+            await StopIfClientGone(context.request)
+            return await to_thread.run_sync(work, job, limiter=REPORT_THREADS)
+    except ReportAbandonedError:
+        LOGGER.info(REPORT_ABANDONED_LOG, TRANSACTION_ID)
+        raise LegacyMessageError(
+            CLIENT_CLOSED_MESSAGE, httpStatus=HTTP_CLIENT_CLOSED_REQUEST
+        ) from None
+
+
+async def BuildReportLines(context: OnlineContext, reportRange: ReportRange) -> list[ReportLine]:
+    """Replace the TDQ job submission (lines 496-535) with the TRANREPT report, built online.
+
+    Raises:
+        LegacyMessageError: As ``RunReportJob``.
+    """
+    return await RunReportJob(context, reportRange, ListReportLines)
+
+
+async def RenderReportDocument(
+    context: OnlineContext, reportRange: ReportRange, renderer: ExportRenderer
+) -> bytes:
+    """Build the confirmed report and render it as ``renderer`` in the same single pass.
+
+    Raises:
+        LegacyMessageError: As ``RunReportJob``.
+    """
+    renderWork = functools.partial(RenderReportLines, renderer.render)
+    return await RunReportJob(context, reportRange, renderWork)
 
 
 def SubmittedResponse(
@@ -582,19 +727,31 @@ def SubmittedResponse(
     )
 
 
-async def EvaluateReportRequest(context: OnlineContext, query: ReportQuery) -> ReportOutcome:
-    """Port PROCESS-ENTER-KEY and SUBMIT-JOB-TO-INTRDR (lines 208-510) for one ENTER.
+async def BuildReportJson(context: OnlineContext, reportRange: ReportRange) -> bytes:
+    """Build the confirmed report and write its success screen as JSON in the same single pass.
+
+    ``report_export.RenderJson`` encodes each line on the report thread as it is built, so the
+    whole line list never exists.
 
     Raises:
-        LegacyMessageError: 400 for the first failing edit or an invalid confirmation; 503
-            when a report read fails.
+        LegacyMessageError: As ``RunReportJob``.
+    """
+    renderScreen = functools.partial(RenderJson, SubmittedResponse(reportRange, []))
+    renderWork = functools.partial(RenderReportLines, renderScreen)
+    return await RunReportJob(context, reportRange, renderWork)
+
+
+def EvaluateReportRequest(query: ReportQuery) -> ReportOutcome:
+    """Port the PROCESS-ENTER-KEY edits and SUBMIT-JOB-TO-INTRDR's confirmation (lines 208-494).
+
+    They run before any report slot, admission or read is taken, so a prompt, a cleared screen
+    or an edit failure never waits behind running reports.
+
+    Raises:
+        LegacyMessageError: 400 for the first failing edit or an invalid confirmation.
     """
     reportRange = ResolveReportRange(query, CurrentDate())
-    pendingResponse = ConfirmationResponse(reportRange, query.confirm)
-    if pendingResponse is not None:
-        return ReportOutcome(response=pendingResponse, built=False)
-    lines = await BuildReportLines(context, reportRange)
-    return ReportOutcome(response=SubmittedResponse(reportRange, lines), built=True)
+    return ReportOutcome(reportRange, ConfirmationResponse(reportRange, query.confirm))
 
 
 async def RunTransactionReport(
@@ -607,10 +764,35 @@ async def RunTransactionReport(
         the CBTRN03C lines (Y), each with 200.
 
     Raises:
-        LegacyMessageError: 400 for an edit or confirmation failure; 503 for a failed read.
+        LegacyMessageError: 400 for an edit or confirmation failure; 503 for a failed read;
+            499 when the client disconnected before the report was built.
     """
-    outcome = await EvaluateReportRequest(context, query)
-    return outcome.response
+    outcome = EvaluateReportRequest(query)
+    if outcome.pendingResponse is not None:
+        return outcome.pendingResponse
+    lines = await BuildReportLines(context, outcome.reportRange)
+    return SubmittedResponse(outcome.reportRange, lines)
+
+
+async def RenderTransactionReportJson(context: OnlineContext, query: ReportQuery) -> bytes:
+    """Run CR00 ENTER as ``RunTransactionReport`` does and return its screen as JSON bytes.
+
+    The bytes are those FastAPI sends for the ``TransactionReportResponse`` that
+    ``RunTransactionReport`` returns, but a confirmed report's lines are encoded one at a time
+    as they are built, so neither the line list nor a response model holding it exists. The
+    screen route sends them as they are.
+
+    Returns:
+        The JSON of the prompt (blank confirmation), the cleared screen (N) or the submitted
+        literal with the CBTRN03C lines (Y), each sent with 200.
+
+    Raises:
+        LegacyMessageError: As ``RunTransactionReport``.
+    """
+    outcome = EvaluateReportRequest(query)
+    if outcome.pendingResponse is not None:
+        return RenderJson(outcome.pendingResponse, NO_REPORT_LINES)
+    return await BuildReportJson(context, outcome.reportRange)
 
 
 async def ExportTransactionReport(
@@ -618,8 +800,8 @@ async def ExportTransactionReport(
 ) -> tuple[bytes, str, str]:
     """Run the CR00 edits and render the confirmed report as a CSV or PDF download.
 
-    The content is built in memory on a ``REPORT_WORKERS`` thread, so rendering never holds the
-    event loop; no file is written.
+    The lines are built and rendered in memory in one pass on a report thread, so rendering
+    never holds the event loop and the whole line list never exists; no file is written.
 
     Returns:
         The document bytes, its media type and its ``TRANREPT_<start>_<end>.<ext>`` file name.
@@ -628,17 +810,18 @@ async def ExportTransactionReport(
         LegacyMessageError: 400 with the prompt or cleared-screen message and cursor when the
             request does not confirm a report; otherwise as ``RunTransactionReport``.
     """
-    outcome = await EvaluateReportRequest(context, query)
-    response = outcome.response
-    if not outcome.built:
+    outcome = EvaluateReportRequest(query)
+    pendingResponse = outcome.pendingResponse
+    if pendingResponse is not None:
         raise LegacyMessageError(
-            response.message, field=response.cursor_field or "", httpStatus=HTTP_EDIT_FAILURE
+            pendingResponse.message,
+            field=pendingResponse.cursor_field or "",
+            httpStatus=HTTP_EDIT_FAILURE,
         )
+    reportRange = outcome.reportRange
     renderer = EXPORT_RENDERERS[exportFormat]
     fileName = EXPORT_FILENAME_TEMPLATE.format(
-        startDate=response.start_date, endDate=response.end_date, extension=renderer.extension
+        startDate=reportRange.startDate, endDate=reportRange.endDate, extension=renderer.extension
     )
-    documentBytes = await to_thread.run_sync(
-        renderer.render, response.lines, limiter=REPORT_WORKERS
-    )
+    documentBytes = await RenderReportDocument(context, reportRange, renderer)
     return documentBytes, renderer.mediaType, fileName

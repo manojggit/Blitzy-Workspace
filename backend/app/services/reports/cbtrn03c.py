@@ -2,9 +2,10 @@
 
 The CBTRN03C transaction detail report as a pure line builder. BuildReport turns the report input
 into the 133-column TRANREPT print lines (CVTRA07Y layouts), each with the structured fields the
-CR00 screen table, the CSV export and the PDF export show. It reads no database, file, clock or
-setting and logs nothing: the CBTRN03C DISPLAY of every TRAN-RECORD and TRAN-AMT has no
-counterpart, because it would log card numbers.
+CR00 screen table, the CSV export and the PDF export show. IterateReport yields the same lines
+one record at a time, so an export never holds the whole report. The module reads no database,
+file, clock or setting and logs nothing: the CBTRN03C DISPLAY of every TRAN-RECORD and TRAN-AMT
+has no counterpart, because it would log card numbers.
 
 The caller supplies the input already filtered and ordered, replacing the proc/TRANREPT.prc
 STEP05R INCLUDE on TRAN-PROC-TS positions 305-314 and its SORT FIELDS=(TRAN-CARD-NUM,A). The
@@ -14,7 +15,7 @@ surviving path is empty input, where the first READ meets end of file and the jo
 so BuildReport returns no lines for no rows.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal, localcontext
 from typing import Any
@@ -107,7 +108,8 @@ class ReportAbendError(RuntimeError):
 class ReportState:
     """Internal accumulator: CBTRN03C WS-REPORT-VARS, WS-CURR-CARD-NUM and the last XREF-ACCT-ID.
 
-    lines holds the TRANREPT records written so far, in print order.
+    lines holds the TRANREPT records written since IterateReport last yielded them, in print
+    order.
     """
 
     query: ReportRequestData
@@ -157,14 +159,40 @@ def BuildReport(
     Raises:
         ReportAbendError: A card, transaction type or category key is not on file (abend 999).
     """
-    if not rows:
-        return []
+    return list(IterateReport(query, rows, typeDescriptions, categoryDescriptions))
+
+
+def IterateReport(
+    query: ReportRequestData,
+    rows: Iterable[Mapping[str, Any]],
+    typeDescriptions: Mapping[str, str],
+    categoryDescriptions: Mapping[tuple[str, int], str],
+) -> Iterator[ReportLine]:
+    """Yield the BuildReport lines for rows one at a time, in the same print order.
+
+    The input contract is BuildReport's. The lines each record writes are yielded once it is
+    processed, and the end-of-file totals once the rows run out, so a CSV or PDF export can be
+    rendered without ever holding the whole report. No rows yield no lines. An abend raises
+    ReportAbendError when its record is reached, after the lines of the records before it.
+    """
     lookups = ReportLookups(typeDescriptions, categoryDescriptions)
     state = ReportState(query=query)
+    lastRow: Mapping[str, Any] | None = None
     for row in rows:
         ProcessRecord(state, row, lookups)
-    FinishReport(state, rows[-1])
-    return state.lines
+        yield from DrainLines(state)
+        lastRow = row
+    if lastRow is None:
+        return
+    FinishReport(state, lastRow)
+    yield from DrainLines(state)
+
+
+def DrainLines(state: ReportState) -> list[ReportLine]:
+    """Return the lines written since the last drain, in print order, and forget them."""
+    writtenLines = state.lines
+    state.lines = []
+    return writtenLines
 
 
 def ProcessRecord(state: ReportState, row: Mapping[str, Any], lookups: ReportLookups) -> None:

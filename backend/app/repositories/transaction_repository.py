@@ -17,11 +17,12 @@ A database error becomes the CICS file condition of app.core.errors.MapDatabaseE
 DuplicateKeyError (DUPREC), 55P03 is RecordLockError and any other, or a connection that cannot
 be opened, is FileIoError. Records are returned as dictionaries keyed by column name;
 ``tran_amt`` stays a Decimal and the timestamps stay datetimes beside their format codes. Browse
-rows hold only the CT00 list columns (BROWSE_COLUMNS). Report rows hold only the columns the
-report builder reads, plus ``xref_acct_id``.
+rows hold only the CT00 list columns (BROWSE_COLUMNS). Report rows are read-only row mappings
+keyed the same way, rather than dictionary copies, and hold only the columns the report builder
+reads, plus ``xref_acct_id``.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
@@ -30,6 +31,7 @@ from sqlalchemy import (
     ColumnElement,
     Executable,
     Result,
+    RowMapping,
     Select,
     Text,
     bindparam,
@@ -284,16 +286,18 @@ class TransactionRepository:
         }
         await self._Execute(unit, insert(Transaction).values(insertValues))
 
-    async def GetReportTransactions(self, startDate: date, endDate: date) -> list[dict[str, Any]]:
+    async def GetReportTransactions(self, startDate: date, endDate: date) -> Sequence[RowMapping]:
         """Replace the TRANREPT STEP05R SORT and the CBTRN03C 1500-A-LOOKUP-XREF reads.
 
         Returns the transactions whose PROC-TS date lies from startDate to endDate inclusive,
         in TRAN-CARD-NUM order and then TRANSACT key order. Each row carries only the fields
         cbtrn03c.BuildReport reads, tran_id, card_num, tran_type_cd, tran_cat_cd, tran_source and
         tran_amt, and ``xref_acct_id``, the XREF-ACCT-ID of its card, or None when the card has
-        no cross-reference (INVALID KEY).
+        no cross-reference (INVALID KEY). The rows are the read-only mappings the result
+        fetched, not dictionary copies, because a yearly report holds many thousands of them.
 
         This read never enters the batch window: CR00 only submitted a job to TDQ JOBS and never
         opened TRANSACT, so a closed window does not stop the report.
         """
-        return await self._FetchRecords(ReportStatement(startDate, endDate))
+        result = await self._Execute(self.context.session, ReportStatement(startDate, endDate))
+        return result.mappings().all()

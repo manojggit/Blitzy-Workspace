@@ -28,7 +28,18 @@ A request therefore holds up to four pooled connections at once: the session, th
 connection and two units. GetSession admits at most ADMITTED_REQUEST_LIMIT requests at a time,
 so admitted requests never need more connections than the pool holds, and a request waits for
 admission before it holds any. Requests can thus never each hold a connection while waiting for
-another until the pool timeout.
+another until the pool timeout. The pool closes a returned connection beyond POOL_SIZE, so
+POOL_SIZE covers all the connections the admitted requests can hold at once and only
+POOL_HEADROOM_CONNECTIONS can overflow. Steady load at any concurrency therefore reuses warm
+connections rather than opening new PostgreSQL sessions.
+
+CR00 (CORPT00C) takes the admission only for its reads. Its route depends on GetReportSession,
+which admits nothing, and corpt00c runs the three report reads inside AdmittedReads, which ends
+the read transaction and returns the session's connection before it frees the admission. The
+report is then built and rendered holding neither, so a queued or running report never keeps
+other online requests waiting. Its reads hold one connection, within REQUEST_CONNECTION_LIMIT,
+and corpt00c takes its report slot before the admission, never while holding one, so the
+reasoning above still holds. Every other route is admitted by GetSession as described above.
 
 main.CreateApp keeps the settings, the engine and the session factory on app.state, and
 everything here reads them from there, so tests can swap engines. The admission semaphore is
@@ -39,7 +50,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import asyncpg
-from anyio import Semaphore
+from anyio import CancelScope, Semaphore
 from fastapi import Request
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
@@ -64,9 +75,8 @@ WRITE_UNIT_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '5s'"
 # read to the end of the request), the batch-window connection and, in CAUP and CB00, two
 # nested write units.
 REQUEST_CONNECTION_LIMIT = 4
-POOL_SIZE = 10
-POOL_MAX_OVERFLOW = 30
-POOL_CAPACITY = POOL_SIZE + POOL_MAX_OVERFLOW
+# The most connections the engine has open at once, kept and overflow together.
+POOL_CAPACITY = 40
 # Connections no admitted request counts on: a cancelled request's session can still be closing
 # after its admission is freed.
 POOL_HEADROOM_CONNECTIONS = 4
@@ -77,6 +87,12 @@ POOL_HEADROOM_CONNECTIONS = 4
 # No cycle of requests each holding a connection while waiting for the next can form, however
 # many requests arrive, so none of them stalls until the pool timeout.
 ADMITTED_REQUEST_LIMIT = (POOL_CAPACITY - POOL_HEADROOM_CONNECTIONS) // REQUEST_CONNECTION_LIMIT
+# The pool keeps open every connection the admitted requests can hold at once. It closes a
+# returned connection beyond POOL_SIZE, so a smaller pool would open and close PostgreSQL
+# sessions under steady load, because each window-gated request holds two connections.
+# Overflow covers only the headroom for sessions still closing after their admission is freed.
+POOL_SIZE = ADMITTED_REQUEST_LIMIT * REQUEST_CONNECTION_LIMIT
+POOL_MAX_OVERFLOW = POOL_CAPACITY - POOL_SIZE
 # The app.state attribute of the admission semaphore, created by the first GetSession call.
 REQUEST_ADMISSION_ATTRIBUTE = "requestAdmission"
 
@@ -107,6 +123,10 @@ def BuildEngine(settings: Settings) -> AsyncEngine:
     open on first use, so the backend starts while PostgreSQL is down and GET /health/ready
     reports 503 until the database is reachable. A DATABASE_URL that does not parse raises
     ParseDatabaseUrl's ValueError, which never repeats the URL.
+
+    Once opened, up to POOL_SIZE connections, all that the admitted requests can hold at once,
+    stay in the pool between requests, so steady load reuses them. POOL_MAX_OVERFLOW more,
+    the closing-session headroom, are closed when returned; POOL_CAPACITY bounds the total.
 
     Password hashes, SSNs, CVVs and customer data travel as bound parameters and result rows,
     so hide_parameters=True keeps parameters out of SQLAlchemy's error text, and
@@ -164,6 +184,49 @@ async def GetSession(request: Request) -> AsyncIterator[AsyncSession]:
     sessionFactory: async_sessionmaker[AsyncSession] = request.app.state.sessionFactory
     async with RequestAdmission(request), sessionFactory() as session:
         yield session
+
+
+async def GetReportSession(request: Request) -> AsyncIterator[AsyncSession]:
+    """Yield the CR00 request's session without admitting the request; close it at the end.
+
+    The session holds no connection until its first read, and the CR00 service runs every read
+    inside AdmittedReads, which takes the admission only for those reads. Leaving the request
+    closes the session, a no-op once AdmittedReads has closed it.
+    """
+    sessionFactory: async_sessionmaker[AsyncSession] = request.app.state.sessionFactory
+    async with sessionFactory() as session:
+        yield session
+
+
+async def CloseReadSession(session: AsyncSession) -> None:
+    """Roll back and close a request session that only read, returning its connection.
+
+    When the close fails on a broken connection, the session is invalidated instead, so the
+    driver connection is discarded rather than pooled. The failure is not raised, so the
+    caller keeps the outcome of its reads.
+    """
+    try:
+        await session.close()
+    except UNIT_FAILURES:
+        await session.invalidate()
+
+
+@asynccontextmanager
+async def AdmittedReads(request: Request, session: AsyncSession) -> AsyncIterator[None]:
+    """Run a block of reads on ``session`` under one of the request admissions.
+
+    The block waits, in arrival order, for one of the ADMITTED_REQUEST_LIMIT admissions before
+    its first read. At exit, whether the block returns, raises or is cancelled, the session's
+    read transaction is ended and its connection returned to the pool before the admission is
+    freed, so a request that goes on working after its reads holds neither. The close is
+    shielded, because under a cancellation every await would be cancelled again.
+    """
+    async with RequestAdmission(request):
+        try:
+            yield
+        finally:
+            with CancelScope(shield=True):
+                await CloseReadSession(session)
 
 
 def TranslateWriteFailure(exc: Exception, fileName: str) -> RepositoryError:
