@@ -2282,6 +2282,20 @@ const SHOWN_CANCEL_CASES: readonly ShownCancelCase[] = [
     },
 ];
 
+// A 422 names the input it refused: the page shows the abend text in red, marks only that input
+// and puts the cursor on it (MOVE -1 TO <field>L), keeping every value as keyed.
+async function MarksStructurallyRejectedInput(): Promise<void> {
+    const user = await RenderInState(UpdateScreenState.SHOW_DETAILS);
+    await KeyEdits(user, NON_CP037_EDITS);
+    mockUpdateAccount.mockRejectedValueOnce(StructuralRejection("addr_line_1"));
+    await PressFunctionKey(user, ENTER_KEY);
+    const keyedFields = WithEdits(TEST_FIELDS, NON_CP037_EDITS);
+    ExpectScreenShown(keyedFields, DETAIL_FIELD_NAMES, [[MSG_ABEND, "error"]]);
+    const markedInputs = [...document.querySelectorAll(MARKED_INPUT_SELECTOR)];
+    expect(markedInputs).toEqual([InputOf("addr_line_1")]);
+    expect(InputOf("addr_line_1")).toHaveFocus();
+}
+
 async function CancelSendsShownFields(cancelCase: ShownCancelCase): Promise<void> {
     const user = await RenderInState(cancelCase.startState);
     await KeyEdits(user, cancelCase.rejectedEdits);
@@ -2336,6 +2350,13 @@ async function SendsTextAsKeyed(keyedCase: KeyedRequestCase): Promise<void> {
     await PressFunctionKey(user, keyedCase.updateKey);
     ExpectUpdateRequest(TEST_ACCOUNT_ID, keyedCase.request);
 }
+
+describe("COACTUPC /accounts/update structural rejections", () => {
+    it(
+        "COACTUPC shows a 422 as the ABEND text and marks and focuses the field it names",
+        MarksStructurallyRejectedInput,
+    );
+});
 
 describe("COACTUPC /accounts/update state transitions", () => {
     it.each(CANCEL_START_STATES)(

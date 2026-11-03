@@ -27,6 +27,7 @@ database.
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from fastapi import Request
@@ -69,6 +70,24 @@ SQLSTATE_ATTRIBUTES = ("sqlstate", "pgcode")
 
 STANDARD_BODY_KEYS = ("message", "info_message", "field_errors", "cursor_field")
 REQUEST_LOCATION_KINDS = frozenset({"body", "query", "path", "header", "cookie"})
+# The screen key each camelCase key parameter carries, named as its program's own errors name it
+# (MOVE -1 TO <field>L): ACCTSID (COACTVWC, COACTUPC, COCRDLIC, COCRDSLC, COCRDUPC), CARDSID
+# (COCRDLIC, COCRDSLC, COCRDUPC), TRNIDIN (COTRN01C, and the COTRN00C search key), USRIDIN
+# (COUSR02C, COUSR03C, and the COUSR00C search key). A 422 on such a parameter therefore marks the
+# same input as the program's 400. Every other parameter keeps its wire name: CR00's ReportQuery
+# names are the CORPT00 page's field names, and the paging, export-format and fetch-screen
+# parameters are no screen input.
+KEY_PARAMETER_FIELDS: Mapping[str, str] = MappingProxyType(
+    {
+        "acctId": "acct_id",
+        "cardNum": "card_num",
+        "tranId": "tran_id",
+        "userId": "user_id",
+        "searchTranId": "search_tran_id",
+        "searchUserId": "search_user_id",
+    }
+)
+KEY_PARAMETER_LOCATIONS = frozenset({"query", "path"})
 
 # The detail of the HTTP 400 FastAPI raises when reading a JSON body fails other than by a
 # JSON decode error: a body that is not valid UTF-8, or one nested too deeply to parse.
@@ -316,12 +335,17 @@ def FieldNameOf(location: Sequence[Any]) -> str:
 
     The field is the last string element after the location kind: ``("body", "password")``
     gives ``password`` and ``("body", "rows", 0)`` gives ``rows``, while ``("body",)`` and the
-    JSON decode position ``("body", 7)`` give "".
+    JSON decode position ``("body", 7)`` give "". A query or path key parameter gives the screen
+    field of KEY_PARAMETER_FIELDS, so ``("query", "acctId")`` gives ``acct_id``; any other
+    parameter keeps its wire name, so ``("query", "reportType")`` gives ``reportType``.
     """
     hasKind = bool(location) and location[0] in REQUEST_LOCATION_KINDS
     fieldParts = location[1:] if hasKind else location
     fieldNames = [part for part in fieldParts if isinstance(part, str)]
-    return fieldNames[-1] if fieldNames else ""
+    fieldName = fieldNames[-1] if fieldNames else ""
+    if hasKind and location[0] in KEY_PARAMETER_LOCATIONS:
+        return KEY_PARAMETER_FIELDS.get(fieldName, fieldName)
+    return fieldName
 
 
 def FieldErrorsOf(errors: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -365,10 +389,12 @@ async def HandleRequestValidationError(
     as the 422 response of every operation FastAPI validates: FastAPI's ``detail`` list, each
     item holding only ``loc``, ``msg`` and ``type``, with the four standard legacy keys beside
     it, all five always present. ``message`` and ``info_message`` are empty. ``field_errors``
-    names each failing field as its location names it: the snake_case attribute of a body
-    field, or the wire name of a query or path parameter (``reportType``, ``format``). A
-    location that names no field, such as a malformed JSON body, adds none. ``cursor_field`` is
-    the first named field, or empty when there is none.
+    names each failing field as FieldNameOf names it: the snake_case attribute of a body field;
+    for a query or path key parameter, the screen field its program's own errors name
+    (``acctId`` gives ``acct_id``); for any other query or path parameter, its wire name
+    (``reportType``, ``format``). A location that names no field, such as a malformed JSON
+    body, adds none. ``cursor_field`` is the first named field, or empty when there is none.
+    ``detail`` keeps every location as FastAPI reports it, wire names included.
     """
     errors = exc.errors()
     fieldDetails = LegacyErrorDetails(fieldErrors=tuple(FieldErrorsOf(errors)))

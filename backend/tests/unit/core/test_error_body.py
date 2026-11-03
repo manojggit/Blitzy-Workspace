@@ -4,15 +4,18 @@ AAP 0.6.5 sets two edit modes. A first-failure program's error names only its cu
 which the body lists as the failing field. An all-field-mode screen lists exactly its failing
 fields, in source order, and may place the cursor on a field that did not fail, such as the
 COCRDUPC (CCUP) name after NO-CHANGES-DETECTED (cbl/COCRDUPC.cbl lines 685-692), so it sets
-``LegacyErrorDetails.exactFieldErrors``. The body is built from literals only: no settings or
-database are needed.
+``LegacyErrorDetails.exactFieldErrors``. The 422 body of a structurally invalid request names
+each failing field as app.core.errors.FieldNameOf names its location: a query or path key
+parameter by the screen field its program's own 400 names, so the page marks the same input,
+and every other parameter and every body field as it stands. The bodies and names are built
+from literals only: no settings or database are needed.
 """
 
 from typing import NamedTuple
 
 import pytest
 
-from app.core.errors import ErrorBody, LegacyErrorDetails
+from app.core.errors import ErrorBody, FieldNameOf, LegacyErrorDetails
 
 MESSAGE = "A legacy message literal"
 INFO_MESSAGE = "A legacy information line"
@@ -61,9 +64,57 @@ FIELD_MARKING_IDS = [
 ]
 
 
+class LocationNameCase(NamedTuple):
+    """A FastAPI validation error location and the field name the 422 body gives it."""
+
+    location: tuple[str | int, ...]
+    expectedField: str
+
+
+LOCATION_NAME_CASES = [
+    LocationNameCase(("query", "acctId"), "acct_id"),
+    LocationNameCase(("query", "cardNum"), "card_num"),
+    LocationNameCase(("path", "acctId"), "acct_id"),
+    LocationNameCase(("path", "cardNum"), "card_num"),
+    LocationNameCase(("path", "tranId"), "tran_id"),
+    LocationNameCase(("path", "userId"), "user_id"),
+    LocationNameCase(("query", "searchTranId"), "search_tran_id"),
+    LocationNameCase(("query", "searchUserId"), "search_user_id"),
+    LocationNameCase(("query", "reportType"), "reportType"),
+    LocationNameCase(("query", "confirm"), "confirm"),
+    LocationNameCase(("query", "startKey"), "startKey"),
+    LocationNameCase(("query", "format"), "format"),
+    LocationNameCase(("body", "fields", "addr_line_1"), "addr_line_1"),
+    LocationNameCase(("body", "acctId"), "acctId"),
+    LocationNameCase(("body", 7), ""),
+]
+LOCATION_NAME_IDS = [
+    "ccli-account-filter",
+    "ccli-card-filter",
+    "cavw-caup-account-key",
+    "ccdl-ccup-card-key",
+    "ct01-tran-id",
+    "cu02-cu03-user-id",
+    "ct00-search-key",
+    "cu00-search-key",
+    "cr00-report-type-wire-name",
+    "cr00-confirm-wire-name",
+    "paging-key-wire-name",
+    "export-format-wire-name",
+    "caup-body-field",
+    "body-name-never-mapped",
+    "json-decode-position",
+]
+
+
 @pytest.mark.parametrize("markingCase", FIELD_MARKING_CASES, ids=FIELD_MARKING_IDS)
 def test_error_body_marks_failing_fields_and_cursor(markingCase):
     body = ErrorBody(MESSAGE, markingCase.field, markingCase.details)
     assert body["message"] == MESSAGE
     assert body["field_errors"] == markingCase.expectedFieldErrors
     assert body["cursor_field"] == markingCase.expectedCursor
+
+
+@pytest.mark.parametrize("nameCase", LOCATION_NAME_CASES, ids=LOCATION_NAME_IDS)
+def test_validation_error_location_names_the_screen_field(nameCase):
+    assert FieldNameOf(nameCase.location) == nameCase.expectedField

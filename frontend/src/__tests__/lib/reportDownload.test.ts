@@ -4,8 +4,9 @@
 // the 401 and 403 handling of the client's interceptor are all observed as the page meets them.
 import { TextEncoder as NodeTextEncoder } from "node:util";
 
-import {
+import axios, {
     AxiosError,
+    AxiosHeaders,
     type AxiosAdapter,
     type AxiosResponse,
     type InternalAxiosRequestConfig,
@@ -129,6 +130,17 @@ async function RejectionOf(format: ExportFormat): Promise<AxiosError> {
     );
     expect(rejection).toBeInstanceOf(AxiosError);
     return rejection as AxiosError;
+}
+
+// The client's bare /auth/me lookup, through which a 403 finds the user's own menu.
+function AnswerHomeRouteLookup(nextRoute: string): jest.SpyInstance {
+    const config: InternalAxiosRequestConfig = {
+        url: API_V1_URL + "/auth/me",
+        headers: new AxiosHeaders(),
+    };
+    const data = { next_route: nextRoute };
+    const answer: AxiosResponse = { data, status: 200, statusText: "", headers: {}, config };
+    return jest.spyOn(axios, "get").mockResolvedValue(answer);
 }
 
 function NavigationWasAttempted(): boolean {
@@ -380,9 +392,11 @@ it("DownloadReportExport leaves a 401 to the client's redirect to /signon", asyn
 // An admin refused on the regular CR00 endpoint gets an empty message and returns to /admin.
 it("DownloadReportExport leaves a 403 to the client's return to the user's own menu", async () => {
     SetHomeRoute(ADMIN_HOME_ROUTE);
+    const lookupSpy = AnswerHomeRouteLookup(ADMIN_HOME_ROUTE);
     API_CLIENT.defaults.adapter = AnswerWith(LegacyAnswer(403, EMPTY_REFUSAL_FEEDBACK));
     const error = await RejectionOf(ExportFormat.PDF);
     expect(error.response?.status).toBe(403);
     expect(NavigationWasAttempted()).toBe(true);
     expect(TakePendingMessage()).toBe("");
+    expect(lookupSpy).toHaveBeenCalledTimes(1);
 });

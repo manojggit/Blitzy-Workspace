@@ -13,8 +13,11 @@
 // user. A provider mounted on any other page reads /auth/me at once. A 401 there reaches the
 // apiClient redirect to sign-on and a 403 its return to the user's own menu; any other failed call
 // of that first read (no answer, a timeout, a 5xx or another status) goes to sign-on once through
-// the same apiClient redirect, unless the read was abandoned first. RefreshSession reads /auth/me
-// on every page and never navigates, so its caller decides what a missing user means.
+// the same apiClient redirect, unless the read was abandoned first. When the first read's
+// next_route names the other menu tree than the page's, the page tree's menu is read as well, so
+// the server refuses it with 403 and the apiClient interceptor returns the user to their own menu
+// with the server's message. RefreshSession reads /auth/me on every page and never navigates, so
+// its caller decides what a missing user means.
 import {
     createContext,
     useCallback,
@@ -31,10 +34,13 @@ import {
 import axios from "axios";
 
 import { FetchCurrentUser, type CurrentUserResponse } from "@/lib/api/auth";
+import { FetchAdminMenu, FetchMainMenu, type MenuResponse } from "@/lib/api/menu";
 import {
+    ADMIN_HOME_ROUTE,
     ClearHomeRoute,
     IsCancelledRequest,
     IsInterceptorRoutedRefusal,
+    MenuTreeHomeRoute,
     RedirectToSignOn,
     SetHomeRoute,
     SIGN_ON_ROUTE,
@@ -137,6 +143,55 @@ async function LoadCurrentUserOrSignOn(read: SessionRead): Promise<CurrentUserRe
     }
 }
 
+// The menu tree of a page that next_route places outside the user's own tree, or null for
+// sign-on, for a page in the user's own tree, and for a tree's menu page, which reads its own menu
+// on mount and so is refused or allowed by the server without a second read.
+function ForeignPageTree(user: CurrentUserResponse): string | null {
+    const { pathname } = window.location;
+    const pageTree = MenuTreeHomeRoute(pathname);
+    if (pageTree === null || pageTree === pathname || pageTree === user.next_route) {
+        return null;
+    }
+    return pageTree;
+}
+
+// The page tree's menu read, answered by the server's role guard on that menu (RequireAdmin on
+// CA00, RequireRegular on CM00). It carries the session read's signal, so a sign-off or the
+// provider's disposal abandons it before its refusal can navigate.
+function ReadPageTreeMenu(pageTree: string, read: SessionRead): Promise<MenuResponse> {
+    const options = { signal: read.signal };
+    return pageTree === ADMIN_HOME_ROUTE ? FetchAdminMenu(options) : FetchMainMenu(options);
+}
+
+// The legacy system had no path from one menu tree to the other, yet the browser decides no role:
+// the server refuses the page tree's menu with 403, and the apiClient interceptor returns the user
+// to their own menu with the server's message. A 200 means the server allows the page, so nothing
+// changes. Only a read still current asks. An axios error, a cancellation included, has already
+// been routed by the interceptor or needs nothing; any other error is a defect and propagates.
+async function ConfirmPageMenuTree(user: CurrentUserResponse, read: SessionRead): Promise<void> {
+    const pageTree = ForeignPageTree(user);
+    if (pageTree === null || !read.IsCurrent()) {
+        return;
+    }
+    try {
+        await ReadPageTreeMenu(pageTree, read);
+    } catch (error) {
+        if (!IsCancelledRequest(error) && !axios.isAxiosError(error)) {
+            throw error;
+        }
+    }
+}
+
+// The provider's first read on any page but sign-on, then the check that the page lies in the
+// user's own menu tree. RefreshSession's read never runs the check.
+async function LoadPageUser(read: SessionRead): Promise<CurrentUserResponse | null> {
+    const user = await LoadCurrentUserOrSignOn(read);
+    if (user !== null) {
+        await ConfirmPageMenuTree(user, read);
+    }
+    return user;
+}
+
 // Aborts the read it replaces. A read begun after the provider is disposed can never be current,
 // so its signal is aborted before it is sent. One begun before the first mount effect, as from a
 // child's own mount effect, is sent and judged when it answers.
@@ -163,7 +218,7 @@ async function NoUserBeforeLogin(): Promise<null> {
 // Runs in the mount effect, so only in the browser; the page is read from window.location, as
 // the apiClient 401 handler reads it.
 function MountUserLoader(): CurrentUserLoader {
-    return window.location.pathname === SIGN_ON_ROUTE ? NoUserBeforeLogin : LoadCurrentUserOrSignOn;
+    return window.location.pathname === SIGN_ON_ROUTE ? NoUserBeforeLogin : LoadPageUser;
 }
 
 // Keeps the user shown. An unchanged flag returns the same state, so React skips the render.

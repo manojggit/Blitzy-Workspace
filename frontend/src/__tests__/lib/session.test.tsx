@@ -2,14 +2,24 @@
 // filled from USRSEC before its XCTL to COADM01C for type A or to COMEN01C otherwise).
 import { Stack, Typography } from "@mui/material";
 import { act, render, screen, waitFor, type RenderResult } from "@testing-library/react";
-import { AxiosError, AxiosHeaders, CanceledError, type InternalAxiosRequestConfig } from "axios";
+import axios, {
+    AxiosError,
+    AxiosHeaders,
+    CanceledError,
+    type AxiosResponse,
+    type InternalAxiosRequestConfig,
+} from "axios";
 import { StrictMode, useEffect, type ReactElement } from "react";
 
 import { FetchCurrentUser, type CurrentUserResponse } from "@/lib/api/auth";
+import { FetchAdminMenu, FetchMainMenu, type MenuResponse } from "@/lib/api/menu";
 import type * as ApiClientModule from "@/lib/apiClient";
 import {
     ClearHomeRoute,
+    HandleResponseError,
     HOME_ROUTE_KEY,
+    PENDING_MESSAGE_KEY,
+    PENDING_MESSAGE_ROUTE_KEY,
     RedirectToSignOn,
     SetHomeRoute,
     SIGN_ON_ROUTE,
@@ -18,6 +28,8 @@ import {
 import { SessionProvider, useSession, type SessionContextValue } from "@/lib/session";
 
 jest.mock("@/lib/api/auth");
+// The page-tree menu reads the provider sends; each test decides how the server answers them.
+jest.mock("@/lib/api/menu");
 
 // The real home-route bookkeeping and sign-on navigation still run; the wrappers only record the
 // calls session.tsx makes.
@@ -35,6 +47,8 @@ const fetchCurrentUserMock = jest.mocked(FetchCurrentUser);
 const setHomeRouteMock = jest.mocked(SetHomeRoute);
 const clearHomeRouteMock = jest.mocked(ClearHomeRoute);
 const redirectToSignOnMock = jest.mocked(RedirectToSignOn);
+const fetchMainMenuMock = jest.mocked(FetchMainMenu);
+const fetchAdminMenuMock = jest.mocked(FetchAdminMenu);
 
 const MAIN_MENU_ROUTE = "/menu";
 const ADMIN_MENU_ROUTE = "/admin";
@@ -800,5 +814,195 @@ it.each(REFRESH_FAILURE_CASES)(
         expect(NavigationAttempts()).toBe(0);
         expect(LatestSession().currentUser).toBeNull();
         expect(LatestSession().isLoading).toBe(false);
+    },
+);
+
+const ACCOUNT_VIEW_ROUTE = "/accounts/view";
+const REPORT_ROUTE = "/reports/transactions";
+const ADMIN_USERS_ROUTE = "/admin/users";
+const ADMIN_USERS_ADD_ROUTE = "/admin/users/add";
+// COMEN01C keeps the trailing space of its literal (cbl/COMEN01C.cbl line 140).
+const ADMIN_ONLY_MESSAGE = "No access - Admin Only option... ";
+
+// The page the provider's first read finds the user on, and the menu reads that follow it.
+interface MenuTreeCase {
+    caseName: string;
+    path: string;
+    user: CurrentUserResponse;
+    mainMenuReads: number;
+    adminMenuReads: number;
+}
+
+// One way the server answers the page tree's menu read.
+interface MenuTreeAnswerCase {
+    caseName: string;
+    Answer: () => Promise<MenuResponse>;
+}
+
+// A page outside the user's own menu tree gets that tree's menu read, which the server's role
+// guard refuses with 403. A page in the user's own tree reads no menu, and neither does a tree's
+// menu page, which reads its own menu on mount.
+const MENU_TREE_CASES: readonly MenuTreeCase[] = [
+    {
+        caseName: "an admin on CAVW",
+        path: ACCOUNT_VIEW_ROUTE,
+        user: ADMIN_USER,
+        mainMenuReads: 1,
+        adminMenuReads: 0,
+    },
+    {
+        caseName: "an admin on CR00",
+        path: REPORT_ROUTE,
+        user: ADMIN_USER,
+        mainMenuReads: 1,
+        adminMenuReads: 0,
+    },
+    {
+        caseName: "a regular user on CU01",
+        path: ADMIN_USERS_ADD_ROUTE,
+        user: REGULAR_USER,
+        mainMenuReads: 0,
+        adminMenuReads: 1,
+    },
+    {
+        caseName: "a regular user on CU00",
+        path: ADMIN_USERS_ROUTE,
+        user: REGULAR_USER,
+        mainMenuReads: 0,
+        adminMenuReads: 1,
+    },
+    {
+        caseName: "a regular user on CAVW",
+        path: ACCOUNT_VIEW_ROUTE,
+        user: REGULAR_USER,
+        mainMenuReads: 0,
+        adminMenuReads: 0,
+    },
+    {
+        caseName: "an admin on CU00",
+        path: ADMIN_USERS_ROUTE,
+        user: ADMIN_USER,
+        mainMenuReads: 0,
+        adminMenuReads: 0,
+    },
+    {
+        caseName: "an admin on CM00",
+        path: MAIN_MENU_ROUTE,
+        user: ADMIN_USER,
+        mainMenuReads: 0,
+        adminMenuReads: 0,
+    },
+    {
+        caseName: "a regular user on CA00",
+        path: ADMIN_MENU_ROUTE,
+        user: REGULAR_USER,
+        mainMenuReads: 0,
+        adminMenuReads: 0,
+    },
+];
+
+// However the server answers, the session shows its user once the menu read settles: the
+// interceptor has already routed a refusal, a cancellation needs nothing, and a 200 means the
+// server allows the page.
+const MENU_TREE_ANSWER_CASES: readonly MenuTreeAnswerCase[] = [
+    { caseName: "a 403", Answer: () => Promise.reject(BuildResponseError(HTTP_FORBIDDEN)) },
+    { caseName: "a cancellation", Answer: () => Promise.reject(new CanceledError()) },
+    { caseName: "a 200", Answer: () => Promise.resolve({ options: [] }) },
+];
+
+// RequireAdmin's refusal of the admin menu read, as the apiClient interceptor meets it.
+function BuildAdminMenuRefusal(): AxiosError {
+    const config: InternalAxiosRequestConfig = { url: "/menu/admin", headers: new AxiosHeaders() };
+    const data = { message: ADMIN_ONLY_MESSAGE, field_errors: [], cursor_field: null };
+    const response = { status: HTTP_FORBIDDEN, data, statusText: "", headers: {}, config };
+    return new AxiosError(
+        "Request failed",
+        AxiosError.ERR_BAD_REQUEST,
+        config,
+        undefined,
+        response,
+    );
+}
+
+// The interceptor's bare /auth/me lookup of the refused user's own menu.
+function AnswerHomeRouteLookup(user: CurrentUserResponse): jest.SpyInstance {
+    const config = BuildCurrentUserConfig();
+    const answer: AxiosResponse = { data: user, status: 200, statusText: "", headers: {}, config };
+    return jest.spyOn(axios, "get").mockResolvedValue(answer);
+}
+
+it.each(MENU_TREE_CASES)(
+    "$caseName reads the main menu $mainMenuReads and the admin menu $adminMenuReads time(s)",
+    async ({ path, user, mainMenuReads, adminMenuReads }) => {
+        window.history.replaceState(null, "", path);
+        await RenderSignedOnSession(user);
+        expect(fetchMainMenuMock).toHaveBeenCalledTimes(mainMenuReads);
+        expect(fetchAdminMenuMock).toHaveBeenCalledTimes(adminMenuReads);
+        const menuReads = [...fetchMainMenuMock.mock.calls, ...fetchAdminMenuMock.mock.calls];
+        expect(menuReads.every(([options]) => options?.signal === ReadSignal(0))).toBe(true);
+        expect(LatestSession().currentUser).toEqual(user);
+    },
+);
+
+it.each(MENU_TREE_ANSWER_CASES)(
+    "an admin on CAVW is shown once the main menu read settles with $caseName",
+    async ({ Answer }) => {
+        window.history.replaceState(null, "", ACCOUNT_VIEW_ROUTE);
+        fetchMainMenuMock.mockImplementationOnce(Answer);
+        await RenderSignedOnSession(ADMIN_USER);
+        expect(fetchMainMenuMock).toHaveBeenCalledTimes(1);
+        expect(LatestSession().currentUser).toEqual(ADMIN_USER);
+        expect(LatestSession().isLoading).toBe(false);
+        expect(redirectToSignOnMock).not.toHaveBeenCalled();
+    },
+);
+
+it("a regular user on CU01 returns to /menu with the server's admin-only literal", async () => {
+    window.history.replaceState(null, "", ADMIN_USERS_ADD_ROUTE);
+    fetchAdminMenuMock.mockImplementationOnce(() => HandleResponseError(BuildAdminMenuRefusal()));
+    const lookupSpy = AnswerHomeRouteLookup(REGULAR_USER);
+    await RenderSignedOnSession(REGULAR_USER);
+    expect(fetchAdminMenuMock).toHaveBeenCalledTimes(1);
+    expect(lookupSpy).toHaveBeenCalledTimes(1);
+    expect(NavigationAttempts()).toBe(1);
+    expect(sessionStorage.getItem(PENDING_MESSAGE_KEY)).toBe(ADMIN_ONLY_MESSAGE);
+    // The message is kept for the main menu, so CU01, mounting while the browser leaves it, cannot
+    // take it.
+    expect(sessionStorage.getItem(PENDING_MESSAGE_ROUTE_KEY)).toBe(MAIN_MENU_ROUTE);
+    lookupSpy.mockRestore();
+});
+
+// Only the provider's first read checks the page's tree: RefreshSession's read never does, on the
+// sign-on page after a login or on any other page.
+it.each([SIGN_ON_ROUTE, ACCOUNT_VIEW_ROUTE])(
+    "on %s, a RefreshSession answering an admin reads no menu",
+    async (path) => {
+        window.history.replaceState(null, "", path);
+        await RenderSignedOnSession(REGULAR_USER);
+        fetchCurrentUserMock.mockResolvedValue(ADMIN_USER);
+        await act(async () => {
+            await LatestSession().RefreshSession();
+        });
+        expect(LatestSession().currentUser).toEqual(ADMIN_USER);
+        expect(fetchMainMenuMock).not.toHaveBeenCalled();
+        expect(fetchAdminMenuMock).not.toHaveBeenCalled();
+    },
+);
+
+it.each(ABANDONED_FIRST_READ_CASES)(
+    "an admin's first read on CAVW answering after $caseName reads no menu",
+    async ({ Abandon }) => {
+        window.history.replaceState(null, "", ACCOUNT_VIEW_ROUTE);
+        const resolveUser = DeferCurrentUser();
+        const view = RenderSessionConsumer(CaptureSession);
+        act(() => {
+            Abandon(LatestSession(), view);
+        });
+        expect(ReadSignal(0).aborted).toBe(true);
+        await act(async () => {
+            resolveUser(ADMIN_USER);
+        });
+        expect(fetchMainMenuMock).not.toHaveBeenCalled();
+        expect(fetchAdminMenuMock).not.toHaveBeenCalled();
     },
 );

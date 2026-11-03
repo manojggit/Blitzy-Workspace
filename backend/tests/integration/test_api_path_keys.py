@@ -13,6 +13,10 @@ with one trailing space, which the programs' space-padded key compares ignore. T
 - a ``card_ref`` longer than CARDSID holding a character outside code page 037 is
     ``Did not find cards for this search condition`` on the GET routes and ignored by the CCUP
     PUT, while CARDSID-length text outside the repertoire and an over-long value stay 422;
+- a key outside the repertoire, in a path or in the CCLI or CT00 query, is 422 whose
+    ``field_errors`` and ``cursor_field`` name the input the program's own 400 marks
+    (``acct_id``, ``card_num``, ``tran_id``, ``search_tran_id``), while CR00's ``confirm``
+    keeps its ReportQuery name and ``detail`` keeps FastAPI's wire location;
 - an existing TRAN-ID holding "/" is shown, and CU01-added IDs with "/" or dots are fetched,
     updated and deleted;
 - ordinary keys, ``card_ref`` tokens, the selections and the collections answer as before.
@@ -228,6 +232,60 @@ MALFORMED_CARD_KEYS = [
 ]
 CARD_ROUTE_SUFFIXES = [pytest.param("", id="ccdl"), pytest.param("/edit", id="ccup-fetch")]
 
+
+class MalformedKeyCase(NamedTuple):
+    """A GET whose key no 3270 terminal could send, its FastAPI location and the field named."""
+
+    path: str
+    location: list[str]
+    field: str
+
+
+# U+1F600 and U+20AC (the euro sign), which code page 037 lacks, as the frontend encodes them.
+NON_CP037_KEY_TEXT = "%F0%9F%98%80"
+NON_CP037_CONFIRM_TEXT = "%E2%82%AC"
+
+MALFORMED_KEY_CASES = [
+    pytest.param(
+        MalformedKeyCase("/cards?acctId=" + NON_CP037_KEY_TEXT, ["query", "acctId"], "acct_id"),
+        id="ccli-account-filter",
+    ),
+    pytest.param(
+        MalformedKeyCase("/cards?cardNum=" + NON_CP037_KEY_TEXT, ["query", "cardNum"], "card_num"),
+        id="ccli-card-filter",
+    ),
+    pytest.param(
+        MalformedKeyCase(f"/accounts/{NON_CP037_KEY_TEXT}", ["path", "acctId"], "acct_id"),
+        id="cavw-account-key",
+    ),
+    pytest.param(
+        MalformedKeyCase(
+            f"/cards/{NON_CP037_CARD_SEGMENT}{ACCOUNT_QUERY}", ["path", "cardNum"], "card_num"
+        ),
+        id="ccdl-card-key",
+    ),
+    pytest.param(
+        MalformedKeyCase(f"/transactions/{NON_CP037_KEY_TEXT}", ["path", "tranId"], "tran_id"),
+        id="ct01-tran-id",
+    ),
+    pytest.param(
+        MalformedKeyCase(
+            "/transactions?searchTranId=" + NON_CP037_KEY_TEXT,
+            ["query", "searchTranId"],
+            "search_tran_id",
+        ),
+        id="ct00-search-key",
+    ),
+    pytest.param(
+        MalformedKeyCase(
+            "/reports/transactions?confirm=" + NON_CP037_CONFIRM_TEXT,
+            ["query", "confirm"],
+            "confirm",
+        ),
+        id="cr00-confirm-keeps-wire-name",
+    ),
+]
+
 USER_KEYS = [
     pytest.param("A/B", "A%2FB", id="slash-inside"),
     pytest.param("/", "%2F", id="slash-only"),
@@ -344,6 +402,19 @@ async def test_card_key_no_terminal_could_send_is_malformed(
     response = await regularClient.get(f"{API_V1}/cards/{segment}{suffix}{ACCOUNT_QUERY}")
     assert response.status_code == HTTP_MALFORMED, response.text
     assert response.json()["detail"][0]["loc"] == ["path", "cardNum"]
+
+
+@pytest.mark.parametrize("keyCase", MALFORMED_KEY_CASES)
+async def test_malformed_key_marks_the_screen_field_of_its_program(
+    regularClient: httpx.AsyncClient, keyCase: MalformedKeyCase
+) -> None:
+    """A 422 names the input the program's 400 marks; detail keeps FastAPI's wire location."""
+    response = await regularClient.get(API_V1 + keyCase.path)
+    body = response.json()
+    assert response.status_code == HTTP_MALFORMED, response.text
+    assert body["field_errors"] == [keyCase.field]
+    assert body["cursor_field"] == keyCase.field
+    assert [item["loc"] for item in body["detail"]] == [keyCase.location]
 
 
 async def test_existing_transaction_with_slash_is_shown(

@@ -339,10 +339,12 @@ class LegacyValidationErrorResponse(BaseModel):
     info_message: str = Field(description="Always empty: no legacy program edit ran.")
     field_errors: list[str] = Field(
         description=(
-            "The failing fields as their locations name them, de-duplicated in error order: the "
-            "snake_case attribute of a body field, or the wire name of a query or path parameter "
-            "(for example userId or reportType); empty when no location names a field, as for "
-            "malformed JSON."
+            "The failing fields, de-duplicated in error order: the snake_case attribute of a body "
+            "field; for a query or path key parameter, the screen field the program's own errors "
+            "name (acctId as acct_id, cardNum as card_num, tranId as tran_id, userId as user_id, "
+            "searchTranId as search_tran_id, searchUserId as search_user_id); for any other query "
+            "or path parameter, its wire name (for example reportType); empty when no location "
+            "names a field, as for malformed JSON."
         ),
     )
     cursor_field: str = Field(

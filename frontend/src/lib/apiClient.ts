@@ -64,6 +64,8 @@ export const SIGN_ON_ROUTE = "/signon";
 export const DEFAULT_HOME_ROUTE = "/menu";
 export const ADMIN_HOME_ROUTE = "/admin";
 export const PENDING_MESSAGE_KEY = "carddemo.pendingMessage";
+// The pathname of the one page a pending message is for, when it names one.
+export const PENDING_MESSAGE_ROUTE_KEY = "carddemo.pendingMessageRoute";
 export const HOME_ROUTE_KEY = "carddemo.homeRoute";
 
 // The only routes a home route may name, as next_route is Literal["/admin", "/menu"] in
@@ -79,6 +81,21 @@ export interface RouteAllowance {
 
 // The sign-on page's next_route and the recorded home route are checked against this one list.
 export const HOME_ROUTE_ALLOWANCE: RouteAllowance = { pathnames: HOME_ROUTES };
+
+// Every page of the admin menu tree: COADM01 itself and the COUSR00-COUSR03 user pages.
+const ADMIN_TREE_PREFIX = ADMIN_HOME_ROUTE + "/";
+
+// The home route of the menu tree a page belongs to, as the server's role guards split them: the
+// admin pages (CA00, CU00-CU03) under /admin, and every other page under the main menu (CM00).
+// Sign-on belongs to neither tree, which null says. The pathname is compared exactly, as a home
+// route is.
+export function MenuTreeHomeRoute(pathname: string): string | null {
+    if (pathname === SIGN_ON_ROUTE) {
+        return null;
+    }
+    const isAdminPage = pathname === ADMIN_HOME_ROUTE || pathname.startsWith(ADMIN_TREE_PREFIX);
+    return isAdminPage ? ADMIN_HOME_ROUTE : DEFAULT_HOME_ROUTE;
+}
 
 // Their 401 bodies carry the sign-on literals (Wrong Password. Try again ...), which the sign-on
 // page shows instead of being redirected.
@@ -220,14 +237,29 @@ function RemoveSessionValue(key: string): void {
 }
 
 // Carries a message across a navigation: the 403 refusal literal, or the F3 sign-off literal.
-// Where the browser refuses storage, the message is lost but the navigation still happens.
-export function StorePendingMessage(message: string): void {
+// A message given a route is for that page alone, because the page being left can still mount
+// and take its own pending message while the browser navigates away. Without a route, the next
+// page to ask takes it. Where the browser refuses storage, the message is lost but the navigation
+// still happens.
+export function StorePendingMessage(message: string, route?: string): void {
     WriteSessionValue(PENDING_MESSAGE_KEY, message);
+    if (route === undefined) {
+        RemoveSessionValue(PENDING_MESSAGE_ROUTE_KEY);
+        return;
+    }
+    WriteSessionValue(PENDING_MESSAGE_ROUTE_KEY, route);
 }
 
+// The pending message, delivered once. A page other than the one the message is for gets "" and
+// leaves the message for that page.
 export function TakePendingMessage(): string {
+    const route = ReadSessionValue(PENDING_MESSAGE_ROUTE_KEY);
+    if (route !== null && route !== window.location.pathname) {
+        return "";
+    }
     const message = ReadSessionValue(PENDING_MESSAGE_KEY) ?? "";
     RemoveSessionValue(PENDING_MESSAGE_KEY);
+    RemoveSessionValue(PENDING_MESSAGE_ROUTE_KEY);
     return message;
 }
 
@@ -345,7 +377,7 @@ export function SetHomeRoute(route: string): void {
     WriteSessionValue(HOME_ROUTE_KEY, route);
 }
 
-// A stored value that is not a home route is removed, so the server is asked instead.
+// A stored value that is not a home route is removed and never used.
 function RecordedHomeRoute(): string | null {
     if (recordedHomeRoute !== null) {
         return recordedHomeRoute;
@@ -380,8 +412,10 @@ export function ClearHomeRoute(): void {
     ForgetHomeRoute();
 }
 
-// A 422 body carries FastAPI's detail list beside empty legacy keys. Its input is structurally
-// malformed, which a 3270 terminal could never send, so it is not a legacy outcome.
+// A 422 body (common.LegacyValidationErrorResponse) carries FastAPI's detail list beside the
+// legacy keys. Its input is structurally malformed, which a 3270 terminal could never send, so no
+// program edit ran and its message is blank: it is not a legacy outcome, although ToScreenFeedback
+// still marks the inputs it names.
 function IsLegacyBody(body: unknown): body is LegacyErrorResponse {
     if (typeof body !== "object" || body === null || "detail" in body) {
         return false;
@@ -418,19 +452,62 @@ export function IsCancelledRequest(error: unknown): boolean {
     return axios.isCancel(error);
 }
 
+const HTTP_UNPROCESSABLE_CONTENT = 422;
+
+// The body of a 422 structural rejection, or null for any other failure.
+function ValidationBodyOf(error: unknown): object | null {
+    if (!axios.isAxiosError(error) || error.response?.status !== HTTP_UNPROCESSABLE_CONTENT) {
+        return null;
+    }
+    const body: unknown = error.response.data;
+    if (typeof body !== "object" || body === null || !("detail" in body)) {
+        return null;
+    }
+    return body;
+}
+
+function IsFieldNameList(value: unknown): value is string[] {
+    return Array.isArray(value) && value.every((name: unknown) => typeof name === "string");
+}
+
+type MarkedFields = Pick<CompleteScreenFeedback, "field_errors" | "cursor_field">;
+
+// The inputs a structural rejection names, as a legacy body names them: field_errors is a list of
+// field names and cursor_field a field name or null. A key absent or of another shape names none.
+function MarkedFieldsOf(body: object): MarkedFields {
+    const fieldErrors: unknown = "field_errors" in body ? body.field_errors : undefined;
+    const cursorField: unknown = "cursor_field" in body ? body.cursor_field : undefined;
+    return {
+        field_errors: IsFieldNameList(fieldErrors) ? fieldErrors : [],
+        cursor_field: typeof cursorField === "string" || cursorField === null ? cursorField : "",
+    };
+}
+
+// The abend text of a failure with no legacy outcome. A 422 also marks the inputs its body names
+// and puts the cursor on its cursor_field (MOVE -1 TO <field>L); any other failure marks none.
+function AbendFeedbackFor(error: unknown): CompleteScreenFeedback {
+    const validationBody = ValidationBodyOf(error);
+    if (validationBody === null) {
+        return { message: ABEND_MESSAGE, info_message: "", field_errors: [], cursor_field: "" };
+    }
+    return { message: ABEND_MESSAGE, info_message: "", ...MarkedFieldsOf(validationBody) };
+}
+
 // The legacy feedback of a failed call. A 500, a network failure or a non-legacy body shows the
-// abend text, because the backend registers no catch-all handler.
+// abend text, because the backend registers no catch-all handler. A 422, whose message is blank,
+// shows the abend text too, with every input its field_errors names marked and the cursor on its
+// cursor_field.
 export function ToScreenFeedback(error: unknown): CompleteScreenFeedback {
     const body = LegacyBodyOf(error);
     if (body === null) {
-        return { message: ABEND_MESSAGE, info_message: "", field_errors: [], cursor_field: "" };
+        return AbendFeedbackFor(error);
     }
     return FeedbackFromBody(body);
 }
 
 // The whole legacy error body, with the extra keys of a screen such as state, screen_token or
 // fields and the standard keys completed as ToScreenFeedback completes them; null when
-// ToScreenFeedback would show the abend text.
+// ToScreenFeedback shows the abend text, a 422 included, whose body carries no screen keys.
 export function LegacyErrorBody<T extends LegacyErrorResponse>(
     error: unknown,
 ): (T & CompleteScreenFeedback) | null {
@@ -489,14 +566,15 @@ async function FetchServerHomeRoute(isCurrent: () => boolean): Promise<string> {
     return route;
 }
 
-// A failed lookup sends the user to the main menu. An error that is not an axios error is a
-// defect, and it reaches every refusal waiting on the lookup.
+// A failed lookup sends the user to the home route this tab recorded, or to the main menu when
+// none is recorded. An error that is not an axios error is a defect, and it reaches every refusal
+// waiting on the lookup.
 async function LookUpHomeRoute(isCurrent: () => boolean): Promise<string> {
     try {
         return await FetchServerHomeRoute(isCurrent);
     } catch (error) {
         if (axios.isAxiosError(error)) {
-            return DEFAULT_HOME_ROUTE;
+            return GetHomeRoute();
         }
         throw error;
     }
@@ -514,19 +592,19 @@ function StartHomeRouteLookup(): Promise<string> {
     return lookup;
 }
 
-// Refusals that arrive together share one lookup instead of each asking the server.
-async function ResolveHomeRoute(): Promise<string> {
-    const knownRoute = RecordedHomeRoute();
-    if (knownRoute !== null) {
-        return knownRoute;
-    }
+// Every refusal asks the server rather than trusting the recorded route: all tabs share one
+// session cookie, so a sign-on in another tab replaces the user while this tab's record still
+// names the previous user's menu. Refusals that arrive together share one lookup instead of each
+// asking the server.
+function ResolveHomeRoute(): Promise<string> {
     return homeRouteLookup ?? StartHomeRouteLookup();
 }
 
-// A refusal returns to the user's own menu, which shows the server message. On the menu itself
-// nothing is stored or reloaded: the page shows its own error, and a reload would loop. A refusal
-// whose session ended while its home route was resolved (sign-off or a new login) is obsolete, so
-// it neither stores its message nor navigates.
+// A refusal returns to the user's own menu, as /auth/me names it when the refusal arrives, and
+// that menu alone shows the server message. On the menu itself nothing is stored or reloaded: the
+// page shows its own error, and a reload would loop. A refusal whose session ended while its home
+// route was resolved (sign-off or a new login) is obsolete, so it neither stores its message nor
+// navigates.
 async function HandleForbidden(error: AxiosError): Promise<void> {
     if (typeof window === "undefined") {
         return;
@@ -538,7 +616,7 @@ async function HandleForbidden(error: AxiosError): Promise<void> {
     }
     const body: unknown = error.response?.data;
     if (IsLegacyBody(body) && body.message !== "") {
-        StorePendingMessage(body.message);
+        StorePendingMessage(body.message, homeRoute);
     }
     window.location.assign(homeRoute);
 }

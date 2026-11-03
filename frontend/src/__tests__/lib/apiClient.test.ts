@@ -24,7 +24,9 @@ import {
     HOME_ROUTE_KEY,
     IsCancelledRequest,
     LegacyErrorBody,
+    MenuTreeHomeRoute,
     PENDING_MESSAGE_KEY,
+    PENDING_MESSAGE_ROUTE_KEY,
     REQUEST_TIMEOUT_MILLISECONDS,
     SeverityForOutcome,
     SetHomeRoute,
@@ -146,21 +148,84 @@ const LEGACY_ERROR_CASES: readonly { status: number; body: LegacyErrorResponse }
     { status: 503, body: BuildLegacyBody("Unable to lookup Account...", "acct_id") },
 ];
 
-// FastAPI's 422 body: the detail list beside empty legacy keys.
-const VALIDATION_BODY = {
-    ...BuildLegacyBody("", null),
-    detail: [{ loc: ["body", "acct_id"], msg: "String too long", type: "string_too_long" }],
-};
-
 const ABEND_CASES: readonly { label: string; error: AxiosError }[] = [
     {
         label: "500 with a legacy body",
         error: BuildAxiosError(500, BuildLegacyBody("Update of record failed", null), ACCOUNT_URL),
     },
     { label: "502 proxy page", error: BuildAxiosError(502, "<html>Bad Gateway</html>", "/cards") },
-    { label: "422 detail list", error: BuildAxiosError(422, VALIDATION_BODY, "/transactions") },
     { label: "network failure", error: BuildNetworkError("/billpay") },
     { label: "timeout", error: BuildTimeoutError(AxiosError.ECONNABORTED) },
+];
+
+const VALIDATION_DETAIL = [
+    { loc: ["body", "desc"], msg: "Value error, code page 037", type: "value_error" },
+];
+
+// FastAPI's 422 body (common.LegacyValidationErrorResponse): the detail list beside a blank
+// message, with the case's field_errors and cursor_field keys as the server sent them.
+function BuildRejection(feedbackKeys: Record<string, unknown>, url: string): AxiosError {
+    const body = { detail: VALIDATION_DETAIL, message: "", info_message: "", ...feedbackKeys };
+    return BuildAxiosError(422, body, url);
+}
+
+// A 422 structural rejection has a blank message, so it shows the abend text, yet every input its
+// field_errors names is marked and the cursor goes to its cursor_field. A key that is absent or
+// of another shape names no input.
+const STRUCTURAL_REJECTION_CASES: readonly {
+    label: string;
+    error: AxiosError;
+    fieldErrors: string[];
+    cursorField: string | null;
+}[] = [
+    {
+        label: "422 naming two CAUP inputs",
+        error: BuildRejection(
+            { field_errors: ["addr_line_1", "last_name"], cursor_field: "addr_line_1" },
+            ACCOUNT_URL,
+        ),
+        fieldErrors: ["addr_line_1", "last_name"],
+        cursorField: "addr_line_1",
+    },
+    {
+        label: "422 naming the CR00 confirm query field",
+        error: BuildRejection(
+            { field_errors: ["confirm"], cursor_field: "confirm" },
+            "/reports/transactions",
+        ),
+        fieldErrors: ["confirm"],
+        cursorField: "confirm",
+    },
+    {
+        label: "422 with a null cursor",
+        error: BuildRejection({ field_errors: ["desc"], cursor_field: null }, "/transactions"),
+        fieldErrors: ["desc"],
+        cursorField: null,
+    },
+    {
+        label: "422 for malformed JSON, which names no field",
+        error: BuildRejection({ field_errors: [], cursor_field: "" }, "/billpay"),
+        fieldErrors: [],
+        cursorField: "",
+    },
+    {
+        label: "422 without the legacy keys",
+        error: BuildAxiosError(422, { detail: VALIDATION_DETAIL }, "/transactions"),
+        fieldErrors: [],
+        cursorField: "",
+    },
+    {
+        label: "422 whose keys have another shape",
+        error: BuildRejection({ field_errors: "desc", cursor_field: 7 }, "/transactions"),
+        fieldErrors: [],
+        cursorField: "",
+    },
+    {
+        label: "422 whose field list holds a non-name",
+        error: BuildRejection({ field_errors: ["desc", 3], cursor_field: "desc" }, "/transactions"),
+        fieldErrors: [],
+        cursorField: "desc",
+    },
 ];
 
 // The client's default and the exported constant, each held to the pinned bound and to the
@@ -224,68 +289,138 @@ const LOGIN_RESPONSE_CASES: readonly {
     { method: "post", url: "/auth/logout", status: 200, clears: false },
 ];
 
-// The /auth/me next_route decides the target: a refusal on that route itself does not reload.
+// The /auth/me next_route decides the target, whatever this tab recorded: a sign-on in another
+// tab replaces the shared session cookie but not this tab's record. A refusal on the target itself
+// does not reload, so a stale record is shown unused when a refusal on it still navigates and one
+// on the fresh route does not.
 const LOOKUP_CASES: readonly {
+    recordedRoute: string | null;
     nextRoute: unknown;
     currentPath: string;
     navigates: boolean;
     storedRoute: string | null;
 }[] = [
     {
+        recordedRoute: null,
         nextRoute: ADMIN_HOME_ROUTE,
         currentPath: "/cards",
         navigates: true,
         storedRoute: ADMIN_HOME_ROUTE,
     },
     {
+        recordedRoute: null,
         nextRoute: ADMIN_HOME_ROUTE,
         currentPath: ADMIN_HOME_ROUTE,
         navigates: false,
         storedRoute: ADMIN_HOME_ROUTE,
     },
     {
+        recordedRoute: null,
         nextRoute: DEFAULT_HOME_ROUTE,
         currentPath: ADMIN_USERS_URL,
         navigates: true,
         storedRoute: DEFAULT_HOME_ROUTE,
     },
     {
+        recordedRoute: null,
         nextRoute: ADMIN_USERS_URL,
         currentPath: DEFAULT_HOME_ROUTE,
         navigates: false,
         storedRoute: null,
     },
-    { nextRoute: undefined, currentPath: "/cards", navigates: true, storedRoute: null },
+    {
+        recordedRoute: null,
+        nextRoute: undefined,
+        currentPath: "/cards",
+        navigates: true,
+        storedRoute: null,
+    },
+    {
+        recordedRoute: DEFAULT_HOME_ROUTE,
+        nextRoute: ADMIN_HOME_ROUTE,
+        currentPath: DEFAULT_HOME_ROUTE,
+        navigates: true,
+        storedRoute: ADMIN_HOME_ROUTE,
+    },
+    {
+        recordedRoute: DEFAULT_HOME_ROUTE,
+        nextRoute: ADMIN_HOME_ROUTE,
+        currentPath: ADMIN_HOME_ROUTE,
+        navigates: false,
+        storedRoute: ADMIN_HOME_ROUTE,
+    },
+    {
+        recordedRoute: ADMIN_HOME_ROUTE,
+        nextRoute: DEFAULT_HOME_ROUTE,
+        currentPath: ADMIN_HOME_ROUTE,
+        navigates: true,
+        storedRoute: DEFAULT_HOME_ROUTE,
+    },
+    {
+        recordedRoute: ADMIN_HOME_ROUTE,
+        nextRoute: DEFAULT_HOME_ROUTE,
+        currentPath: DEFAULT_HOME_ROUTE,
+        navigates: false,
+        storedRoute: DEFAULT_HOME_ROUTE,
+    },
 ];
 
+// A failed lookup falls back to the route this tab recorded, or to the main menu without one. A
+// refusal on the fallback route itself does not reload, which shows the route chosen.
 const LOOKUP_FAILURE_CASES: readonly {
     failure: string;
     error: AxiosError;
+    recordedRoute: string | null;
     currentPath: string;
     navigates: boolean;
 }[] = [
     {
         failure: "network failure",
         error: BuildNetworkError(CURRENT_USER_URL),
+        recordedRoute: null,
         currentPath: "/cards",
         navigates: true,
     },
     {
         failure: "network failure",
         error: BuildNetworkError(CURRENT_USER_URL),
+        recordedRoute: null,
         currentPath: DEFAULT_HOME_ROUTE,
         navigates: false,
     },
     {
         failure: "timeout",
         error: BuildTimeoutError(AxiosError.ECONNABORTED, BuildRequestConfig(CURRENT_USER_URL)),
+        recordedRoute: null,
         currentPath: "/cards",
         navigates: true,
     },
     {
         failure: "timeout",
         error: BuildTimeoutError(AxiosError.ETIMEDOUT, BuildRequestConfig(CURRENT_USER_URL)),
+        recordedRoute: null,
         currentPath: DEFAULT_HOME_ROUTE,
+        navigates: false,
+    },
+    {
+        failure: "network failure",
+        error: BuildNetworkError(CURRENT_USER_URL),
+        recordedRoute: ADMIN_HOME_ROUTE,
+        currentPath: DEFAULT_HOME_ROUTE,
+        navigates: true,
+    },
+    {
+        failure: "network failure",
+        error: BuildNetworkError(CURRENT_USER_URL),
+        recordedRoute: ADMIN_HOME_ROUTE,
+        currentPath: ADMIN_HOME_ROUTE,
+        navigates: false,
+    },
+    {
+        failure: "a 503",
+        error: BuildAxiosError(503, BuildLegacyBody("", null), CURRENT_USER_URL),
+        recordedRoute: ADMIN_HOME_ROUTE,
+        currentPath: ADMIN_HOME_ROUTE,
         navigates: false,
     },
 ];
@@ -348,9 +483,10 @@ async function ExpectRejectedUnchanged(error: AxiosError): Promise<void> {
     await expect(HandleResponseError(error)).rejects.toBe(error);
 }
 
+// Storage is read directly, because a message kept for another page is withheld from this one.
 function ExpectNoRefusalEffects(): void {
     expect(NavigationWasAttempted(consoleErrorSpy)).toBe(false);
-    expect(TakePendingMessage()).toBe("");
+    expect(window.sessionStorage.getItem(PENDING_MESSAGE_KEY)).toBeNull();
 }
 
 function BuildLookupAnswer(nextRoute: unknown): AxiosResponse {
@@ -359,6 +495,13 @@ function BuildLookupAnswer(nextRoute: unknown): AxiosResponse {
 
 function MockHomeRouteLookup(nextRoute: unknown): jest.SpyInstance {
     return jest.spyOn(axios, "get").mockResolvedValue(BuildLookupAnswer(nextRoute));
+}
+
+// The home route this tab recorded before a refusal; null records none.
+function RecordHomeRoute(route: string | null): void {
+    if (route !== null) {
+        SetHomeRoute(route);
+    }
 }
 
 // The /auth/me answer arrives only when the returned function is called.
@@ -508,16 +651,20 @@ it.each(LOGIN_RESPONSE_CASES)(
 it("403 stores the server message and returns to the home menu (COMMAREA XCTL back)", async () => {
     SetHomeRoute(DEFAULT_HOME_ROUTE);
     window.history.pushState({}, "", ADMIN_USERS_URL);
-    const lookupSpy = jest.spyOn(axios, "get");
+    const lookupSpy = MockHomeRouteLookup(DEFAULT_HOME_ROUTE);
     await ExpectRejectedUnchanged(BuildAxiosError(403, ADMIN_ONLY_BODY, ADMIN_USERS_URL));
+    expect(NavigationWasAttempted(consoleErrorSpy)).toBe(true);
+    expect(lookupSpy).toHaveBeenCalledTimes(1);
+    // The refused page, still mounting while the browser leaves it, takes nothing.
+    expect(TakePendingMessage()).toBe("");
+    window.history.pushState({}, "", DEFAULT_HOME_ROUTE);
     expect(TakePendingMessage()).toBe(ADMIN_ONLY_MESSAGE);
     expect(TakePendingMessage()).toBe("");
-    expect(NavigationWasAttempted(consoleErrorSpy)).toBe(true);
-    expect(lookupSpy).not.toHaveBeenCalled();
 });
 
 it("403 with no message returns an admin to /admin storing nothing (COSGN00C type A)", async () => {
     SetHomeRoute(ADMIN_HOME_ROUTE);
+    MockHomeRouteLookup(ADMIN_HOME_ROUTE);
     window.history.pushState({}, "", "/accounts/view");
     await ExpectRejectedUnchanged(BuildAxiosError(403, EMPTY_REFUSAL_BODY, ACCOUNT_URL));
     expect(GetHomeRoute()).toBe(ADMIN_HOME_ROUTE);
@@ -529,6 +676,7 @@ it.each(HOME_ROUTE_CASES)(
     "403 on the home menu %s itself stores and reloads nothing",
     async (home) => {
         SetHomeRoute(home);
+        MockHomeRouteLookup(home);
         window.history.pushState({}, "", home);
         await ExpectRejectedUnchanged(BuildAxiosError(403, ADMIN_ONLY_BODY, ADMIN_USERS_URL));
         ExpectNoRefusalEffects();
@@ -536,13 +684,15 @@ it.each(HOME_ROUTE_CASES)(
 );
 
 it.each(LOOKUP_CASES)(
-    "403 with no recorded home asks /auth/me (next_route $nextRoute, on $currentPath)",
-    async ({ nextRoute, currentPath, navigates, storedRoute }) => {
+    "403 under record $recordedRoute asks /auth/me (next_route $nextRoute, on $currentPath)",
+    async ({ recordedRoute, nextRoute, currentPath, navigates, storedRoute }) => {
+        RecordHomeRoute(recordedRoute);
         const lookupSpy = MockHomeRouteLookup(nextRoute);
         window.history.pushState({}, "", currentPath);
         await ExpectRejectedUnchanged(BuildAxiosError(403, ADMIN_ONLY_BODY, ADMIN_USERS_URL));
         expect(NavigationWasAttempted(consoleErrorSpy)).toBe(navigates);
-        expect(TakePendingMessage()).toBe(navigates ? ADMIN_ONLY_MESSAGE : "");
+        const pendingMessage = window.sessionStorage.getItem(PENDING_MESSAGE_KEY);
+        expect(pendingMessage).toBe(navigates ? ADMIN_ONLY_MESSAGE : null);
         expect(window.sessionStorage.getItem(HOME_ROUTE_KEY)).toBe(storedRoute);
         expect(lookupSpy).toHaveBeenCalledTimes(1);
         const lookupOptions = expect.objectContaining(EXPECTED_LOOKUP_OPTIONS);
@@ -564,13 +714,14 @@ it("403 refusals arriving together share one /auth/me lookup", async () => {
 });
 
 it.each(LOOKUP_FAILURE_CASES)(
-    "403 whose /auth/me lookup fails ($failure) asks once and returns to /menu (on $currentPath)",
-    async ({ error, currentPath, navigates }) => {
+    "403 whose lookup fails ($failure) falls back to record $recordedRoute (on $currentPath)",
+    async ({ error, recordedRoute, currentPath, navigates }) => {
+        RecordHomeRoute(recordedRoute);
         const lookupSpy = jest.spyOn(axios, "get").mockRejectedValue(error);
         window.history.pushState({}, "", currentPath);
         await ExpectRejectedUnchanged(BuildAxiosError(403, ADMIN_ONLY_BODY, ADMIN_USERS_URL));
         expect(NavigationWasAttempted(consoleErrorSpy)).toBe(navigates);
-        expect(window.sessionStorage.getItem(HOME_ROUTE_KEY)).toBeNull();
+        expect(window.sessionStorage.getItem(HOME_ROUTE_KEY)).toBe(recordedRoute);
         expect(lookupSpy).toHaveBeenCalledTimes(1);
         const lookupOptions = expect.objectContaining(EXPECTED_LOOKUP_OPTIONS);
         expect(lookupSpy).toHaveBeenCalledWith(CURRENT_USER_URL, lookupOptions);
@@ -609,10 +760,13 @@ it.each(LEGACY_ERROR_CASES)(
     },
 );
 
-it.each(ABEND_CASES)("$label is rejected unchanged without navigating", async ({ error }) => {
-    await ExpectRejectedUnchanged(error);
-    ExpectNoRefusalEffects();
-});
+it.each([...ABEND_CASES, ...STRUCTURAL_REJECTION_CASES])(
+    "$label is rejected unchanged without navigating",
+    async ({ error }) => {
+        await ExpectRejectedUnchanged(error);
+        ExpectNoRefusalEffects();
+    },
+);
 
 it.each(LEGACY_ERROR_CASES)(
     "$status shows its legacy body verbatim on the message line: $body.message",
@@ -637,6 +791,18 @@ it.each(ABEND_CASES)("$label becomes UNEXPECTED ABEND OCCURRED. (ABEND-ROUTINE)"
     expect(ToScreenFeedback(error)).toStrictEqual(ABEND_FEEDBACK);
     expect(LegacyErrorBody(error)).toBeNull();
 });
+
+it.each(STRUCTURAL_REJECTION_CASES)(
+    "$label shows the abend text, marks $fieldErrors and puts the cursor on $cursorField",
+    ({ error, fieldErrors, cursorField }) => {
+        expect(ToScreenFeedback(error)).toStrictEqual({
+            ...ABEND_FEEDBACK,
+            field_errors: fieldErrors,
+            cursor_field: cursorField,
+        });
+        expect(LegacyErrorBody(error)).toBeNull();
+    },
+);
 
 it("a non-axios defect is rethrown instead of shown as a message", () => {
     const error = new Error("boom");
@@ -701,6 +867,42 @@ it("a pending message is delivered exactly once across a navigation", () => {
     expect(TakePendingMessage()).toBe("");
 });
 
+// A message stored for one page reaches that page only; one stored without a route reaches the
+// next page to ask. left is what stays stored after the page asks.
+const PENDING_ROUTE_CASES: readonly {
+    route: string | undefined;
+    takenOn: string;
+    taken: string;
+    left: string | null;
+}[] = [
+    { route: DEFAULT_HOME_ROUTE, takenOn: ADMIN_USERS_URL, taken: "", left: ADMIN_ONLY_MESSAGE },
+    {
+        route: DEFAULT_HOME_ROUTE,
+        takenOn: DEFAULT_HOME_ROUTE,
+        taken: ADMIN_ONLY_MESSAGE,
+        left: null,
+    },
+    { route: undefined, takenOn: ADMIN_USERS_URL, taken: ADMIN_ONLY_MESSAGE, left: null },
+];
+
+it.each(PENDING_ROUTE_CASES)(
+    "a pending message for $route asked for on $takenOn gives $taken",
+    ({ route, takenOn, taken, left }) => {
+        StorePendingMessage(ADMIN_ONLY_MESSAGE, route);
+        window.history.pushState({}, "", takenOn);
+        expect(TakePendingMessage()).toBe(taken);
+        expect(window.sessionStorage.getItem(PENDING_MESSAGE_KEY)).toBe(left);
+    },
+);
+
+it("a pending message stored without a route replaces one kept for another page", () => {
+    StorePendingMessage(ADMIN_ONLY_MESSAGE, DEFAULT_HOME_ROUTE);
+    StorePendingMessage("Thank you for using CardDemo application...");
+    window.history.pushState({}, "", SIGN_ON_ROUTE);
+    expect(TakePendingMessage()).toBe("Thank you for using CardDemo application...");
+    expect(window.sessionStorage.getItem(PENDING_MESSAGE_ROUTE_KEY)).toBeNull();
+});
+
 it("the home route defaults to the main menu, records /admin and clears on sign-off", () => {
     expect(GetHomeRoute()).toBe(DEFAULT_HOME_ROUTE);
     SetHomeRoute(ADMIN_HOME_ROUTE);
@@ -728,6 +930,27 @@ it.each(NON_HOME_ROUTES)("a stored home route %p is removed and never used", (ro
     expect(GetHomeRoute()).toBe(DEFAULT_HOME_ROUTE);
     expect(window.sessionStorage.getItem(HOME_ROUTE_KEY)).toBeNull();
 });
+
+// The admin tree is COADM01 and the COUSR00-COUSR03 pages under it, compared exactly; every other
+// page but sign-on belongs to the main menu's tree.
+const MENU_TREE_CASES: readonly { pathname: string; treeHomeRoute: string | null }[] = [
+    { pathname: ADMIN_HOME_ROUTE, treeHomeRoute: ADMIN_HOME_ROUTE },
+    { pathname: ADMIN_USERS_URL, treeHomeRoute: ADMIN_HOME_ROUTE },
+    { pathname: "/admin/users/delete", treeHomeRoute: ADMIN_HOME_ROUTE },
+    { pathname: "/administrator", treeHomeRoute: DEFAULT_HOME_ROUTE },
+    { pathname: "/ADMIN", treeHomeRoute: DEFAULT_HOME_ROUTE },
+    { pathname: DEFAULT_HOME_ROUTE, treeHomeRoute: DEFAULT_HOME_ROUTE },
+    { pathname: "/accounts/view", treeHomeRoute: DEFAULT_HOME_ROUTE },
+    { pathname: "/reports/transactions", treeHomeRoute: DEFAULT_HOME_ROUTE },
+    { pathname: SIGN_ON_ROUTE, treeHomeRoute: null },
+];
+
+it.each(MENU_TREE_CASES)(
+    "page $pathname belongs to the menu tree of $treeHomeRoute",
+    ({ pathname, treeHomeRoute }) => {
+        expect(MenuTreeHomeRoute(pathname)).toBe(treeHomeRoute);
+    },
+);
 
 it.each(STORAGE_REFUSAL_NAMES)(
     "a refused sessionStorage (%s) leaves the in-memory state",
