@@ -1,7 +1,12 @@
 // Screen tests: BMS COBIL00, program COBIL00C (CB00), page /billpay.
 // Literals and HTTP statuses are copied verbatim from backend/app/services/billpay/cobil00c.py
 // and cbl/COBIL00C.cbl; field prompts and lengths from bms/COBIL00.bms.
-import { alertClasses } from "@mui/material";
+import {
+    alertClasses,
+    formControlClasses,
+    inputBaseClasses,
+    inputLabelClasses,
+} from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
@@ -225,6 +230,13 @@ const DUPLICATE_TRAN_ID_CASE = ErrorCase(
 );
 const KEPT_BALANCE_CASES: readonly LiteralCase[] = [INVALID_CONFIRM_CASE, DUPLICATE_TRAN_ID_CASE];
 
+// Edit failures naming the field ENTER is pressed in: the blank ACTIDIN, which holds the cursor
+// from first display (BMS IC), and CONFIRM, where the invalid answer was keyed last.
+const KEYED_FIELD_FAILURES: readonly LiteralCase[] = [
+    ErrorCase(HTTP_EDIT_FAILURE, ACCT_ID_EMPTY_MESSAGE, "acct_id", BLANK_REQUEST),
+    INVALID_CONFIRM_CASE,
+];
+
 // The id of the MessageLine ERRMSG Alert, which a field named in field_errors is described by.
 const ERRMSG_ID = "message-line-errmsg";
 
@@ -413,6 +425,18 @@ function ExpectKeyboardLocked(): void {
     expect(screen.getByRole("button", { name: MAP_KEYS.F3.button })).toBeEnabled();
 }
 
+// MUI's focus state matches the browser focus: the input shows the focused outline, and a label
+// floating inside its field (ACTIDIN's) floats above the keyed text. CONFIRM's prompt is a label
+// above its field, so it never covers the text.
+function ExpectFocusedField(input: HTMLElement): void {
+    expect(input).toHaveFocus();
+    expect(input.closest(`.${inputBaseClasses.root}`)).toHaveClass(inputBaseClasses.focused);
+    const field = input.closest(`.${formControlClasses.root}`);
+    for (const label of field?.querySelectorAll(`.${inputLabelClasses.root}`) ?? []) {
+        expect(label).toHaveClass(inputLabelClasses.focused, inputLabelClasses.shrink);
+    }
+}
+
 // Typing and the physical F4 while the call runs change nothing on the screen that was sent.
 async function TryToEditWhileLocked(user: UserEvent, confirmSent: string): Promise<void> {
     await user.type(InputOf("acct_id"), UNKNOWN_ACCOUNT_ID);
@@ -543,6 +567,21 @@ it.each(LITERAL_CASES)(
         await ExpectAlert(literalCase.message, literalCase.severity);
         expect(mockPayBill).toHaveBeenCalledWith(literalCase.request);
         expect(InputOf(literalCase.cursorField)).toHaveFocus();
+    },
+);
+
+// The lock disables the field ENTER is pressed in, which keeps the browser focus through the
+// call; the answer naming that field gives it back its focused outline and floated label.
+it.each(KEYED_FIELD_FAILURES)(
+    "COBIL00C $message after ENTER in $cursorField leaves that field focused",
+    async (literalCase) => {
+        MockOutcome(literalCase);
+        const user = RenderScreen();
+        await KeyRequest(user, literalCase.request);
+        await PressKey(user, MAP_KEYS.ENTER.key);
+        await ExpectAlert(literalCase.message, "error");
+        expect(mockPayBill).toHaveBeenCalledWith(literalCase.request);
+        ExpectFocusedField(InputOf(literalCase.cursorField));
     },
 );
 

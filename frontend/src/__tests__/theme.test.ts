@@ -1,7 +1,7 @@
-// Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE), the Material
-// Design 3 token theme of AAP 0.5.3–0.5.4.
+// Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE, PRINT_LINE_STYLE),
+// the Material Design 3 token theme of AAP 0.5.3–0.5.4.
 import type { Theme } from "@mui/material/styles";
-import { CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE } from "@/app/theme";
+import { CARD_DEMO_THEME, PRINT_LINE_STYLE, VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 
 type ColourReader = (theme: Theme) => string | undefined;
 
@@ -184,6 +184,16 @@ const MUI_VISUALLY_HIDDEN_VALUES = {
     width: "1px",
 };
 
+// The TRANREPT print lines: Courier, as the report PDF draws them, then a generic fixed-pitch face,
+// at the M3 body-small size and line height, with every blank kept and no wrapping.
+const PRINT_LINE_VALUES = {
+    fontFamily: '"Courier New", Courier, monospace',
+    fontSize: "12px",
+    lineHeight: "16px",
+    fontWeight: 400,
+    whiteSpace: "pre",
+};
+
 function FontSizeToPixels(value: string | number | undefined): number {
     if (typeof value === "number") {
         return value;
@@ -353,5 +363,11 @@ describe("M3 segmented-button states (gap 0.5.4)", () => {
 describe("Visually hidden text", () => {
     it("VISUALLY_HIDDEN_STYLE carries MUI's visuallyHidden values", () => {
         expect(VISUALLY_HIDDEN_STYLE).toEqual(MUI_VISUALLY_HIDDEN_VALUES);
+    });
+});
+
+describe("Report print lines", () => {
+    it("PRINT_LINE_STYLE is fixed pitch, body-small and pre-formatted", () => {
+        expect(PRINT_LINE_STYLE).toEqual(PRINT_LINE_VALUES);
     });
 });

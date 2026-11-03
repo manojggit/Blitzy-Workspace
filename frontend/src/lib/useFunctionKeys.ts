@@ -26,11 +26,20 @@ export interface FunctionKeyDefinition {
     disabled?: boolean;
 }
 
-// Elements that act on Enter themselves: a focused button clicks itself, an open Select menu picks
-// its option, and a closed MUI Select (role "combobox" since MUI v6, "button" before) opens its
-// menu. The screen's ENTER must not run a second action on top of that.
+// Elements that act on Enter themselves: a focused button clicks itself, a link follows itself, an
+// open Select menu picks its option, and a closed MUI Select (role "combobox" since MUI v6,
+// "button" before) opens its menu. The screen's ENTER must not run a second action on top of that.
 const ENTER_EXCLUDED_SELECTOR =
-    "button, [role='button'], [role='combobox'], [role='option'], [role='listbox']";
+    "a[href], button, [role='button'], [role='combobox'], [role='option'], [role='listbox']";
+
+// Marks one of those elements as taking Enter as the screen's ENTER: the hook blocks the element's
+// own Enter action and runs ENTER alone. An element that acts on Enter in its own handler, as a
+// Select opening its menu does, must skip each IsScreenEnterKey press.
+export const SCREEN_ENTER_ATTRIBUTE = "data-screen-enter";
+
+// Spread onto the marked element, or onto the props a component passes to that element.
+export const SCREEN_ENTER_PROPS: Readonly<Record<typeof SCREEN_ENTER_ATTRIBUTE, string>> =
+    Object.freeze({ [SCREEN_ENTER_ATTRIBUTE]: "true" });
 
 function FindDefinition(
     definitions: readonly FunctionKeyDefinition[],
@@ -39,13 +48,23 @@ function FindDefinition(
     return definitions.find((definition) => PF_KEY_ACTIONS[definition.key] === eventKey);
 }
 
+// The nearest element that acts on Enter itself keeps Enter, unless it is marked as the screen's.
 function IsEnterExcludedTarget(target: EventTarget | null): boolean {
-    return target instanceof Element && target.closest(ENTER_EXCLUDED_SELECTOR) !== null;
+    if (!(target instanceof Element)) {
+        return false;
+    }
+    const enterOwner = target.closest(ENTER_EXCLUDED_SELECTOR);
+    return enterOwner !== null && !enterOwner.hasAttribute(SCREEN_ENTER_ATTRIBUTE);
 }
 
 // Modifier chords belong to the browser or the OS, and an IME composition owns its Enter.
 function IsChordOrComposing(event: KeyboardEvent): boolean {
     return event.isComposing || event.ctrlKey || event.altKey || event.metaKey;
+}
+
+// The Enter press the hook takes as the screen's ENTER: no modifier chord, no IME composition.
+export function IsScreenEnterKey(event: KeyboardEvent): boolean {
+    return event.key === PF_KEY_ACTIONS.ENTER && !IsChordOrComposing(event);
 }
 
 function HandleKeyDown(event: KeyboardEvent, definitions: readonly FunctionKeyDefinition[]): void {

@@ -1,6 +1,6 @@
 // Screen tests: BMS CORPT00, program CORPT00C with CBTRN03C lines (CR00),
 // page /reports/transactions.
-import { alertClasses, tableCellClasses } from "@mui/material";
+import { alertClasses, inputBaseClasses, inputLabelClasses, tableCellClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { PointerEventsCheckLevel, type UserEvent } from "@testing-library/user-event";
@@ -107,6 +107,7 @@ const CONFIRM_LABEL = "The Report will be submitted for printing. Please confirm
 const MENU_ROUTE = "/menu";
 
 const REPORT_TABLE_LABEL = "Transaction report";
+const REPORT_LINES_REGION_LABEL = "Transaction report lines";
 // CVTRA07Y TRANSACTION-HEADER-1, trimmed.
 const TABLE_HEADINGS = [
     "Transaction ID",
@@ -223,6 +224,7 @@ const EMPTY_RANGE_HEADING = "Date Range: 2021-01-01 to 2021-01-31";
 
 // The corpt00c.py literals (CORPT00C lines 213-531).
 const SELECT_REPORT_TYPE_MESSAGE = "Select a report type to print report...";
+const START_MONTH_EMPTY_MESSAGE = "Start Date - Month can NOT be empty...";
 const START_MONTH_INVALID_MESSAGE = "Start Date - Not a valid Month...";
 const MONTHLY_SUBMITTED_MESSAGE = "Monthly report submitted for printing ...";
 const CUSTOM_SUBMITTED_MESSAGE = "Custom report submitted for printing ...";
@@ -321,6 +323,50 @@ const LINE_KIND_CASES: readonly LineKindCase[] = [
     },
 ];
 
+// FD-REPTFILE-REC PIC X(133): every CBTRN03C print line is padded with blanks to 133 columns.
+const PRINT_LINE_COLUMNS = 133;
+// The four lines of CBTRN03C 1120-WRITE-HEADERS, as cbtrn03c.py prints them for the Monthly
+// range: their inner and trailing blanks must all reach the screen.
+interface HeaderLineCase {
+    name: string;
+    position: number;
+    text: string;
+}
+
+const HEADER_LINE_CASES: readonly HeaderLineCase[] = [
+    {
+        name: "REPORT-NAME-HEADER",
+        position: 0,
+        text: ["DALYREPT".padEnd(38), "Daily Transaction Report".padEnd(41), DATE_RANGE_HEADING]
+            .join("")
+            .padEnd(PRINT_LINE_COLUMNS),
+    },
+    { name: "WS-BLANK-LINE", position: 1, text: " ".repeat(PRINT_LINE_COLUMNS) },
+    {
+        name: "TRANSACTION-HEADER-1",
+        position: 2,
+        text: [
+            "Transaction ID   ",
+            "Account ID  ",
+            "Transaction Type   ",
+            "Tran Category                      ",
+            "Tran Source            ",
+            "Amount",
+        ]
+            .join("")
+            .padEnd(PRINT_LINE_COLUMNS),
+    },
+    { name: "TRANSACTION-HEADER-2", position: 3, text: "-".repeat(PRINT_LINE_COLUMNS) },
+];
+const HEADER_LINES: readonly ReportLine[] = HEADER_LINE_CASES.map(({ text }) =>
+    BuildReportLine({ line_kind: ReportLineKind.HEADER, text }),
+);
+// A print line keeps every blank, never wraps and sets its columns in Courier, as the PDF does.
+const PRINT_LINE_CELL_STYLE = {
+    fontFamily: '"Courier New", Courier, monospace',
+    whiteSpace: "pre",
+};
+
 // One CORPT00C outcome: the literal, its HTTP status, the message-line severity, the field the
 // cursor goes to and, for a 200, the report lines returned with it. isCleared marks the screen
 // INITIALIZE-ALL-FIELDS leaves after confirm N, which corpt00c answers with blank dates.
@@ -351,7 +397,7 @@ function SubmittedOutcome(literal: string, lines: readonly ReportLine[]): Litera
 // Every literal CORPT00C sends on ENTER, in source order.
 const LITERAL_CASES: readonly LiteralCase[] = [
     EditFailure(SELECT_REPORT_TYPE_MESSAGE, "reportType"),
-    EditFailure("Start Date - Month can NOT be empty...", "startMm"),
+    EditFailure(START_MONTH_EMPTY_MESSAGE, "startMm"),
     EditFailure("Start Date - Day can NOT be empty...", "startDd"),
     EditFailure("Start Date - Year can NOT be empty...", "startYyyy"),
     EditFailure("End Date - Month can NOT be empty...", "endMm"),
@@ -526,6 +572,35 @@ const LONG_REPORT_PAGE_CASES: readonly ReportPageCase[] = [
 // A short report and one of exactly one full page.
 const ONE_PAGE_LINE_COUNTS: readonly number[] = [REPORT_LINES.length, REPORT_LINES_PER_PAGE];
 
+const PREVIOUS_PAGE_BUTTON_NAME = "Go to previous page";
+
+// The page arrows pressed in turn through the three-page long report, the page they end on and
+// the arrow that then holds the focus: an arrow that still pages keeps it, and one its own press
+// disables on the first or the last page hands it to the other.
+interface PageArrowFocusCase {
+    pressedArrows: readonly string[];
+    rangeLabel: string;
+    focusedArrow: string;
+}
+
+const PAGE_ARROW_FOCUS_CASES: readonly PageArrowFocusCase[] = [
+    {
+        pressedArrows: [NEXT_PAGE_BUTTON_NAME],
+        rangeLabel: SECOND_PAGE_CASE.rangeLabel,
+        focusedArrow: NEXT_PAGE_BUTTON_NAME,
+    },
+    {
+        pressedArrows: [NEXT_PAGE_BUTTON_NAME, NEXT_PAGE_BUTTON_NAME],
+        rangeLabel: "101–103 of 103",
+        focusedArrow: PREVIOUS_PAGE_BUTTON_NAME,
+    },
+    {
+        pressedArrows: [NEXT_PAGE_BUTTON_NAME, PREVIOUS_PAGE_BUTTON_NAME],
+        rangeLabel: FIRST_PAGE_CASE.rangeLabel,
+        focusedArrow: NEXT_PAGE_BUTTON_NAME,
+    },
+];
+
 const REPORT_TYPE_GROUP_LABEL = "Report type";
 // The id of the MessageLine ERRMSG Alert, which every control the server names is described by.
 const ERRMSG_ID = "message-line-errmsg";
@@ -588,34 +663,44 @@ const UNFLAGGED_REPORT_TYPE_CASES: readonly UnflaggedReportTypeCase[] = [
     },
 ];
 
-// An ENTER outcome that names one text control, that control and its own hint, if any.
+// An ENTER outcome that names one text control, that control, its own hint and the hint's id.
 interface FlaggedControlCase {
     control: string;
     outcome: LiteralCase;
     FlaggedControl: () => HTMLElement;
-    hint: string | null;
+    hint: string;
+    HintId: (control: HTMLElement) => string;
+}
+
+// MUI TextField names a field's helper text by the field's id.
+function HelperTextId(control: HTMLElement): string {
+    return `${control.id}-helper-text`;
 }
 
 // The date edits and the invalid-confirm edit name their field in field_errors; the blank-confirm
-// prompt names CONFIRM as its cursor. CONFIRM keeps its Y/N hint after the ERRMSG line.
+// prompt names CONFIRM as its cursor. A date part keeps its row's (MM/DD/YYYY) hint, and CONFIRM
+// its Y/N hint, after the ERRMSG line.
 const FLAGGED_CONTROL_CASES: readonly FlaggedControlCase[] = [
     {
         control: "the start month",
         outcome: EditFailure(START_MONTH_INVALID_MESSAGE, "startMm"),
         FlaggedControl: () => DatePartInput(START_MONTH_PART),
-        hint: null,
+        hint: DATE_HINT,
+        HintId: () => DateHint(START_DATE_LEGEND).id,
     },
     {
         control: "CONFIRM",
         outcome: EditFailure('"X" is not a valid value to confirm...', "confirm"),
         FlaggedControl: () => ConfirmInput(),
         hint: "Y/N",
+        HintId: HelperTextId,
     },
     {
         control: "CONFIRM",
         outcome: PromptOutcome("Please confirm to print the Monthly report..."),
         FlaggedControl: () => ConfirmInput(),
         hint: "Y/N",
+        HintId: HelperTextId,
     },
 ];
 
@@ -756,6 +841,19 @@ function DatePartInput(part: DatePartCase): HTMLElement {
     return screen.getByRole("textbox", { name: part.name });
 }
 
+// The (MM/DD/YYYY) hint of one date row.
+function DateHint(legend: string): HTMLElement {
+    return within(screen.getByRole("group", { name: legend })).getByText(DATE_HINT);
+}
+
+// A date part the server does not name is described by its own row's hint alone.
+function ExpectDescribedByDateHintOnly(part: DatePartCase): void {
+    const hintId = DateHint(part.legend).id;
+    expect(hintId).not.toBe("");
+    expect(DatePartInput(part)).toHaveAttribute("aria-describedby", hintId);
+    expect(DatePartInput(part)).toHaveAccessibleDescription(DATE_HINT);
+}
+
 function ConfirmInput(): HTMLElement {
     return screen.getByRole("textbox", { name: CONFIRM_LABEL });
 }
@@ -784,6 +882,17 @@ function ExpectErrorSegments(chosenLabel: string | null): void {
         expect(button).toHaveStyle({
             borderColor: error.main,
             color: isChosen ? m3.onPrimaryContainer : error.main,
+        });
+    }
+}
+
+// The group reads as valid, is described by nothing and shows no error border.
+function ExpectReportTypeUnflagged(): void {
+    expect(ReportTypeGroup()).toHaveAttribute("aria-invalid", "false");
+    expect(ReportTypeGroup()).not.toHaveAccessibleDescription();
+    for (const label of REPORT_TYPE_LABELS) {
+        expect(ReportTypeButton(label)).not.toHaveStyle({
+            borderColor: CARD_DEMO_THEME.palette.error.main,
         });
     }
 }
@@ -920,6 +1029,15 @@ function ExpectKeyboardUnlocked(): void {
     expect(screen.getByRole("button", { name: ENTER_KEY.buttonName })).toBeEnabled();
 }
 
+// MUI's focus state matches the browser focus: the input shows the focused outline and its label
+// floats above the keyed text.
+function ExpectFocusedField(input: HTMLElement): void {
+    expect(input).toHaveFocus();
+    expect(input.closest(`.${inputBaseClasses.root}`)).toHaveClass(inputBaseClasses.focused);
+    const label = document.querySelector(`label[for="${input.id}"]`);
+    expect(label).toHaveClass(inputLabelClasses.focused, inputLabelClasses.shrink);
+}
+
 // Each keyed field is blank or full to its BMS LENGTH, so each edit deletes the last character
 // before typing; an unlocked field would change.
 const LOCKED_EDIT_KEYS = "{Backspace}9";
@@ -995,13 +1113,32 @@ it.each(DATE_PARTS)(
     },
 );
 
-it.each(KEY_ENTRIES)(
-    "CORPT00C ENTER by %s with no report type sends no reportType",
-    async (entry) => {
+interface EnterPressCase {
+    entry: string;
+    PressEnter: (user: UserEvent) => Promise<void>;
+}
+
+// ENTER by its button, by the key from the start month part, and by the key on MONTHLY, which
+// holds the cursor on first display: Enter on a segment is the map's ENTER and chooses nothing.
+const NO_TYPE_ENTER_CASES: readonly EnterPressCase[] = [
+    ...KEY_ENTRIES.map((entry) => ({
+        entry,
+        PressEnter: (user: UserEvent) => PressScreenKey(user, ENTER_KEY, entry),
+    })),
+    {
+        entry: "key on the focused MONTHLY",
+        PressEnter: (user: UserEvent) => PressKey(user, ENTER_KEY.keyName),
+    },
+];
+
+it.each(NO_TYPE_ENTER_CASES)(
+    "CORPT00C ENTER by $entry with no report type sends no reportType",
+    async ({ PressEnter }) => {
         MockReportOutcome(EditFailure(SELECT_REPORT_TYPE_MESSAGE, "reportType"));
         const user = await RenderScreen();
-        await PressScreenKey(user, ENTER_KEY, entry);
+        await PressEnter(user);
         await ExpectAlert(SELECT_REPORT_TYPE_MESSAGE, "error");
+        expect(MonthlyButton()).toHaveAttribute("aria-pressed", "false");
         expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
         expect(mockFetchTransactionReport).toHaveBeenCalledWith(
             expect.not.objectContaining({ reportType: expect.anything() }),
@@ -1014,20 +1151,43 @@ it.each(KEY_ENTRIES)(
     },
 );
 
-it("CORPT00C pressing the chosen report type again clears the selection", async () => {
-    MockReportOutcome(EditFailure(SELECT_REPORT_TYPE_MESSAGE, "reportType"));
-    const user = await RenderScreen();
-    await user.click(ReportTypeButton(YEARLY_LABEL));
-    expect(ReportTypeButton(YEARLY_LABEL)).toHaveAttribute("aria-pressed", "true");
-    await user.click(ReportTypeButton(YEARLY_LABEL));
-    expect(ReportTypeButton(YEARLY_LABEL)).toHaveAttribute("aria-pressed", "false");
-    await PressScreenKey(user, ENTER_KEY, "click");
-    await ExpectAlert(SELECT_REPORT_TYPE_MESSAGE, "error");
-    expect(mockFetchTransactionReport).toHaveBeenCalledWith(
-        expect.not.objectContaining({ reportType: expect.anything() }),
-        READ_SIGNAL_OPTIONS,
-    );
-});
+async function PressSegmentBySpace(user: UserEvent, label: string): Promise<void> {
+    await act(async () => {
+        ReportTypeButton(label).focus();
+    });
+    await user.keyboard("[Space]");
+}
+
+interface SegmentPressCase {
+    press: string;
+    PressSegment: (user: UserEvent, label: string) => Promise<void>;
+}
+
+// A report type is pressed by pointer, or by Space on the segment holding the cursor; neither
+// sends anything.
+const SEGMENT_PRESS_CASES: readonly SegmentPressCase[] = [
+    { press: "click", PressSegment: (user, label) => user.click(ReportTypeButton(label)) },
+    { press: "Space", PressSegment: PressSegmentBySpace },
+];
+
+it.each(SEGMENT_PRESS_CASES)(
+    "CORPT00C pressing the chosen report type again by $press clears the selection",
+    async ({ PressSegment }) => {
+        MockReportOutcome(EditFailure(SELECT_REPORT_TYPE_MESSAGE, "reportType"));
+        const user = await RenderScreen();
+        await PressSegment(user, YEARLY_LABEL);
+        expect(ReportTypeButton(YEARLY_LABEL)).toHaveAttribute("aria-pressed", "true");
+        await PressSegment(user, YEARLY_LABEL);
+        expect(ReportTypeButton(YEARLY_LABEL)).toHaveAttribute("aria-pressed", "false");
+        expect(mockFetchTransactionReport).not.toHaveBeenCalled();
+        await PressScreenKey(user, ENTER_KEY, "click");
+        await ExpectAlert(SELECT_REPORT_TYPE_MESSAGE, "error");
+        expect(mockFetchTransactionReport).toHaveBeenCalledWith(
+            expect.not.objectContaining({ reportType: expect.anything() }),
+            READ_SIGNAL_OPTIONS,
+        );
+    },
+);
 
 it("CORPT00C ENTER sends the Custom date parts and confirm exactly as keyed", async () => {
     MockReportOutcome(EditFailure(START_MONTH_INVALID_MESSAGE, "startMm"));
@@ -1181,6 +1341,18 @@ it.each(LOCKED_CALL_CASES)(
     },
 );
 
+// The lock disables the blank Start MM part ENTER is pressed in, which keeps the browser focus
+// through the call; the answer naming that part gives it back its focused outline and label.
+it("CORPT00C an edit failure naming the part ENTER was pressed in keeps it focused", async () => {
+    MockReportOutcome(EditFailure(START_MONTH_EMPTY_MESSAGE, "startMm"));
+    const user = await RenderScreen();
+    await user.click(ReportTypeButton(CUSTOM_LABEL));
+    await PressScreenKey(user, ENTER_KEY, "key");
+    await ExpectAlert(START_MONTH_EMPTY_MESSAGE, "error");
+    expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
+    ExpectFocusedField(DatePartInput(START_MONTH_PART));
+});
+
 it.each(FLAGGED_REPORT_TYPE_CASES)(
     "CORPT00C marks the Report type group invalid after $name",
     async ({ status, body, chosenLabel }) => {
@@ -1199,23 +1371,30 @@ it.each(FLAGGED_REPORT_TYPE_CASES)(
     },
 );
 
+// Each date part is described by its own row's (MM/DD/YYYY) hint from the first display.
+it.each(DATE_PARTS)(
+    "CORPT00 $name is described by the (MM/DD/YYYY) hint of the $legend row",
+    async (part) => {
+        await RenderScreen();
+        ExpectDescribedByDateHintOnly(part);
+    },
+);
+
 // The ERRMSG Alert comes first in the description, then the control's own hint; a part the
-// answer does not name is described by nothing.
+// answer does not name is described by its row's hint alone.
 it.each(FLAGGED_CONTROL_CASES)(
     "CORPT00C describes $control by the ERRMSG line after $outcome.literal",
-    async ({ outcome, FlaggedControl, hint }) => {
+    async ({ outcome, FlaggedControl, hint, HintId }) => {
         MockReportOutcome(outcome);
         const user = await RenderScreen();
         await PressScreenKey(user, ENTER_KEY, "click");
         await ExpectAlert(outcome.literal, outcome.severity);
         const control = FlaggedControl();
-        const hintIds = hint === null ? [] : [`${control.id}-helper-text`];
-        const hintTexts = hint === null ? [] : [hint];
         expect(control).toHaveAttribute("aria-invalid", "true");
-        expect(control).toHaveAttribute("aria-describedby", [ERRMSG_ID, ...hintIds].join(" "));
+        expect(control).toHaveAttribute("aria-describedby", `${ERRMSG_ID} ${HintId(control)}`);
         expect(document.getElementById(ERRMSG_ID)).toBe(screen.getByRole("alert"));
-        expect(control).toHaveAccessibleDescription([outcome.literal, ...hintTexts].join(" "));
-        expect(DatePartInput(START_YEAR_PART)).not.toHaveAttribute("aria-describedby");
+        expect(control).toHaveAccessibleDescription(`${outcome.literal} ${hint}`);
+        ExpectDescribedByDateHintOnly(START_YEAR_PART);
     },
 );
 
@@ -1226,13 +1405,30 @@ it.each(UNFLAGGED_REPORT_TYPE_CASES)(
         for (const outcome of outcomes) {
             await SubmitOutcome(user, outcome);
         }
-        expect(ReportTypeGroup()).toHaveAttribute("aria-invalid", "false");
-        expect(ReportTypeGroup()).not.toHaveAccessibleDescription();
-        for (const label of REPORT_TYPE_LABELS) {
-            expect(ReportTypeButton(label)).not.toHaveStyle({
-                borderColor: CARD_DEMO_THEME.palette.error.main,
-            });
+        ExpectReportTypeUnflagged();
+    },
+);
+
+// A choice made after the flag answers it, while the message line keeps the literal; the next
+// ENTER outcome that names the report type flags the group again.
+it.each(FLAGGED_REPORT_TYPE_CASES)(
+    "CORPT00C a choice after $name clears the Report type flag until ENTER flags it again",
+    async ({ status, body, chosenLabel }) => {
+        mockFetchTransactionReport.mockRejectedValue(BuildAxiosError(status, body));
+        const user = await RenderScreen();
+        if (chosenLabel !== null) {
+            await user.click(ReportTypeButton(chosenLabel));
         }
+        await PressScreenKey(user, ENTER_KEY, "click");
+        await ExpectAlert(body.message, "error");
+        expect(ReportTypeGroup()).toHaveAttribute("aria-invalid", "true");
+        await user.click(ReportTypeButton(YEARLY_LABEL));
+        ExpectReportTypeUnflagged();
+        await ExpectAlert(body.message, "error");
+        await PressScreenKey(user, ENTER_KEY, "click");
+        await waitFor(() => expect(ReportTypeGroup()).toHaveAttribute("aria-invalid", "true"));
+        expect(mockFetchTransactionReport).toHaveBeenCalledTimes(2);
+        ExpectErrorSegments(YEARLY_LABEL);
     },
 );
 
@@ -1406,6 +1602,18 @@ it.each(LINE_KIND_CASES)(
     },
 );
 
+it.each(HEADER_LINE_CASES)(
+    "CBTRN03C $name keeps its print text in one fixed-pitch cell across every column",
+    async ({ position, text }) => {
+        await ShowMonthlyReport(HEADER_LINES);
+        const rowCells = within(ReportBodyRow(position)).getAllByRole("cell");
+        expect(rowCells).toHaveLength(1);
+        expect(rowCells[0]?.textContent).toBe(text);
+        expect(rowCells[0]).toHaveAttribute("colspan", String(TABLE_HEADINGS.length));
+        expect(rowCells[0]).toHaveStyle(PRINT_LINE_CELL_STYLE);
+    },
+);
+
 it.each(DOWNLOAD_CASES)(
     "CORPT00C report download as %s repeats the confirmed query",
     async (format, linkName) => {
@@ -1416,6 +1624,30 @@ it.each(DOWNLOAD_CASES)(
         const link = screen.getByRole("link", { name: linkName });
         expect(link).toHaveAttribute("href", EXPORT_URL_PREFIX + format);
         expect(link).toHaveAttribute("download");
+    },
+);
+
+// The table scrolls inside its container, which the keyboard reaches after CONFIRM as a named tab
+// stop.
+it("CORPT00C report table scrolls in a named region, the tab stop after CONFIRM", async () => {
+    const user = await ShowMonthlyReport();
+    const region = screen.getByRole("region", { name: REPORT_LINES_REGION_LABEL });
+    expect(region).toHaveAttribute("tabindex", "0");
+    expect(region).toContainElement(screen.getByRole("table", { name: REPORT_TABLE_LABEL }));
+    await user.click(ConfirmInput());
+    await user.tab();
+    expect(region).toHaveFocus();
+});
+
+// MUI's start-icon wrapper puts a zero-width space ahead of each link's text, so each link is
+// named by its label itself rather than by its content.
+it.each(DOWNLOAD_CASES)(
+    "CORPT00C report download as %s link is named %s alone",
+    async (_format, linkName) => {
+        await ShowMonthlyReport();
+        const link = screen.getByText(linkName).closest("a");
+        expect(link).toHaveAttribute("aria-label", linkName);
+        expect(link).toHaveAccessibleName(linkName);
     },
 );
 
@@ -1444,6 +1676,21 @@ it.each(ONE_PAGE_LINE_COUNTS)(
     },
 );
 
+it.each(PAGE_ARROW_FOCUS_CASES)(
+    "CORPT00C paging to $rangeLabel leaves the focus on $focusedArrow",
+    async ({ pressedArrows, rangeLabel, focusedArrow }) => {
+        const user = await ShowMonthlyReport(LONG_REPORT_LINES);
+        for (const arrowName of pressedArrows) {
+            await user.click(screen.getByRole("button", { name: arrowName }));
+        }
+        expect(screen.getByText(rangeLabel)).toBeInTheDocument();
+        await waitFor(() =>
+            expect(screen.getByRole("button", { name: focusedArrow })).toHaveFocus(),
+        );
+        expect(screen.getByRole("button", { name: focusedArrow })).toBeEnabled();
+    },
+);
+
 it("CORPT00C a new report opens on its first page", async () => {
     const user = await ShowMonthlyReport(LONG_REPORT_LINES);
     await PressNextPage(user);
@@ -1456,6 +1703,24 @@ it("CORPT00C a new report opens on its first page", async () => {
     expect(await screen.findByText(FIRST_PAGE_CASE.rangeLabel)).toBeInTheDocument();
     expect(ShownTranIds()).toEqual(LongReportTranIds(0, FIRST_PAGE_CASE.lineCount));
     ExpectCompleteDownloads(MONTHLY_CONFIRMED_QUERY);
+});
+
+// ENTER drops the report it supersedes as its read starts, so no render holds both reports; the
+// answer then opens on its first page.
+it("CORPT00C a new ENTER removes the shown report while its read runs", async () => {
+    const user = await ShowMonthlyReport(LONG_REPORT_LINES);
+    await PressNextPage(user);
+    expect(screen.getByText(SECOND_PAGE_CASE.rangeLabel)).toBeInTheDocument();
+    const pendingReport = DeferReport();
+    await SubmitMonthlyReport(user);
+    await screen.findByRole("progressbar");
+    ExpectReportRemoved();
+    await act(async () => {
+        pendingReport.Answer(BuildReportResponse({ lines: [...LONG_REPORT_LINES] }));
+    });
+    expect(await screen.findByText(FIRST_PAGE_CASE.rangeLabel)).toBeInTheDocument();
+    expect(ShownTranIds()).toEqual(LongReportTranIds(0, FIRST_PAGE_CASE.lineCount));
+    expect(mockFetchTransactionReport).toHaveBeenCalledTimes(2);
 });
 
 it("CORPT00C criteria edits do not render the shown report again", async () => {
@@ -1509,17 +1774,16 @@ it.each(LEAVE_CASES)(
 );
 
 // A cancelled read is discarded before ToScreenFeedback, which would show the abend text: the
-// report shown keeps its message, its date range and its lines, and ENTER is active again.
-it("CORPT00C discards a cancelled report read and keeps the report shown", async () => {
+// message line keeps its message and ENTER is active again. The read had already removed the
+// report it was to replace.
+it("CORPT00C discards a cancelled report read and keeps the message shown", async () => {
     const user = await ShowMonthlyReport();
     mockFetchTransactionReport.mockRejectedValue(new CanceledError());
     await PressScreenKey(user, ENTER_KEY, "click");
     await waitFor(() => expect(mockFetchTransactionReport).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.queryByRole("progressbar")).not.toBeInTheDocument());
     await ExpectAlert(MONTHLY_SUBMITTED_MESSAGE, "success");
-    expect(screen.getByRole("heading", { level: 2, name: DATE_RANGE_HEADING })).toBeInTheDocument();
-    const table = screen.getByRole("table", { name: REPORT_TABLE_LABEL });
-    expect(within(table).getAllByRole("row")).toHaveLength(REPORT_LINES.length + 1);
+    ExpectReportRemoved();
     expect(screen.getByRole("button", { name: ENTER_KEY.buttonName })).toBeEnabled();
 });
 
@@ -1562,6 +1826,34 @@ function BuildExportFile(format: ExportFormat): ReportExportFile {
 
 function DownloadLink(linkName: string): HTMLElement {
     return screen.getByRole("link", { name: linkName });
+}
+
+// A download link is activated by pointer, or by Enter or Space while it holds the focus.
+type LinkActivation = "click" | "Enter" | "Space";
+
+const LINK_ACTIVATIONS: readonly LinkActivation[] = ["click", "Enter", "Space"];
+const LINK_ACTIVATION_KEYS: Readonly<Record<Exclude<LinkActivation, "click">, string>> = {
+    Enter: "{Enter}",
+    Space: "[Space]",
+};
+
+const DOWNLOAD_ACTIVATION_CASES = DOWNLOAD_CASES.flatMap(([format, linkName]) =>
+    LINK_ACTIVATIONS.map((activation) => ({ format, linkName, activation })),
+);
+
+async function ActivateLink(
+    user: UserEvent,
+    linkName: string,
+    activation: LinkActivation,
+): Promise<void> {
+    if (activation === "click") {
+        await user.click(DownloadLink(linkName));
+        return;
+    }
+    await act(async () => {
+        DownloadLink(linkName).focus();
+    });
+    await user.keyboard(LINK_ACTIVATION_KEYS[activation]);
 }
 
 // A download that never answers: like axios, it rejects with CanceledError once its signal is
@@ -1642,28 +1934,38 @@ const DOWNLOAD_FAILURE_CASES: readonly DownloadFailureCase[] = [
     },
 ];
 
-// The saving link is the page's own transient link; its blob URL outlives the click.
-it.each(DOWNLOAD_CASES)(
-    "CORPT00C activating the %s link fetches the confirmed report and saves the server's file",
-    async (format, linkName) => {
+// The page's own transient link saved the file under the server's name; its blob URL is not yet
+// released.
+function ExpectSavedThroughLink(probe: FileSavingProbe, file: ReportExportFile): void {
+    expect(probe.createObjectUrl.mock.calls).toEqual([[file.content]]);
+    const savingLink = probe.linkClick.mock.contexts[0] as HTMLAnchorElement;
+    expect(savingLink.getAttribute("href")).toBe(SAVED_FILE_URL);
+    expect(savingLink.download).toBe(file.fileName);
+    expect(probe.revokeObjectUrl).not.toHaveBeenCalled();
+}
+
+// The saving link is the page's own transient link; its blob URL outlives the click. Enter and
+// Space on the focused link download as a click does, and the screen's ENTER never runs on the
+// criteria the confirmed report cleared.
+it.each(DOWNLOAD_ACTIVATION_CASES)(
+    "CORPT00C $activation on the $linkName link fetches the confirmed report and saves its file",
+    async ({ format, linkName, activation }) => {
         jest.useFakeTimers({ advanceTimers: true });
         const probe = ProbeFileSaving();
         const file = BuildExportFile(format);
         mockDownloadReportExport.mockResolvedValue(file);
         const user = await ShowMonthlyReport();
-        await user.click(DownloadLink(linkName));
+        await ActivateLink(user, linkName, activation);
         await waitFor(() => expect(probe.linkClick).toHaveBeenCalledTimes(1));
         expect(mockDownloadReportExport.mock.calls).toEqual([
             [MONTHLY_CONFIRMED_QUERY, format, READ_SIGNAL_OPTIONS],
         ]);
-        expect(probe.createObjectUrl.mock.calls).toEqual([[file.content]]);
-        const savingLink = probe.linkClick.mock.contexts[0] as HTMLAnchorElement;
-        expect(savingLink.getAttribute("href")).toBe(SAVED_FILE_URL);
-        expect(savingLink.download).toBe(file.fileName);
-        expect(probe.revokeObjectUrl).not.toHaveBeenCalled();
+        ExpectSavedThroughLink(probe, file);
         act(() => jest.runOnlyPendingTimers());
         expect(probe.revokeObjectUrl.mock.calls).toEqual([[SAVED_FILE_URL]]);
         await ExpectAlert(MONTHLY_SUBMITTED_MESSAGE, "success");
+        ExpectMonthlyReportShown();
+        expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
     },
 );
 
@@ -1720,7 +2022,7 @@ it("CORPT00C discards a cancelled download and keeps the report and its message"
 });
 
 // One activation is one request: while it runs, both links, ENTER and the criteria are locked and
-// the busy bar shows, and a click on the locked links starts nothing.
+// the busy bar shows, and a click, Enter or Space on the locked links starts nothing.
 it("CORPT00C locks both downloads and ENTER while a download runs", async () => {
     mockDownloadReportExport.mockImplementation(PendDownloadUntilAborted);
     const user = await ShowMonthlyReport();
@@ -1729,9 +2031,10 @@ it("CORPT00C locks both downloads and ENTER while a download runs", async () => 
     ExpectDownloadLinksLocked(true);
     ExpectKeyboardLocked();
     const lockedUser = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
-    for (const [, linkName] of DOWNLOAD_CASES) {
-        await lockedUser.click(DownloadLink(linkName));
+    for (const { linkName, activation } of DOWNLOAD_ACTIVATION_CASES) {
+        await ActivateLink(lockedUser, linkName, activation);
     }
+    expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
     expect(mockDownloadReportExport).toHaveBeenCalledTimes(1);
     expect(mockDownloadReportExport).toHaveBeenCalledWith(
         MONTHLY_CONFIRMED_QUERY,
@@ -1740,6 +2043,91 @@ it("CORPT00C locks both downloads and ENTER while a download runs", async () => 
     );
     expect(FirstDownloadSignal()?.aborted).toBe(false);
 });
+
+// One ENTER activation dispatched straight to the page, as a script or a fast double press
+// delivers it: a click on the Continue button, or the physical key in the CONFIRM field.
+function ActivateEnter(entry: KeyEntry): void {
+    if (entry === "click") {
+        fireEvent.click(screen.getByRole("button", { name: ENTER_KEY.buttonName }));
+        return;
+    }
+    fireEvent.keyDown(ConfirmInput(), { key: ENTER_KEY.keyName });
+}
+
+function ActivateCsvDownload(): void {
+    fireEvent.click(DownloadLink(CSV_LINK_NAME));
+}
+
+// Both activations run in one act scope, so React renders neither before the second arrives: the
+// ENTER key and links the first one's render disables cannot refuse it, only the screen lock can.
+async function ActivateBeforeRender(first: () => void, second: () => void): Promise<void> {
+    await act(async () => {
+        first();
+        second();
+    });
+}
+
+it.each(KEY_ENTRIES)(
+    "CORPT00C two ENTER activations by %s before a render send one request",
+    async (entry) => {
+        mockFetchTransactionReport.mockResolvedValue(BuildReportResponse());
+        const user = await RenderScreen();
+        await user.click(MonthlyButton());
+        await user.type(ConfirmInput(), "Y");
+        await ActivateBeforeRender(
+            () => ActivateEnter(entry),
+            () => ActivateEnter(entry),
+        );
+        await ExpectAlert(MONTHLY_SUBMITTED_MESSAGE, "success");
+        expect(mockFetchTransactionReport.mock.calls).toEqual([
+            [MONTHLY_CONFIRMED_QUERY, READ_SIGNAL_OPTIONS],
+        ]);
+        expect(FirstReadSignal()?.aborted).toBe(false);
+        ExpectMonthlyReportShown();
+    },
+);
+
+// ENTER's read and a download, started one right after the other before a render: the request
+// started first holds the screen lock, so the other sends nothing.
+interface LockedPairCase {
+    name: string;
+    ActivateFirst: () => void;
+    ActivateSecond: () => void;
+    reads: number;
+    downloads: number;
+}
+
+// The reads count ShowMonthlyReport's own read.
+const LOCKED_PAIR_CASES: readonly LockedPairCase[] = [
+    {
+        name: "ENTER right after a download link",
+        ActivateFirst: ActivateCsvDownload,
+        ActivateSecond: () => ActivateEnter("click"),
+        reads: 1,
+        downloads: 1,
+    },
+    {
+        name: "a download link right after ENTER",
+        ActivateFirst: () => ActivateEnter("click"),
+        ActivateSecond: ActivateCsvDownload,
+        reads: 2,
+        downloads: 0,
+    },
+];
+
+it.each(LOCKED_PAIR_CASES)(
+    "CORPT00C $name sends nothing while the first request runs",
+    async ({ ActivateFirst, ActivateSecond, reads, downloads }) => {
+        await ShowMonthlyReport();
+        mockFetchTransactionReport.mockImplementation(PendUntilAborted);
+        mockDownloadReportExport.mockImplementation(PendDownloadUntilAborted);
+        await ActivateBeforeRender(ActivateFirst, ActivateSecond);
+        expect(mockFetchTransactionReport).toHaveBeenCalledTimes(reads);
+        expect(mockDownloadReportExport).toHaveBeenCalledTimes(downloads);
+        await screen.findByRole("progressbar");
+        ExpectKeyboardLocked();
+    },
+);
 
 // Leaving the screen while a download runs aborts it, so no file arrives for a screen nobody sees.
 it.each(LEAVE_CASES)(

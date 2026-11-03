@@ -101,6 +101,17 @@ describe("FunctionKeyBar PF legend names, variants and group", () => {
     });
 });
 
+// MUI's start-icon wrapper puts a zero-width space ahead of the F7 label, so every button is named
+// by its legend label itself rather than by its content.
+describe("FunctionKeyBar PF legend accessible names", () => {
+    it.each(LEGEND_CASES)("PF legend $name is named by its label alone", (legendCase) => {
+        RenderLegend(BuildDefinitions());
+        const button = screen.getByText(legendCase.name).closest("button");
+        expect(button).toHaveAttribute("aria-label", legendCase.name);
+        expect(button).toHaveAccessibleName(legendCase.name);
+    });
+});
+
 describe("FunctionKeyBar paging icons (F7=Backward, F8=Forward)", () => {
     it.each(PAGING_CASES)("$legend shows $iconTestId in $wrapperSelector", (pagingCase) => {
         RenderLegend(BuildDefinitions());

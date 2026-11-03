@@ -52,6 +52,8 @@ function KeyIconProps(key: PfKey): KeyIcons {
     return {};
 }
 
+// The label is the name as well, because MUI's start-icon wrapper adds a zero-width space that
+// would otherwise lead the name of the F7 button.
 function KeyButton(props: { definition: FunctionKeyDefinition }) {
     const { definition } = props;
     return (
@@ -59,6 +61,7 @@ function KeyButton(props: { definition: FunctionKeyDefinition }) {
             variant={KEY_BUTTON_VARIANTS[definition.key]}
             onClick={() => definition.onPress()}
             disabled={definition.disabled ?? false}
+            aria-label={FormatKeyLabel(definition)}
             {...KeyIconProps(definition.key)}
         >
             {FormatKeyLabel(definition)}

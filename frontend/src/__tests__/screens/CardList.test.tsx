@@ -560,11 +560,17 @@ describe("COCRDLIC CRDSEL1-7 codes on /cards", () => {
     });
 });
 
+// ENTER by its button, by the key from the account filter, or by the key on the row Select that
+// keeps the cursor once its code is chosen.
+type SelectionTrigger = KeyTrigger | "key on the row Select";
+
+const SELECTION_TRIGGERS: readonly SelectionTrigger[] = [...KEY_TRIGGERS, "key on the row Select"];
+
 interface SelectionRouteCase extends FilterCase {
     code: string;
     action: CardSelectionAction;
     route: string;
-    trigger: KeyTrigger;
+    trigger: SelectionTrigger;
 }
 
 const SELECTION_ROUTES: readonly Pick<SelectionRouteCase, "code" | "action" | "route">[] = [
@@ -575,10 +581,22 @@ const SELECTION_ROUTES: readonly Pick<SelectionRouteCase, "code" | "action" | "r
 // The keyed filters travel only in the selection body; the route names the card_ref and the
 // selected row's own account, never a filter.
 const SELECTION_ROUTE_CASES: readonly SelectionRouteCase[] = SELECTION_ROUTES.flatMap((routeCase) =>
-    KEY_TRIGGERS.flatMap((trigger) =>
+    SELECTION_TRIGGERS.flatMap((trigger) =>
         FILTER_CASES.map((filterCase) => ({ ...routeCase, trigger, ...filterCase })),
     ),
 );
+
+// Enter on the focused row Select is the screen's ENTER: the menu stays closed.
+async function PressSelectionEnter(user: UserSession, trigger: SelectionTrigger): Promise<void> {
+    if (trigger !== "key on the row Select") {
+        await PressScreenKey(user, "Enter", trigger);
+        return;
+    }
+    expect(SelectionField(SELECTED_ROW)).toHaveFocus();
+    await PressKey(user, "Enter");
+    await WaitForIdle();
+    expect(screen.queryByRole("listbox")).toBeNull();
+}
 
 describe("COCRDLIC selection on /cards", () => {
     it.each(SELECTION_ROUTE_CASES)(
@@ -588,7 +606,7 @@ describe("COCRDLIC selection on /cards", () => {
             const user = await RenderScreen();
             await KeyFilters(user, filters);
             await ChooseSelection(user, SELECTED_ROW, code);
-            await PressScreenKey(user, "Enter", trigger);
+            await PressSelectionEnter(user, trigger);
             expect(mockSelectCards).toHaveBeenCalledTimes(1);
             expect(mockSelectCards).toHaveBeenCalledWith(ExpectedSelectionRequest(code, filters));
             expect(mockListCards).toHaveBeenCalledTimes(1);

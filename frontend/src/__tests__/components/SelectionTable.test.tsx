@@ -1,7 +1,7 @@
 // Tests SelectionTable, which replaces the COCRDLI CRDSEL1-7, COTRN00 SEL0001-10 and COUSR00
 // SEL0001-10 selection fields.
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import type { ReactElement } from "react";
 
@@ -11,6 +11,7 @@ import {
     type SelectionColumn,
     type SelectionRow,
 } from "@/components/SelectionTable";
+import { SCREEN_ENTER_ATTRIBUTE } from "@/lib/useFunctionKeys";
 
 /** One list map: its replaced BMS selection fields, codes, rows and trimmed INITIAL headers. */
 interface MapCase {
@@ -202,6 +203,46 @@ describe("SelectionTable selection", () => {
             expect(onSelectionChange).toHaveBeenCalledWith("KEY2", code);
         },
     );
+});
+
+// A key pressed on the closed field of row 1, the first tab stop. Plain Enter is the screen's
+// ENTER, so it leaves the menu closed; Space, the arrow keys and a chorded Enter open it.
+const CLOSED_FIELD_KEY_CASES: readonly { press: string; keys: string; opens: boolean }[] = [
+    { press: "Enter", keys: "{Enter}", opens: false },
+    { press: "Space", keys: "[Space]", opens: true },
+    { press: "ArrowDown", keys: "{ArrowDown}", opens: true },
+    { press: "ArrowUp", keys: "{ArrowUp}", opens: true },
+    { press: "Ctrl+Enter", keys: "{Control>}{Enter}{/Control}", opens: true },
+];
+
+async function PressOnClosedField({ keys, opens }: { keys: string; opens: boolean }) {
+    const user = userEvent.setup();
+    const onSelectionChange = RenderTable(COCRDLI_CASE);
+    await user.tab();
+    const field = screen.getByRole("combobox", { name: SelectionFieldName(1) });
+    expect(field).toHaveFocus();
+    expect(field).toHaveAttribute(SCREEN_ENTER_ATTRIBUTE);
+    await user.keyboard(keys);
+    expect(field).toHaveAttribute("aria-expanded", String(opens));
+    expect(screen.queryByRole("listbox") !== null).toBe(opens);
+    expect(onSelectionChange).not.toHaveBeenCalled();
+}
+
+describe("SelectionTable keyboard", () => {
+    it.each(CLOSED_FIELD_KEY_CASES)(
+        "COCRDLI CRDSEL1 $press on the closed field opens its menu: $opens",
+        PressOnClosedField,
+    );
+
+    it("COCRDLI CRDSEL1 Enter in the open menu picks the highlighted code and closes it", async () => {
+        const user = userEvent.setup();
+        const onSelectionChange = RenderTable(COCRDLI_CASE);
+        await user.tab();
+        await user.keyboard("{ArrowDown}");
+        await user.keyboard("{ArrowDown}{Enter}");
+        expect(onSelectionChange.mock.calls).toEqual([["KEY1", "S"]]);
+        await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+    });
 });
 
 // The input root carries MUI's error state, which colours the field red as DFHRED did.

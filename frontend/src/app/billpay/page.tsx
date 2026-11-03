@@ -148,10 +148,18 @@ function IsInputName(name: string | null): name is BillPayInputName {
 
 // Replaces MOVE -1 TO <field>L: the input the server names takes the cursor. Any other name, or
 // none (the abend text), puts it on ACTIDIN, the map's IC field, because the keyboard lock took
-// the focus from whatever held it while the call ran.
+// the focus from whatever held it while the call ran. That lock clears MUI's focused state while
+// the browser keeps a disabled input focused, and focusing that input again fires no focus event,
+// so it is blurred first and MUI restores its focused outline and floated label.
 function FocusCursorField(inputs: BillPayInputElements, cursorField: string | null): void {
-    const focusedInput = IsInputName(cursorField) ? cursorField : FIRST_INPUT_NAME;
-    inputs[focusedInput]?.focus();
+    const cursorInput = inputs[IsInputName(cursorField) ? cursorField : FIRST_INPUT_NAME];
+    if (cursorInput === null) {
+        return;
+    }
+    if (cursorInput === document.activeElement) {
+        cursorInput.blur();
+    }
+    cursorInput.focus();
 }
 
 // The N/n answer runs CLEAR-CURRENT-SCREEN, which the server sends back with every field and

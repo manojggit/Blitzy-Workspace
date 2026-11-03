@@ -7,16 +7,19 @@ import {
     Suspense,
     useCallback,
     useEffect,
+    useId,
     useMemo,
     useRef,
     useState,
     useSyncExternalStore,
     type ChangeEvent,
     type Dispatch,
+    type KeyboardEvent,
     type MouseEvent,
     type ReactNode,
     type Ref,
     type RefCallback,
+    type RefObject,
     type SetStateAction,
 } from "react";
 import { useRouter } from "next/navigation";
@@ -35,6 +38,7 @@ import {
     ToggleButton,
     ToggleButtonGroup,
     Typography,
+    tablePaginationClasses,
     toggleButtonClasses,
     useMediaQuery,
     useTheme,
@@ -47,9 +51,14 @@ import {
 import DownloadIcon from "@mui/icons-material/Download";
 import axios, { type AxiosError } from "axios";
 
+import { PRINT_LINE_STYLE } from "@/app/theme";
 import { ConfirmField } from "@/components/ConfirmField";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
+import {
+    ErrorMessageReference,
+    MessageLine,
+    type ErrorMessageReferenceAttributes,
+} from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     IsCancelledRequest,
@@ -70,7 +79,11 @@ import {
     type ReportQuery,
     type TransactionReportResponse,
 } from "@/lib/api/reports";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    SCREEN_ENTER_PROPS,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CR00";
 const PROGRAM_NAME = "CORPT00C";
@@ -125,6 +138,13 @@ const TABLE_HEADINGS = [
 ] as const;
 const AMOUNT_HEADING = "Amount";
 const REPORT_TABLE_LABEL = "Transaction report";
+// The scrolling container of the table is a tab stop, so the keyboard can scroll it; it is named
+// apart from the table it holds.
+const REPORT_LINES_REGION_PROPS = {
+    role: "region",
+    "aria-label": "Transaction report lines",
+    tabIndex: 0,
+} as const;
 // Bounds the table so its sticky headings stay in view and the PF-key bar stays reachable below a
 // long report; theme spacing units, 4 dp each.
 const REPORT_TABLE_MAX_HEIGHT_UNITS = 150;
@@ -442,6 +462,9 @@ interface FieldFocus {
 
 interface ReportSubmission {
     isBusy: boolean;
+    // Counts ENTER's report reads. The report shown always answers the latest one, so a new
+    // number is a new report.
+    readNumber: number;
     submit: SubmitAction;
     abortRead: ReadAborter;
 }
@@ -464,6 +487,7 @@ interface ReportDownloads {
 // The requests of the screen: ENTER's report read and the downloads share one lock.
 interface ReportRequests {
     isBusy: boolean;
+    readNumber: number;
     keys: readonly FunctionKeyDefinition[];
     downloads: ReportDownloads;
 }
@@ -490,12 +514,25 @@ function useReportInputs(): ReportInputsState {
     return { inputs, setInputs, setReportType, setTextInput };
 }
 
+// The keyboard lock disables the criteria during a call, which clears MUI's focused state though
+// the browser keeps the disabled control focused. Focusing that control again fires no focus
+// event, so it is blurred first and MUI restores its focused outline, label or focus ring.
+function PlaceCursor(control: HTMLElement | null | undefined): void {
+    if (control === null || control === undefined) {
+        return;
+    }
+    if (control === document.activeElement) {
+        control.blur();
+    }
+    control.focus();
+}
+
 // The first focus request is the report type, as MONTHLY carries IC on first display.
 function useFieldFocus(): FieldFocus {
     const fieldRefs = useRef<Partial<Record<CursorField, HTMLElement | null>>>({});
     const [focusRequest, setFocusRequest] = useState<FocusRequest>(INITIAL_FOCUS_REQUEST);
     useEffect(() => {
-        fieldRefs.current[focusRequest.field]?.focus();
+        PlaceCursor(fieldRefs.current[focusRequest.field]);
     }, [focusRequest]);
     const bindRef = useCallback((name: CursorField): RefCallback<HTMLElement> => {
         return (element) => {
@@ -660,47 +697,77 @@ async function RunReportDownload(request: DownloadRequest, setters: ScreenSetter
     }
 }
 
-// Each download owns an AbortController, as a report read does: a new download aborts the one it
-// replaces, and F3 and the unmount abort the one in flight. An aborted download leaves the busy
-// state to the download replacing it. A download is never retried.
-function useReportDownload(setters: ScreenSetters): ReportDownload {
+// The screen's one-request-at-a-time lock, shared by ENTER's report read and the downloads.
+type RequestLock = RefObject<boolean>;
+type BusySetter = Dispatch<SetStateAction<boolean>>;
+// The call a request makes, with the signal of the read that owns it.
+type SignalledCall = (signal: AbortSignal) => Promise<void>;
+
+// What one request runs with: the screen's lock, and the request's own read and busy flag.
+interface ScreenRequestRunner {
+    lock: RequestLock;
+    startRead: ReadStarter;
+    setIsBusy: BusySetter;
+}
+
+// The disabled ENTER key and download links take effect only in the render after a press, so the
+// lock, taken before anything else, refuses a second ENTER or download made in that gap: one press
+// is one request. The lock is released once the request settles, answered, failed or aborted, a
+// rethrown defect included. An aborted request leaves the busy state set, because only F3 and the
+// unmount abort one, and both leave the screen.
+async function RunScreenRequest(runner: ScreenRequestRunner, call: SignalledCall): Promise<void> {
+    if (runner.lock.current) {
+        return;
+    }
+    runner.lock.current = true;
+    const signal = runner.startRead();
+    runner.setIsBusy(true);
+    try {
+        await call(signal);
+    } finally {
+        runner.lock.current = false;
+        if (!signal.aborted) {
+            runner.setIsBusy(false);
+        }
+    }
+}
+
+// Each download owns an AbortController, as a report read does, which F3 and the unmount abort. A
+// download is never retried.
+function useReportDownload(setters: ScreenSetters, lock: RequestLock): ReportDownload {
     const [isDownloading, setIsDownloading] = useState(false);
     const { startRead, abortRead } = useReadController();
     const startDownload = useCallback(
-        async (query: ReportQuery, format: ExportFormat) => {
-            const signal = startRead();
-            setIsDownloading(true);
-            try {
-                await RunReportDownload({ query, format, signal }, setters);
-            } finally {
-                if (!signal.aborted) {
-                    setIsDownloading(false);
-                }
-            }
-        },
-        [setters, startRead],
+        (query: ReportQuery, format: ExportFormat) =>
+            RunScreenRequest({ lock, startRead, setIsBusy: setIsDownloading }, (signal) =>
+                RunReportDownload({ query, format, signal }, setters),
+            ),
+        [setters, startRead, lock],
     );
     return { isDownloading, startDownload, abortDownload: abortRead };
 }
 
-// An aborted read leaves the busy state alone: the read replacing it owns that state, and a screen
-// that was left has none.
-function useReportSubmit(inputs: ReportInputs, setters: ScreenSetters): ReportSubmission {
+// ENTER sends the criteria as they stood when it was pressed. Every ENTER outcome removes or
+// replaces the report shown, so the read drops it as it starts: no render then holds the
+// superseded report beside the next one, which leaves it free to be collected.
+function useReportSubmit(
+    inputs: ReportInputs,
+    setters: ScreenSetters,
+    lock: RequestLock,
+): ReportSubmission {
     const [isBusy, setIsBusy] = useState(false);
+    const [readNumber, setReadNumber] = useState(0);
     const { startRead, abortRead } = useReadController();
-    const submit = useCallback(async () => {
-        const query = BuildQueryFromInputs(inputs);
-        const signal = startRead();
-        setIsBusy(true);
-        try {
-            await RunReportRead(query, signal, setters);
-        } finally {
-            if (!signal.aborted) {
-                setIsBusy(false);
-            }
-        }
-    }, [inputs, setters, startRead]);
-    return { isBusy, submit, abortRead };
+    const submit = useCallback(
+        () =>
+            RunScreenRequest({ lock, startRead, setIsBusy }, (signal) => {
+                setReadNumber((current) => current + 1);
+                setters.setResult(null);
+                return RunReportRead(BuildQueryFromInputs(inputs), signal, setters);
+            }),
+        [inputs, setters, startRead, lock],
+    );
+    return { isBusy, readNumber, submit, abortRead };
 }
 
 // What the PF keys act on: ENTER submits; F3 aborts every request in flight before it leaves.
@@ -735,18 +802,21 @@ function useScreenKeys(actions: ScreenKeyActions): readonly FunctionKeyDefinitio
 }
 
 // One request runs at a time: while ENTER's read or a download runs, ENTER, the criteria and the
-// download links are all locked and the busy bar shows.
+// download links are all locked and the busy bar shows. The shared lock holds from the press,
+// before the render that locks them.
 function useReportRequests(inputs: ReportInputs, setters: ScreenSetters): ReportRequests {
-    const { isBusy: isReading, submit, abortRead } = useReportSubmit(inputs, setters);
-    const { isDownloading, startDownload, abortDownload } = useReportDownload(setters);
-    const isBusy = isReading || isDownloading;
+    const lock = useRef(false);
+    const reading = useReportSubmit(inputs, setters, lock);
+    const { submit, abortRead, readNumber } = reading;
+    const { isDownloading, startDownload, abortDownload } = useReportDownload(setters, lock);
+    const isBusy = reading.isBusy || isDownloading;
     const abortRequests = useCallback(() => {
         abortRead();
         abortDownload();
     }, [abortRead, abortDownload]);
     const keys = useScreenKeys({ submit, abortRequests, isBusy });
     const downloads = useMemo(() => ({ disabled: isBusy, startDownload }), [isBusy, startDownload]);
-    return { isBusy, keys, downloads };
+    return { isBusy, readNumber, keys, downloads };
 }
 
 function useReportForm(): ReportForm {
@@ -769,6 +839,8 @@ interface ReportTypeSelectorProps {
     firstButtonRef: Ref<HTMLButtonElement>;
     // The server names reportType in cursor_field or field_errors.
     isFlagged: boolean;
+    // The ENTER outcome that flag comes from.
+    feedback: FeedbackState;
 }
 
 type SelectorOrientation = "horizontal" | "vertical";
@@ -780,13 +852,19 @@ function useSelectorOrientation(): SelectorOrientation {
 }
 
 // ToggleButtonGroup places its segments by position among its direct children, so each button is
-// an element of the group rather than a component of its own.
+// an element of the group rather than a component of its own. Enter on a segment is the map's
+// ENTER, as it was from the one-byte selector field holding the cursor; Space chooses it.
 function RenderReportTypeButton(
     option: ReportTypeOption,
     buttonRef: Ref<HTMLButtonElement> | undefined,
 ): ReactNode {
     return (
-        <ToggleButton key={option.value} value={option.value} ref={buttonRef}>
+        <ToggleButton
+            key={option.value}
+            value={option.value}
+            ref={buttonRef}
+            {...SCREEN_ENTER_PROPS}
+        >
             {option.label}
         </ToggleButton>
     );
@@ -805,21 +883,38 @@ function FlaggedSelectorProps(isFlagged: boolean): Partial<ToggleButtonGroupProp
     };
 }
 
+type ReportTypeChangeHandler = (event: MouseEvent<HTMLElement>, next: ReportType | null) => void;
+
+interface ReportTypeChoice {
+    isFlagged: boolean;
+    handleChange: ReportTypeChangeHandler;
+}
+
+// A choice made after the server flagged the group answers that flag, so the group no longer
+// reads as invalid; the next ENTER outcome that names the report type flags it again.
+function useReportTypeChoice(props: ReportTypeSelectorProps): ReportTypeChoice {
+    const [answeredFeedback, setAnsweredFeedback] = useState<FeedbackState | null>(null);
+    const handleChange: ReportTypeChangeHandler = (_event, next) => {
+        setAnsweredFeedback(props.feedback);
+        props.onChange(next);
+    };
+    return { isFlagged: props.isFlagged && answeredFeedback !== props.feedback, handleChange };
+}
+
 // One exclusive choice replaces the three one-byte selectors. Pressing the chosen type again
 // clears the choice, as blanking the field did, so the no-selection literal stays reachable.
 function ReportTypeSelector(props: ReportTypeSelectorProps) {
     const orientation = useSelectorOrientation();
-    const handleChange = (_event: MouseEvent<HTMLElement>, next: ReportType | null): void =>
-        props.onChange(next);
+    const choice = useReportTypeChoice(props);
     return (
         <ToggleButtonGroup
             exclusive
             value={props.value}
             orientation={orientation}
             disabled={props.disabled}
-            onChange={handleChange}
+            onChange={choice.handleChange}
             aria-label={REPORT_TYPE_GROUP_LABEL}
-            {...FlaggedSelectorProps(props.isFlagged)}
+            {...FlaggedSelectorProps(choice.isFlagged)}
         >
             {REPORT_TYPE_OPTIONS.map((option, position) =>
                 RenderReportTypeButton(option, position === 0 ? props.firstButtonRef : undefined),
@@ -828,19 +923,28 @@ function ReportTypeSelector(props: ReportTypeSelectorProps) {
     );
 }
 
+// Every part is described by its row's (MM/DD/YYYY) hint; a part the server names in error is
+// described first by the ERRMSG line that holds its literal.
+function DatePartDescription(isFlagged: boolean, hintId: string): ErrorMessageReferenceAttributes {
+    if (isFlagged) {
+        return ErrorMessageReference(isFlagged, hintId);
+    }
+    return { "aria-describedby": hintId };
+}
+
 // Only the BMS LENGTH limits the part: the keyed text is never trimmed, padded or checked here,
-// so every CORPT00C date literal stays reachable. A part the server names in error is described
-// by the ERRMSG line that holds its literal.
+// so every CORPT00C date literal stays reachable.
 function DatePartSlotProps(
     part: DatePartDefinition,
     isFlagged: boolean,
+    hintId: string,
 ): TextFieldProps["slotProps"] {
     return {
         htmlInput: {
             maxLength: part.maxLength,
             inputMode: "numeric",
             "aria-label": part.ariaLabel,
-            ...ErrorMessageReference(isFlagged),
+            ...DatePartDescription(isFlagged, hintId),
         },
     };
 }
@@ -852,6 +956,8 @@ interface DatePartInputProps {
     isFlagged: boolean;
     disabled: boolean;
     inputRef: RefCallback<HTMLElement>;
+    // The element id of the row's (MM/DD/YYYY) hint.
+    hintId: string;
 }
 
 function DatePartInput(props: DatePartInputProps) {
@@ -869,7 +975,7 @@ function DatePartInput(props: DatePartInputProps) {
             size="small"
             fullWidth
             inputRef={inputRef}
-            slotProps={DatePartSlotProps(part, isFlagged)}
+            slotProps={DatePartSlotProps(part, isFlagged, props.hintId)}
         />
     );
 }
@@ -884,8 +990,12 @@ interface DatePartsFieldProps {
     bindRef: FieldRefBinder;
 }
 
+interface DatePartsRowProps extends DatePartsFieldProps {
+    hintId: string;
+}
+
 // The MM, DD and YYYY parts of one map row.
-function DatePartsRow(props: DatePartsFieldProps) {
+function DatePartsRow(props: DatePartsRowProps) {
     return (
         <Grid container spacing={2}>
             {props.parts.map((part) => (
@@ -897,6 +1007,7 @@ function DatePartsRow(props: DatePartsFieldProps) {
                         isFlagged={props.errorFields.includes(part.name)}
                         disabled={props.disabled}
                         inputRef={props.bindRef(part.name)}
+                        hintId={props.hintId}
                     />
                 </Grid>
             ))}
@@ -904,15 +1015,16 @@ function DatePartsRow(props: DatePartsFieldProps) {
     );
 }
 
-// The legend, the date parts and the (MM/DD/YYYY) hint of one map row.
+// The legend, the date parts and the (MM/DD/YYYY) hint of one map row, which describes each part.
 function DatePartsField(props: DatePartsFieldProps) {
+    const hintId = useId();
     return (
         <Stack spacing={2} useFlexGap role="group" aria-label={props.legend}>
             <Typography variant="titleSmall" component="p">
                 {props.legend}
             </Typography>
-            <DatePartsRow {...props} />
-            <Typography variant="bodySmall" component="p" color="text.secondary">
+            <DatePartsRow {...props} hintId={hintId} />
+            <Typography id={hintId} variant="bodySmall" component="p" color="text.secondary">
                 {DATE_HINT}
             </Typography>
         </Stack>
@@ -980,6 +1092,7 @@ function ReportCriteriaSection({ form }: ReportFormSectionProps) {
                 disabled={form.isBusy}
                 firstButtonRef={form.bindRef("reportType")}
                 isFlagged={errorFields.includes("reportType")}
+                feedback={form.feedback}
             />
             <DateRangeFields form={form} errorFields={errorFields} />
             <ReportConfirmField form={form} errorFields={errorFields} />
@@ -1045,12 +1158,15 @@ function TotalRow({ line }: ReportLineRowProps) {
 }
 
 // The page headers CBTRN03C repeats: REPORT-NAME-HEADER, WS-BLANK-LINE, TRANSACTION-HEADER-1 and
-// the TRANSACTION-HEADER-2 dash rule, each shown as printed. The blank line stays a blank row
-// rather than a copy of the column headings, which the next header line already prints.
+// the TRANSACTION-HEADER-2 dash rule, each shown as printed, in fixed pitch across every column.
+// The blank line stays a blank row rather than a copy of the column headings, which the next
+// header line already prints.
 function HeaderRow({ line }: ReportLineRowProps) {
     return (
         <TableRow>
-            <TableCell colSpan={TABLE_HEADINGS.length}>{line.text ?? ""}</TableCell>
+            <TableCell colSpan={TABLE_HEADINGS.length} sx={PRINT_LINE_STYLE}>
+                {line.text ?? ""}
+            </TableCell>
         </TableRow>
     );
 }
@@ -1099,7 +1215,7 @@ function ReportLinesPageTable({ lines, page }: ReportLinesPageProps) {
     const firstPosition = page * REPORT_LINES_PER_PAGE;
     const pageLines = lines.slice(firstPosition, firstPosition + REPORT_LINES_PER_PAGE);
     return (
-        <TableContainer key={page} sx={REPORT_TABLE_STYLE}>
+        <TableContainer key={page} sx={REPORT_TABLE_STYLE} {...REPORT_LINES_REGION_PROPS}>
             <Table stickyHeader size="small" aria-label={REPORT_TABLE_LABEL}>
                 <ReportTableHead />
                 <TableBody>
@@ -1122,39 +1238,65 @@ interface ReportLinesPaginationProps {
     onPageChange: ReportPageChanger;
 }
 
+// The page arrows that can still page; the pagination's actions hold only previous and next.
+const ENABLED_PAGE_ARROW_SELECTOR = `.${tablePaginationClasses.actions} button:not(:disabled)`;
+
+interface PageArrowFocus {
+    paginationRef: RefObject<HTMLDivElement | null>;
+    changePage: ReportPageChanger;
+}
+
+function FocusEnabledPageArrow(pagination: HTMLElement | null): void {
+    pagination?.querySelector<HTMLButtonElement>(ENABLED_PAGE_ARROW_SELECTOR)?.focus();
+}
+
+// An arrow its own page change disables, on the first or the last page, would leave the focus on
+// nothing, so the focus moves to the arrow that still pages. Only an arrow activation moves it:
+// neither the first display nor a new report takes the focus.
+function usePageArrowFocus(page: number, onPageChange: ReportPageChanger): PageArrowFocus {
+    const paginationRef = useRef<HTMLDivElement | null>(null);
+    const activatedArrowRef = useRef<HTMLButtonElement | null>(null);
+    useEffect(() => {
+        const activatedArrow = activatedArrowRef.current;
+        activatedArrowRef.current = null;
+        if (activatedArrow?.disabled === true) {
+            FocusEnabledPageArrow(paginationRef.current);
+        }
+    }, [page]);
+    const changePage: ReportPageChanger = (event, nextPage) => {
+        activatedArrowRef.current = event?.currentTarget ?? null;
+        onPageChange(event, nextPage);
+    };
+    return { paginationRef, changePage };
+}
+
 // Shown only for a report longer than one page. These pages are not PF-key paging: the CORPT00
 // legend is ENTER and F3 alone, and the pages only view the print report.
 function ReportLinesPagination({ lineCount, page, onPageChange }: ReportLinesPaginationProps) {
+    const { paginationRef, changePage } = usePageArrowFocus(page, onPageChange);
     if (lineCount <= REPORT_LINES_PER_PAGE) {
         return null;
     }
     return (
         <TablePagination
+            ref={paginationRef}
             component="div"
             count={lineCount}
             page={page}
             rowsPerPage={REPORT_LINES_PER_PAGE}
             rowsPerPageOptions={REPORT_PAGE_SIZE_OPTIONS}
-            onPageChange={onPageChange}
+            onPageChange={changePage}
         />
     );
 }
 
-interface ReportLinesPageState {
-    lines: readonly ReportLine[];
-    page: number;
-}
-
-// The chosen page belongs to the lines it was chosen in, so a new report opens on its first page
-// with no effect resetting it.
+// Each report mounts its own table (TransactionReportsScreen keys the report by its read), so a
+// new report opens on its first page with no effect resetting it. The state holds the chosen page
+// only, never the lines, so a replaced report is not kept alive by it.
 function ReportLinesTable({ lines }: ReportLinesTableProps) {
-    const [pageState, setPageState] = useState<ReportLinesPageState>({
-        lines,
-        page: FIRST_REPORT_PAGE,
-    });
-    const page = pageState.lines === lines ? pageState.page : FIRST_REPORT_PAGE;
+    const [page, setPage] = useState(FIRST_REPORT_PAGE);
     const changePage: ReportPageChanger = (_event, nextPage) => {
-        setPageState({ lines, page: nextPage });
+        setPage(nextPage);
     };
     return (
         <Stack>
@@ -1171,15 +1313,43 @@ interface ReportDownloadButtonProps {
 }
 
 type DownloadClickHandler = (event: MouseEvent<HTMLElement>) => void;
+type DownloadKeyHandler = (event: KeyboardEvent<HTMLElement>) => void;
+
+// The KeyboardEvent.key of the space bar.
+const SPACE_KEY = " ";
+
+// A locked link, still focused from its own activation, starts nothing.
+function StartUnlockedDownload(props: ReportDownloadButtonProps): void {
+    if (!props.downloads.disabled) {
+        void props.downloads.startDownload(props.query, props.option.format);
+    }
+}
 
 // Activating a link fetches its file through the API client instead of following the address,
 // so a refused or failed export redirects or shows its legacy message rather than replacing the
-// screen. A locked link, still focused from its own click, starts nothing.
+// screen.
 function BuildDownloadClickHandler(props: ReportDownloadButtonProps): DownloadClickHandler {
     return (event) => {
         event.preventDefault();
-        if (!props.downloads.disabled) {
-            void props.downloads.startDownload(props.query, props.option.format);
+        StartUnlockedDownload(props);
+    };
+}
+
+function IsModifiedKey(event: KeyboardEvent<HTMLElement>): boolean {
+    return event.ctrlKey || event.altKey || event.metaKey || event.shiftKey;
+}
+
+// Enter follows the link, which its click handler turns into the download. Space, which presses
+// the button the link is styled as, starts the same download instead of scrolling the page; a
+// held Space is one activation, and a chord is left to the browser.
+function BuildDownloadKeyHandler(props: ReportDownloadButtonProps): DownloadKeyHandler {
+    return (event) => {
+        if (event.key !== SPACE_KEY || IsModifiedKey(event)) {
+            return;
+        }
+        event.preventDefault();
+        if (!event.repeat) {
+            StartUnlockedDownload(props);
         }
     };
 }
@@ -1193,8 +1363,10 @@ function ReportDownloadButton(props: ReportDownloadButtonProps) {
             download
             disabled={props.downloads.disabled}
             onClick={BuildDownloadClickHandler(props)}
+            onKeyDown={BuildDownloadKeyHandler(props)}
             variant="outlined"
             startIcon={<DownloadIcon />}
+            aria-label={props.option.label}
         >
             {props.option.label}
         </Button>
@@ -1245,14 +1417,20 @@ function ReportResultSection({ result, downloads }: ReportResultSectionProps) {
     );
 }
 
+// The report renders again only for a new result or when a request locks or frees its downloads,
+// never for a criteria keystroke. Each ENTER read mounts a report section of its own, so no part
+// of a superseded report outlives it.
+function useReportResultView(form: ReportForm): ReactNode {
+    const { readNumber, result, downloads } = form;
+    return useMemo(
+        () => <ReportResultSection key={readNumber} result={result} downloads={downloads} />,
+        [readNumber, result, downloads],
+    );
+}
+
 function TransactionReportsScreen() {
     const form = useReportForm();
-    // The report renders again only for a new result or when a request locks or frees its
-    // downloads, never for a criteria keystroke.
-    const resultView = useMemo(
-        () => <ReportResultSection result={form.result} downloads={form.downloads} />,
-        [form.result, form.downloads],
-    );
+    const resultView = useReportResultView(form);
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}

@@ -13,10 +13,13 @@ import {
     TableRow,
     type MenuProps,
     type SelectChangeEvent,
+    type SelectProps,
     type SxProps,
     type Theme,
 } from "@mui/material";
-import type { ReactElement } from "react";
+import { useState, type HTMLAttributes, type ReactElement, type SyntheticEvent } from "react";
+
+import { IsScreenEnterKey, SCREEN_ENTER_PROPS } from "@/lib/useFunctionKeys";
 
 import { ErrorMessageReference } from "@/components/MessageLine";
 
@@ -61,6 +64,13 @@ interface SelectionTableRowProps {
 
 type SelectionCellProps = Omit<SelectionTableRowProps, "columns">;
 
+// The open state of one row's menu, spread onto its Select.
+interface SelectionMenuState {
+    open: boolean;
+    onOpen: (event: SyntheticEvent) => void;
+    onClose: () => void;
+}
+
 interface SelectionTableBodyProps {
     rows: readonly SelectionRow[];
     columns: readonly SelectionColumn[];
@@ -73,12 +83,28 @@ const BLANK_SELECTION_LABEL = "No selection";
 // An empty MenuItem collapses to its padding; a zero-width space keeps one text line, the way
 // MUI renders an empty Select value, so the blank option is as tall as the code options.
 const ZERO_WIDTH_SPACE = "\u200b";
+// Enter on a closed selection field is the screen's ENTER, as it was from the 3270 field holding
+// the cursor; the marker rides on the combobox element MUI renders.
+const SELECTION_DISPLAY_PROPS: HTMLAttributes<HTMLDivElement> & typeof SCREEN_ENTER_PROPS = {
+    ...SCREEN_ENTER_PROPS,
+};
 // A content-sized field grows when a code replaces the blank, and the table's automatic layout
 // then shifts every column, so the field keeps one width: MUI's select padding plus the widest
 // glyph a one-character code can hold (code page 037), in theme spacing units of 4 dp each.
 const SELECTION_FIELD_WIDTH_UNITS = 16;
 const SELECTION_FIELD_STYLE: SxProps<Theme> = {
     width: (theme) => theme.spacing(SELECTION_FIELD_WIDTH_UNITS),
+};
+// The props every row's selection field shares: its size, the blank shown as a value, its fixed
+// width and the screen-ENTER marker on its combobox.
+const SELECTION_FIELD_PROPS: Pick<
+    SelectProps<string>,
+    "size" | "displayEmpty" | "sx" | "SelectDisplayProps"
+> = {
+    size: "small",
+    displayEmpty: true,
+    sx: SELECTION_FIELD_STYLE,
+    SelectDisplayProps: SELECTION_DISPLAY_PROPS,
 };
 
 /** The accessible name of a row's selection field; `rowNumber` counts from 1, as CRDSEL1. */
@@ -112,6 +138,27 @@ function SelectionOptionsFor(
     return [blankOption, ...codeOptions];
 }
 
+function IsScreenEnterPress(event: SyntheticEvent): boolean {
+    return event.nativeEvent instanceof KeyboardEvent && IsScreenEnterKey(event.nativeEvent);
+}
+
+// The menu opens on Space, the arrow keys and the pointer, and stays closed on the Enter the
+// screen takes as its ENTER, so one press is one action; inside the open menu Enter picks an
+// option. React recognises hooks only by the camelCase "use" prefix, so this name is a
+// framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
+function useSelectionMenu(): SelectionMenuState {
+    const [isOpen, setIsOpen] = useState(false);
+    return {
+        open: isOpen,
+        onOpen: (event) => {
+            if (!IsScreenEnterPress(event)) {
+                setIsOpen(true);
+            }
+        },
+        onClose: () => setIsOpen(false),
+    };
+}
+
 // A flagged code field is tied to the ERRMSG line, which MUI's SelectInput passes on to the
 // combobox, so assistive technology reads the literal when the cursor lands on the row.
 function SelectionInputProps(row: SelectionRow, rowNumber: number) {
@@ -128,13 +175,13 @@ function SelectionMenuPropsFor(rowNumber: number): Partial<MenuProps> {
 
 function SelectionCell({ row, rowNumber, tableProps }: SelectionCellProps) {
     const { allowedCodes, onSelectionChange } = tableProps;
+    const menu = useSelectionMenu();
     return (
         <Select
-            size="small"
-            displayEmpty
-            sx={SELECTION_FIELD_STYLE}
+            {...SELECTION_FIELD_PROPS}
             error={row.isError ?? false}
             value={row.selectedCode}
+            {...menu}
             inputProps={SelectionInputProps(row, rowNumber)}
             MenuProps={SelectionMenuPropsFor(rowNumber)}
             onChange={(event: SelectChangeEvent<string>) =>

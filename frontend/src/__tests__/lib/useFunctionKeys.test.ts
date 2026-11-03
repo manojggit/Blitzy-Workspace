@@ -1,11 +1,13 @@
 // Tests: lib/useFunctionKeys.ts (replaces the EVALUATE EIBAID PF-key dispatch of
 // cbl/COUSR02C.cbl and cbl/COTRN00C.cbl; unbound keys keep the CSMSG01Y invalid-key path).
-import { Box, Button, TextField } from "@mui/material";
+import { Box, Button, TextField, ToggleButton } from "@mui/material";
 import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { createElement, type ReactElement } from "react";
 
 import {
+    IsScreenEnterKey,
     PF_KEY_ACTIONS,
+    SCREEN_ENTER_PROPS,
     useFunctionKeys,
     type FunctionKeyDefinition,
     type PfKey,
@@ -30,6 +32,49 @@ const MODIFIER_CASES: readonly { modifier: string; chord: KeyboardEventInit }[] 
 
 // Roles whose focused element acts on Enter itself (MUI Select trigger, menu and options).
 const ENTER_OWNING_ROLES: readonly string[] = ["button", "combobox", "listbox", "option"];
+
+interface FocusedControlCase {
+    control: string;
+    element: ReactElement;
+}
+
+// Native controls that act on Enter themselves: a button clicks itself and a link follows itself.
+const NATIVE_ENTER_CONTROLS: readonly FocusedControlCase[] = [
+    { control: "button", element: createElement(Button, null, "Process") },
+    { control: "link", element: createElement(Button, { href: "/export" }, "Download CSV") },
+];
+
+// Controls marked as the screen's ENTER: a report-type segment and a row Select trigger.
+const MARKED_ENTER_CONTROLS: readonly FocusedControlCase[] = [
+    {
+        control: "button",
+        element: createElement(
+            ToggleButton,
+            { value: "monthly", ...SCREEN_ENTER_PROPS },
+            "Monthly",
+        ),
+    },
+    {
+        control: "combobox",
+        element: createElement(Box, { role: "combobox", tabIndex: 0, ...SCREEN_ENTER_PROPS }),
+    },
+];
+
+// A marked control's Enter runs ENTER once, or nothing while ENTER is inactive; it is blocked
+// either way, so the control's own Enter action never runs.
+const MARKED_ENTER_CASES = MARKED_ENTER_CONTROLS.flatMap((controlCase) =>
+    [false, true].map((disabled) => ({ ...controlCase, disabled, pressCount: disabled ? 0 : 1 })),
+);
+
+// Plain Enter is the screen's ENTER; a chord, an IME composition or another key is not.
+const SCREEN_ENTER_KEY_CASES: readonly { press: string; init: KeyboardEventInit; is: boolean }[] = [
+    { press: "Enter", init: { key: "Enter" }, is: true },
+    { press: "Ctrl+Enter", init: { key: "Enter", ctrlKey: true }, is: false },
+    { press: "Alt+Enter", init: { key: "Enter", altKey: true }, is: false },
+    { press: "Meta+Enter", init: { key: "Enter", metaKey: true }, is: false },
+    { press: "a composing Enter", init: { key: "Enter", isComposing: true }, is: false },
+    { press: "Space", init: { key: " " }, is: false },
+];
 
 const UNBOUND_KEYS: readonly string[] = ["F8", "a"];
 
@@ -118,13 +163,32 @@ it.each(MODIFIER_CASES)(
     },
 );
 
-it("Enter on a focused button is left to the button (no double ENTER AID)", async () => {
-    const definition = BuildDefinition("ENTER");
-    BindKeys([definition]);
-    const focusedButton = await RenderFocused(createElement(Button, null, "Process"), "button");
-    const keyEvent = DispatchKey({ key: "Enter" }, focusedButton);
-    expect(definition.onPress).not.toHaveBeenCalled();
-    expect(keyEvent.defaultPrevented).toBe(false);
+it.each(NATIVE_ENTER_CONTROLS)(
+    "Enter on a focused $control is left to the $control (no double ENTER AID)",
+    async ({ control, element }) => {
+        const definition = BuildDefinition("ENTER");
+        BindKeys([definition]);
+        const focusedControl = await RenderFocused(element, control);
+        const keyEvent = DispatchKey({ key: "Enter" }, focusedControl);
+        expect(definition.onPress).not.toHaveBeenCalled();
+        expect(keyEvent.defaultPrevented).toBe(false);
+    },
+);
+
+it.each(MARKED_ENTER_CASES)(
+    "Enter on a marked $control runs ENTER $pressCount time(s), disabled $disabled, and is blocked",
+    async ({ control, element, disabled, pressCount }) => {
+        const definition = BuildDefinition("ENTER", disabled);
+        BindKeys([definition]);
+        const focusedControl = await RenderFocused(element, control);
+        const keyEvent = DispatchKey({ key: "Enter" }, focusedControl);
+        expect(definition.onPress).toHaveBeenCalledTimes(pressCount);
+        expect(keyEvent.defaultPrevented).toBe(true);
+    },
+);
+
+it.each(SCREEN_ENTER_KEY_CASES)("IsScreenEnterKey for $press is $is", ({ init, is }) => {
+    expect(IsScreenEnterKey(new KeyboardEvent("keydown", init))).toBe(is);
 });
 
 it.each(ENTER_OWNING_ROLES)("Enter on a focused role=%s is left to that element", async (role) => {

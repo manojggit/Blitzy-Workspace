@@ -236,3 +236,17 @@ export const VISUALLY_HIDDEN_STYLE: SxProps<Theme> = {
     whiteSpace: "nowrap",
     width: "1px",
 };
+
+// Courier, the face the report PDF draws its print lines in, then the platform's fixed-pitch face.
+const PRINT_LINE_FONT_FAMILY = '"Courier New", Courier, monospace';
+
+/**
+ * A CBTRN03C print line shown as the TRANREPT file prints it, as an sx style: a fixed-pitch face
+ * at the M3 body-small size, every blank kept and no wrapping, so the column headings and the
+ * 133-column dash rule line up as printed. A line wider than its table scrolls with the table.
+ */
+export const PRINT_LINE_STYLE: SxProps<Theme> = {
+    ...M3_TYPE_SCALE.bodySmall,
+    fontFamily: PRINT_LINE_FONT_FAMILY,
+    whiteSpace: "pre",
+};
