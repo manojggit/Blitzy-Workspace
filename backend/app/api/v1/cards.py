@@ -113,8 +113,10 @@ async def ViewCard(
     response_model=CardScreen,
     summary="CCUP / COCRDUPC: fetch card for update",
     description=(
-        "Edits both keys and fetches the card into the update screen in state SHOW_DETAILS, "
-        "with the card number masked, no CVV, and the screen_token the next PUT sends back."
+        "Fetches the card into the update screen in state SHOW_DETAILS, with the card number "
+        "masked, no CVV, and the screen_token the next PUT sends back. A card_ref from the card "
+        "list, sent with its row's 11-digit acctId, is read with those list keys and no key "
+        "edits; a typed card number has both keys edited first."
     ),
     responses=LegacyErrorResponses(400, 401, 403, 404, 503),
 )

@@ -124,7 +124,8 @@ def AddMiddleware(application: FastAPI, settings: Settings) -> None:
     Starlette wraps later-added middleware around earlier ones. CORS therefore answers the
     preflight OPTIONS before the guard sees it, and decorates the guard's 403 with its headers,
     so the browser can read the refusal. Credentials are allowed, so the origins are always the
-    explicit BACKEND_CORS_ORIGINS list, never "*".
+    explicit BACKEND_CORS_ORIGINS list: Settings refuses a wildcard or a malformed entry at
+    startup.
     """
     allowedOrigins = settings.CorsOrigins()
     application.add_middleware(OriginGuard, allowedOrigins=allowedOrigins)

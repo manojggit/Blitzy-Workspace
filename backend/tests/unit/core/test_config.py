@@ -4,9 +4,13 @@ The unit replaces the CICS region settings of csd/CARDDEMO.CSD and the configura
 travelled in the COMMAREA (cpy/COCOM01Y.cpy), as specified in the Technical Specification,
 Sections 0.7.1 and 0.7.6. These tests pin that a settings object never renders SECRET_KEY or
 a database-URL password, while its attributes keep the raw values the engines and the token
-signer read, and that LOGIN_MAX_ATTEMPTS is accepted only within the SMALLINT range of
-security.login_attempts.failure_count. Every key and password is generated at run time with
-the secrets module, and backend/.env is never read (_env_file=None).
+signer read, that LOGIN_MAX_ATTEMPTS is accepted only within the SMALLINT range of
+security.login_attempts.failure_count, and that BACKEND_CORS_ORIGINS is accepted only as one or
+more origins exactly as a browser sends them in the Origin header, so a wildcard, a path, a
+trailing slash, a malformed or noncanonical host or port, or an empty list never reaches the
+credentialed CORS middleware, and its error never echoes the value.
+Every key and password is generated at run time with the secrets module, and backend/.env is
+never read (_env_file=None).
 """
 
 import io
@@ -22,6 +26,11 @@ SETTINGS_LOGGER_NAME = "carddemo.tests.unit.core.config"
 # The PostgreSQL SMALLINT maximum, the type of security.login_attempts.failure_count.
 SMALLINT_MAXIMUM = 32767
 LOGIN_MAX_ATTEMPTS_LOCATION = [("LOGIN_MAX_ATTEMPTS",)]
+BACKEND_CORS_ORIGINS_LOCATION = [("BACKEND_CORS_ORIGINS",)]
+DEFAULT_CORS_ORIGINS = Settings.model_fields["BACKEND_CORS_ORIGINS"].default
+LOCAL_FRONTEND_ORIGIN = "http://127.0.0.1:3000"
+SECOND_LOCAL_ORIGIN = "http://127.0.0.1:3001"
+LOCAL_ORIGIN_PAIR = (LOCAL_FRONTEND_ORIGIN, SECOND_LOCAL_ORIGIN)
 
 
 def BuildDatabaseUrl(driverName, databasePassword):
@@ -61,6 +70,17 @@ def LoginMaxAttemptsOutcome(attemptLimit, secretKey, databasePassword):
     except ValidationError as error:
         return [fieldError["loc"] for fieldError in error.errors()]
     return builtSettings.LOGIN_MAX_ATTEMPTS
+
+
+def BuildCorsSettings(corsOrigins, secretKey, databasePassword):
+    """Return Settings holding the generated key and password and BACKEND_CORS_ORIGINS."""
+    return Settings(
+        _env_file=None,
+        SECRET_KEY=secretKey,
+        DATABASE_URL=BuildDatabaseUrl("asyncpg", databasePassword),
+        SYNC_DATABASE_URL=BuildDatabaseUrl("psycopg2", databasePassword),
+        BACKEND_CORS_ORIGINS=corsOrigins,
+    )
 
 
 @pytest.fixture(name="secretKey")
@@ -146,3 +166,92 @@ def test_login_max_attempts_stays_within_failure_count_range(
     attemptLimit, expectedOutcome, secretKey, databasePassword
 ):
     assert LoginMaxAttemptsOutcome(attemptLimit, secretKey, databasePassword) == expectedOutcome
+
+
+@pytest.mark.parametrize(
+    "rejectedOrigins",
+    [
+        "*",
+        LOCAL_FRONTEND_ORIGIN + "/",
+        ",",
+        LOCAL_FRONTEND_ORIGIN + "/app",
+        "127.0.0.1:3000",
+        "HTTP://127.0.0.1:3000",
+        "null",
+        LOCAL_FRONTEND_ORIGIN + ",*",
+        "http://[:::]:3000",
+        "http://[1]:3000",
+        "http://127.0.0.1:65536",
+        "http://127.0.0.1:03000",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:80",
+        "https://carddemo.example.com:443",
+        "http://[0:0:0:0:0:0:0:1]:3000",
+        "http://127.1:3000",
+        "http://127.0.0.01:3000",
+        "http://-carddemo.example:3000",
+        "http://carddemo..example:3000",
+    ],
+    ids=[
+        "wildcard",
+        "trailing-slash",
+        "no-entries",
+        "path",
+        "no-scheme",
+        "upper-case-scheme",
+        "null-origin",
+        "origin-then-wildcard",
+        "ipv6-triple-colon",
+        "ipv6-single-group",
+        "port-above-maximum",
+        "port-leading-zero",
+        "port-zero",
+        "http-default-port",
+        "https-default-port",
+        "ipv6-expanded",
+        "ipv4-shorthand",
+        "ipv4-octet-leading-zero",
+        "label-leading-hyphen",
+        "empty-label",
+    ],
+)
+def test_backend_cors_origins_refuses_non_origin_entries(
+    rejectedOrigins, secretKey, databasePassword
+):
+    with pytest.raises(ValidationError) as raisedError:
+        BuildCorsSettings(rejectedOrigins, secretKey, databasePassword)
+    rejectedLocations = [fieldError["loc"] for fieldError in raisedError.value.errors()]
+    assert rejectedLocations == BACKEND_CORS_ORIGINS_LOCATION
+    assert "input_value" not in str(raisedError.value)
+
+
+@pytest.mark.parametrize(
+    ("acceptedOrigins", "expectedOrigins"),
+    [
+        (DEFAULT_CORS_ORIGINS, (LOCAL_FRONTEND_ORIGIN,)),
+        (f"{LOCAL_FRONTEND_ORIGIN},{SECOND_LOCAL_ORIGIN}", LOCAL_ORIGIN_PAIR),
+        (f" {LOCAL_FRONTEND_ORIGIN} , ,{SECOND_LOCAL_ORIGIN},", LOCAL_ORIGIN_PAIR),
+        ("https://carddemo.example.com", ("https://carddemo.example.com",)),
+        ("http://[::1]:3000", ("http://[::1]:3000",)),
+        ("http://127.0.0.1:65535", ("http://127.0.0.1:65535",)),
+        ("http://localhost:3000", ("http://localhost:3000",)),
+        ("http://[2001:db8::1]", ("http://[2001:db8::1]",)),
+        ("https://carddemo.example.com:8443", ("https://carddemo.example.com:8443",)),
+    ],
+    ids=[
+        "default",
+        "two-origins",
+        "padded-with-blank-entries",
+        "https-host-name",
+        "ipv6-literal",
+        "port-maximum",
+        "single-label-host",
+        "ipv6-default-port",
+        "https-non-default-port",
+    ],
+)
+def test_backend_cors_origins_accepts_origin_lists(
+    acceptedOrigins, expectedOrigins, secretKey, databasePassword
+):
+    builtSettings = BuildCorsSettings(acceptedOrigins, secretKey, databasePassword)
+    assert builtSettings.CorsOrigins() == expectedOrigins

@@ -18,23 +18,23 @@
 # all local URLs use, so the session cookie and the CORS origin name the same site.
 
 # Shared by migrator and backend, overriding backend/.env: the database host is the db service
-# and the seed images are the read-only ./data mount. A backslash ending a line inside double
-# quotes joins the next line with no space, so each URL resolves to one string.
+# and the seed images are the read-only ./data mount. The URLs name only driver, host and port;
+# psycopg2 (libpq) and asyncpg take the role, password and database from PGUSER, PGPASSWORD and
+# PGDATABASE, so the raw POSTGRES_* values never pass through URL syntax, where a character
+# such as @, : or / would change how the URL parses.
 x-backend-environment: &backend-environment
-    DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-carddemo}\
-        :${POSTGRES_PASSWORD:-carddemo}@db:5432/${POSTGRES_DB:-carddemo}"
-    SYNC_DATABASE_URL: "postgresql+psycopg2://${POSTGRES_USER:-carddemo}\
-        :${POSTGRES_PASSWORD:-carddemo}@db:5432/${POSTGRES_DB:-carddemo}"
+    DATABASE_URL: postgresql+asyncpg://db:5432
+    SYNC_DATABASE_URL: postgresql+psycopg2://db:5432
+    PGUSER: ${POSTGRES_USER:-carddemo}
+    PGPASSWORD: ${POSTGRES_PASSWORD:-carddemo}
+    PGDATABASE: ${POSTGRES_DB:-carddemo}
     CARDDEMO_EBCDIC_DIR: /app/data/EBCDIC
     CARDDEMO_ASCII_DIR: /app/data/ASCII
 
-# One image, built from the repository root, serves both migrator and backend.
+# One image serves both: migrator builds it from the repository root and backend reuses it.
 x-backend-common: &backend-common
     profiles: ["full"]
     image: carddemo-backend:local
-    build:
-        context: .
-        dockerfile: backend/Dockerfile
     env_file: backend/.env
     environment: *backend-environment
     volumes:
@@ -54,7 +54,7 @@ services:
             - "127.0.0.1:5432:5432"
         volumes:
             - pgdata:/var/lib/postgresql/data
-            # Creates carddemo_test, once, when the pgdata volume is first initialised.
+            # Creates carddemo_test, owned by the POSTGRES_USER role, on a fresh pgdata volume only.
             - ./docker/postgres/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
         healthcheck:
             # Over TCP, not the default Unix socket: first initialisation runs init-test-db.sql
@@ -66,15 +66,22 @@ services:
             timeout: 5s
             retries: 10
 
-    # Runs once per `up` and must exit 0 before backend starts, so migrations never run beside a
-    # serving backend.
+    # Applies `alembic upgrade head` on each `up`; backend's condition makes a backend that is
+    # starting wait for it to exit 0. Migrations must run with the backend stopped, so before a
+    # later upgrade stop it first with `docker compose --profile full stop backend`, then run
+    # `docker compose --profile full up -d --build`.
     migrator:
         <<: *backend-common
+        build:
+            context: .
+            dockerfile: backend/Dockerfile
         command: ["alembic", "upgrade", "head"]
         restart: "no"
 
     backend:
         <<: *backend-common
+        # The image exists only locally, built by migrator, so Compose never tries to pull it.
+        pull_policy: never
         environment:
             <<: *backend-environment
             BACKEND_CORS_ORIGINS: http://127.0.0.1:3000

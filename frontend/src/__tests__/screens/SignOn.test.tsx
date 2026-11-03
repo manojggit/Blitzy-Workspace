@@ -101,9 +101,11 @@ const THANK_YOU_MESSAGE = "Thank you for using CardDemo application...";
 // CSMSG02Y ABEND-MSG: a 500 has no legacy body, because the backend has no catch-all handler.
 const ABEND_MESSAGE = "UNEXPECTED ABEND OCCURRED.";
 
-// cosgn00c.SIGNON_FAILURE_STATUS and login_throttle.LOCKED_STATUS.
+// cosgn00c.SIGNON_FAILURE_STATUS, login_throttle.LOCKED_STATUS and
+// cosgn00c.UNABLE_TO_VERIFY_STATUS (backend/app/services/auth).
 const HTTP_SIGN_ON_FAILURE = 401;
 const HTTP_LOGIN_LOCKED = 429;
+const HTTP_FILE_ERROR = 503;
 const HTTP_INTERNAL_SERVER_ERROR = 500;
 const LOGIN_PATH = "/auth/login";
 // jsdom reports every window.location.assign through console.error instead of navigating.
@@ -210,7 +212,7 @@ const SIGN_ON_FAILURE_CASES: readonly SignOnFailureCase[] = [
     WRONG_PASSWORD_CASE,
     {
         message: UNABLE_TO_VERIFY_MESSAGE,
-        status: HTTP_SIGN_ON_FAILURE,
+        status: HTTP_FILE_ERROR,
         cursorField: "user_id",
         typed: TYPED_CREDENTIALS,
     },

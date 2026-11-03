@@ -5,10 +5,12 @@ blank user ID, then a blank password, ends validation with its literal. Both inp
 upper-cased, letters a-z only as FUNCTION UPPER-CASE does, for the USRSEC read and the password
 compare of READ-USER-SEC-FILE. Type exactly A opens /admin (XCTL COADM01C); every other type
 opens /menu (XCTL COMEN01C). The login throttle is the one added control: a locked user ID
-answers 429, and every failed lookup or compare counts one failure against the upper-cased ID.
-The router issues and clears the session cookie, so nothing here creates, returns or logs a
-token. PF3 of MAIN-PARA is SignOff. MAIN-PARA's invalid-key branch has no path: the sign-on
-request carries no AID key, and the COSGN00 legend offers only ENTER and F3.
+answers 429 before any edit, and every failed sign-on, the blank-field edits included, counts
+one failure against the upper-cased ID. The blank-field edits, NOTFND and the wrong password
+answer 401; the WHEN OTHER literal ``Unable to verify the User ...`` answers 503. The router
+issues and clears the session cookie, so nothing here creates, returns or logs a token. PF3 of
+MAIN-PARA is SignOff. MAIN-PARA's invalid-key branch has no path: the sign-on request carries no
+AID key, and the COSGN00 legend offers only ENTER and F3.
 """
 
 import asyncio
@@ -18,6 +20,7 @@ from typing import Any, NamedTuple, NoReturn
 
 from app.core.dependencies import CurrentUser, OnlineContext, SessionRefusal
 from app.core.errors import (
+    HTTP_FILE_ERROR,
     HTTP_SIGN_ON_FAILURE,
     LegacyMessageError,
     RecordNotFoundError,
@@ -39,9 +42,11 @@ UNABLE_TO_VERIFY_MESSAGE = "Unable to verify the User ..."
 # The cursor fields that replace MOVE -1 TO USERIDL / PASSWDL, named as the LoginRequest fields.
 USER_ID_FIELD = "user_id"
 CREDENTIAL_FIELD = "password"
-# Every CC00 outcome on the public sign-on endpoint, the blank-field edits and the USRSEC
-# WHEN OTHER literal included, is a sign-on failure and answers 401.
+# The blank-field edits, NOTFND and the wrong password are sign-on failures and answer 401. The
+# WHEN OTHER literal, which the batch window and every USRSEC or throttle failure give, is a
+# file error and answers 503. login_throttle answers the lockout with 429.
 SIGNON_FAILURE_STATUS = HTTP_SIGN_ON_FAILURE
+UNABLE_TO_VERIFY_STATUS = HTTP_FILE_ERROR
 
 # The pages that replace XCTL COADM01C and XCTL COMEN01C (lines 230-239).
 ADMIN_ROUTE = "/admin"
@@ -88,12 +93,23 @@ def SignOnError(message: str, field: str) -> LegacyMessageError:
     return LegacyMessageError(message, field=field, httpStatus=SIGNON_FAILURE_STATUS)
 
 
-def EditRequiredFields(request: LoginRequest) -> None:
-    """Port the EVALUATE TRUE of PROCESS-ENTER-KEY (lines 117-130): the first blank field fails."""
+def UnableToVerifyError() -> LegacyMessageError:
+    """Return the 503 WHEN OTHER failure (lines 252-256): the literal, cursor on the user ID."""
+    return LegacyMessageError(
+        UNABLE_TO_VERIFY_MESSAGE, field=USER_ID_FIELD, httpStatus=UNABLE_TO_VERIFY_STATUS
+    )
+
+
+def RequiredFieldFailure(request: LoginRequest) -> LegacyMessageError | None:
+    """Port the EVALUATE TRUE of PROCESS-ENTER-KEY (lines 117-130): the first blank field fails.
+
+    Return the 401 failure of a blank user ID, else of a blank password, else None.
+    """
     if IsBlank(request.user_id):
-        raise SignOnError(USER_ID_REQUIRED_MESSAGE, USER_ID_FIELD)
+        return SignOnError(USER_ID_REQUIRED_MESSAGE, USER_ID_FIELD)
     if IsBlank(request.password):
-        raise SignOnError(CREDENTIAL_REQUIRED_MESSAGE, CREDENTIAL_FIELD)
+        return SignOnError(CREDENTIAL_REQUIRED_MESSAGE, CREDENTIAL_FIELD)
+    return None
 
 
 def NextRouteFor(userType: str) -> str:
@@ -123,55 +139,68 @@ def BuildLoginResponse(userRow: Mapping[str, Any]) -> LoginResponse:
 
 
 async def FailSignOn(
-    context: OnlineContext, upperUserId: str, message: str, field: str
+    context: OnlineContext, upperUserId: str, failure: LegacyMessageError
 ) -> NoReturn:
-    """Count one failed sign-on for the upper-cased user ID, then raise the failure literal.
+    """Count one failed sign-on for the upper-cased user ID, then raise its ``failure``.
 
     The failure commits in the throttle's own write unit before the error reaches the client.
-    A throttle that cannot record it answers the WHEN OTHER literal, so the control never fails
-    open.
+    A throttle that cannot record it answers the 503 WHEN OTHER literal instead, so the control
+    never fails open.
     """
     try:
         await login_throttle.RecordFailure(context, upperUserId)
     except RepositoryError as error:
-        raise SignOnError(UNABLE_TO_VERIFY_MESSAGE, USER_ID_FIELD) from error
-    raise SignOnError(message, field)
+        raise UnableToVerifyError() from error
+    raise failure
+
+
+async def EditRequiredFields(
+    context: OnlineContext, upperUserId: str, request: LoginRequest
+) -> None:
+    """Fail the first blank map field, counting it like every other failed sign-on.
+
+    The failure counts against the upper-cased user ID, so a blank password counts against the
+    keyed ID and a blank user ID against the blank ID.
+    """
+    blankFieldFailure = RequiredFieldFailure(request)
+    if blankFieldFailure is not None:
+        await FailSignOn(context, upperUserId, blankFieldFailure)
 
 
 async def GuardLockout(context: OnlineContext, upperUserId: str) -> None:
     """Refuse a locked user ID with the throttle's 429 before any edit runs.
 
-    A throttle read failure is the WHEN OTHER literal and counts no failure.
+    A throttle read failure is the 503 WHEN OTHER literal and counts no failure.
     """
     try:
         await login_throttle.CheckLocked(context, upperUserId)
     except RepositoryError as error:
-        raise SignOnError(UNABLE_TO_VERIFY_MESSAGE, USER_ID_FIELD) from error
+        raise UnableToVerifyError() from error
 
 
 async def ClearFailures(context: OnlineContext, upperUserId: str) -> None:
     """Delete the user ID's failure count after a successful sign-on.
 
-    A throttle that cannot reset answers the WHEN OTHER literal instead of signing on.
+    A throttle that cannot reset answers the 503 WHEN OTHER literal instead of signing on.
     """
     try:
         await login_throttle.ResetAttempts(context, upperUserId)
     except RepositoryError as error:
-        raise SignOnError(UNABLE_TO_VERIFY_MESSAGE, USER_ID_FIELD) from error
+        raise UnableToVerifyError() from error
 
 
 async def LookUpUser(context: OnlineContext, upperUserId: str) -> dict[str, Any] | None:
     """Port the CICS READ of USRSEC (lines 211-219): the record, or None for NOTFND (RESP 13).
 
     Any other condition, the batch window's NOTOPEN included, is the WHEN OTHER branch
-    (lines 252-256) and counts a failure.
+    (lines 252-256): it counts a failure and answers the 503 literal.
     """
     try:
         return await UserRepository(context).GetUser(upperUserId)
     except RecordNotFoundError:
         return None
     except RepositoryError:
-        await FailSignOn(context, upperUserId, UNABLE_TO_VERIFY_MESSAGE, USER_ID_FIELD)
+        await FailSignOn(context, upperUserId, UnableToVerifyError())
 
 
 async def CredentialMatches(upperCredential: str, passwordHash: str) -> bool:
@@ -194,9 +223,10 @@ async def VerifyUser(
     """
     userRow = await LookUpUser(context, upperUserId)
     if userRow is None:
-        await FailSignOn(context, upperUserId, USER_NOT_FOUND_MESSAGE, USER_ID_FIELD)
+        await FailSignOn(context, upperUserId, SignOnError(USER_NOT_FOUND_MESSAGE, USER_ID_FIELD))
     if not await CredentialMatches(upperCredential, userRow["password_hash"]):
-        await FailSignOn(context, upperUserId, WRONG_CREDENTIAL_MESSAGE, CREDENTIAL_FIELD)
+        wrongCredential = SignOnError(WRONG_CREDENTIAL_MESSAGE, CREDENTIAL_FIELD)
+        await FailSignOn(context, upperUserId, wrongCredential)
     return userRow
 
 
@@ -204,13 +234,15 @@ async def SignOn(context: OnlineContext, request: LoginRequest) -> LoginResponse
     """Port PROCESS-ENTER-KEY (lines 108-140) and READ-USER-SEC-FILE (lines 209-257).
 
     Raises:
-        LegacyMessageError: 429 with the lockout literal while the user ID is locked; 401
-            with the COSGN00C literal and its cursor field for every other sign-on failure.
+        LegacyMessageError: 429 with the lockout literal while the user ID is locked; 503 with
+            ``Unable to verify the User ...`` when USRSEC or the throttle fails, the batch
+            window included; 401 with the COSGN00C literal and its cursor field for every other
+            sign-on failure.
     """
     upperUserId = NormaliseSignOnInput(request.user_id)
     upperCredential = NormaliseSignOnInput(request.password)
     await GuardLockout(context, upperUserId)
-    EditRequiredFields(request)
+    await EditRequiredFields(context, upperUserId, request)
     userRow = await VerifyUser(context, upperUserId, upperCredential)
     await ClearFailures(context, upperUserId)
     return BuildLoginResponse(userRow)

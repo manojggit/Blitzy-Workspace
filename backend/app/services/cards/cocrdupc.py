@@ -55,8 +55,10 @@ from app.schemas.cards import CardScreen, CardScreenFields, CardUpdateRequest
 from app.schemas.common import UpdateAction, UpdateScreenState
 from app.services.cards.cocrdslc import (
     ACCT_ID_FIELD,
+    ACCT_ID_LENGTH,
     CARD_NOT_FOUND_MESSAGE,
     CARD_NUM_FIELD,
+    CARD_NUM_LENGTH,
     PROMPT_FOR_KEYS_INFO,
     READ_OPERATION,
     BuildFileErrorMessage,
@@ -200,9 +202,18 @@ class NewCardData:
 class CardUpdateState:
     """WS-THIS-PROGCOMMAREA as the screen token carries it between requests.
 
-    ``acctId`` and ``cardNum`` are the 11- and 16-digit keys that passed 1210 and 1220, empty
-    before fetch. ``beforeImage`` is set in every state of FETCHED_STATES, and ``newData``
-    only in STATE_CONFIRM; DecodeUpdateToken refuses a token that breaks either rule.
+    ``acctId`` and ``cardNum`` are the keys that passed 1210 and 1220, or the card-list keys
+    read without those edits (lines 482-497); both are empty before fetch. ``beforeImage`` is
+    CCUP-OLD-DETAILS once the card is read. ``newData`` is set on entering STATE_CONFIRM with
+    the validated values F5 rewrites, and is kept into STATE_DONE, STATE_LOCK_ERROR and
+    STATE_UPDATE_FAILED, whose screen shows the values written or attempted (3200
+    CCUP-CHANGES-MADE, lines 1113-1123); STATE_SHOW_DETAILS and STATE_CHANGES_NOT_OK carry
+    none.
+
+    DecodeUpdateToken requires only the COCRDUPC program tag, a known state code and text
+    keys; a state of FETCHED_STATES also needs both keys and ``beforeImage``, and
+    STATE_CONFIRM ``newData`` too (IsCompleteState). Any other state is accepted with
+    whatever well-formed records it carries.
     """
 
     stateCode: str
@@ -313,19 +324,37 @@ ScreenHandler = Callable[[OnlineContext, CardUpdateState, CardScreenFields], Awa
 
 
 async def FetchCardForEdit(context: OnlineContext, cardKey: str, acctId: str) -> CardScreen:
-    """Port of the card-list entry (lines 482-497): fetch the card for update.
+    """Port of the CCUP entry: fetch the card for update, from the card list or typed keys.
 
     ``cardKey`` is the ``{cardNum}`` path value, a keyed card number or a ``card_ref`` token,
-    and ``acctId`` the account as keyed. The keys run the 1210 and 1220 edits and the card is
-    read as the not-fetched ENTER reads it.
+    and ``acctId`` the account. A ``card_ref`` sent with its list row's account is the
+    card-list entry (lines 482-497): both keys are taken as the list sent them and the card is
+    read without the 1210 and 1220 edits, so a card keyed all zeros opens. Any other keys,
+    typed ones included, run the 1210 and 1220 edits and the card is read as the not-fetched
+    ENTER reads it.
 
     Raises:
         LegacyMessageError: 404 ``Did not find cards for this search condition`` for an
-            invalid ``card_ref`` or a card that does not exist; 400 with the key edit literal;
-            503 with the CARDDAT READ file-error text.
+            invalid or expired ``card_ref``, one carrying no card key, or a card that does not
+            exist; 400 with the key edit literal, never for the card-list entry; 503 with the
+            CARDDAT READ file-error text.
     """
     cardText = ResolveCardKey(cardKey, context.settings)
+    if IsListEntry(cardKey, acctId):
+        return await ShowFetchedCard(context, acctId, cardText)
     return await FetchWithKeys(context, acctId, cardText)
+
+
+def IsListEntry(cardKey: str, acctId: str) -> bool:
+    """Return True for the card-list entry of lines 482-497: a ``card_ref`` and a row account.
+
+    COCRDLIC passes the selected row's WS-ROW-CARD-NUM and WS-ROW-ACCTNO (lines 552-556), and
+    COCRDUPC sets both filter flags valid without editing them. Only a ``card_ref`` path value
+    with an account of exactly 11 ASCII digits, zeros included, has that shape; with any other
+    account the keys are not list keys and run the 1210 and 1220 edits.
+    """
+    isCardRef = len(cardKey) > CARD_NUM_LENGTH
+    return isCardRef and len(acctId) == ACCT_ID_LENGTH and IsAsciiDigits(acctId)
 
 
 async def ProcessCardUpdate(

@@ -16,8 +16,9 @@ value as a parameter.
 A database error becomes the CICS file condition of app.core.errors.MapDatabaseError: 23505 is
 DuplicateKeyError (DUPREC), 55P03 is RecordLockError and any other, or a connection that cannot
 be opened, is FileIoError. Records are returned as dictionaries keyed by column name;
-``tran_amt`` stays a Decimal and the timestamps stay datetimes beside their format codes. Report
-rows hold only the columns the report builder reads, plus ``xref_acct_id``.
+``tran_amt`` stays a Decimal and the timestamps stay datetimes beside their format codes. Browse
+rows hold only the CT00 list columns (BROWSE_COLUMNS). Report rows hold only the columns the
+report builder reads, plus ``xref_acct_id``.
 """
 
 from collections.abc import Mapping
@@ -55,6 +56,14 @@ TRAN_ID_MODULUS = 10**TRAN_ID_DIGITS
 GENERATED_COLUMNS = ("tran_id_sort",)
 
 TRANSACTION_COLUMNS = tuple(Transaction.__table__.columns)
+# The TRAN-RECORD fields COTRN00C POPULATE-TRAN-DATA moves to a list row.
+BROWSE_COLUMNS = (
+    Transaction.tran_id,
+    Transaction.orig_ts,
+    Transaction.orig_ts_format,
+    Transaction.tran_desc,
+    Transaction.tran_amt,
+)
 # The only transaction fields cbtrn03c.BuildReport reads from a report row.
 REPORT_COLUMNS = (
     Transaction.tran_id,
@@ -87,17 +96,23 @@ def StartKeySort(startKey: str) -> ColumnElement[str]:
 
 
 def ForwardBrowseStatement(startKey: str | None, rowLimit: int) -> Select[Any]:
-    """Return the GTEQ forward browse from startKey; None (LOW-VALUES) starts at the lowest key."""
-    statement = select(*TRANSACTION_COLUMNS).order_by(Transaction.tran_id_sort.asc())
+    """Return the GTEQ forward browse from startKey; None (LOW-VALUES) starts at the lowest key.
+
+    The statement selects only the BROWSE_COLUMNS.
+    """
+    statement = select(*BROWSE_COLUMNS).order_by(Transaction.tran_id_sort.asc())
     if startKey is not None:
         statement = statement.where(Transaction.tran_id_sort >= StartKeySort(startKey))
     return statement.limit(rowLimit)
 
 
 def BackwardBrowseStatement(startKey: str, rowLimit: int) -> Select[Any]:
-    """Return the records before startKey, nearest first, as successive READPREVs read them."""
+    """Return the records before startKey, nearest first, as successive READPREVs read them.
+
+    The statement selects only the BROWSE_COLUMNS.
+    """
     return (
-        select(*TRANSACTION_COLUMNS)
+        select(*BROWSE_COLUMNS)
         .where(Transaction.tran_id_sort < StartKeySort(startKey))
         .order_by(Transaction.tran_id_sort.desc())
         .limit(rowLimit)
@@ -194,7 +209,8 @@ class TransactionRepository:
         startKey, or the HIGH-VALUES key. When not inclusive (F8), the first record at or after
         startKey is discarded, as the extra READNEXT is, even if startKey itself has gone.
         The rest, at most limit + 1, follow in key order: element ``limit`` is the look-ahead
-        READNEXT, and an empty list is READNEXT ENDFILE.
+        READNEXT, and an empty list is READNEXT ENDFILE. Each record holds only the
+        BROWSE_COLUMNS.
         """
         await EnterOnlineWindow(self.context.request, TRANSACTION_FILE_NAME)
         if startKey == HIGH_VALUES_TRAN_ID:
@@ -212,7 +228,8 @@ class TransactionRepository:
         startKey None is LOW-VALUES. None is returned for STARTBR NOTFND, when no record lies
         at or after startKey. Otherwise the records before startKey follow nearest first, the
         record at startKey being the one the first READPREV discards: element ``limit`` is the
-        look-ahead READPREV, and fewer than ``limit`` records mean READPREV ENDFILE.
+        look-ahead READPREV, and fewer than ``limit`` records mean READPREV ENDFILE. Each record
+        holds only the BROWSE_COLUMNS.
         """
         await EnterOnlineWindow(self.context.request, TRANSACTION_FILE_NAME)
         sortStart = startKey.rstrip(" ") if startKey is not None else None

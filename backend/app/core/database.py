@@ -67,8 +67,8 @@ REQUEST_CONNECTION_LIMIT = 4
 POOL_SIZE = 10
 POOL_MAX_OVERFLOW = 30
 POOL_CAPACITY = POOL_SIZE + POOL_MAX_OVERFLOW
-# Connections no admitted request counts on: GET /health/ready connects without admission, and
-# a cancelled request's session can still be closing after its admission is freed.
+# Connections no admitted request counts on: a cancelled request's session can still be closing
+# after its admission is freed.
 POOL_HEADROOM_CONNECTIONS = 4
 # GetSession admits at most this many requests at once, and a request waits for admission
 # before it holds any connection. All admitted requests together need at most
@@ -88,13 +88,25 @@ CONNECTION_FAILURES = (OSError, asyncpg.PostgresError, asyncpg.InterfaceError, P
 UNIT_FAILURES = (DBAPIError, *CONNECTION_FAILURES)
 
 
+def DriverConnectArguments(settings: Settings) -> dict[str, float]:
+    """Return asyncpg's connect timeout (``timeout``) and per-statement ``command_timeout``.
+
+    The one source of the driver timeouts, for the engine's pooled connections and for the
+    readiness probe's own connection.
+    """
+    return {
+        "timeout": settings.DB_CONNECT_TIMEOUT_SECONDS,
+        "command_timeout": settings.DB_COMMAND_TIMEOUT_SECONDS,
+    }
+
+
 def BuildEngine(settings: Settings) -> AsyncEngine:
     """Build the asyncpg engine of DATABASE_URL without connecting.
 
-    asyncpg takes ``timeout`` as the connect timeout and ``command_timeout`` as the timeout of
-    each statement. Connections open on first use, so the backend starts while PostgreSQL is
-    down and GET /health/ready reports 503 until the database is reachable. A DATABASE_URL
-    that does not parse raises ParseDatabaseUrl's ValueError, which never repeats the URL.
+    Every pooled connection gets the driver timeouts of DriverConnectArguments. Connections
+    open on first use, so the backend starts while PostgreSQL is down and GET /health/ready
+    reports 503 until the database is reachable. A DATABASE_URL that does not parse raises
+    ParseDatabaseUrl's ValueError, which never repeats the URL.
 
     Password hashes, SSNs, CVVs and customer data travel as bound parameters and result rows,
     so hide_parameters=True keeps parameters out of SQLAlchemy's error text, and
@@ -102,16 +114,12 @@ def BuildEngine(settings: Settings) -> AsyncEngine:
     created at all.
     """
     SuppressEngineStatementLogging()
-    connectArgs = {
-        "timeout": settings.DB_CONNECT_TIMEOUT_SECONDS,
-        "command_timeout": settings.DB_COMMAND_TIMEOUT_SECONDS,
-    }
     return create_async_engine(
         ParseDatabaseUrl(settings.DATABASE_URL, "DATABASE_URL"),
         pool_pre_ping=True,
         pool_size=POOL_SIZE,
         max_overflow=POOL_MAX_OVERFLOW,
-        connect_args=connectArgs,
+        connect_args=DriverConnectArguments(settings),
         hide_parameters=True,
     )
 

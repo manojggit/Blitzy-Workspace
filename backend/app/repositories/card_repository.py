@@ -9,7 +9,8 @@ Each public method reproduces one CICS file-control command of those programs ag
 - ``GetCardForUpdate`` and ``UpdateCard``: the ``READ ... UPDATE`` and ``REWRITE`` of COCRDUPC
   9200-WRITE-PROCESSING, inside the caller's ``WriteUnit(context.engine, "CARDDAT")``.
 - ``BrowseCards``: the ``STARTBR GTEQ`` and the ``READNEXT`` loop of COCRDLIC 9000-READ-FORWARD
-  or the ``READPREV`` loop of 9100-READ-BACKWARDS, applying 9500-FILTER-RECORDS.
+  or the ``READPREV`` loop of 9100-READ-BACKWARDS, applying 9500-FILTER-RECORDS. Its records
+  hold only the BROWSE_COLUMNS; the keyed reads return the whole record.
 
 Key order is EBCDIC order, through the generated ``card_num_sort`` column (C collation). The
 CARDAIX path has no method, because no reachable paragraph reads it.
@@ -41,6 +42,14 @@ BROWSE_BACKWARD = "backward"
 GENERATED_COLUMNS = ("card_num_sort",)
 KEY_COLUMN = "card_num"
 CARD_TABLE = Card.__table__
+# The CARD-RECORD fields COCRDLIC 1200-SCREEN-ARRAY-INIT moves to a list row, plus the sort key
+# the unfiltered look-ahead READNEXT continues from.
+BROWSE_COLUMNS = (
+    CARD_TABLE.c.card_num,
+    CARD_TABLE.c.card_num_sort,
+    CARD_TABLE.c.acct_id,
+    CARD_TABLE.c.active_status,
+)
 
 
 @dataclass(frozen=True)
@@ -160,6 +169,7 @@ class CardRepository:
         """``EXEC CICS STARTBR FILE(CARDDAT) GTEQ`` and a filtered READNEXT or READPREV loop.
 
         ``startKey`` None is LOW-VALUES. ``limit`` is the page size, WS-MAX-SCREEN-LINES (7).
+        Each record holds only the BROWSE_COLUMNS: never the CVV, embossed name or expiry.
 
         - ``BROWSE_FORWARD`` (9000-READ-FORWARD) returns up to ``limit`` matching records in
           ascending key order from ``startKey`` inclusive. After a full page it appends one
@@ -191,7 +201,7 @@ class CardRepository:
         if startKey is not None:
             conditions.append(CARD_TABLE.c.card_num_sort >= _SortKeyOf(startKey))
         statement = (
-            select(CARD_TABLE)
+            select(*BROWSE_COLUMNS)
             .where(*conditions)
             .order_by(CARD_TABLE.c.card_num_sort.asc())
             .limit(limit)
@@ -210,7 +220,7 @@ class CardRepository:
         not, or None at end of file (CA-NEXT-PAGE-NOT-EXISTS).
         """
         statement = (
-            select(CARD_TABLE)
+            select(*BROWSE_COLUMNS)
             .where(CARD_TABLE.c.card_num_sort > lastRecord["card_num_sort"])
             .order_by(CARD_TABLE.c.card_num_sort.asc())
             .limit(1)
@@ -231,7 +241,7 @@ class CardRepository:
         conditions = _FilterConditions(filters)
         conditions.append(CARD_TABLE.c.card_num_sort < _SortKeyOf(startKey))
         statement = (
-            select(CARD_TABLE)
+            select(*BROWSE_COLUMNS)
             .where(*conditions)
             .order_by(CARD_TABLE.c.card_num_sort.desc())
             .limit(limit)

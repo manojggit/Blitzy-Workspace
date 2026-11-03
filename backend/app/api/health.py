@@ -6,9 +6,11 @@ control that reports the same availability for the HTTP service. Specified in th
 Specification, Section 0.6.5.
 
 main.CreateApp includes ROUTER with no prefix, so both probes stay outside /api/v1. Neither
-reads a session cookie. The readiness probe connects straight through app.state.engine and
-never takes the batch-window lock of core.locks, so it stays ready while a batch command holds
-the window.
+reads a session cookie. The readiness probe opens its own unpooled driver connection to the
+database of app.state.engine and terminates it afterwards. It takes no pooled connection, no
+session and no batch-window lock of core.locks, so it stays ready while a batch command holds
+the window, and its answer is bounded by HEALTH_READY_TIMEOUT_SECONDS even when the database
+stops responding.
 """
 
 import asyncio
@@ -18,11 +20,11 @@ from typing import Annotated
 import asyncpg
 from fastapi import APIRouter, Depends, Request, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings
+from app.core.database import DriverConnectArguments
 from app.core.dependencies import GetAppSettings
 
 LOGGER = logging.getLogger(__name__)
@@ -37,11 +39,21 @@ STATUS_UNAVAILABLE = "unavailable"
 
 READINESS_PROBE_SQL = "SELECT 1"
 
+# URL query options that SQLAlchemy's asyncpg adapter consumes before it calls asyncpg.connect,
+# which accepts none of them.
+ADAPTER_ONLY_CONNECT_OPTIONS = (
+    "async_fallback",
+    "async_creator_fn",
+    "prepared_statement_cache_size",
+    "prepared_statement_name_func",
+)
+
 # Every failure that means "database not ready", and nothing broader. asyncio.timeout raises
-# TimeoutError; refused or unresolvable connects are OSError; statement and pool failures are
-# SQLAlchemyError. The asyncpg dialect passes connect-time rejections through unwrapped, so
-# asyncpg.PostgresError (database starting up, too many connections, bad credentials, unknown
-# database) and asyncpg.InterfaceError are listed as well: each of them must give 503, not 500.
+# TimeoutError; refused or unresolvable connects are OSError. The probe calls asyncpg directly,
+# so asyncpg.PostgresError (database starting up, too many connections, bad credentials,
+# unknown database, a failed statement) and asyncpg.InterfaceError reach it unwrapped.
+# SQLAlchemyError covers the dialect's create_connect_args, which raises ArgumentError for a
+# URL it cannot turn into connect options. Each of them must give 503, not 500.
 PROBE_FAILURES = (
     TimeoutError,
     OSError,
@@ -67,15 +79,47 @@ class HealthStatusResponse(BaseModel):
     )
 
 
-async def ProbeDatabase(engine: AsyncEngine, timeoutSeconds: float) -> bool:
-    """Return True when SELECT 1 completes within timeoutSeconds, False on a probe failure.
+def ProbeConnectOptions(engine: AsyncEngine, settings: Settings) -> dict[str, object]:
+    """Return the asyncpg.connect keywords of the engine's database and driver timeouts.
 
-    Only the exception class name is logged: its text can carry the database host, user or URL.
+    The dialect turns engine.url into driver keywords, as it does for a pooled connection; the
+    adapter-only options are dropped, and DriverConnectArguments is merged last, so the
+    settings override the URL query just as the engine's connect_args do.
+    """
+    _, connectOptions = engine.dialect.create_connect_args(engine.url)
+    for optionName in ADAPTER_ONLY_CONNECT_OPTIONS:
+        connectOptions.pop(optionName, None)
+    return {**connectOptions, **DriverConnectArguments(settings)}
+
+
+async def RunProbeQuery(connectOptions: dict[str, object]) -> None:
+    """Run READINESS_PROBE_SQL on a new unpooled asyncpg connection, then terminate it.
+
+    terminate() aborts the socket and cancels asyncpg's pending cancel request without
+    awaiting the server, so no cleanup after a failure or a cancellation can wait on an
+    unresponsive database; close() would wait for the server to take the cancel request. A
+    pooled connection gives no such bound: its checkout pre-ping and its rollback and release
+    after a cancellation both await the server.
+    """
+    connection: asyncpg.Connection | None = None
+    try:
+        connection = await asyncpg.connect(**connectOptions)
+        await connection.fetchval(READINESS_PROBE_SQL)
+    finally:
+        if connection is not None:
+            connection.terminate()
+
+
+async def ProbeDatabase(engine: AsyncEngine, settings: Settings) -> bool:
+    """Return True when SELECT 1 completes within HEALTH_READY_TIMEOUT_SECONDS, else False.
+
+    The timeout bounds the whole probe: the connect options, the connect, the query and the
+    termination. Only the exception class name is logged: its text can carry the database
+    host, user or URL.
     """
     try:
-        async with asyncio.timeout(timeoutSeconds):
-            async with engine.connect() as connection:
-                await connection.execute(text(READINESS_PROBE_SQL))
+        async with asyncio.timeout(settings.HEALTH_READY_TIMEOUT_SECONDS):
+            await RunProbeQuery(ProbeConnectOptions(engine, settings))
     except PROBE_FAILURES as probeError:
         LOGGER.warning("Readiness probe failed: %s", type(probeError).__name__)
         return False
@@ -115,7 +159,7 @@ async def GetReadiness(
     The status is set on the injected response, so both outcomes pass the response model.
     """
     engine: AsyncEngine = request.app.state.engine
-    isReady = await ProbeDatabase(engine, settings.HEALTH_READY_TIMEOUT_SECONDS)
+    isReady = await ProbeDatabase(engine, settings)
     if not isReady:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return HealthStatusResponse(status=STATUS_UNAVAILABLE)

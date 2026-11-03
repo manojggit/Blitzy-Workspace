@@ -6,8 +6,9 @@ the SESSION_COOKIE_NAME cookie holding a signed session token, and no response b
 carries a token. ENTER on COSGN00 is ``POST /login``, PF3 is ``POST /logout``, and the frontend
 reads ``GET /me`` to choose the user's menu and fill the screen header.
 
-Only ``POST /login`` reads a caller's identity, from its ``user_id`` and ``password`` fields;
-every other route takes the user from the verified cookie. ``core.middleware.OriginGuard``
+Only ``POST /login`` reads a caller's identity, from its ``user_id`` and ``password`` fields.
+``GET /me`` takes the user from the verified cookie. ``POST /logout`` reads no identity and
+needs no session, so repeating it is harmless. ``core.middleware.OriginGuard``
 exempts only ``POST /api/v1/auth/login``, so ``POST /logout`` without an allow-listed Origin is
 refused with 403 before it reaches its handler. The COSGN00C service owns every literal and
 every edit; its ``LegacyMessageError`` outcomes are serialised by ``app.core.errors``.
@@ -69,7 +70,7 @@ def ClearCookieOptions(settings: Settings) -> dict[str, object]:
     response_model=LoginResponse,
     summary="CC00 / COSGN00C: sign on",
     description=LOGIN_DESCRIPTION,
-    responses=LegacyErrorResponses(401, 429),
+    responses=LegacyErrorResponses(401, 429, 503),
 )
 async def Login(
     loginRequest: LoginRequest,
