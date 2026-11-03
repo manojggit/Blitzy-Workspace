@@ -43,7 +43,7 @@ from app.core.errors import (
     RepositoryError,
 )
 from app.repositories.account_repository import ACCOUNT_FILE_NAME, AccountRepository
-from app.repositories.card_xref_repository import CardXrefRepository
+from app.repositories.card_xref_repository import CardXrefRepository, DuplicateAlternateKeyError
 from app.repositories.transaction_repository import TRANSACTION_FILE_NAME, TransactionRepository
 from app.schemas.billpay import BillPayRequest, BillPayResponse
 from app.utils.decimal_utils import COBOL_CONTEXT, StoreInto
@@ -129,7 +129,8 @@ class PaymentState:
 
     ``account`` is ACCOUNT-RECORD as read for update; after the COMPUTE it holds the new
     balance. ``screenBalance`` is what lines 193-194 moved to CURBAL, which the COMPUTE never
-    updates. ``xrefCardNum`` keeps the record area's initial blank until CXACAIX returns a row.
+    updates. ``xrefCardNum`` keeps the record area's initial blank until CXACAIX returns a row:
+    the account's only record on NORMAL, or the first in AIX order on DUPKEY.
     ``message``, ``messageStatus`` and ``cursorField`` hold the last literal recorded.
     ``screenCleared`` is set once INITIALIZE-ALL-FIELDS ran, and ``rewriteStarted`` tells a
     REWRITE failure leaving the account unit from a failed READ UPDATE.
@@ -281,11 +282,19 @@ async def RunPaymentSequence(
 async def LookupXref(context: OnlineContext, state: PaymentState) -> None:
     """READ-CXACAIX-FILE (lines 408-436): the account's cross-reference, for its card number.
 
-    A failure records its literal and the sequence goes on, with the card number left at the
-    record area's initial blank, so the insert outcome is whatever the database returns.
+    A failure records its literal and the sequence goes on. DUPKEY is a WHEN OTHER failure, but
+    READ ... INTO(CARD-XREF-RECORD) has already filled XREF-CARD-NUM from the first record in
+    AIX order, so the WRITE carries that card and the literal of its outcome replaces this one.
+    Any other failure leaves the card number at the record area's initial blank, so the insert
+    outcome is whatever the database returns.
     """
     try:
         xref = await CardXrefRepository(context).GetXrefByAccount(state.acctId)
+    except DuplicateAlternateKeyError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
+        RecordMessage(state, XREF_LOOKUP_FAILED_MESSAGE, HTTP_FILE_ERROR)
+        state.xrefCardNum = error.firstRecord[CARD_NUM_COLUMN]
+        return
     except RepositoryError as error:
         LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         RecordMessage(state, XREF_LOOKUP_FAILED_MESSAGE, HTTP_FILE_ERROR)

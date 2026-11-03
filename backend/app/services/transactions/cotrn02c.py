@@ -45,6 +45,7 @@ from app.core.errors import (
     HTTP_NOT_FOUND,
     HTTP_RECORD_CHANGED,
     DuplicateKeyError,
+    FileIoError,
     LegacyMessageError,
     LogFileCondition,
     RepositoryError,
@@ -544,6 +545,18 @@ def BuildTransactionValues(screen: ScreenFields, tranId: str) -> dict[str, Any]:
     return values
 
 
+def UnstorableRecordError(error: TimestampFormatError) -> LegacyMessageError:
+    """Log the WRITE's WHEN OTHER condition for a record TRANSACT cannot hold; return its 503.
+
+    The DISPLAY of line 743 is logged as TRANSACT's IOERR raised from ``error``, so the line
+    names the innermost cause's class and never the date text the error carries.
+    """
+    writeError = FileIoError(TRANSACTION_FILE_NAME)
+    writeError.__cause__ = error
+    LogFileCondition(LOGGER, TRANSACTION_ID, WRITE_OPERATION, writeError)
+    return ScreenError(ADD_FAILED_MESSAGE, ACCT_ID_FIELD, HTTP_FILE_ERROR)
+
+
 async def WriteNewTransaction(context: OnlineContext, screen: ScreenFields) -> str:
     """Port ADD-TRANSACTION and WRITE-TRANSACT-FILE (lines 442-466, 711-749) in one write unit.
 
@@ -573,7 +586,7 @@ async def WriteNewTransaction(context: OnlineContext, screen: ScreenFields) -> s
     except TimestampFormatError as error:
         # A year-0000 date passes CSUTLDTC (CEEDAYS 2513) but no TIMESTAMP(6) value holds it,
         # so the record cannot be written: the WRITE's WHEN OTHER outcome, nothing stored.
-        raise ScreenError(ADD_FAILED_MESSAGE, ACCT_ID_FIELD, HTTP_FILE_ERROR) from error
+        raise UnstorableRecordError(error) from error
     return tranId
 
 

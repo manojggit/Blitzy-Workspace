@@ -2,7 +2,7 @@
 // SEL0001-10 selection fields.
 import { ThemeProvider } from "@mui/material/styles";
 import { render, screen, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import userEvent, { type UserEvent } from "@testing-library/user-event";
 import type { ReactElement } from "react";
 
 import { CARD_DEMO_THEME } from "@/app/theme";
@@ -217,4 +217,150 @@ describe("SelectionTable field errors", () => {
         const marked = RowNumbersUpTo(COCRDLI_CASE.rowCount).map(IsMarkedAsError);
         expect(marked).toEqual([false, true, true, false, false, false, false]);
     });
+});
+
+const CONTROLLED_ROW_NUMBER = 2;
+const CONTROLLED_ROW_KEY = "KEY2";
+const UNLISTED_CODE = "X";
+const BLANK_OPTION_NAME = "No selection";
+const ZERO_WIDTH_SPACE = "\u200b";
+
+type SelectionChangeMock = jest.Mock<void, [string, string]>;
+
+let consoleWarningSpies: jest.SpyInstance[] = [];
+
+function SpyOnConsoleWarnings() {
+    consoleWarningSpies = [jest.spyOn(console, "error"), jest.spyOn(console, "warn")];
+}
+
+// React reports a duplicate option key through console.error, and MUI a value that matches no
+// option through console.warn.
+function ExpectNoConsoleWarnings() {
+    const warningCalls = consoleWarningSpies.flatMap((spy) => spy.mock.calls);
+    for (const spy of consoleWarningSpies) {
+        spy.mockRestore();
+    }
+    expect(warningCalls).toEqual([]);
+}
+
+function RowsWithCode(mapCase: MapCase, rowKey: string, code: string): SelectionRow[] {
+    return BuildRows(mapCase.columns, mapCase.rowCount).map((row) =>
+        row.rowKey === rowKey ? { ...row, selectedCode: code } : row,
+    );
+}
+
+function TableTree(
+    mapCase: MapCase,
+    rows: readonly SelectionRow[],
+    onSelectionChange: SelectionChangeMock,
+): ReactElement {
+    return (
+        <ThemeProvider theme={CARD_DEMO_THEME}>
+            <SelectionTable
+                columns={mapCase.columns}
+                rows={rows}
+                allowedCodes={mapCase.allowedCodes}
+                onSelectionChange={onSelectionChange}
+                selectionHeader={mapCase.selectionHeader}
+            />
+        </ThemeProvider>
+    );
+}
+
+// The blank option, like an empty Select, renders only a zero-width space and never a code.
+function DisplayedCode(rowNumber: number): string {
+    const field = screen.getByRole("combobox", { name: SelectionFieldName(rowNumber) });
+    return (field.textContent ?? "").replaceAll(ZERO_WIDTH_SPACE, "");
+}
+
+async function OfferedValuesOf(user: UserEvent, rowNumber: number): Promise<(string | null)[]> {
+    await user.click(screen.getByRole("combobox", { name: SelectionFieldName(rowNumber) }));
+    return within(screen.getByRole("listbox"))
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("data-value"));
+}
+
+async function ChooseOption(user: UserEvent, optionName: string) {
+    const field = screen.getByRole("combobox", { name: SelectionFieldName(CONTROLLED_ROW_NUMBER) });
+    await user.click(field);
+    await user.click(within(screen.getByRole("listbox")).getByRole("option", { name: optionName }));
+}
+
+// The page's part: the code reported for a row comes back as that row's selectedCode.
+function EchoReportedCode(
+    rerender: (ui: ReactElement) => void,
+    mapCase: MapCase,
+    onSelectionChange: SelectionChangeMock,
+) {
+    const [rowKey, code] = onSelectionChange.mock.lastCall ?? [];
+    if (rowKey === undefined || code === undefined) {
+        throw new Error("SelectionTable reported no selection to echo back");
+    }
+    rerender(TableTree(mapCase, RowsWithCode(mapCase, rowKey, code), onSelectionChange));
+}
+
+async function ShowsRetainedCode({ code, mapCase }: CodeCase) {
+    const user = userEvent.setup();
+    render(TableTree(mapCase, RowsWithCode(mapCase, CONTROLLED_ROW_KEY, code), jest.fn()));
+    const expectedCodes = RowNumbersUpTo(mapCase.rowCount).map((rowNumber) =>
+        rowNumber === CONTROLLED_ROW_NUMBER ? code : "",
+    );
+    expect(RowNumbersUpTo(mapCase.rowCount).map(DisplayedCode)).toEqual(expectedCodes);
+    const offeredValues = await OfferedValuesOf(user, CONTROLLED_ROW_NUMBER);
+    expect(offeredValues).toEqual(["", ...mapCase.allowedCodes]);
+}
+
+async function ClearsEchoedCodeThroughBlank({ code, mapCase }: CodeCase) {
+    const user = userEvent.setup();
+    const onSelectionChange: SelectionChangeMock = jest.fn();
+    const rows = BuildRows(mapCase.columns, mapCase.rowCount);
+    const { rerender } = render(TableTree(mapCase, rows, onSelectionChange));
+    await ChooseOption(user, code);
+    expect(onSelectionChange.mock.calls).toEqual([[CONTROLLED_ROW_KEY, code]]);
+    EchoReportedCode(rerender, mapCase, onSelectionChange);
+    expect(DisplayedCode(CONTROLLED_ROW_NUMBER)).toBe(code);
+    await ChooseOption(user, BLANK_OPTION_NAME);
+    expect(onSelectionChange).toHaveBeenCalledTimes(2);
+    expect(onSelectionChange).toHaveBeenLastCalledWith(CONTROLLED_ROW_KEY, "");
+    EchoReportedCode(rerender, mapCase, onSelectionChange);
+    expect(DisplayedCode(CONTROLLED_ROW_NUMBER)).toBe("");
+}
+
+async function OffersEchoedUnlistedCodeLast(mapCase: MapCase) {
+    const user = userEvent.setup();
+    render(TableTree(mapCase, RowsWithCode(mapCase, CONTROLLED_ROW_KEY, UNLISTED_CODE), jest.fn()));
+    expect(DisplayedCode(CONTROLLED_ROW_NUMBER)).toBe(UNLISTED_CODE);
+    const offeredValues = await OfferedValuesOf(user, CONTROLLED_ROW_NUMBER);
+    expect(offeredValues).toEqual(["", ...mapCase.allowedCodes, UNLISTED_CODE]);
+}
+
+async function OffersOneBlankAndEachCodeOnce(mapCase: MapCase) {
+    const user = userEvent.setup();
+    const repeatedCodes = [...mapCase.allowedCodes, "", ...mapCase.allowedCodes];
+    const repeatedCase: MapCase = { ...mapCase, allowedCodes: repeatedCodes };
+    render(TableTree(repeatedCase, BuildRows(mapCase.columns, mapCase.rowCount), jest.fn()));
+    const offeredValues = await OfferedValuesOf(user, 1);
+    expect(offeredValues).toEqual(["", ...mapCase.allowedCodes]);
+}
+
+describe("SelectionTable controlled selectedCode", () => {
+    beforeEach(SpyOnConsoleWarnings);
+    afterEach(ExpectNoConsoleWarnings);
+
+    it.each(CODE_CASES)(
+        "$mapName $fieldNames row 2 shows retained code $code, offers it once, other rows none",
+        ShowsRetainedCode,
+    );
+    it.each(CODE_CASES)(
+        "$mapName $fieldNames row 2 shows echoed code $code, then clears it through No selection",
+        ClearsEchoedCodeThroughBlank,
+    );
+    it.each(MAP_CASES)(
+        "$mapName $fieldNames shows an echoed code outside its codes and offers it last",
+        OffersEchoedUnlistedCodeLast,
+    );
+    it.each(MAP_CASES)(
+        "$mapName $fieldNames offers one blank and each code once from repeated and blank codes",
+        OffersOneBlankAndEachCodeOnce,
+    );
 });

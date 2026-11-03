@@ -10,7 +10,8 @@ has no write or ``FOR UPDATE`` method and never opens a write unit.
 CLOSEFIL closes CCXREF and CXACAIX, so every read first enters the online batch window under
 the name of the path it reads; FileNotOpenError (NOTOPEN) then names that path, and the service
 builds its program's WHEN OTHER literal from it. A found record is a dictionary keyed by the
-column names ``card_num``, ``cust_id`` and ``acct_id``; NOTFND is ``None``.
+column names ``card_num``, ``cust_id`` and ``acct_id``; NOTFND is ``None``; a CXACAIX DUPKEY
+raises DuplicateAlternateKeyError carrying the first record in AIX order.
 """
 
 from typing import Any
@@ -21,7 +22,7 @@ from sqlalchemy.exc import DBAPIError
 from app.core.dependencies import OnlineContext
 from app.core.errors import FileIoError, MapDatabaseError, RepositoryError
 from app.core.locks import WINDOW_FAILURES, EnterOnlineWindow
-from app.models import CardXref
+from app.models import Card, CardXref
 
 XREF_FILE_NAME = "CCXREF"
 XREF_ACCOUNT_PATH_NAME = "CXACAIX"
@@ -40,13 +41,17 @@ ACCOUNT_PATH_READ_LIMIT = 2
 class DuplicateAlternateKeyError(RepositoryError):
     """CICS DUPKEY (RESP 15, RESP2 140): another record has the alternate key just read.
 
-    CICS returns the first record of a non-unique alternate key and raises DUPKEY when another
-    follows. COACTVWC, COACTUPC, COTRN02C and COBIL00C test only NORMAL and NOTFND after their
-    CXACAIX READ, so DUPKEY takes each program's WHEN OTHER branch and the record is never used.
+    CICS reads the first record of a non-unique alternate key into the INTO area and raises
+    DUPKEY when another follows; ``firstRecord`` is that record. COACTVWC, COACTUPC, COTRN02C
+    and COBIL00C test only NORMAL and NOTFND after their CXACAIX READ, so DUPKEY takes each
+    program's WHEN OTHER branch. The first three stop there; COBIL00C goes on to WRITE the
+    payment with XREF-CARD-NUM, which that READ ... INTO(CARD-XREF-RECORD) has filled from it.
+    The exception text keeps to the file name and codes; the record is only an attribute.
     """
 
-    def __init__(self, fileName: str) -> None:
+    def __init__(self, fileName: str, firstRecord: dict[str, Any]) -> None:
         super().__init__(fileName, resp=CICS_RESP_DUPKEY, resp2=CICS_RESP2_DUPKEY_NONUNIQUE_PATH)
+        self.firstRecord = firstRecord
 
 
 class CardXrefRepository:
@@ -90,16 +95,21 @@ class CardXrefRepository:
         COACTVWC and COACTUPC 9200-GETCARDXREF-BYACCT, COTRN02C and COBIL00C READ-CXACAIX-FILE.
         Returns the account's only record, or None for NOTFND. CXACAIX is non-unique: when a
         second record has the account ID, CICS raises DUPKEY, so this raises
-        DuplicateAlternateKeyError. The record CICS would return with it is the first in AIX
-        order, but none of the four programs reads it, so the query needs no ordering.
+        DuplicateAlternateKeyError with the record CICS reads with it, the first in AIX order.
+        XREFFILE's BLDINDEX lists an alternate key's base records in prime-key order, so that
+        record is the account's lowest XREF-CARD-NUM in EBCDIC order: the card COBIL00C pays on.
         """
         await EnterOnlineWindow(self.context.request, XREF_ACCOUNT_PATH_NAME)
+        # EBCDIC order comes from the generated cards.card_num_sort column, as every key-ordered
+        # read takes it; the card foreign key on card_xref.card_num means the join drops no row.
         statement = (
             select(CARD_XREF_TABLE)
+            .join(Card, Card.card_num == CardXref.card_num)
             .where(CardXref.acct_id == acctId.rstrip(" "))
+            .order_by(Card.card_num_sort)
             .limit(ACCOUNT_PATH_READ_LIMIT)
         )
         rows = await self._Execute(statement, XREF_ACCOUNT_PATH_NAME)
         if len(rows) > 1:
-            raise DuplicateAlternateKeyError(XREF_ACCOUNT_PATH_NAME)
+            raise DuplicateAlternateKeyError(XREF_ACCOUNT_PATH_NAME, rows[0])
         return rows[0] if rows else None
