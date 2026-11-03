@@ -21,11 +21,15 @@ export interface SelectionColumn {
     header: string;
 }
 
-/** A list row: the page's stable key, its display texts, and the code entered for it. */
+/**
+ * A list row: the page's stable key, its display texts, and the code entered for it. `isError`
+ * marks a code the server named in `field_errors`, as the maps colour a flagged code field red.
+ */
 export interface SelectionRow {
     rowKey: string;
     cells: Record<string, string>;
     selectedCode: string;
+    isError?: boolean;
 }
 
 export interface SelectionTableProps {
@@ -102,6 +106,7 @@ function SelectionCell({ row, rowNumber, tableProps }: SelectionCellProps) {
         <Select
             size="small"
             displayEmpty
+            error={row.isError ?? false}
             value={row.selectedCode}
             inputProps={{ "aria-label": SelectionLabelFor(rowNumber) }}
             onChange={(event: SelectChangeEvent<string>) =>

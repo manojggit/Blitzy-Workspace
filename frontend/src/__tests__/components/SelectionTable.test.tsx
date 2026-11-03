@@ -193,3 +193,28 @@ describe("SelectionTable selection", () => {
         },
     );
 });
+
+// The input root carries MUI's error state, which colours the field red as DFHRED did.
+function IsMarkedAsError(rowNumber: number): boolean {
+    const field = screen.getByRole("combobox", { name: SelectionFieldName(rowNumber) });
+    return field.closest(".MuiInputBase-root")?.classList.contains("Mui-error") ?? false;
+}
+
+describe("SelectionTable field errors", () => {
+    it("COCRDLI CRDSEL1-7 marks only the rows flagged by the server", () => {
+        const rows = BuildRows(COCRDLI_CASE.columns, COCRDLI_CASE.rowCount).map((row, index) => ({
+            ...row,
+            isError: index === 1 || index === 2,
+        }));
+        RenderWithTheme(
+            <SelectionTable
+                columns={COCRDLI_CASE.columns}
+                rows={rows}
+                allowedCodes={COCRDLI_CASE.allowedCodes}
+                onSelectionChange={jest.fn()}
+            />,
+        );
+        const marked = RowNumbersUpTo(COCRDLI_CASE.rowCount).map(IsMarkedAsError);
+        expect(marked).toEqual([false, true, true, false, false, false, false]);
+    });
+});

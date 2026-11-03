@@ -1,0 +1,665 @@
+// Replaces: BMS map COCRDLI, program COCRDLIC (CCLI); copybooks COCRDLI (cpy-bms),
+// CVACT02Y, CVCRD01Y, CSUSR01Y, COCOM01Y, COTTL01Y, CSDAT01Y, CSMSG01Y
+"use client";
+
+import { Box, Grid, TextField, Typography } from "@mui/material";
+import axios, { type AxiosError } from "axios";
+import { useRouter } from "next/navigation";
+import {
+    Suspense,
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+    type Dispatch,
+    type RefObject,
+    type SetStateAction,
+} from "react";
+
+import { FunctionKeyBar } from "@/components/FunctionKeyBar";
+import { MessageLine } from "@/components/MessageLine";
+import { ScreenShell } from "@/components/ScreenShell";
+import {
+    SelectionLabelFor,
+    SelectionTable,
+    type SelectionColumn,
+    type SelectionRow,
+} from "@/components/SelectionTable";
+import {
+    ListCards,
+    SelectCards,
+    type CardListQuery,
+    type CardListResponse,
+    type CardListRow,
+    type CardSelectionAction,
+    type CardSelectionResponse,
+    type CardSelectionRow,
+} from "@/lib/api/cards";
+import {
+    Direction,
+    LegacyErrorBody,
+    SeverityForOutcome,
+    TakePendingMessage,
+    ToScreenFeedback,
+    type LegacyErrorResponse,
+    type MessageSeverity,
+    type OutcomeFlags,
+    type PageState,
+    type ScreenFeedback,
+} from "@/lib/apiClient";
+import { useFunctionKeys, type FunctionKeyDefinition, type PfKey } from "@/lib/useFunctionKeys";
+
+const TRANSACTION_ID = "CCLI";
+const PROGRAM_NAME = "COCRDLIC";
+// The BMS INITIAL texts of COCRDLI, verbatim.
+const SCREEN_TITLE = "List Credit Cards";
+const ACCOUNT_FILTER_LABEL = "Account Number    :";
+const CARD_FILTER_LABEL = "Credit Card Number:";
+const ACCOUNT_FILTER_MAX_LENGTH = 11;
+const CARD_FILTER_MAX_LENGTH = 16;
+const SELECTION_HEADER = "Select";
+const SELECTION_CODES = ["S", "U"] as const;
+const PAGE_LABEL = "Page";
+const MENU_ROUTE = "/menu";
+const VIEW_ROUTE = "/cards/view";
+const UPDATE_ROUTE = "/cards/update";
+
+// The PF-key labels; FunctionKeyBar appends the key name, as in "Backward (F7)".
+const ENTER_LABEL = "Continue";
+const EXIT_LABEL = "Exit";
+const BACKWARD_LABEL = "Backward";
+const FORWARD_LABEL = "Forward";
+
+// The field names the server reports in field_errors and cursor_field for ACCTSID and CARDSID.
+const ACCT_ID_FIELD = "acct_id";
+const CARD_NUM_FIELD = "card_num";
+
+// The column headings of COCRDLI row 9, trimmed of their padding blanks.
+const CARD_LIST_COLUMNS: readonly SelectionColumn[] = [
+    { field: "acct_id", header: "Account Number" },
+    { field: "card_num_masked", header: "Card Number" },
+    { field: "active_status", header: "Active" },
+];
+
+// The first entry from the menu reads the first page with no filters.
+const FIRST_ENTRY_QUERY: CardListQuery = {};
+
+// COCRDLIC never changes the BMS colour of ERRMSG (COLOR=RED) and writes no record, so every
+// message it sets, a paging literal on a 200 included, is a red error line.
+const ERRMSG_OUTCOME: OutcomeFlags = { isError: true, isCompletedWrite: false };
+
+// cursor_field names a row's selection code as rows[<0-based index>].selection.
+const SELECTION_CURSOR_PATTERN = /^rows\[(\d+)\]\.selection$/;
+
+const BLANK_CODE = "";
+
+type FilterFieldName = typeof ACCT_ID_FIELD | typeof CARD_NUM_FIELD;
+
+type CardFilterTexts = Record<FilterFieldName, string>;
+
+type FilterInputs = Record<string, HTMLInputElement | null>;
+
+type AppRouter = ReturnType<typeof useRouter>;
+
+interface FilterFieldDefinition {
+    name: FilterFieldName;
+    label: string;
+    maxLength: number;
+    autoFocus: boolean;
+}
+
+// ACCTSID carries the initial cursor (BMS IC); CARDSID follows it.
+const FILTER_FIELDS: readonly FilterFieldDefinition[] = [
+    {
+        name: ACCT_ID_FIELD,
+        label: ACCOUNT_FILTER_LABEL,
+        maxLength: ACCOUNT_FILTER_MAX_LENGTH,
+        autoFocus: true,
+    },
+    {
+        name: CARD_NUM_FIELD,
+        label: CARD_FILTER_LABEL,
+        maxLength: CARD_FILTER_MAX_LENGTH,
+        autoFocus: false,
+    },
+];
+
+const EMPTY_FILTERS: CardFilterTexts = { acct_id: "", card_num: "" };
+
+// The rows shown, the page position the server returned, and the CRDSELn code keyed on each
+// row. Codes are kept by row position, as WS-EDIT-SELECT holds them, because every response
+// issues fresh card_ref tokens.
+interface ListState {
+    rows: readonly CardListRow[];
+    pageState: PageState | null;
+    selectionCodes: readonly string[];
+}
+
+const EMPTY_LIST: ListState = { rows: [], pageState: null, selectionCodes: [] };
+
+interface ScreenMessages {
+    message: string;
+    severity: MessageSeverity;
+    infoMessage: string;
+    fieldErrors: readonly string[];
+    cursorField: string;
+}
+
+const NO_MESSAGES: ScreenMessages = {
+    message: "",
+    severity: SeverityForOutcome(ERRMSG_OUTCOME),
+    infoMessage: "",
+    fieldErrors: [],
+    cursorField: "",
+};
+
+// A refused selection redisplays rows and page keys; a refused filter carries neither.
+interface CardListErrorBody extends LegacyErrorResponse {
+    rows?: CardListRow[];
+    first_key?: string;
+    last_key?: string;
+}
+
+interface ScreenSetters {
+    setList: Dispatch<SetStateAction<ListState>>;
+    setMessages: Dispatch<SetStateAction<ScreenMessages>>;
+    setIsBusy: Dispatch<SetStateAction<boolean>>;
+}
+
+interface ScreenContext {
+    filters: CardFilterTexts;
+    list: ListState;
+    setters: ScreenSetters;
+    router: AppRouter;
+}
+
+interface CursorTargets {
+    fieldInputs: FilterInputs;
+    tableElement: HTMLElement | null;
+}
+
+const SELECTION_ROUTES: Readonly<Record<CardSelectionAction, string>> = {
+    view: VIEW_ROUTE,
+    update: UPDATE_ROUTE,
+};
+
+// The server's text is shown verbatim; an absent key or a null cursor becomes empty.
+function MessagesFrom(feedback: ScreenFeedback): ScreenMessages {
+    return {
+        message: feedback.message ?? "",
+        severity: SeverityForOutcome(ERRMSG_OUTCOME),
+        infoMessage: feedback.info_message ?? "",
+        fieldErrors: feedback.field_errors ?? [],
+        cursorField: feedback.cursor_field ?? "",
+    };
+}
+
+// A new page clears every selection code, as 1200-SCREEN-ARRAY-INIT shows a fresh page.
+function ListStateFrom(response: CardListResponse): ListState {
+    return {
+        rows: response.rows,
+        pageState: {
+            page: response.page,
+            first_key: response.first_key,
+            last_key: response.last_key,
+        },
+        selectionCodes: [],
+    };
+}
+
+// The page number is unchanged by a refused selection, so the body carries none.
+function RedisplayedListState(current: ListState, body: CardListErrorBody): ListState {
+    if (body.rows === undefined) {
+        return current;
+    }
+    return {
+        rows: body.rows,
+        pageState: { ...current.pageState, first_key: body.first_key, last_key: body.last_key },
+        selectionCodes: current.selectionCodes.slice(0, body.rows.length),
+    };
+}
+
+function WithSelectionCode(list: ListState, rowKey: string, code: string): ListState {
+    const rowIndex = list.rows.findIndex((row) => row.card_ref === rowKey);
+    if (rowIndex < 0) {
+        return list;
+    }
+    const selectionCodes = list.rows.map((_row, index) =>
+        index === rowIndex ? code : (list.selectionCodes[index] ?? BLANK_CODE),
+    );
+    return { ...list, selectionCodes };
+}
+
+function HasSelection(list: ListState): boolean {
+    return list.selectionCodes.some((code) => code !== BLANK_CODE);
+}
+
+// Every row shown is sent, a blank code included, so the server can refuse more than one
+// selection or an invalid code.
+function BuildSelectionRows(list: ListState): CardSelectionRow[] {
+    return list.rows.map((row, index) => ({
+        card_ref: row.card_ref,
+        selection: list.selectionCodes[index] ?? BLANK_CODE,
+    }));
+}
+
+// The server accepts only one selected row, so the row holding a code is the one it transfers.
+function SelectedRow(list: ListState): CardListRow | undefined {
+    const rowIndex = list.selectionCodes.findIndex((code) => code !== BLANK_CODE);
+    return list.rows[rowIndex];
+}
+
+// The server's field_errors name for a row's CRDSELn code, e.g. rows[2].selection.
+function SelectionFieldName(rowIndex: number): string {
+    return `rows[${rowIndex}].selection`;
+}
+
+function SelectionRowsFor(list: ListState, fieldErrors: readonly string[]): SelectionRow[] {
+    return list.rows.map((row, index) => ({
+        rowKey: row.card_ref,
+        cells: {
+            acct_id: row.acct_id,
+            card_num_masked: row.card_num_masked,
+            active_status: row.active_status,
+        },
+        selectedCode: list.selectionCodes[index] ?? BLANK_CODE,
+        isError: fieldErrors.includes(SelectionFieldName(index)),
+    }));
+}
+
+// ENTER and F7 re-read from the first card shown, F8 from the last; each echoes the page number.
+// The keys are opaque server tokens, absent before the first page arrives.
+function ListQuery(context: ScreenContext, direction?: Direction): CardListQuery {
+    const pageState = context.list.pageState;
+    const startKey = direction === Direction.FORWARD ? pageState?.last_key : pageState?.first_key;
+    return {
+        acctId: context.filters.acct_id,
+        cardNum: context.filters.card_num,
+        startKey,
+        direction,
+        page: pageState?.page,
+    };
+}
+
+// The card_ref token travels in the URL instead of the card number; URLSearchParams encodes the
+// "=" padding of the token.
+function CardRoute(action: CardSelectionAction, cardRef: string, acctId: string): string {
+    const query = new URLSearchParams({ cardRef, acctId });
+    return `${SELECTION_ROUTES[action]}?${query.toString()}`;
+}
+
+function ApplyListResponse(setters: ScreenSetters, response: CardListResponse): void {
+    setters.setList(ListStateFrom(response));
+    setters.setMessages(MessagesFrom(response));
+}
+
+// A legacy outcome keeps the rows shown unless its body redisplays them; a 500, a network
+// failure or a non-legacy body shows the abend text.
+function ApplyCallFailure(setters: ScreenSetters, error: AxiosError): void {
+    const body = LegacyErrorBody<CardListErrorBody>(error);
+    if (body === null) {
+        setters.setMessages(MessagesFrom(ToScreenFeedback(error)));
+        return;
+    }
+    setters.setList((current) => RedisplayedListState(current, body));
+    setters.setMessages(MessagesFrom(body));
+}
+
+// The 401 and 403 redirects belong to the API client interceptor. Anything other than an axios
+// error is a defect and propagates.
+async function RunScreenCall(setters: ScreenSetters, call: () => Promise<void>): Promise<void> {
+    setters.setIsBusy(true);
+    try {
+        await call();
+    } catch (error) {
+        if (axios.isAxiosError(error)) {
+            ApplyCallFailure(setters, error);
+        } else {
+            throw error;
+        }
+    } finally {
+        setters.setIsBusy(false);
+    }
+}
+
+function ReadPage(context: ScreenContext, query: CardListQuery): Promise<void> {
+    return RunScreenCall(context.setters, async () => {
+        ApplyListResponse(context.setters, await ListCards(query));
+    });
+}
+
+// A pending message is shown at once and kept when the first page brings no message of its own.
+async function LoadFirstPage(setters: ScreenSetters, pendingMessage: string): Promise<void> {
+    if (pendingMessage !== "") {
+        setters.setMessages(MessagesFrom({ message: pendingMessage }));
+    }
+    await RunScreenCall(setters, async () => {
+        const response = await ListCards(FIRST_ENTRY_QUERY);
+        ApplyListResponse(setters, { ...response, message: response.message || pendingMessage });
+    });
+}
+
+// S opens the card view (COCRDSLC) and U the card update (COCRDUPC). No action is the WHEN OTHER
+// path, which re-reads the page shown.
+async function FollowSelection(
+    context: ScreenContext,
+    response: CardSelectionResponse,
+): Promise<void> {
+    if (response.action === null) {
+        ApplyListResponse(context.setters, await ListCards(ListQuery(context)));
+        return;
+    }
+    const acctId = SelectedRow(context.list)?.acct_id ?? "";
+    context.router.push(CardRoute(response.action, response.card_ref, acctId));
+}
+
+function SubmitSelection(context: ScreenContext): Promise<void> {
+    const rows = BuildSelectionRows(context.list);
+    const { acct_id, card_num } = context.filters;
+    return RunScreenCall(context.setters, async () => {
+        await FollowSelection(context, await SelectCards({ acct_id, card_num, rows }));
+    });
+}
+
+// The filters travel as keyed: the server runs every filter edit and returns its literal.
+function HandleEnter(context: ScreenContext): Promise<void> {
+    if (HasSelection(context.list)) {
+        return SubmitSelection(context);
+    }
+    return ReadPage(context, ListQuery(context));
+}
+
+function HandlePageBackward(context: ScreenContext): Promise<void> {
+    return ReadPage(context, ListQuery(context, Direction.BACKWARD));
+}
+
+function HandlePageForward(context: ScreenContext): Promise<void> {
+    return ReadPage(context, ListQuery(context, Direction.FORWARD));
+}
+
+// PF3 transfers to the main menu (COMEN01C).
+function HandleExit(context: ScreenContext): void {
+    context.router.push(MENU_ROUTE);
+}
+
+interface ScreenKeyAction {
+    key: PfKey;
+    label: string;
+    Run: (context: ScreenContext) => Promise<void> | void;
+}
+
+// The PF-key legend "F3=Exit F7=Backward  F8=Forward", with ENTER implicit on the map.
+const SCREEN_KEY_ACTIONS: readonly ScreenKeyAction[] = [
+    { key: "ENTER", label: ENTER_LABEL, Run: HandleEnter },
+    { key: "F3", label: EXIT_LABEL, Run: HandleExit },
+    { key: "F7", label: BACKWARD_LABEL, Run: HandlePageBackward },
+    { key: "F8", label: FORWARD_LABEL, Run: HandlePageForward },
+];
+
+// The keys are inactive while a call runs, as the 3270 keyboard locks until the screen returns.
+function BuildFunctionKeys(context: ScreenContext, isBusy: boolean): FunctionKeyDefinition[] {
+    return SCREEN_KEY_ACTIONS.map(({ key, label, Run }) => ({
+        key,
+        label,
+        onPress: () => void Run(context),
+        disabled: isBusy,
+    }));
+}
+
+function SelectionElementFor(cursorField: string, tableElement: HTMLElement | null) {
+    const match = SELECTION_CURSOR_PATTERN.exec(cursorField);
+    if (match === null || tableElement === null) {
+        return null;
+    }
+    const label = SelectionLabelFor(Number(match[1]) + 1);
+    return tableElement.querySelector<HTMLElement>(`[role="combobox"][aria-label="${label}"]`);
+}
+
+// Replaces MOVE -1 TO <field>L: the cursor goes to the filter or the row selection the server
+// names.
+function FocusCursorField(cursorField: string, targets: CursorTargets): void {
+    const filterInput = targets.fieldInputs[cursorField];
+    const element = filterInput ?? SelectionElementFor(cursorField, targets.tableElement);
+    element?.focus();
+}
+
+interface ScreenState {
+    filters: CardFilterTexts;
+    setFilters: Dispatch<SetStateAction<CardFilterTexts>>;
+    list: ListState;
+    messages: ScreenMessages;
+    isBusy: boolean;
+    setters: ScreenSetters;
+}
+
+interface CursorRefs {
+    fieldInputsRef: RefObject<FilterInputs>;
+    tableRef: RefObject<HTMLDivElement | null>;
+}
+
+interface FilterHandlers {
+    onFilterChange: (name: FilterFieldName, value: string) => void;
+    onInputRef: (name: FilterFieldName, element: HTMLInputElement | null) => void;
+}
+
+interface CardListScreenModel {
+    filters: CardFilterTexts;
+    list: ListState;
+    messages: ScreenMessages;
+    isBusy: boolean;
+    keys: readonly FunctionKeyDefinition[];
+    filterHandlers: FilterHandlers;
+    tableRef: RefObject<HTMLDivElement | null>;
+    onSelectionChange: (rowKey: string, code: string) => void;
+}
+
+// React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
+// framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
+function useScreenState(): ScreenState {
+    const [filters, setFilters] = useState<CardFilterTexts>(EMPTY_FILTERS);
+    const [list, setList] = useState<ListState>(EMPTY_LIST);
+    const [messages, setMessages] = useState<ScreenMessages>(NO_MESSAGES);
+    const [isBusy, setIsBusy] = useState(false);
+    const setters = useMemo<ScreenSetters>(() => ({ setList, setMessages, setIsBusy }), []);
+    return { filters, setFilters, list, messages, isBusy, setters };
+}
+
+// Every response moves the cursor, even to the field it already names, so the effect follows
+// the messages object rather than the field name.
+function useCursorFocus(messages: ScreenMessages): CursorRefs {
+    const fieldInputsRef = useRef<FilterInputs>({});
+    const tableRef = useRef<HTMLDivElement>(null);
+    useEffect(() => {
+        const targets = { fieldInputs: fieldInputsRef.current, tableElement: tableRef.current };
+        FocusCursorField(messages.cursorField, targets);
+    }, [messages]);
+    return { fieldInputsRef, tableRef };
+}
+
+function useFilterHandlers(
+    setFilters: Dispatch<SetStateAction<CardFilterTexts>>,
+    fieldInputsRef: RefObject<FilterInputs>,
+): FilterHandlers {
+    return useMemo(
+        () => ({
+            onFilterChange: (name, value) =>
+                setFilters((current) => ({ ...current, [name]: value })),
+            onInputRef: (name, element) => {
+                fieldInputsRef.current[name] = element;
+            },
+        }),
+        [setFilters, fieldInputsRef],
+    );
+}
+
+// The pending message is taken once, so React's development remount of the effect still shows it.
+function useFirstPageLoad(setters: ScreenSetters): void {
+    const pendingMessageRef = useRef<string | null>(null);
+    useEffect(() => {
+        if (pendingMessageRef.current === null) {
+            pendingMessageRef.current = TakePendingMessage();
+        }
+        void LoadFirstPage(setters, pendingMessageRef.current);
+    }, [setters]);
+}
+
+function useScreenContext(state: ScreenState): ScreenContext {
+    const router = useRouter();
+    const { filters, list, setters } = state;
+    return useMemo(() => ({ filters, list, setters, router }), [filters, list, setters, router]);
+}
+
+function useCardListScreen(): CardListScreenModel {
+    const state = useScreenState();
+    const { setters, isBusy } = state;
+    const { fieldInputsRef, tableRef } = useCursorFocus(state.messages);
+    const filterHandlers = useFilterHandlers(state.setFilters, fieldInputsRef);
+    const context = useScreenContext(state);
+    const keys = useMemo(() => BuildFunctionKeys(context, isBusy), [context, isBusy]);
+    const onSelectionChange = useCallback(
+        (rowKey: string, code: string) =>
+            setters.setList((current) => WithSelectionCode(current, rowKey, code)),
+        [setters],
+    );
+    useFunctionKeys(keys);
+    useFirstPageLoad(setters);
+    const { filters, list, messages } = state;
+    return { filters, list, messages, isBusy, keys, filterHandlers, tableRef, onSelectionChange };
+}
+
+interface PageIndicatorProps {
+    pageState: PageState | null;
+}
+
+interface CardFilterFieldProps {
+    definition: FilterFieldDefinition;
+    value: string;
+    isError: boolean;
+    handlers: FilterHandlers;
+}
+
+interface CardFilterFieldsProps {
+    filters: CardFilterTexts;
+    fieldErrors: readonly string[];
+    handlers: FilterHandlers;
+}
+
+interface CardListTableProps {
+    list: ListState;
+    fieldErrors: readonly string[];
+    tableRef: RefObject<HTMLDivElement | null>;
+    onSelectionChange: (rowKey: string, code: string) => void;
+}
+
+// PAGENO, right of the title as on the map; blank until the first page arrives.
+function PageIndicator({ pageState }: PageIndicatorProps) {
+    const page = pageState?.page;
+    const pageText = page === undefined ? PAGE_LABEL : `${PAGE_LABEL} ${page}`;
+    return (
+        <Typography variant="labelLarge" component="p" align="right">
+            {pageText}
+        </Typography>
+    );
+}
+
+// The value is sent as typed: no trim, case change or digit filter, so every server literal
+// stays reachable. Only the BMS LENGTH is enforced.
+function CardFilterField({ definition, value, isError, handlers }: CardFilterFieldProps) {
+    const { name } = definition;
+    return (
+        <Grid size={{ xs: 12, md: 6 }}>
+            <TextField
+                variant="outlined"
+                fullWidth
+                label={definition.label}
+                value={value}
+                error={isError}
+                autoFocus={definition.autoFocus}
+                onChange={(event) => handlers.onFilterChange(name, event.target.value)}
+                inputRef={(element: HTMLInputElement | null) => handlers.onInputRef(name, element)}
+                slotProps={{ htmlInput: { maxLength: definition.maxLength } }}
+            />
+        </Grid>
+    );
+}
+
+function CardFilterFields({ filters, fieldErrors, handlers }: CardFilterFieldsProps) {
+    return (
+        <Grid container spacing={4}>
+            {FILTER_FIELDS.map((definition) => (
+                <CardFilterField
+                    key={definition.name}
+                    definition={definition}
+                    value={filters[definition.name]}
+                    isError={fieldErrors.includes(definition.name)}
+                    handlers={handlers}
+                />
+            ))}
+        </Grid>
+    );
+}
+
+// Only the masked card number is ever shown; the full number never reaches this page.
+function CardListTable({ list, fieldErrors, tableRef, onSelectionChange }: CardListTableProps) {
+    return (
+        <Box ref={tableRef}>
+            <SelectionTable
+                columns={CARD_LIST_COLUMNS}
+                rows={SelectionRowsFor(list, fieldErrors)}
+                allowedCodes={SELECTION_CODES}
+                onSelectionChange={onSelectionChange}
+                selectionHeader={SELECTION_HEADER}
+            />
+        </Box>
+    );
+}
+
+interface CardListContentProps {
+    model: CardListScreenModel;
+}
+
+function CardListContent({ model }: CardListContentProps) {
+    return (
+        <>
+            <PageIndicator pageState={model.list.pageState} />
+            <CardFilterFields
+                filters={model.filters}
+                fieldErrors={model.messages.fieldErrors}
+                handlers={model.filterHandlers}
+            />
+            <CardListTable
+                list={model.list}
+                fieldErrors={model.messages.fieldErrors}
+                tableRef={model.tableRef}
+                onSelectionChange={model.onSelectionChange}
+            />
+        </>
+    );
+}
+
+function CardListScreen() {
+    const model = useCardListScreen();
+    const { message, severity, infoMessage } = model.messages;
+    return (
+        <ScreenShell
+            transactionId={TRANSACTION_ID}
+            programName={PROGRAM_NAME}
+            screenTitle={SCREEN_TITLE}
+            isBusy={model.isBusy}
+        >
+            <CardListContent model={model} />
+            <MessageLine message={message} severity={severity} infoMessage={infoMessage} />
+            <FunctionKeyBar keys={model.keys} />
+        </ScreenShell>
+    );
+}
+
+// CCLI: the card list, reached from main-menu option 3 and returning to it on F3.
+export default function CardListPage() {
+    return (
+        <Suspense fallback={null}>
+            <CardListScreen />
+        </Suspense>
+    );
+}
