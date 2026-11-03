@@ -37,7 +37,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from app.core.errors import FileIoError, RepositoryError
+from app.core.errors import CICS_RESP_NOTOPEN, FileIoError, RepositoryError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -56,7 +56,6 @@ WINDOW_TABLES: Mapping[str, tuple[str, ...]] = MappingProxyType(
     }
 )
 
-CICS_RESP_NOTOPEN = 19
 CICS_RESP2_NOTOPEN_CLOSED = 60
 
 TRY_SHARED_WINDOW_SQL = "SELECT pg_try_advisory_lock_shared(:lockKey)"

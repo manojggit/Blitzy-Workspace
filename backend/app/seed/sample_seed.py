@@ -13,11 +13,14 @@ jcl/POSTTRAN.jcl reads through its DALYTRAN DD:
 
 The module is synchronous and reads no settings and no SECRET_KEY: the APP_ENV gate that keeps
 the sample users out of production lives in revision 0002. The batch loaders replace tables
-through batch/loaders/replace_loader.py and share only app.seed.image_reader with this module.
+through batch/loaders/replace_loader.py, which shares app.seed.image_reader and the row builders
+with this module. The builders are lazy, one row per record in record order, so a loader
+streaming an image holds one insert batch at a time while the seed and the loaders build
+identical rows; the seed materialises every table's rows before its first DELETE.
 """
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,8 +78,8 @@ FIELD_PADDING = " "
 DEFER_CONSTRAINTS_SQL = "SET CONSTRAINTS ALL DEFERRED"
 RESTORE_CONSTRAINTS_SQL = "SET CONSTRAINTS ALL IMMEDIATE"
 
-DecodedRecords = Sequence[Mapping[str, object]]
-RowBuilder = Callable[[DecodedRecords, int], list[dict[str, object]]]
+DecodedRecords = Iterable[Mapping[str, object]]
+RowBuilder = Callable[[DecodedRecords, int], Iterator[dict[str, object]]]
 
 
 @dataclass(frozen=True)
@@ -118,42 +121,40 @@ SEED_TABLES: tuple[SeedTable, ...] = (
 )
 
 
-def BuildPlainRows(records: DecodedRecords, bcryptRounds: int) -> list[dict[str, object]]:
-    """Return each decoded record unchanged as an insert row; its keys are the column names.
+def BuildPlainRows(records: DecodedRecords, bcryptRounds: int) -> Iterator[dict[str, object]]:
+    """Yield each decoded record unchanged as an insert row; its keys are the column names.
 
     Keys are deliberately not filtered, so a layout and table that disagree fail the insert
     with SQLAlchemy's unconsumed-column error rather than losing a field. bcryptRounds is
     accepted only so that every RowBuilder shares one signature.
     """
-    return [dict(record) for record in records]
+    for record in records:
+        yield dict(record)
 
 
-def BuildUserRows(records: DecodedRecords, bcryptRounds: int) -> list[dict[str, object]]:
-    """Return USRSEC rows with SEC-USR-PWD replaced by its bcrypt hash at cost bcryptRounds.
+def BuildUserRows(records: DecodedRecords, bcryptRounds: int) -> Iterator[dict[str, object]]:
+    """Yield USRSEC rows with SEC-USR-PWD replaced by its bcrypt hash at cost bcryptRounds.
 
     The password is hashed exactly as the image holds it, case kept and only its space padding
     removed, as DUSRSECJ and COUSR01C store it. The plaintext never reaches a row or a log.
     """
-    userRows: list[dict[str, object]] = []
     for record in records:
         userRow = {key: value for key, value in record.items() if key != USRSEC_PLAINTEXT_KEY}
         plaintext = str(record[USRSEC_PLAINTEXT_KEY]).rstrip(FIELD_PADDING)
         userRow[USER_HASH_COLUMN] = HashPassword(plaintext, bcryptRounds)
-        userRows.append(userRow)
-    return userRows
+        yield userRow
 
 
 def BuildDailyTransactionRows(
     records: DecodedRecords, bcryptRounds: int
-) -> list[dict[str, object]]:
-    """Return DALYTRAN rows numbered record_seq from 1 in file order, as CBTRN02C reads them.
+) -> Iterator[dict[str, object]]:
+    """Yield DALYTRAN rows numbered record_seq from 1 in file order, as CBTRN02C reads them.
 
-    A repeated tran_id is kept: a sequential file may repeat one, and its index is not unique.
+    The numbering runs over the whole of records, however a caller batches the rows. A repeated
+    tran_id is kept: a sequential file may repeat one, and its index is not unique.
     """
-    return [
-        {DAILY_SEQUENCE_COLUMN: recordSeq, **record}
-        for recordSeq, record in enumerate(records, start=1)
-    ]
+    for recordSeq, record in enumerate(records, start=1):
+        yield {DAILY_SEQUENCE_COLUMN: recordSeq, **record}
 
 
 # Datasets whose rows need more than the decoded record; all others use BuildPlainRows.
@@ -185,10 +186,12 @@ def ReadAllImages(sourceDir: str | Path, encoding: str) -> dict[str, ImageConten
 def BuildAllRows(
     images: Mapping[str, ImageContents], bcryptRounds: int
 ) -> dict[str, list[dict[str, object]]]:
-    """Return the insert rows of every SEED_TABLES dataset, keyed by dataset."""
+    """Return the insert rows of every SEED_TABLES dataset, built in full, keyed by dataset."""
     return {
-        spec.dataset: ROW_BUILDERS.get(spec.dataset, BuildPlainRows)(
-            images[spec.dataset].records, bcryptRounds
+        spec.dataset: list(
+            ROW_BUILDERS.get(spec.dataset, BuildPlainRows)(
+                images[spec.dataset].records, bcryptRounds
+            )
         )
         for spec in SEED_TABLES
     }

@@ -11,6 +11,7 @@ Shared with cocrdupc.py and cocrdlic.py: the key edits (``EditCardKeys``, ``Edit
 field-name and length constants.
 """
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -25,6 +26,7 @@ from app.core.errors import (
     HTTP_NOT_FOUND,
     LegacyErrorDetails,
     LegacyMessageError,
+    LogFileCondition,
     RepositoryError,
 )
 from app.core.security import DecodeCardRef, EncodeCardRef, MaskCardNumber
@@ -34,6 +36,11 @@ from app.schemas.cards import CardDetailResponse
 if TYPE_CHECKING:
     # Type-only: the Settings that OnlineContext.settings carries and DecodeCardRef expects.
     from app.core.config import Settings
+
+LOGGER = logging.getLogger(__name__)
+
+# LIT-THISTRANID (lines 165-166).
+TRANSACTION_ID = "CCDL"
 
 # WS-RETURN-MSG 88 levels and literal MOVEs set on a reachable path (lines 134-158, 670, 711).
 ACCOUNT_NOT_PROVIDED_MESSAGE = "Account number not provided"
@@ -331,6 +338,7 @@ async def ReadCardOrRaise(context: OnlineContext, cardNum: str) -> Mapping[str, 
     try:
         card = await CardRepository(context).GetCard(cardNum)
     except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         raise FileErrorFromRepository(error) from error
     if card is None:
         raise NotFoundError()

@@ -41,7 +41,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from app.core.dependencies import OnlineContext
-from app.core.errors import HTTP_FILE_ERROR, LegacyMessageError, RepositoryError
+from app.core.errors import HTTP_FILE_ERROR, LegacyMessageError, LogFileCondition, RepositoryError
 from app.core.messages import (
     ALREADY_AT_BOTTOM_MESSAGE,
     ALREADY_AT_TOP_MESSAGE,
@@ -64,6 +64,14 @@ from app.utils.decimal_utils import StoreInto
 from app.utils.record_layouts import EncodeTimestamp
 
 LOGGER = logging.getLogger(__name__)
+
+# WS-TRANID (line 37).
+TRANSACTION_ID = "CT00"
+# The CICS commands of the TRANSACT browses, which one repository call runs, as their logged
+# file conditions name them; a STARTBR alone tests whether TRANSACT holds any record.
+STARTBR_OPERATION = "STARTBR"
+BROWSE_FORWARD_OPERATION = "STARTBR/READNEXT"
+BROWSE_BACKWARD_OPERATION = "STARTBR/READPREV"
 
 # The ten list rows of the COTRN00 map: SEL0001-SEL0010 with TRNID01-TRNID10.
 PAGE_SIZE = TRANSACTION_LIST_PAGE_SIZE
@@ -93,8 +101,6 @@ TRAN_ID_NOT_NUMERIC_MESSAGE = "Tran ID must be Numeric ..."
 # 683), lower-case "t" as in the source; the batch window's NOTOPEN reaches them too.
 TRAN_LOOKUP_FAILED_MESSAGE = "Unable to lookup transaction..."
 LOOKUP_ERROR_STATUS = HTTP_FILE_ERROR
-# DISPLAY 'RESP:' WS-RESP-CD 'REAS:' WS-REAS-CD in those branches.
-LOOKUP_LOG_MESSAGE = "RESP:%d REAS:%d"
 # MOVE SPACES TO WS-MESSAGE (MAIN-PARA line 102): a page with no literal has a blank line.
 NO_MESSAGE = ""
 # PROCESS-ENTER-KEY moves 0 to CDEMO-CT00-PAGE-NUM before PROCESS-PAGE-FORWARD (line 224).
@@ -237,18 +243,19 @@ def _IsNumericKey(searchTranId: str) -> bool:
 
 
 async def _Lookup(
-    browse: Awaitable[list[dict[str, Any]] | None],
+    browse: Awaitable[list[dict[str, Any]] | None], operation: str
 ) -> list[dict[str, Any]] | None:
     """Await one TRANSACT browse; a file condition becomes ``Unable to lookup transaction...``.
 
     Ports the WHEN OTHER branches of STARTBR-, READNEXT- and READPREV-TRANSACT-FILE (lines
-    612-618, 646-652, 680-686), their DISPLAY of the condition codes included. FileNotOpenError,
-    the NOTOPEN of a TRANSACT the batch window closed, belongs to the RepositoryError family.
+    612-618, 646-652, 680-686), their DISPLAY of the condition codes included, logged with
+    ``operation``, the CICS commands of the browse awaited. FileNotOpenError, the NOTOPEN of a
+    TRANSACT the batch window closed, belongs to the RepositoryError family.
     """
     try:
         return await browse
     except RepositoryError as exc:
-        LOGGER.warning(LOOKUP_LOG_MESSAGE, exc.resp, exc.resp2)
+        LogFileCondition(LOGGER, TRANSACTION_ID, operation, exc)
         raise LegacyMessageError(
             TRAN_LOOKUP_FAILED_MESSAGE, field=SEARCH_CURSOR_FIELD, httpStatus=LOOKUP_ERROR_STATUS
         ) from exc
@@ -269,7 +276,7 @@ async def _ProcessEnterKey(
     state.page = ENTER_BASE_PAGE
     startKey = None if _IsBlank(searchTranId) else searchTranId
     browse = repository.BrowseForward(startKey, inclusive=True, limit=PAGE_SIZE)
-    records = await _Lookup(browse)
+    records = await _Lookup(browse, BROWSE_FORWARD_OPERATION)
     if records is None:
         await _ProcessStartNotFound(repository, state)
         return
@@ -296,7 +303,7 @@ async def _ProcessNonNumericSearch(repository: TransactionRepository, state: Lis
 async def _TransactFileIsEmpty(repository: TransactionRepository) -> bool:
     """Return whether a STARTBR at LOW-VALUES is NOTFND: TRANSACT holds no record."""
     browse = repository.BrowseForward(None, inclusive=True, limit=0)
-    return await _Lookup(browse) is None
+    return await _Lookup(browse, STARTBR_OPERATION) is None
 
 
 async def _ProcessStartNotFound(repository: TransactionRepository, state: ListState) -> None:
@@ -322,7 +329,7 @@ async def _ProcessPf8Key(repository: TransactionRepository, state: ListState) ->
     """
     startKey = NO_NEXT_PAGE_KEY if _IsBlank(state.lastKey) else state.lastKey
     browse = repository.BrowseForward(startKey, inclusive=True, limit=PAGE_SIZE + 1)
-    records = await _Lookup(browse)
+    records = await _Lookup(browse, BROWSE_FORWARD_OPERATION)
     if records is None or len(records) <= 1:
         state.message = ALREADY_AT_BOTTOM_MESSAGE
         await _RereadBottomPage(repository, state, records)
@@ -343,7 +350,8 @@ async def _ProcessPf7Key(repository: TransactionRepository, state: ListState) ->
         await _RereadShownPage(repository, state)
         return
     startKey = None if _IsBlank(state.firstKey) else state.firstKey
-    records = await _Lookup(repository.BrowseBackward(startKey, limit=PAGE_SIZE))
+    browse = repository.BrowseBackward(startKey, limit=PAGE_SIZE)
+    records = await _Lookup(browse, BROWSE_BACKWARD_OPERATION)
     if records is None:
         state.message = AT_TOP_OF_PAGE_MESSAGE
         await _RereadShownPage(repository, state)
@@ -398,7 +406,7 @@ async def _RereadShownPage(repository: TransactionRepository, state: ListState) 
     records: list[dict[str, Any]] | None = []
     if not _IsBlank(state.firstKey):
         browse = repository.BrowseForward(state.firstKey, inclusive=True, limit=PAGE_SIZE - 1)
-        records = await _Lookup(browse)
+        records = await _Lookup(browse, BROWSE_FORWARD_OPERATION)
     _ShowRows(state, records or [])
 
 
@@ -416,7 +424,7 @@ async def _RereadBottomPage(
         return
     lastRecord = records[0]
     browse = repository.BrowseBackward(lastRecord["tran_id"], limit=PAGE_SIZE - 2)
-    earlierRecords = await _Lookup(browse) or []
+    earlierRecords = await _Lookup(browse, BROWSE_BACKWARD_OPERATION) or []
     _ShowRows(state, [*reversed(earlierRecords), lastRecord])
 
 

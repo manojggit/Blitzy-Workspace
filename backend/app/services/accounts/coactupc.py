@@ -28,6 +28,7 @@ flags of every failing edit are kept) and every write effect follow the COBOL pa
 function names.
 """
 
+import logging
 import string
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -49,6 +50,7 @@ from app.core.errors import (
     HTTP_RECORD_LOCKED,
     LegacyErrorDetails,
     LegacyMessageError,
+    LogFileCondition,
     RepositoryError,
 )
 from app.core.security import DecodeScreenToken, EncodeScreenToken
@@ -84,9 +86,14 @@ from app.utils.lookup_codes import (
     IsValidUsStateZipPrefix,
 )
 
+LOGGER = logging.getLogger(__name__)
+
 # LIT-THISPGM and LIT-THISTRANID.
 PROGRAM_NAME = "COACTUPC"
 TRANSACTION_ID = "CAUP"
+# The CICS commands of 9600-WRITE-PROCESSING, as its logged file conditions name them.
+READ_UPDATE_OPERATION = "READ UPDATE"
+REWRITE_OPERATION = "REWRITE"
 # WS-EDIT-VARIABLE-NAME PIC X(25): a longer field label is cut before TRIM puts it in a message.
 EDIT_VARIABLE_NAME_LENGTH = 25
 # WS-EDIT-CURRENCY-9-2-F, the picture every COACTUP amount is shown in.
@@ -1260,7 +1267,7 @@ async def FetchDetails(context: OnlineContext, keyText: str) -> AccountScreen:
     if keyFlag != FLAG_VALID:
         keyMessage = MSG_NO_INPUT_RECEIVED if keyFlag == FLAG_BLANK else MSG_ACCOUNT_KEY_INVALID
         RaiseScreenError(KeyErrorOutcome(keyText, keyMessage), context)
-    readResult = await ReadAccountChain(context, keyText.ljust(ACCOUNT_KEY_LENGTH))
+    readResult = await ReadAccountChain(context, keyText.ljust(ACCOUNT_KEY_LENGTH), TRANSACTION_ID)
     if readResult.message:
         RaiseScreenError(ReadFailureOutcome(readResult), context)
     return BuildScreen(ShowDetailsOutcome(readResult), context)
@@ -1389,7 +1396,7 @@ async def ProcessCancel(
     A successful read shows SHOW_DETAILS with a fresh before-image and no flagged field.
     """
     provisional = ProvisionalOutcome(updateState, screenFields)
-    readResult = await ReadAccountChain(context, updateState.acctId)
+    readResult = await ReadAccountChain(context, updateState.acctId, TRANSACTION_ID)
     if readResult.message:
         return Respond(CancelReadFailureOutcome(provisional, readResult), context)
     return Respond(ShowDetailsOutcome(readResult), context)
@@ -1416,6 +1423,12 @@ class WriteAttempt:
 
     outcome: str = OUTCOME_ACCOUNT_LOCK_FAILED
     freshImage: dict[str, str] | None = None
+
+    def StepInProgress(self) -> str:
+        """Return the CICS command a file condition ending the units now would have failed."""
+        if self.outcome == OUTCOME_UPDATE_FAILED:
+            return REWRITE_OPERATION
+        return READ_UPDATE_OPERATION
 
 
 @dataclass(frozen=True)
@@ -1614,7 +1627,10 @@ async def RunWriteProcessing(
     attempt = WriteAttempt()
     try:
         await WriteProcessing(context, updateState, attempt)
-    except (RepositoryError, WriteAbandoned):
+    except WriteAbandoned:
+        return attempt
+    except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, attempt.StepInProgress(), error)
         return attempt
     attempt.outcome = OUTCOME_DONE
     return attempt

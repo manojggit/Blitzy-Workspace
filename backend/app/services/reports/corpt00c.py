@@ -2,8 +2,10 @@
 
 The CR00 transaction report screen. CORPT00C edited the request and wrote inline JCL to TDQ
 ``JOBS``, which ran ``proc/TRANREPT.prc`` (backup, sort and filter, then CBTRN03C) to print the
-TRANREPT file; here the report is built synchronously by ``cbtrn03c.BuildReport`` and returned
-as JSON lines, or rendered as CSV or PDF by ``report_export``.
+TRANREPT file; here the report is built within the request by ``cbtrn03c.BuildReport`` and
+returned as JSON lines, or rendered as CSV or PDF by ``report_export``. Once the async reads have
+returned, the CPU-bound line building and CSV or PDF rendering run on a bounded worker thread
+(``REPORT_WORKERS``), so the event loop keeps serving other requests while a report is built.
 
 The TRANREPT STEP01R backup of TRANSACT is superseded: this module never writes, deletes or
 archives anything and only reads. CR00 never opened a CLOSEFIL file, so the report is not gated
@@ -20,13 +22,22 @@ POPULATE-HEADER-INFO is the frontend ScreenShell.
 """
 
 import calendar
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import MINYEAR, date, datetime
 from typing import Any, NamedTuple
 
+from anyio import CapacityLimiter, to_thread
+
 from app.core.dependencies import OnlineContext
-from app.core.errors import HTTP_EDIT_FAILURE, HTTP_FILE_ERROR, LegacyMessageError, RepositoryError
+from app.core.errors import (
+    HTTP_EDIT_FAILURE,
+    HTTP_FILE_ERROR,
+    LegacyMessageError,
+    LogFileCondition,
+    RepositoryError,
+)
 from app.repositories.reference_repository import ReferenceRepository
 from app.repositories.transaction_repository import TransactionRepository
 from app.schemas.common import ExportFormat, ReportType
@@ -41,6 +52,14 @@ from app.utils.date_validation import (
     DateCheckResult,
 )
 from app.utils.decimal_utils import StoreInto
+
+LOGGER = logging.getLogger(__name__)
+
+# WS-TRANID (line 38).
+TRANSACTION_ID = "CR00"
+# The TRANREPT reads of TRANTYPE, TRANCATG and TRANSACT that replace the TDQ write, as their
+# logged file conditions name them.
+READ_OPERATION = "READ"
 
 # PROCESS-ENTER-KEY WHEN OTHER (line 438): no report type was selected.
 SELECT_REPORT_TYPE_MESSAGE = "Select a report type to print report..."
@@ -240,6 +259,14 @@ EXPORT_RENDERERS: dict[ExportFormat, ExportRenderer] = {
     ExportFormat.CSV: ExportRenderer(RenderCsv, CSV_MEDIA_TYPE, "csv"),
     ExportFormat.PDF: ExportRenderer(RenderPdf, PDF_MEDIA_TYPE, "pdf"),
 }
+
+# The most worker threads building or rendering reports at once, across all requests. The work
+# is pure Python that holds the GIL, so more threads add no throughput and only compete with the
+# event loop; core.database admission already caps concurrent requests at ADMITTED_REQUEST_LIMIT.
+REPORT_WORKER_LIMIT = 2
+# Shared by every report request; created at import, before any event loop runs, so anyio
+# creates the backend limiter on first use.
+REPORT_WORKERS = CapacityLimiter(REPORT_WORKER_LIMIT)
 
 
 def CurrentDate() -> date:
@@ -507,9 +534,11 @@ async def ReadReportRows(
 async def BuildReportLines(context: OnlineContext, reportRange: ReportRange) -> list[ReportLine]:
     """Replace the TDQ job submission (lines 496-535) with the TRANREPT report, built online.
 
-    Only reads run: the STEP01R backup of TRANSACT is superseded. ``cbtrn03c.ReportAbendError``
-    (the CBTRN03C abend 999) is deliberately not caught, so it reaches FastAPI's 500 and the
-    page shows the legacy abend text.
+    Only reads run: the STEP01R backup of TRANSACT is superseded. Once the reads have returned,
+    ``BuildReport`` runs over the fetched rows on a ``REPORT_WORKERS`` thread, so building a
+    large report never holds the event loop. ``cbtrn03c.ReportAbendError`` (the CBTRN03C abend
+    999) is deliberately not caught, so it reaches FastAPI's 500 and the page shows the legacy
+    abend text.
 
     Raises:
         LegacyMessageError: 503 ``Unable to Write TDQ (JOBS)...`` with the cursor on the report
@@ -521,11 +550,19 @@ async def BuildReportLines(context: OnlineContext, reportRange: ReportRange) -> 
         categoryDescriptions = await referenceRepository.GetCategoryDescriptions()
         rows = await ReadReportRows(TransactionRepository(context), reportRange)
     except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         raise LegacyMessageError(
             UNABLE_TO_WRITE_TDQ_MESSAGE, field=CURSOR_REPORT_TYPE, httpStatus=HTTP_FILE_ERROR
         ) from error
     requestData = ReportRequestData(reportRange.startDate, reportRange.endDate)
-    return BuildReport(requestData, rows, typeDescriptions, categoryDescriptions)
+    return await to_thread.run_sync(
+        BuildReport,
+        requestData,
+        rows,
+        typeDescriptions,
+        categoryDescriptions,
+        limiter=REPORT_WORKERS,
+    )
 
 
 def SubmittedResponse(
@@ -581,7 +618,8 @@ async def ExportTransactionReport(
 ) -> tuple[bytes, str, str]:
     """Run the CR00 edits and render the confirmed report as a CSV or PDF download.
 
-    The content is built in memory; no file is written.
+    The content is built in memory on a ``REPORT_WORKERS`` thread, so rendering never holds the
+    event loop; no file is written.
 
     Returns:
         The document bytes, its media type and its ``TRANREPT_<start>_<end>.<ext>`` file name.
@@ -600,4 +638,7 @@ async def ExportTransactionReport(
     fileName = EXPORT_FILENAME_TEMPLATE.format(
         startDate=response.start_date, endDate=response.end_date, extension=renderer.extension
     )
-    return renderer.render(response.lines), renderer.mediaType, fileName
+    documentBytes = await to_thread.run_sync(
+        renderer.render, response.lines, limiter=REPORT_WORKERS
+    )
+    return documentBytes, renderer.mediaType, fileName

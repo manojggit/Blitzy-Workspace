@@ -4,10 +4,12 @@ The revision logs a skipped seed or truncate at INFO in offline mode and at WARN
 APP_ENV=production. A malformed seed image is logged by whitelisted metadata only (image
 directory, image file name, record number, error and cause classes) and re-raised as an
 ImageFormatError with no record text, because the decoder's message can quote raw field content
-such as a card number or an SSN. The revision is loaded from its file, and its Alembic context,
-op proxy and MigrationSettings are replaced by stubs, so no backend/.env and no database is
-needed. The malformed images are copies of data/EBCDIC with one DALYTRAN.PS field overwritten by
-text carrying SENSITIVE_MARKER.
+such as a card number or an SSN. A seeding upgrade sets the seed-provenance marker revision 0008
+reads only after the load, and a seeding downgrade clears it after the truncate; a skipped or
+failed run, whose op stub offers only get_bind, issues no statement at all. The revision is
+loaded from its file, and its Alembic context, op proxy and MigrationSettings are replaced by
+stubs, so no backend/.env and no database is needed. The malformed images are copies of
+data/EBCDIC with one DALYTRAN.PS field overwritten by text carrying SENSITIVE_MARKER.
 """
 
 import errno
@@ -45,6 +47,11 @@ TRAN_AMT_OFFSET = 132
 SENSITIVE_MARKER = "SECRETMARK"
 # Fails any use: no test may reach the database.
 UNUSED_CONNECTION = object()
+# The call-log entry of one LoadSampleData call; every other entry is a statement op.execute ran.
+LOAD_CALL = "load the sample images"
+# The rows per table the LoadSampleData stub reports, which upgrade() only logs.
+STUB_SEED_COUNTS: dict[str, int] = {"accounts": 50, "transactions": 0}
+EXPECTED_CLEAR_MARKER_SQL = "COMMENT ON SCHEMA batch IS NULL"
 
 
 @dataclass(frozen=True)
@@ -83,6 +90,16 @@ class MigrationStep(NamedTuple):
     stepName: str
 
 
+class SeededRun(NamedTuple):
+    """A revision entry point run with seeding allowed, and the calls it must make, in order.
+
+    Each call name is LOAD_CALL or the name of the revision 0002 SQL constant op.execute runs.
+    """
+
+    functionName: str
+    callNames: tuple[str, ...]
+
+
 FIELD_CORRUPTIONS = (
     pytest.param(
         FieldCorruption(ORIG_TS_OFFSET, f"{SENSITIVE_MARKER}-123-45-6789-XYZ"),
@@ -104,6 +121,14 @@ MIGRATION_STEPS = (
     pytest.param(MigrationStep("upgrade", "sample seed"), id="upgrade"),
     pytest.param(MigrationStep("downgrade", "sample seed truncate"), id="downgrade"),
 )
+SEEDED_RUNS = (
+    pytest.param(SeededRun("upgrade", (LOAD_CALL, "RECORD_SEED_MARKER_SQL")), id="upgrade"),
+    pytest.param(
+        SeededRun("downgrade", ("TRUNCATE_DATASET_TABLES", "CLEAR_SEED_MARKER_SQL")),
+        id="downgrade",
+    ),
+)
+SEED_APP_ENVS = (pytest.param("local", id="local"), pytest.param("test", id="test"))
 
 
 @pytest.fixture(name="seedRevision", scope="module")
@@ -172,6 +197,31 @@ def SoleErrorMessage(logRecords: list[logging.LogRecord]) -> str:
     errorRecords = [logRecord for logRecord in logRecords if logRecord.levelno == logging.ERROR]
     assert [logRecord.name for logRecord in errorRecords] == [MIGRATION_LOGGER_NAME]
     return errorRecords[0].getMessage()
+
+
+def RecordSeedingCalls(revisionModule: ModuleType, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Point revision 0002's op and LoadSampleData at stubs that log each call; return the log.
+
+    op.execute logs its statement; LoadSampleData logs LOAD_CALL and returns STUB_SEED_COUNTS.
+    """
+    callLog: list[str] = []
+
+    def LoadStubImages(*loadArguments: object) -> dict[str, int]:
+        callLog.append(LOAD_CALL)
+        return dict(STUB_SEED_COUNTS)
+
+    opStub = SimpleNamespace(get_bind=lambda: UNUSED_CONNECTION, execute=callLog.append)
+    monkeypatch.setattr(revisionModule, "op", opStub)
+    monkeypatch.setattr(revisionModule, "LoadSampleData", LoadStubImages)
+    return callLog
+
+
+def ExpectedCalls(revisionModule: ModuleType, seededRun: SeededRun) -> list[str]:
+    """Return seededRun's call log: LOAD_CALL as it is, each SQL constant name as its text."""
+    return [
+        callName if callName == LOAD_CALL else getattr(revisionModule, callName)
+        for callName in seededRun.callNames
+    ]
 
 
 def AssertWithheldError(raisedError: ImageFormatError) -> None:
@@ -251,3 +301,22 @@ def test_skipped_step_logs_offline_at_info_and_production_at_warning(
     assert [(logRecord.levelno, logRecord.getMessage()) for logRecord in caplog.records] == [
         (skipCase.expectedLevel, expectedMessage)
     ]
+
+
+@pytest.mark.parametrize("seededRun", SEEDED_RUNS)
+@pytest.mark.parametrize("appEnv", SEED_APP_ENVS)
+def test_seeding_run_sets_or_clears_the_seed_marker_after_its_data_step(
+    stubRevision, appEnv, seededRun, monkeypatch
+):
+    revisionModule = stubRevision(False, SettingsStub(APP_ENV=appEnv))
+    callLog = RecordSeedingCalls(revisionModule, monkeypatch)
+    getattr(revisionModule, seededRun.functionName)()
+    assert callLog == ExpectedCalls(revisionModule, seededRun)
+
+
+def test_seed_marker_statements_set_and_clear_the_batch_schema_comment(seedRevision):
+    expectedRecordSql = f"COMMENT ON SCHEMA batch IS '{seedRevision.SEED_MARKER_COMMENT}'"
+    assert seedRevision.RECORD_SEED_MARKER_SQL == expectedRecordSql
+    assert seedRevision.CLEAR_SEED_MARKER_SQL == EXPECTED_CLEAR_MARKER_SQL
+    # The marker is embedded in a quoted SQL literal, so it must hold no quote of its own.
+    assert "'" not in seedRevision.SEED_MARKER_COMMENT

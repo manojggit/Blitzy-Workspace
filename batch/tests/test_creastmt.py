@@ -6,15 +6,25 @@ STATEMNT.PS records of 80 columns and STATEMNT.HTML records of exactly 100 colum
 51-card by 10-transaction table bound (Technical Specification, Sections 0.6.11 and 0.6.12).
 """
 
-from collections.abc import Iterator
+import errno
+import logging
+import os
+import secrets
+from collections.abc import Callable, Iterator
 from decimal import Decimal
+from pathlib import Path
+from typing import NamedTuple
 from unittest import mock
 
 import pytest
+from app.utils.cobol_format import PictureError
+from jinja2.exceptions import UndefinedError
 from sqlalchemy import Select
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 
-from batch.jobs.statement_gen import cbstm03a, cbstm03b
+from batch.jobs.statement_gen import cbstm03a, cbstm03b, creastmt
+from batch.orchestration.job_context import EXIT_ABEND, JobContext, JobFailure
 
 CARD_NUM = "0000000000000101"
 CUST_ID = "000000001"
@@ -391,3 +401,495 @@ def test_html_record_refuses_unfittable_line(renderedLine: str, expectedMessage:
     """A rendered line with literals over 100 columns or a lone field marker raises ValueError."""
     with pytest.raises(ValueError, match=expectedMessage):
         cbstm03a.FitHtmlRecord(renderedLine)
+
+
+# RunJob's 9999-ABEND-PROGRAM diagnostics: what the ERROR log line and JobFailure may carry.
+ABEND_CARD_GROUP_COUNT = 4
+ABEND_CARD_GROUP_LIMIT = 10_000
+ABEND_STATEMENT = "SELECT card_num FROM transactions.transactions"
+
+
+class AbendSyntheticValues(NamedTuple):
+    """Row-like sensitive values made at run time, for the abend tests to inject and look for."""
+
+    cardNumber: str
+    holderName: str
+    sessionToken: str
+
+
+class AbendDriverError(Exception):
+    """A DBAPI error stand-in: its text is the server message, and pgcode is its SQLSTATE."""
+
+    def __init__(self, message: str, pgcode: object) -> None:
+        super().__init__(message)
+        self.pgcode = pgcode
+
+
+def AbendRandomValues() -> AbendSyntheticValues:
+    """Return a 16-digit card-like number assembled from four random groups, a name, a token."""
+    cardNumber = "".join(
+        f"{secrets.randbelow(ABEND_CARD_GROUP_LIMIT):04d}" for _ in range(ABEND_CARD_GROUP_COUNT)
+    )
+    holderName = f"Holder{secrets.token_hex(4).upper()}"
+    return AbendSyntheticValues(cardNumber, holderName, secrets.token_urlsafe(16))
+
+
+def AbendRowText(values: AbendSyntheticValues) -> str:
+    """Return error text quoting a row that holds every synthetic value."""
+    return f"card {values.cardNumber} holder {values.holderName} token {values.sessionToken}"
+
+
+def AbendDetailText(values: AbendSyntheticValues) -> str:
+    """Return a PostgreSQL unique-violation message whose DETAIL line quotes the row."""
+    return (
+        'duplicate key value violates unique constraint "abend_pkey"\n'
+        f"DETAIL:  Key (card_num, holder, token)=({values.cardNumber}, {values.holderName},"
+        f" {values.sessionToken}) already exists."
+    )
+
+
+def AbendIntegrityError(values: AbendSyntheticValues) -> Exception:
+    """Return a unique violation as SQLAlchemy wraps it: SQLSTATE 23505, DETAIL and parameters."""
+    driverError = AbendDriverError(AbendDetailText(values), "23505")
+    return IntegrityError(ABEND_STATEMENT, {"card_num": values.cardNumber}, driverError)
+
+
+def AbendConnectionError(values: AbendSyntheticValues) -> Exception:
+    """Return a refused connection as SQLAlchemy wraps it: no SQLSTATE, credentials in its text."""
+    driverError = AbendDriverError(f"password authentication failed: {AbendRowText(values)}", None)
+    return OperationalError(ABEND_STATEMENT, None, driverError)
+
+
+def AbendMalformedCodeError(values: AbendSyntheticValues) -> Exception:
+    """Return a database error whose pgcode is row text rather than a 5-character SQLSTATE."""
+    driverError = AbendDriverError(AbendDetailText(values), values.sessionToken)
+    return DBAPIError(ABEND_STATEMENT, None, driverError)
+
+
+def AbendEncodingError(values: AbendSyntheticValues) -> Exception:
+    """Return the UnicodeEncodeError of a strict Latin-1 write, its reason quoting the row."""
+    unencodableText = f"{values.holderName}\u0100"
+    position = len(values.holderName)
+    return UnicodeEncodeError(
+        creastmt.OUTPUT_ENCODING, unencodableText, position, position + 1, AbendRowText(values)
+    )
+
+
+def DirectJobContext(statementsDir: Path) -> JobContext:
+    """Return the JobContext of a direct RunJob call: no ledger run, a mock engine and clock."""
+    settings = mock.Mock(spec=["StatementsDir"])
+    settings.StatementsDir.return_value = statementsDir
+    return JobContext(engine=mock.MagicMock(), settings=settings, clock=mock.Mock())
+
+
+def AbendRunJob(statementsDir: Path, transactionRead: mock.Mock) -> JobFailure:
+    """Run RunJob with transactionRead as the TRNXFILE read; return the JobFailure it raises."""
+    with (
+        mock.patch.object(cbstm03b, "ReadStatementTransactions", transactionRead),
+        pytest.raises(JobFailure) as raised,
+    ):
+        creastmt.RunJob(DirectJobContext(statementsDir))
+    return raised.value
+
+
+def AbendLogMessages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the ERROR messages creastmt logged."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == creastmt.LOGGER.name and record.levelno == logging.ERROR
+    ]
+
+
+@pytest.mark.parametrize(
+    ("errorFactory", "expectedDiagnostic"),
+    [
+        pytest.param(
+            AbendIntegrityError,
+            "DATABASE ERROR IntegrityError (AbendDriverError) SQLSTATE 23505",
+            id="integrity-error",
+        ),
+        pytest.param(
+            AbendConnectionError,
+            "DATABASE ERROR OperationalError (AbendDriverError) SQLSTATE UNKNOWN",
+            id="operational-error-without-sqlstate",
+        ),
+        pytest.param(
+            AbendMalformedCodeError,
+            "DATABASE ERROR DBAPIError (AbendDriverError) SQLSTATE UNKNOWN",
+            id="dbapi-error-with-malformed-sqlstate",
+        ),
+        pytest.param(
+            lambda values: FileExistsError(
+                errno.EEXIST, os.strerror(errno.EEXIST), AbendRowText(values)
+            ),
+            "FILE ERROR FileExistsError ERRNO EEXIST",
+            id="file-error-with-errno",
+        ),
+        pytest.param(
+            lambda values: OSError(AbendRowText(values)),
+            "FILE ERROR OSError ERRNO UNKNOWN",
+            id="file-error-without-errno",
+        ),
+        pytest.param(
+            lambda values: ValueError(AbendRowText(values)),
+            "PICTURE, ENCODING OR RECORD LAYOUT ERROR ValueError",
+            id="record-layout-error",
+        ),
+        pytest.param(
+            lambda values: PictureError(AbendRowText(values)),
+            "PICTURE, ENCODING OR RECORD LAYOUT ERROR PictureError",
+            id="picture-error",
+        ),
+        pytest.param(
+            AbendEncodingError,
+            "PICTURE, ENCODING OR RECORD LAYOUT ERROR UnicodeEncodeError",
+            id="encoding-error",
+        ),
+        pytest.param(
+            lambda values: UndefinedError(AbendRowText(values)),
+            "STATEMENT TEMPLATE ERROR UndefinedError",
+            id="template-error",
+        ),
+    ],
+)
+def test_run_job_abend_names_error_class_and_code_never_error_text(
+    errorFactory: Callable[[AbendSyntheticValues], Exception],
+    expectedDiagnostic: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A database, file, value or template abend logs and raises no text of the error itself."""
+    caplog.set_level(logging.ERROR, logger=creastmt.LOGGER.name)
+    values = AbendRandomValues()
+    error = errorFactory(values)
+    assert all(value in str(error) for value in values)
+    failure = AbendRunJob(tmp_path, mock.Mock(side_effect=error))
+    expectedMessage = f"ABENDING PROGRAM CBSTM03A: {expectedDiagnostic}"
+    assert (failure.exitCode, failure.message, failure.__cause__) == (
+        EXIT_ABEND,
+        expectedMessage,
+        error,
+    )
+    assert AbendLogMessages(caplog) == [expectedMessage]
+    assert [value for value in values if value in caplog.text or value in failure.message] == []
+
+
+def AbendOverCapacityRows(values: AbendSyntheticValues) -> list[dict[str, object]]:
+    """Return a full table of 51 cards and a 52nd card's row holding the synthetic values."""
+    overflowRow = TransactionRecord(1, AbendRowText(values), cardNum=values.cardNumber)
+    return TableInput((1,) * cbstm03a.MAX_STATEMENT_CARDS) + [overflowRow]
+
+
+@pytest.mark.parametrize(
+    ("rowsFactory", "expectedDiagnostic"),
+    [
+        pytest.param(
+            AbendOverCapacityRows,
+            CAPACITY_MESSAGE_PREFIX + "MORE THAN 51 CARDS AT TABLE ENTRY 52",
+            id="table-capacity",
+        ),
+        pytest.param(
+            lambda values: [], "ERROR READING TRNXFILE RETURN CODE: 10", id="empty-trnxfile"
+        ),
+    ],
+)
+def test_run_job_abend_keeps_the_cbstm03a_display_text(
+    rowsFactory: Callable[[AbendSyntheticValues], list[dict[str, object]]],
+    expectedDiagnostic: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A CBSTM03A abend logs and raises its DISPLAY text verbatim, with exit 16 and no row text."""
+    caplog.set_level(logging.ERROR, logger=creastmt.LOGGER.name)
+    values = AbendRandomValues()
+    failure = AbendRunJob(tmp_path, mock.Mock(return_value=rowsFactory(values)))
+    expectedMessage = f"ABENDING PROGRAM CBSTM03A: {expectedDiagnostic}"
+    assert isinstance(failure.__cause__, cbstm03a.StatementAbendError)
+    assert str(failure.__cause__) == expectedDiagnostic
+    assert (failure.exitCode, failure.message) == (EXIT_ABEND, expectedMessage)
+    assert AbendLogMessages(caplog) == [expectedMessage]
+    assert [value for value in values if value in caplog.text] == []
+
+
+# PublishFiles and RecoverInterruptedPublication: STATEMNT.PS and STATEMNT.HTML are published as
+# one pair, and a failure or a kill before the commit point leaves the previous pair as it was.
+PUBLICATION_DIRECTORY_NAME = "statements"
+PUBLICATION_PS_NAME = "STATEMNT.PS"
+PUBLICATION_HTML_NAME = "STATEMNT.HTML"
+PUBLICATION_ENCODING = "latin-1"
+PUBLICATION_STATEMENT_COUNT = 2
+PUBLICATION_INJECTED_TEXT = "injected rename failure"
+PUBLICATION_LEDGER_STATEMENT = "UPDATE batch.job_runs SET status = %(status)s"
+PUBLICATION_CYCLE_ID = 1
+PUBLICATION_STEP_NO = 17
+PUBLICATION_RUN_ID = 1
+
+
+def PublicationRecords(label: str) -> list[cbstm03a.StatementRecords]:
+    """Return statements of one 80-column PS and one 100-column HTML record, marked by label.
+
+    Statement n counts n transaction lines.
+    """
+    return [
+        cbstm03a.StatementRecords(
+            psLines=(f"{label} {PUBLICATION_PS_NAME} {index}".ljust(PS_LINE_WIDTH),),
+            htmlLines=(f"{label} {PUBLICATION_HTML_NAME} {index}".ljust(HTML_LINE_WIDTH),),
+            transactionCount=index,
+        )
+        for index in range(1, PUBLICATION_STATEMENT_COUNT + 1)
+    ]
+
+
+def PublicationContents(records: list[cbstm03a.StatementRecords]) -> dict[str, bytes]:
+    """Return the bytes of the two statement files written from records, by file name."""
+    psText = "".join(line + "\n" for statement in records for line in statement.psLines)
+    htmlText = "".join(line + "\n" for statement in records for line in statement.htmlLines)
+    return {
+        PUBLICATION_PS_NAME: psText.encode(PUBLICATION_ENCODING),
+        PUBLICATION_HTML_NAME: htmlText.encode(PUBLICATION_ENCODING),
+    }
+
+
+def PublicationWritePair(statementsDir: Path, label: str) -> dict[str, bytes]:
+    """Write the pair of PublicationRecords(label) as the statement files; return its bytes."""
+    contents = PublicationContents(PublicationRecords(label))
+    statementsDir.mkdir(parents=True, exist_ok=True)
+    for fileName, content in contents.items():
+        (statementsDir / fileName).write_bytes(content)
+    return contents
+
+
+def PublicationFiles(statementsDir: Path) -> dict[str, bytes] | None:
+    """Return every file in statementsDir by name with its bytes, or None with no directory."""
+    if not statementsDir.exists():
+        return None
+    return {path.name: path.read_bytes() for path in statementsDir.iterdir()}
+
+
+def PublicationInterruptedState(
+    statementsDir: Path, hasPrevious: bool, renamesDone: int
+) -> dict[str, bytes]:
+    """Leave the files of a run killed after its backups, its marker and renamesDone renames.
+
+    Returns what a rollback must leave: the previous pair, or no file after a first run.
+    """
+    statementsDir.mkdir(parents=True, exist_ok=True)
+    previous = PublicationWritePair(statementsDir, "PREVIOUS") if hasPrevious else {}
+    for fileName in previous:
+        os.link(statementsDir / fileName, creastmt.BackupPath(statementsDir, fileName))
+    creastmt.MarkerPath(statementsDir).touch()
+    newContents = PublicationContents(PublicationRecords("NEW"))
+    for position, (fileName, content) in enumerate(newContents.items()):
+        temporaryPath = creastmt.TemporaryPath(statementsDir, fileName)
+        temporaryPath.write_bytes(content)
+        if position < renamesDone:
+            os.replace(temporaryPath, statementsDir / fileName)
+    return previous
+
+
+def PublicationRollbackLogs(statementsDir: Path, hasPrevious: bool, renamesDone: int) -> list[str]:
+    """Return the WARNING lines recovery logs for PublicationInterruptedState's files, in order:
+    each .part file left, the rollback, then each renamed file restored or removed."""
+    fileNames = [PUBLICATION_PS_NAME, PUBLICATION_HTML_NAME]
+    staleParts = [
+        creastmt.STALE_FILE_LOG % creastmt.TemporaryPath(statementsDir, fileName)
+        for fileName in fileNames[renamesDone:]
+    ]
+    changedFiles = [
+        creastmt.RESTORED_FILE_LOG
+        % (statementsDir / fileName, creastmt.BackupPath(statementsDir, fileName))
+        if hasPrevious
+        else creastmt.UNPUBLISHED_FILE_LOG % (statementsDir / fileName)
+        for fileName in fileNames[:renamesDone]
+    ]
+    return [*staleParts, creastmt.ROLLBACK_LOG % creastmt.MarkerPath(statementsDir), *changedFiles]
+
+
+def PublicationFailingReplace(failingRenames: tuple[int, ...]) -> Callable[[Path, Path], None]:
+    """Return an os.replace stand-in that raises OSError on the .part renames numbered in
+    failingRenames, counting from 1, and performs every other rename."""
+    realReplace = os.replace
+    partRenames: list[Path] = []
+
+    def Replace(source: Path, destination: Path) -> None:
+        if os.fspath(source).endswith(creastmt.TEMPORARY_SUFFIX):
+            partRenames.append(source)
+            if len(partRenames) in failingRenames:
+                raise OSError(errno.EIO, PUBLICATION_INJECTED_TEXT, os.fspath(source))
+        realReplace(source, destination)
+
+    return Replace
+
+
+def PublicationJobContext(statementsDir: Path) -> JobContext:
+    """Return a chain-started run's JobContext, its statements in statementsDir."""
+    context = DirectJobContext(statementsDir)
+    return context.ForRun(PUBLICATION_CYCLE_ID, PUBLICATION_STEP_NO, PUBLICATION_RUN_ID)
+
+
+def PublicationRunJob(statementsDir: Path, transactionRows: list[dict[str, object]]) -> JobFailure:
+    """Run RunJob over transactionRows and one card's cross-reference, with a ledger finish
+    that fails; return the JobFailure it raises."""
+    source = cbstm03b.StatementSource(XrefRecord(), CustomerRecord(), AccountRecord())
+    sources = (xrefSource for xrefSource in [source])
+    ledgerError = DBAPIError(PUBLICATION_LEDGER_STATEMENT, None, ConnectionError("lost"))
+    with (
+        mock.patch.object(cbstm03b, "ReadStatementTransactions", return_value=transactionRows),
+        mock.patch.object(cbstm03b, "ReadXrefsInCardOrder", return_value=sources),
+        mock.patch.object(creastmt.run_ledger, "FinishIfRunning", side_effect=ledgerError),
+        pytest.raises(JobFailure) as raised,
+    ):
+        creastmt.RunJob(PublicationJobContext(statementsDir))
+    return raised.value
+
+
+@pytest.mark.parametrize("hasPrevious", [True, False], ids=["previous-pair", "first-run"])
+def test_publication_replaces_both_files_and_leaves_no_work_file(
+    tmp_path: Path, hasPrevious: bool
+) -> None:
+    """A complete run leaves exactly the new pair: no .part file, backup or marker."""
+    statementsDir = tmp_path / PUBLICATION_DIRECTORY_NAME
+    if hasPrevious:
+        PublicationWritePair(statementsDir, "PREVIOUS")
+    records = PublicationRecords("NEW")
+    counts = creastmt.WriteStatementFiles(statementsDir, records)
+    assert PublicationFiles(statementsDir) == PublicationContents(records)
+    assert counts.AsLedgerCounts() == {"statements": 2, "transactions": 3}
+
+
+@pytest.mark.parametrize("failingRename", [1, 2], ids=["first-rename", "second-rename"])
+@pytest.mark.parametrize("hasPrevious", [True, False], ids=["previous-pair", "first-run"])
+def test_publication_rename_failure_leaves_the_previous_pair_and_no_work_file(
+    tmp_path: Path, hasPrevious: bool, failingRename: int
+) -> None:
+    """An OSError on either .part rename is raised after the rollback, which leaves the
+    previous pair byte for byte, or no statement file after a first run, and nothing else."""
+    statementsDir = tmp_path / PUBLICATION_DIRECTORY_NAME
+    previous = PublicationWritePair(statementsDir, "PREVIOUS") if hasPrevious else {}
+    with (
+        mock.patch.object(creastmt.os, "replace", PublicationFailingReplace((failingRename,))),
+        pytest.raises(OSError, match=PUBLICATION_INJECTED_TEXT),
+    ):
+        creastmt.WriteStatementFiles(statementsDir, PublicationRecords("NEW"))
+    assert PublicationFiles(statementsDir) == previous
+
+
+def test_publication_refuses_an_unrecovered_marker_and_keeps_its_backups(tmp_path: Path) -> None:
+    """A marker no recovery has handled stops the publication before it touches a file."""
+    statementsDir = tmp_path / PUBLICATION_DIRECTORY_NAME
+    PublicationInterruptedState(statementsDir, True, 2)
+    interruptedFiles = PublicationFiles(statementsDir)
+    with pytest.raises(FileExistsError):
+        creastmt.WriteStatementFiles(statementsDir, PublicationRecords("LATER"))
+    assert PublicationFiles(statementsDir) == interruptedFiles
+
+
+@pytest.mark.parametrize("renamesDone", [0, 1, 2], ids=["no-rename", "one-rename", "two-renames"])
+@pytest.mark.parametrize("hasPrevious", [True, False], ids=["previous-pair", "first-run"])
+def test_recovery_rolls_back_a_publication_killed_before_its_commit_point(
+    tmp_path: Path, hasPrevious: bool, renamesDone: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A marker left by a killed run makes the next run restore the previous pair, or remove
+    the new files of a first run, and delete every work file."""
+    statementsDir = tmp_path / PUBLICATION_DIRECTORY_NAME
+    previous = PublicationInterruptedState(statementsDir, hasPrevious, renamesDone)
+    caplog.set_level(logging.WARNING, logger=creastmt.LOGGER.name)
+    creastmt.RecoverInterruptedPublication(statementsDir)
+    assert PublicationFiles(statementsDir) == previous
+    assert caplog.messages == PublicationRollbackLogs(statementsDir, hasPrevious, renamesDone)
+
+
+def test_failed_rollback_keeps_its_marker_and_the_next_run_completes_it(tmp_path: Path) -> None:
+    """A rollback that fails in turn is raised with the marker and backups kept, and the next
+    run's recovery restores the previous pair."""
+    statementsDir = tmp_path / PUBLICATION_DIRECTORY_NAME
+    previous = PublicationWritePair(statementsDir, "PREVIOUS")
+    with (
+        mock.patch.object(creastmt.os, "replace", PublicationFailingReplace((2, 3))),
+        pytest.raises(OSError, match=PUBLICATION_INJECTED_TEXT),
+    ):
+        creastmt.WriteStatementFiles(statementsDir, PublicationRecords("NEW"))
+    assert creastmt.MarkerPath(statementsDir).exists()
+    creastmt.RecoverInterruptedPublication(statementsDir)
+    assert PublicationFiles(statementsDir) == previous
+
+
+def test_recovery_cut_short_keeps_its_marker_and_the_next_run_completes_it(tmp_path: Path) -> None:
+    """A recovery killed after restoring STATEMNT.PS keeps the marker and backups, so the next
+    recovery restores STATEMNT.HTML too, with STATEMNT.PS restored once more unchanged."""
+    statementsDir = tmp_path / PUBLICATION_DIRECTORY_NAME
+    previous = PublicationInterruptedState(statementsDir, True, 2)
+    with (
+        mock.patch.object(creastmt.os, "replace", PublicationFailingReplace((2,))),
+        pytest.raises(OSError, match=PUBLICATION_INJECTED_TEXT),
+    ):
+        creastmt.RecoverInterruptedPublication(statementsDir)
+    assert creastmt.MarkerPath(statementsDir).exists()
+    assert (statementsDir / PUBLICATION_PS_NAME).read_bytes() == previous[PUBLICATION_PS_NAME]
+    creastmt.RecoverInterruptedPublication(statementsDir)
+    assert PublicationFiles(statementsDir) == previous
+
+
+@pytest.mark.parametrize(
+    "leftoverPathOf",
+    [
+        pytest.param(creastmt.BackupPath, id="backups-after-commit"),
+        pytest.param(creastmt.TemporaryPath, id="parts-mid-write"),
+    ],
+)
+def test_recovery_without_marker_deletes_leftover_work_files_and_keeps_the_pair(
+    tmp_path: Path,
+    leftoverPathOf: Callable[[Path, str], Path],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With no marker, the backups or .part files a killed run left are deleted and logged by
+    path, and the statement files stay as they are."""
+    statementsDir = tmp_path / PUBLICATION_DIRECTORY_NAME
+    current = PublicationWritePair(statementsDir, "CURRENT")
+    leftoverPaths = [leftoverPathOf(statementsDir, fileName) for fileName in current]
+    for leftoverPath in leftoverPaths:
+        leftoverPath.write_bytes(b"LEFTOVER")
+    caplog.set_level(logging.WARNING, logger=creastmt.LOGGER.name)
+    creastmt.RecoverInterruptedPublication(statementsDir)
+    assert PublicationFiles(statementsDir) == current
+    assert caplog.messages == [creastmt.STALE_FILE_LOG % path for path in leftoverPaths]
+
+
+def test_recovery_creates_nothing_without_a_statement_directory(tmp_path: Path) -> None:
+    """Recovery of an output directory with no statements creates no directory or file."""
+    creastmt.RecoverInterruptedPublication(tmp_path / PUBLICATION_DIRECTORY_NAME)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_ledger_failure_after_the_commit_point_exits_16_with_the_new_statements(
+    tmp_path: Path,
+) -> None:
+    """A ledger finish that fails after the commit point exits 16 with the new pair in place."""
+    statementsDir = tmp_path / PUBLICATION_DIRECTORY_NAME
+    PublicationWritePair(statementsDir, "PREVIOUS")
+    failure = PublicationRunJob(statementsDir, [TransactionRecord(1)])
+    psLines, htmlLines = BuildSingleStatement(CustomerRecord(), [TransactionRecord(1)])
+    newRecords = [cbstm03a.StatementRecords(psLines, htmlLines, transactionCount=1)]
+    assert failure.exitCode == EXIT_ABEND
+    assert isinstance(failure.__cause__, DBAPIError)
+    assert PublicationFiles(statementsDir) == PublicationContents(newRecords)
+
+
+@pytest.mark.parametrize(
+    "cardTransactionCounts",
+    [pytest.param((1,) * 52, id="52nd-card"), pytest.param((11,), id="11th-transaction")],
+)
+@pytest.mark.parametrize(
+    "interrupted", [True, False], ids=["killed-mid-publication", "fresh-output-directory"]
+)
+def test_read_abend_after_recovery_leaves_the_previous_statements(
+    tmp_path: Path, interrupted: bool, cardTransactionCounts: tuple[int, ...]
+) -> None:
+    """Recovery runs before the reads, so a capacity abend exits 16 with the previous pair
+    restored from a killed publication, or with no statement directory created."""
+    statementsDir = tmp_path / PUBLICATION_DIRECTORY_NAME
+    previous = PublicationInterruptedState(statementsDir, True, 1) if interrupted else None
+    failure = PublicationRunJob(statementsDir, TableInput(cardTransactionCounts))
+    assert failure.exitCode == EXIT_ABEND
+    assert PublicationFiles(statementsDir) == previous

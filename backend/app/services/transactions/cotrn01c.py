@@ -26,9 +26,9 @@ from app.core.errors import (
     HTTP_FILE_ERROR,
     HTTP_NOT_FOUND,
     LegacyMessageError,
+    LogFileCondition,
     RepositoryError,
 )
-from app.core.locks import FileNotOpenError
 from app.core.security import MaskCardNumber
 from app.repositories.transaction_repository import TransactionRepository
 from app.schemas.transactions import TransactionDetailResponse
@@ -37,6 +37,11 @@ from app.utils.record_layouts import EncodeTimestamp
 
 LOGGER = logging.getLogger(__name__)
 
+# WS-TRANID (line 37).
+TRANSACTION_ID = "CT01"
+# The CICS command of READ-TRANSACT-FILE, as its logged file conditions name it.
+READ_OPERATION = "READ"
+
 # COTRN01C message literals, verbatim (lines 149, 285 and 292).
 TRAN_ID_EMPTY_MESSAGE = "Tran ID can NOT be empty..."
 TRAN_ID_NOT_FOUND_MESSAGE = "Transaction ID NOT found..."
@@ -44,12 +49,6 @@ TRAN_LOOKUP_FAILED_MESSAGE = "Unable to lookup Transaction..."
 
 # MOVE -1 TO TRNIDINL: the cursor target, named as the response attribute of the entered ID.
 TRAN_ID_CURSOR_FIELD = "tran_id"
-
-# The WHEN OTHER ``DISPLAY 'RESP:' WS-RESP-CD 'REAS:' WS-REAS-CD`` of READ-TRANSACT-FILE.
-FILE_ERROR_LOG = "RESP:%d REAS:%d"
-# The TRANSACT condition online use expects and clears by retrying: the batch window's NOTOPEN.
-# Any other condition is an I/O failure, logged as an error.
-EXPECTED_FILE_CONDITIONS = (FileNotOpenError,)
 
 # MOVE TRAN-AMT TO WS-TRAN-AMT (line 177): the PIC +99999999.99 receiver keeps eight integer
 # digits, so a ninth integer digit of the S9(09)V99 amount is dropped, as the map showed it.
@@ -80,13 +79,10 @@ def RequireTranId(tranId: str) -> None:
 def FileErrorOutcome(error: RepositoryError) -> LegacyMessageError:
     """Return the WHEN OTHER outcome of the TRANSACT read: 503 ``Unable to lookup Transaction...``.
 
-    The condition is logged as the source's RESP and REAS DISPLAY: the batch window's NOTOPEN
-    (FileNotOpenError) at WARNING, and every other condition, an I/O error (FileIoError) among
-    them, at ERROR. The cursor stays on the transaction ID.
+    The condition is logged as the source's RESP and REAS DISPLAY, the batch window's NOTOPEN
+    (FileNotOpenError) included. The cursor stays on the transaction ID.
     """
-    isExpectedCondition = isinstance(error, EXPECTED_FILE_CONDITIONS)
-    logLevel = logging.WARNING if isExpectedCondition else logging.ERROR
-    LOGGER.log(logLevel, FILE_ERROR_LOG, error.resp, error.resp2)
+    LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
     return LegacyMessageError(
         TRAN_LOOKUP_FAILED_MESSAGE, field=TRAN_ID_CURSOR_FIELD, httpStatus=HTTP_FILE_ERROR
     )

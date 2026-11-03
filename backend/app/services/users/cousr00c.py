@@ -19,6 +19,7 @@ guard; PF3 (``XCTL COADM01C``) is frontend navigation; other AID keys cannot rea
 POPULATE-HEADER-INFO is the frontend ScreenShell; clearing USRIDIN after a browse is the page's.
 """
 
+import logging
 from collections.abc import Awaitable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlencode
@@ -29,6 +30,7 @@ from app.core.errors import (
     HTTP_FILE_ERROR,
     LegacyErrorDetails,
     LegacyMessageError,
+    LogFileCondition,
     RepositoryError,
 )
 from app.core.locks import FileNotOpenError
@@ -49,6 +51,15 @@ from app.schemas.users import (
     UserSelectionRequest,
     UserSelectionResponse,
 )
+
+LOGGER = logging.getLogger(__name__)
+
+# WS-TRANID (line 37).
+TRANSACTION_ID = "CU00"
+# The CICS commands of the forward and backward browses, which one repository call runs, as
+# their logged file conditions name them.
+BROWSE_FORWARD_OPERATION = "STARTBR/READNEXT"
+BROWSE_BACKWARD_OPERATION = "STARTBR/READPREV"
 
 # WS-USER-DATA, USER-REC OCCURS 10 TIMES (line 57).
 PAGE_SIZE = 10
@@ -186,16 +197,18 @@ def _Refusal(message: str) -> LegacyMessageError:
 
 
 async def _Lookup(
-    browse: Awaitable[list[dict[str, Any]] | None],
+    browse: Awaitable[list[dict[str, Any]] | None], operation: str
 ) -> list[dict[str, Any]] | None:
     """Await one USRSEC browse; a file condition becomes ``Unable to lookup User...``.
 
     Ports the WHEN OTHER branches of the STARTBR, READNEXT and READPREV paragraphs (lines
     607-613, 641-647, 675-681). FileNotOpenError is the NOTOPEN of a USRSEC that CLOSEFIL closed.
+    The condition is logged with ``operation``, the CICS commands of the browse awaited.
     """
     try:
         return await browse
     except (FileNotOpenError, RepositoryError) as exc:
+        LogFileCondition(LOGGER, TRANSACTION_ID, operation, exc)
         raise LegacyMessageError(
             UNABLE_TO_LOOKUP_USER_MESSAGE,
             field=SEARCH_CURSOR_FIELD,
@@ -220,7 +233,7 @@ async def _BrowseFromSearch(
     """
     startKey = None if _IsBlank(searchUserId) else searchUserId
     browse = repository.BrowseForward(startKey, inclusive=True, limit=PAGE_SIZE)
-    records = await _Lookup(browse)
+    records = await _Lookup(browse, BROWSE_FORWARD_OPERATION)
     if records is None:
         raise _SearchNotFound()
     return _BuildForwardPage(records, ENTER_BASE_PAGE, priorMessage)
@@ -253,7 +266,7 @@ async def _PageForward(repository: UserRepository, lastKey: str, page: int) -> U
     if page == ENTER_BASE_PAGE or _IsBlank(lastKey):
         raise _Refusal(ALREADY_AT_BOTTOM_MESSAGE)
     browse = repository.BrowseForward(lastKey, inclusive=False, limit=PAGE_SIZE)
-    records = await _Lookup(browse)
+    records = await _Lookup(browse, BROWSE_FORWARD_OPERATION)
     if not records:
         raise _Refusal(ALREADY_AT_BOTTOM_MESSAGE)
     return _BuildForwardPage(records, page, NO_MESSAGE)
@@ -286,7 +299,8 @@ async def _PageBackward(repository: UserRepository, firstKey: str, page: int) ->
     if page <= FIRST_PAGE:
         raise _Refusal(ALREADY_AT_TOP_MESSAGE)
     startKey = None if _IsBlank(firstKey) else firstKey
-    records = await _Lookup(repository.BrowseBackward(startKey, limit=PAGE_SIZE))
+    browse = repository.BrowseBackward(startKey, limit=PAGE_SIZE)
+    records = await _Lookup(browse, BROWSE_BACKWARD_OPERATION)
     if records is None:
         raise _Refusal(AT_TOP_OF_PAGE_MESSAGE)
     if not records:

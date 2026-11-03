@@ -649,6 +649,8 @@ Their semantics are in [batch.md](batch.md) and, for the login throttle,
 - `opened_by`: `SEED`, `seed-all` or `run-all`.
 - `opened_at`.
 - `closed_at` `NULL`.
+- Partial index `ix_cycles_cycle_id_open` on `cycle_id` `WHERE status = 'OPEN'`, not unique: finding
+    and abandoning the `OPEN` cycle reads no closed cycles.
 
 `batch.cycle_steps`:
 
@@ -670,6 +672,8 @@ Their semantics are in [batch.md](batch.md) and, for the login throttle,
 - `started_at`.
 - `finished_at` `NULL`.
 - Run history only: any number of rows per step, with an index on (`cycle_id`, `step_no`).
+- Partial index `ix_job_runs_run_id_running` on `run_id` `WHERE status = 'RUNNING'`, not unique:
+    classifying interrupted runs at the start of every command reads no finished runs.
 
 `batch.gdg_generations`:
 
@@ -680,6 +684,12 @@ Their semantics are in [batch.md](batch.md) and, for the login throttle,
 - `state`: `COMMITTED`, `PUBLISHED`, `ROLLED_OFF`, `LOST` or `ABANDONED`.
 - `run_id`, FK → `batch.job_runs`.
 - `created_at`.
+- Partial indexes, none unique, so catalog lookups read no rolled-off or abandoned history:
+    `ix_gdg_generations_run_id_committed` on `run_id` `WHERE state = 'COMMITTED'` (catalog
+    recovery and a run's publication); `ix_gdg_generations_run_id_lost` on `run_id`
+    `WHERE state = 'LOST'` (the lost generations of a cycle's runs); and
+    `ix_gdg_generations_base_name_generation_published` on (`base_name`, `generation`)
+    `WHERE state = 'PUBLISHED'` (resolving `(0)` and `(-n)`, and retention beyond `LIMIT 5`).
 
 ### Alembic revisions
 
@@ -703,12 +713,19 @@ Notes:
     comments.
 - **`0002`.** `app.seed.sample_seed.LoadSampleData` loads the tables with the loader semantics of
     [batch.md](batch.md). It runs only when `APP_ENV` is `local` or `test`. Under `production` it
-    logs a skip and loads nothing, so the sample users never reach a production database.
+    logs a skip and loads nothing, so the sample users never reach a production database. A
+    completed load sets the comment of schema `batch` to the seed marker, in the seed's own
+    transaction: `CardDemo sample seed loaded by Alembic revision 0002`. Its downgrade truncates
+    the tables and clears the marker, under the same `APP_ENV` gate.
 - **`0003`.** The indexes named above; `ebcdic_sort_key(text)`; the three generated sort columns
     and their indexes.
 - **`0008`.** `batch.cycles`, `batch.cycle_steps` and `batch.job_runs`. When `0002` loaded data,
     `0008` also records that seed as an `OPEN` cycle (`opened_by = 'SEED'`): one `job_runs` row
-    per seeded loader, chain steps 1–5 and 7–12 `COMPLETED`, and the rest `PENDING`.
+    per seeded loader, chain steps 1–5 and 7–12 `COMPLETED`, and the rest `PENDING`. `0008`
+    judges that `0002` loaded data only when schema `batch` carries the seed marker and
+    `accounts.accounts` still holds rows. Rows without the marker, such as data loaded while
+    `0002` was skipped under `production`, record no cycle. In offline mode (`--sql`) `0008`
+    records none either.
 
 ### Expected rows after migration
 

@@ -19,6 +19,7 @@ is the frontend ScreenShell.
 """
 
 import asyncio
+import logging
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
@@ -28,6 +29,7 @@ from app.core.errors import (
     HTTP_FILE_ERROR,
     HTTP_NOT_FOUND,
     LegacyMessageError,
+    LogFileCondition,
     RecordLockError,
     RecordNotFoundError,
     RepositoryError,
@@ -36,6 +38,15 @@ from app.core.locks import FileNotOpenError
 from app.core.security import HashPassword, VerifyPassword
 from app.repositories.user_repository import USER_FILE_NAME, UserRepository
 from app.schemas.users import UserDetailResponse, UserMessageResponse, UserUpdateRequest
+
+LOGGER = logging.getLogger(__name__)
+
+# WS-TRANID (line 37).
+TRANSACTION_ID = "CU02"
+# The CICS commands logged with a file condition: the fetch's READ, and the update unit's
+# READ UPDATE and REWRITE, whichever of the two failed.
+READ_OPERATION = "READ"
+UPDATE_OPERATION = "READ UPDATE/REWRITE"
 
 # Message literals of COUSR02C, verbatim.
 USER_ID_EMPTY_MESSAGE = "User ID can NOT be empty..."
@@ -126,6 +137,7 @@ async def FetchUser(context: OnlineContext, userId: str) -> UserDetailResponse:
     try:
         storedRecord = await UserRepository(context).GetUser(userId)
     except (FileNotOpenError, RepositoryError) as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         raise LegacyMessageError(
             UNABLE_TO_LOOKUP_USER_MESSAGE, field=FIRST_NAME_FIELD, httpStatus=HTTP_FILE_ERROR
         ) from error
@@ -240,6 +252,7 @@ async def UpdateUser(
     # literal: COUSR02C runs on past a failed READ, and the REWRITE that follows, with no
     # record held for update, fails and sends the last message the screen shows.
     except (FileNotOpenError, RecordLockError, RepositoryError) as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, UPDATE_OPERATION, error)
         raise LegacyMessageError(
             UNABLE_TO_UPDATE_USER_MESSAGE, field=FIRST_NAME_FIELD, httpStatus=HTTP_FILE_ERROR
         ) from error

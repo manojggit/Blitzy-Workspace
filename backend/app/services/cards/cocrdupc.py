@@ -27,6 +27,7 @@ The REWRITE of 9200-WRITE-PROCESSING runs in one write unit with its READ UPDATE
   date that cannot exist fails the REWRITE.
 """
 
+import logging
 import string
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -47,6 +48,7 @@ from app.core.errors import (
     HTTP_RECORD_LOCKED,
     LegacyErrorDetails,
     LegacyMessageError,
+    LogFileCondition,
     RepositoryError,
 )
 from app.core.security import DecodeScreenToken, EncodeCardRef, EncodeScreenToken, MaskCardNumber
@@ -73,6 +75,14 @@ from app.services.cards.cocrdslc import (
 if TYPE_CHECKING:
     # Type-only: the Settings that OnlineContext.settings carries and core.security expects.
     from app.core.config import Settings
+
+LOGGER = logging.getLogger(__name__)
+
+# LIT-THISTRANID (lines 221-222).
+TRANSACTION_ID = "CCUP"
+# The CICS commands of 9200-WRITE-PROCESSING, as its logged file conditions name them.
+READ_UPDATE_OPERATION = "READ UPDATE"
+REWRITE_OPERATION = "REWRITE"
 
 # WS-RETURN-MSG 88 levels set on a reachable path (lines 181-210). The never-set 88 texts, such
 # as SEARCHED-ACCT-NOT-NUMERIC and XREF-READ-ERROR, are deliberately absent.
@@ -557,6 +567,7 @@ async def ReadBeforeImage(context: OnlineContext, acctId: str, cardNum: str) -> 
     try:
         card = await CardRepository(context).GetCard(cardNum)
     except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         message = BuildFileErrorMessage(READ_OPERATION, CARD_FILE_NAME, error.resp, error.resp2)
         reply = ReadFailureReply((acctId, cardNum), message, (ACCT_ID_FIELD,))
         raise ScreenError(reply, STATUS_FILE_ERROR, context.settings) from error
@@ -881,6 +892,12 @@ class WriteAttempt:
     rewritten: bool = False
     freshImage: BeforeImage | None = None
 
+    def StepInProgress(self) -> str:
+        """Return the CICS command a file condition ending the unit now would have failed."""
+        if self.outcome == OUTCOME_UPDATE_FAILED:
+            return REWRITE_OPERATION
+        return READ_UPDATE_OPERATION
+
 
 async def SaveChanges(
     context: OnlineContext, state: CardUpdateState, screenFields: CardScreenFields
@@ -914,7 +931,8 @@ async def WriteProcessing(context: OnlineContext, state: CardUpdateState) -> Wri
     try:
         async with WriteUnit(context.engine, CARD_FILE_NAME) as unit:
             await LockCompareAndRewrite(CardRepository(context), unit, state, attempt)
-    except RepositoryError:
+    except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, attempt.StepInProgress(), error)
         return attempt
     if attempt.rewritten:
         attempt.outcome = OUTCOME_DONE

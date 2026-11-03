@@ -12,11 +12,16 @@ as one that is not valid UTF-8, gets the same 422 body as malformed JSON. The CS
 work area has no counterpart here: no catch-all handler is registered, so an unexpected error is
 FastAPI's 500 and the frontend shows ``UNEXPECTED ABEND OCCURRED.``.
 
+``LogFileCondition`` replaces the ``DISPLAY 'RESP:' WS-RESP-CD 'REAS:' WS-REAS-CD`` of the
+``WHEN OTHER`` branches: every service logs a file condition it answers with a literal through
+it, with codes and class names only.
+
 This is a leaf module. It imports only the standard library, FastAPI, Starlette and
 ``sqlalchemy.exc``, so repositories and batch jobs import it without ``SECRET_KEY`` or a
 database.
 """
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -41,10 +46,23 @@ HTTP_FILE_ERROR = 503
 CICS_RESP_NOTFND = 13
 CICS_RESP_DUPREC = 14
 CICS_RESP_IOERR = 17
+CICS_RESP_NOTOPEN = 19
 CICS_RESP_RECORDBUSY = 101
 
 UNIQUE_VIOLATION_SQLSTATE = "23505"
 LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+
+# The batch window's NOTOPEN and a record another task holds clear on a retry, so they are
+# logged at WARNING; any other condition (IOERR, DUPREC, ...) is a failure, logged at ERROR.
+TRANSIENT_FILE_CONDITIONS = frozenset({CICS_RESP_NOTOPEN, CICS_RESP_RECORDBUSY})
+FILE_CONDITION_LOG = "Transaction %s %s on %s returned RESP:%d REAS:%d (cause %s, SQLSTATE %s)"
+# Logged for the cause and the SQLSTATE of a condition that has none, such as NOTOPEN.
+NO_FAILURE_DETAIL = "none"
+# The deepest exception chain FailureCauseOf follows, so a cyclic chain still ends.
+MAX_CAUSE_DEPTH = 10
+# The driver error attributes holding the SQLSTATE: asyncpg and SQLAlchemy's asyncpg adapter
+# set sqlstate, psycopg2 sets pgcode.
+SQLSTATE_ATTRIBUTES = ("sqlstate", "pgcode")
 
 STANDARD_BODY_KEYS = ("message", "info_message", "field_errors", "cursor_field")
 REQUEST_LOCATION_KINDS = frozenset({"body", "query", "path", "header", "cookie"})
@@ -186,14 +204,22 @@ class FileIoError(RepositoryError):
         super().__init__(fileName, CICS_RESP_IOERR, 0)
 
 
-def SqlStateOf(dbError: DBAPIError) -> str:
-    """Return the SQLSTATE of the driver error wrapped by SQLAlchemy, or "" when it has none.
+def SqlStateAttributeOf(error: BaseException | None) -> str:
+    """Return the SQLSTATE a driver error carries, or "" when it carries none.
 
-    SQLAlchemy's asyncpg adapter sets both ``sqlstate`` and ``pgcode`` on ``orig``; psycopg2,
-    used by batch, sets ``pgcode`` only.
+    SQLAlchemy's asyncpg adapter sets both ``sqlstate`` and ``pgcode``, asyncpg ``sqlstate``
+    and psycopg2, used by batch, ``pgcode`` only. Only a non-empty text value counts.
     """
-    driverError = dbError.orig
-    return getattr(driverError, "sqlstate", None) or getattr(driverError, "pgcode", None) or ""
+    for attributeName in SQLSTATE_ATTRIBUTES:
+        sqlState = getattr(error, attributeName, None)
+        if isinstance(sqlState, str) and sqlState:
+            return sqlState
+    return ""
+
+
+def SqlStateOf(dbError: DBAPIError) -> str:
+    """Return the SQLSTATE of the driver error wrapped by SQLAlchemy, or "" when it has none."""
+    return SqlStateAttributeOf(dbError.orig)
 
 
 def MapDatabaseError(dbError: DBAPIError, fileName: str) -> RepositoryError:
@@ -208,6 +234,66 @@ def MapDatabaseError(dbError: DBAPIError, fileName: str) -> RepositoryError:
     if sqlState == LOCK_NOT_AVAILABLE_SQLSTATE:
         return RecordLockError(fileName)
     return FileIoError(fileName)
+
+
+def NextCauseOf(error: BaseException) -> BaseException | None:
+    """Return the exception ``error`` was raised from, else the driver error it wraps, or None.
+
+    ``raise ... from`` sets ``__cause__``; a DBAPIError built without it still holds the driver
+    error in ``orig``.
+    """
+    if error.__cause__ is not None:
+        return error.__cause__
+    wrappedError = getattr(error, "orig", None)
+    return wrappedError if isinstance(wrappedError, BaseException) else None
+
+
+def FailureCauseOf(error: BaseException) -> tuple[str, str]:
+    """Return the class name of the innermost cause of ``error`` and the first SQLSTATE found.
+
+    The chain is followed inward from the cause of ``error`` for at most MAX_CAUSE_DEPTH links,
+    so a cyclic chain still ends. An error raised from nothing, such as the batch window's
+    NOTOPEN, gives NO_FAILURE_DETAIL for both. Only class names and SQLSTATE codes are read,
+    never an exception's text, arguments or traceback, which can echo SQL, bound keys, card
+    numbers or SSNs.
+    """
+    cause = NextCauseOf(error)
+    if cause is None:
+        return (NO_FAILURE_DETAIL, NO_FAILURE_DETAIL)
+    sqlState = SqlStateAttributeOf(cause)
+    for _ in range(MAX_CAUSE_DEPTH - 1):
+        innerCause = NextCauseOf(cause)
+        if innerCause is None:
+            break
+        cause = innerCause
+        sqlState = sqlState or SqlStateAttributeOf(cause)
+    return (type(cause).__name__, sqlState or NO_FAILURE_DETAIL)
+
+
+def LogFileCondition(
+    logger: logging.Logger, transactionId: str, operation: str, error: RepositoryError
+) -> None:
+    """Log, on ``logger``, a file condition that a ``WHEN OTHER`` branch answers with a literal.
+
+    The record names the CICS transaction ID, the operation (the CICS command of the paragraph
+    that failed), the legacy file, RESP and RESP2, and the class name and SQLSTATE of
+    FailureCauseOf. TRANSIENT_FILE_CONDITIONS (NOTOPEN, RECORDBUSY) are logged at WARNING and
+    every other condition at ERROR. Only codes and class names are logged, never exception text
+    or record values.
+    """
+    logLevel = logging.WARNING if error.resp in TRANSIENT_FILE_CONDITIONS else logging.ERROR
+    causeName, sqlState = FailureCauseOf(error)
+    logger.log(
+        logLevel,
+        FILE_CONDITION_LOG,
+        transactionId,
+        operation,
+        error.fileName,
+        error.resp,
+        error.resp2,
+        causeName,
+        sqlState,
+    )
 
 
 async def HandleLegacyMessageError(request: Request, exc: LegacyMessageError) -> JSONResponse:

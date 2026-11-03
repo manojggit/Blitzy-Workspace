@@ -14,6 +14,7 @@ AID key, and the COSGN00 legend offers only ENTER and F3.
 """
 
 import asyncio
+import logging
 import string
 from collections.abc import Mapping
 from typing import Any, NamedTuple, NoReturn
@@ -23,6 +24,7 @@ from app.core.errors import (
     HTTP_FILE_ERROR,
     HTTP_SIGN_ON_FAILURE,
     LegacyMessageError,
+    LogFileCondition,
     RecordNotFoundError,
     RepositoryError,
 )
@@ -31,6 +33,16 @@ from app.core.security import VerifyPassword
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import CurrentUserResponse, LoginRequest, LoginResponse, LogoutResponse
 from app.services.auth import login_throttle
+
+LOGGER = logging.getLogger(__name__)
+
+# WS-TRANID (line 37).
+TRANSACTION_ID = "CC00"
+# The operations logged with a file condition: the USRSEC READ of READ-USER-SEC-FILE and the
+# sign-on throttle's LOGINATT read, failure-count write and reset delete.
+READ_OPERATION = "READ"
+WRITE_OPERATION = "WRITE"
+DELETE_OPERATION = "DELETE"
 
 # Message literals of COSGN00C, verbatim (lines 120, 125, 242, 249, 254).
 USER_ID_REQUIRED_MESSAGE = "Please enter User ID ..."
@@ -150,6 +162,7 @@ async def FailSignOn(
     try:
         await login_throttle.RecordFailure(context, upperUserId)
     except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, WRITE_OPERATION, error)
         raise UnableToVerifyError() from error
     raise failure
 
@@ -175,6 +188,7 @@ async def GuardLockout(context: OnlineContext, upperUserId: str) -> None:
     try:
         await login_throttle.CheckLocked(context, upperUserId)
     except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         raise UnableToVerifyError() from error
 
 
@@ -186,6 +200,7 @@ async def ClearFailures(context: OnlineContext, upperUserId: str) -> None:
     try:
         await login_throttle.ResetAttempts(context, upperUserId)
     except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, DELETE_OPERATION, error)
         raise UnableToVerifyError() from error
 
 
@@ -199,7 +214,8 @@ async def LookUpUser(context: OnlineContext, upperUserId: str) -> dict[str, Any]
         return await UserRepository(context).GetUser(upperUserId)
     except RecordNotFoundError:
         return None
-    except RepositoryError:
+    except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         await FailSignOn(context, upperUserId, UnableToVerifyError())
 
 
@@ -258,11 +274,12 @@ async def ReadDisplayNames(context: OnlineContext, userId: str) -> DisplayNames:
 
     The names are display only. A deleted user keeps a valid session until the next sign-on,
     and the menus touch no batch-window file, so NOTFND and every other file condition, NOTOPEN
-    included, give blank names rather than an error.
+    included, give blank names rather than an error; a file condition is still logged.
     """
     try:
         userRow = await UserRepository(context).GetUser(userId)
-    except RepositoryError:
+    except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         return NO_DISPLAY_NAMES
     if userRow is None:
         return NO_DISPLAY_NAMES

@@ -11,12 +11,16 @@ and transcribed in docs/batch.md ("GDG archives").
   PUBLISHED. Given the caller's connection (atomic and final-transaction callers), the row joins
   the caller's transaction and PublishRunGenerations publishes it once that has committed.
 - Recovery: ReconcileCatalog completes an interrupted publication, marks a row whose file is
-  gone LOST and deletes orphan .part files. A LOST row blocks the OPEN cycle until seed-all or
-  run-all --new-cycle abandons it (run_ledger.AbandonOpenCycle).
+  gone LOST and deletes orphan .part files. It then applies retention to every base and deletes
+  the leftover files of ROLLED_OFF SCRATCH generations, so a crash between publication and
+  retention, or between ROLLED_OFF and the unlink, is completed by the next command. A LOST row
+  blocks the OPEN cycle until seed-all or run-all --new-cycle abandons it
+  (run_ledger.AbandonOpenCycle).
 - Abnormal disposition: an exception inside NewGeneration deletes the .part and catalogs
   nothing, as DISP=(NEW,CATLG,DELETE) does.
-- Retention: LIMIT 5. The oldest PUBLISHED generation beyond it becomes ROLLED_OFF; SCRATCH bases
-  also delete its file, NOSCRATCH TRANSACT.BKUP keeps it.
+- Retention: LIMIT 5, applied after every publication and again by every ReconcileCatalog. The
+  oldest PUBLISHED generation beyond it becomes ROLLED_OFF, committed before SCRATCH bases delete
+  its file; NOSCRATCH TRANSACT.BKUP keeps it.
 
 Records arrive already encoded by record_layouts.EncodeRecord; this module only checks their
 length and writes them, one per line ended by "\\n". Base names come from GDG_BASES only, never
@@ -29,6 +33,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -59,6 +64,10 @@ RECORD_TERMINATOR = b"\n"
 FORBIDDEN_RECORD_CHARACTERS = ("\r", "\n")
 PART_SUFFIX = ".part"
 GENERATION_FILE_TEMPLATE = "G{generation:04d}V00.dat"
+# The final file names GENERATION_FILE_TEMPLATE produces; a match is kept only when it
+# round-trips through the template, so G01V00.dat or G00001V00.dat names no generation.
+GENERATION_FILE_GLOB = "G*V00.dat"
+GENERATION_FILE_PATTERN = re.compile(r"G(?P<generation>\d+)V00\.dat", re.ASCII)
 GENERATION_NAME_TEMPLATE = "{base}.G{generation:04d}V00"
 LOST_GENERATION_TEMPLATE = (
     "GENERATION {base}.G{generation:04d}V00 OF CYCLE {cycleId} IS LOST;"
@@ -74,6 +83,7 @@ PUBLISHED_LOG = "GENERATION %s PUBLISHED: %d RECORDS"
 LOST_LOG = "GENERATION %s IS LOST: NEITHER %s NOR ITS .part FILE MATCHES SHA-256 %s"
 ROLLED_OFF_LOG = "GENERATION %s ROLLED OFF (LIMIT %d); FILE %s"
 ORPHAN_DELETED_LOG = "ORPHAN GENERATION FILE %s DELETED"
+LEFTOVER_DELETED_LOG = "ROLLED-OFF GENERATION %s: LEFTOVER FILE %s DELETED"
 DIRECTORY_FSYNC_LOG = "DIRECTORY FSYNC REFUSED FOR %s: %s"
 RECONCILE_LOG = "GDG CATALOG RECONCILED: %d PUBLISHED, %d LOST, %d ORPHAN .part FILES DELETED"
 FILE_SCRATCHED = "SCRATCHED"
@@ -478,8 +488,9 @@ def RollOff(context: JobContext, base: GdgBase, limit: int = GDG_LIMIT) -> int:
     """Roll off every PUBLISHED generation of base beyond the newest limit; return the count.
 
     The rows become ROLLED_OFF, so no reference resolves them, and commit before any SCRATCH
-    file is deleted: a crash in between leaves an unreferenced leftover file, never a
-    resolvable generation without its file. TRANSACT.BKUP (NOSCRATCH) keeps its files.
+    file is deleted: a crash or unlink error in between leaves an unreferenced leftover file,
+    which the next ReconcileCatalog deletes, never a resolvable generation without its file.
+    TRANSACT.BKUP (NOSCRATCH) keeps its files.
     """
     statement = PublishedNewestFirstStatement(base).offset(limit)
     with context.engine.begin() as connection:
@@ -505,18 +516,84 @@ def DeleteOrphanParts(context: JobContext) -> int:
     return deletedCount
 
 
+def GenerationOfFileName(fileName: str) -> int | None:
+    """Return the generation a final file name holds, or None for any other name."""
+    match = GENERATION_FILE_PATTERN.fullmatch(fileName)
+    if match is None:
+        return None
+    generation = int(match["generation"])
+    if GENERATION_FILE_TEMPLATE.format(generation=generation) != fileName:
+        return None
+    return generation
+
+
+def FinalFileGenerations(context: JobContext, base: GdgBase) -> list[int]:
+    """Return the generation numbers of the final files in the base's directory, ascending."""
+    directory = context.settings.GdgDir() / base.name
+    generations = (
+        GenerationOfFileName(path.name)
+        for path in directory.glob(GENERATION_FILE_GLOB)
+        if path.is_file()
+    )
+    return sorted(generation for generation in generations if generation is not None)
+
+
+def RolledOffRowsStatement(base: GdgBase, generations: list[int]) -> Select:
+    """Return the query of the base's ROLLED_OFF rows among the given generation numbers."""
+    return (
+        select(GDG_GENERATIONS)
+        .where(
+            GDG_GENERATIONS.c.base_name == base.name,
+            GDG_GENERATIONS.c.generation.in_(generations),
+            GDG_GENERATIONS.c.state == GDG_ROLLED_OFF,
+        )
+        .order_by(GDG_GENERATIONS.c.generation)
+    )
+
+
+def DeleteLeftoverFiles(context: JobContext, base: GdgBase) -> int:
+    """Delete the files left behind by ROLLED_OFF generations of a SCRATCH base; return the count.
+
+    RollOff commits ROLLED_OFF before it deletes a file, so a crash or unlink error leaves the
+    file. The directory listing drives the lookup: it holds at most GDG_LIMIT published files
+    plus such leftovers, so only their rows are read, by primary key, never the catalog history.
+    A file with no row, or whose row is in another state, is left alone; NOSCRATCH bases keep
+    theirs.
+    """
+    generations = FinalFileGenerations(context, base) if base.scratch else []
+    if not generations:
+        return 0
+    rolledOffRows = SelectRows(context, RolledOffRowsStatement(base, generations))
+    for row in rolledOffRows:
+        ScratchFile(context, base, row)
+        generationName = GenerationName(row.base_name, row.generation)
+        leftoverPath = ResolveFilePath(context, row.file_path)
+        LOGGER.warning(LEFTOVER_DELETED_LOG, generationName, leftoverPath)
+    return len(rolledOffRows)
+
+
+def DeleteRolledOffLeftovers(context: JobContext) -> int:
+    """Delete the leftover files of ROLLED_OFF generations of every SCRATCH base; return a count."""
+    return sum(DeleteLeftoverFiles(context, base) for base in GDG_BASES.values())
+
+
 def ReconcileCatalog(context: JobContext) -> ReconcileSummary:
-    """Complete or condemn interrupted publications, and delete orphan .part files.
+    """Complete interrupted publications, retention and SCRATCH deletions; delete orphan parts.
 
     batch/cli.py runs it at the start of every command, under the batch window and after
     run_ledger.ClassifyInterruptedRuns; batch_chain also runs it after a failed step. Once every
     COMMITTED row is PUBLISHED or LOST, any .part left is an orphan of a crash before commit, or
-    the corrupt file of a LOST row.
+    the corrupt file of a LOST row. Retention then runs for every base, whether or not it gained
+    a generation here, so the extra generation a crash between publication and RollOff left
+    resolvable rolls off before any command resolves it. Last, the files of ROLLED_OFF SCRATCH
+    generations that a crash or unlink error left behind are deleted. Each stage finds nothing
+    to do when the catalog is already consistent, so a second call changes nothing.
     """
     committedRows = SelectRows(context, CommittedRowsStatement())
-    gainedBaseNames, lostCount = PublishRows(context, committedRows)
+    _, lostCount = PublishRows(context, committedRows)
     orphansDeleted = DeleteOrphanParts(context)
-    RollOffBases(context, gainedBaseNames)
+    RollOffBases(context, GDG_BASES.keys())
+    DeleteRolledOffLeftovers(context)
     summary = ReconcileSummary(
         published=len(committedRows) - lostCount, lost=lostCount, orphansDeleted=orphansDeleted
     )

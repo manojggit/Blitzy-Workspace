@@ -27,6 +27,7 @@ sets that field, and the ``IF ERR-FLG-ON`` block opening VALIDATE-INPUT-DATA-FIE
 unreachable, as every earlier failure has already returned.
 """
 
+import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ from app.core.errors import (
     DuplicateKeyError,
     LegacyErrorDetails,
     LegacyMessageError,
+    LogFileCondition,
     RepositoryError,
 )
 from app.core.security import MaskCardNumber
@@ -71,6 +73,17 @@ from app.utils.record_layouts import (
     EncodeTimestamp,
     TimestampFormatError,
 )
+
+LOGGER = logging.getLogger(__name__)
+
+# WS-TRANID (line 37).
+TRANSACTION_ID = "CT02"
+# The CICS commands of READ-CXACAIX-FILE and READ-CCXREF-FILE, of the STARTBR HIGH-VALUES /
+# READPREV that finds the highest TRAN-ID, and of WRITE-TRANSACT-FILE, as their logged file
+# conditions name them.
+READ_OPERATION = "READ"
+BROWSE_BACKWARD_OPERATION = "STARTBR/READPREV"
+WRITE_OPERATION = "WRITE"
 
 # BMS COTRN02 input field LENGTHs (cpy-bms/COTRN02.CPY).
 ACCT_ID_LENGTH = 11
@@ -417,6 +430,7 @@ async def ResolveKeyField(context: OnlineContext, screen: ScreenFields, keyPath:
     try:
         xref = await keyPath.lookup(CardXrefRepository(context), keyValue)
     except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         raise ScreenError(
             screen, keyPath.lookupFailedMessage, cursorField, HTTP_FILE_ERROR
         ) from error
@@ -570,6 +584,8 @@ async def WriteNewTransaction(context: OnlineContext, screen: ScreenFields) -> s
             screen, DUPLICATE_TRAN_ID_MESSAGE, ACCT_ID_FIELD, DUPLICATE_TRAN_ID_STATUS
         ) from error
     except RepositoryError as error:
+        operation = WRITE_OPERATION if tranId else BROWSE_BACKWARD_OPERATION
+        LogFileCondition(LOGGER, TRANSACTION_ID, operation, error)
         message = ADD_FAILED_MESSAGE if tranId else TRAN_LOOKUP_FAILED_MESSAGE
         raise ScreenError(screen, message, ACCT_ID_FIELD, HTTP_FILE_ERROR) from error
     except TimestampFormatError as error:
@@ -663,6 +679,7 @@ async def CopyLastTranData(context: OnlineContext, screen: ScreenFields) -> Tran
     try:
         lastRecord = await TransactionRepository(context).GetHighestTransaction()
     except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, BROWSE_BACKWARD_OPERATION, error)
         raise ScreenError(
             screen, TRAN_LOOKUP_FAILED_MESSAGE, ACCT_ID_FIELD, HTTP_FILE_ERROR
         ) from error

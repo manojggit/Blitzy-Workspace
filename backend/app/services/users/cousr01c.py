@@ -16,6 +16,7 @@ the CSMSG01Y CCDA-MSG-INVALID-KEY literal of core.messages.
 """
 
 import asyncio
+import logging
 from typing import NamedTuple, NoReturn
 
 from app.core.database import WriteUnit
@@ -26,12 +27,20 @@ from app.core.errors import (
     HTTP_RECORD_CHANGED,
     DuplicateKeyError,
     LegacyMessageError,
+    LogFileCondition,
     RepositoryError,
 )
 from app.core.messages import INVALID_KEY_MESSAGE
 from app.core.security import HashPassword
 from app.repositories.user_repository import USER_FILE_NAME, UserRepository
 from app.schemas.users import UserCreateRequest, UserMessageResponse
+
+LOGGER = logging.getLogger(__name__)
+
+# WS-TRANID (line 37).
+TRANSACTION_ID = "CU01"
+# The CICS command of WRITE-USER-SEC-FILE, as its logged file conditions name it.
+WRITE_OPERATION = "WRITE"
 
 
 class RequiredField(NamedTuple):
@@ -133,6 +142,7 @@ async def WriteUserSecFile(context: OnlineContext, userValues: dict[str, str]) -
             USER_ID_EXISTS_MESSAGE, field=USER_ID_FIELD, httpStatus=USER_ID_EXISTS_STATUS
         ) from error
     except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, WRITE_OPERATION, error)
         raise LegacyMessageError(
             UNABLE_TO_ADD_USER_MESSAGE, field=FIRST_NAME_FIELD, httpStatus=HTTP_FILE_ERROR
         ) from error

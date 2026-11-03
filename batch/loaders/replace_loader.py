@@ -9,21 +9,26 @@ XREFFILE, TRANFILE, TRANTYPE, TRANCATG, DISCGRP, TCATBALF, DUSRSECJ and the DALY
 load each declare a LOADER_SPEC and call ReplaceTable, the single implementation of that
 pattern. Specified in the Technical Specification, Sections 0.6.8, 0.6.12 and 0.7.2.
 
-ReplaceTable reads and decodes the image and builds the rows before any database work, then
-empties and refills the table in one transaction with the deferrable foreign keys deferred, and
-finishes the ledger run in that same transaction, so every run gives the same result. The
+ReplaceTable opens the image before any database work, then, in one transaction with the
+deferrable foreign keys deferred, empties the table and refills it from the image as a stream:
+records are decoded, turned into rows and inserted INSERT_BATCH_SIZE at a time, so memory stays
+bounded whatever the size of the image or of a --daily-file. The ledger run finishes in that
+same transaction once the whole image has been read, so every run gives the same result. The
 failure paths of IDCAMS belong to the IBM utility, not to CardDemo source, so a load is atomic:
-an unsupported encoding, a missing or malformed image, a duplicate key REPRO would have
-reported, or a foreign-key violation found at commit raises JobFailure(EXIT_FAILURE) and leaves
-the table as it was.
+an unsupported encoding, a missing image, a malformed record anywhere in the image, a duplicate
+key REPRO would have reported, or a foreign-key violation found at commit raises
+JobFailure(EXIT_FAILURE) and leaves the table as it was. A malformed record found after earlier
+batches were inserted rolls back the DELETE, those batches and the ledger write together.
 
 Financial-reload refusal, cycles, skips and RUNNING rows belong to batch_chain and run_ledger,
 and the batch window is held by batch/cli.py around the command. Rows are never logged: they
 carry card numbers, SSNs and password hashes.
 """
 
+import itertools
 import logging
-from collections.abc import Callable, Iterator, Sequence
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,12 +38,14 @@ from app.seed.image_reader import (
     ENCODING_ASCII,
     ENCODING_EBCDIC,
     ImageFormatError,
-    ReadImage,
+    ImageStream,
     SampleImagePath,
+    StreamImage,
 )
 from app.seed.sample_seed import BuildPlainRows
 from app.utils.record_layouts import RecordLayout
 from sqlalchemy import Table, delete, insert, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
 from batch.orchestration import run_ledger
@@ -60,6 +67,11 @@ IMAGE_ENCODINGS: tuple[str, ...] = (ENCODING_EBCDIC, ENCODING_ASCII)
 # commit.
 DEFER_CONSTRAINTS_SQL = text("SET CONSTRAINTS ALL DEFERRED")
 
+# Rows per INSERT executemany. It bounds the decoded records and insert rows a load holds at
+# once, and equals the insertmanyvalues page size of SQLAlchemy's psycopg2 dialect, so each
+# batch is sent as one multi-row INSERT.
+INSERT_BATCH_SIZE = 1000
+
 # The batch.job_runs.counts keys of a load, the ones Alembic 0008 writes for the seed cycle.
 ROWS_LOADED_KEY = "rows_loaded"
 RECORDS_SKIPPED_KEY = "records_skipped"
@@ -76,7 +88,9 @@ ENCODING_SEPARATOR = ", "
 
 LOAD_COMPLETE_TEMPLATE = "%s: %d ROWS LOADED, %d RECORDS SKIPPED"
 
-type RowBuilder = Callable[[Sequence[dict[str, object]], JobContext], list[dict[str, object]]]
+# A row builder receives the image's decoded records as a lazy stream in file order and returns
+# their insert rows lazily, one per record and in the same order.
+type RowBuilder = Callable[[Iterable[dict[str, object]], JobContext], Iterable[dict[str, object]]]
 
 
 @dataclass(frozen=True)
@@ -87,8 +101,9 @@ class LoaderSpec:
     of app.utils.record_layouts. dataset is the image_reader.SAMPLE_IMAGE_NAMES key, which is
     also the table name. encodings lists the encodings the dataset's images exist in, the
     default first; TRANFILE and DUSRSECJ have no ASCII copy. primingCheck, when set, sees each
-    raw record and skips the ones it accepts. rowBuilder turns the decoded records into insert
-    rows; without one, each record is inserted as decoded.
+    raw record and skips the ones it accepts. rowBuilder turns the stream of decoded records
+    into insert rows as they are read, one row per record, without collecting either; without
+    one, each record is inserted as decoded.
     """
 
     table: Table
@@ -100,9 +115,9 @@ class LoaderSpec:
 
 
 def BuildPlainTableRows(
-    records: Sequence[dict[str, object]], context: JobContext
-) -> list[dict[str, object]]:
-    """Return each decoded record as its insert row, exactly as the Alembic sample seed does."""
+    records: Iterable[dict[str, object]], context: JobContext
+) -> Iterator[dict[str, object]]:
+    """Return a lazy iterator of each record as its insert row, as the Alembic sample seed does."""
     return BuildPlainRows(records, context.settings.BCRYPT_ROUNDS)
 
 
@@ -163,9 +178,9 @@ def IntegrityReason(error: IntegrityError) -> str:
 
 
 def ImageErrorMessage(spec: LoaderSpec, imagePath: Path, error: ImageFormatError) -> str:
-    """Return the exit-12 text of an image ReadImage refused.
+    """Return the exit-12 text of an image StreamImage refused.
 
-    ReadImage reports an absent file as ImageFormatError chained to the FileNotFoundError, so
+    StreamImage reports an absent file as ImageFormatError chained to the FileNotFoundError, so
     that case is named as a missing image rather than a malformed one.
     """
     if isinstance(error.__cause__, FileNotFoundError):
@@ -178,9 +193,11 @@ def MappedLoadErrors(spec: LoaderSpec, imagePath: Path) -> Iterator[None]:
     """Turn the expected failures of one load into JobFailure(EXIT_FAILURE), chained to them.
 
     Only a missing image, a malformed or undecodable image, and an integrity violation are
-    mapped. A duplicate key surfaces at the insert and a deferred foreign-key violation at
-    commit, so the context encloses the whole transaction. JobFailure and every other error
-    propagate unchanged, for batch_chain to record.
+    mapped. A missing image surfaces when StreamImage opens it, a malformed record while a
+    batch is being read, a duplicate key at a batch's insert and a deferred foreign-key
+    violation at commit, so the context encloses StreamImage and the whole transaction, and
+    each error reaches it after the transaction has rolled back. JobFailure and every other
+    error propagate unchanged, for batch_chain to record.
     """
     try:
         yield
@@ -199,51 +216,63 @@ def MappedLoadErrors(spec: LoaderSpec, imagePath: Path) -> Iterator[None]:
         raise JobFailure(EXIT_FAILURE, message) from error
 
 
-def ReadRows(
-    context: JobContext, spec: LoaderSpec, imagePath: Path, encoding: str
-) -> tuple[list[dict[str, object]], int]:
-    """Read, decode and build the insert rows of the image; return them and the skipped count.
+def InsertBatches(connection: Connection, table: Table, rows: Iterable[dict[str, object]]) -> int:
+    """Insert rows into table INSERT_BATCH_SIZE at a time, as they are built; return the count.
 
-    This runs before the transaction opens, so row building, bcrypt hashing for DUSRSECJ
-    included, holds no lock.
+    Each batch is drawn from rows only when the previous one has been executed, so one batch
+    is held at a time. No INSERT runs when rows yields nothing, because SQLAlchemy would
+    execute one default-valued INSERT for an empty parameter list.
     """
-    contents = ReadImage(imagePath, spec.layout, encoding, spec.primingCheck)
-    rowBuilder = spec.rowBuilder or BuildPlainTableRows
-    return rowBuilder(contents.records, context), contents.skippedCount
+    rowCount = 0
+    for batch in itertools.batched(rows, INSERT_BATCH_SIZE):
+        connection.execute(insert(table), list(batch))
+        rowCount += len(batch)
+    return rowCount
 
 
-def WriteRows(
-    context: JobContext, spec: LoaderSpec, rows: list[dict[str, object]], result: JobResult
-) -> None:
-    """Replace the table's rows and finish the ledger run, committing both together.
+def WriteRows(context: JobContext, spec: LoaderSpec, image: ImageStream) -> JobResult:
+    """Replace the table's rows with the image's, finish the ledger run, and commit together.
 
+    The rows are built from the stream and inserted in batches inside the transaction.
     Generated sort columns and audit timestamps are never in the rows: the database fills
-    them. No insert runs for an empty list, because SQLAlchemy would execute one default-valued
-    INSERT. Any error rolls back the delete, the inserts and the ledger write alike.
+    them. Any error, a malformed record found after earlier batches included, rolls back the
+    delete, every inserted batch and the ledger write alike. Returns the load's counts.
     """
+    rowBuilder = spec.rowBuilder or BuildPlainTableRows
     with context.engine.begin() as connection:
         connection.execute(DEFER_CONSTRAINTS_SQL)
         connection.execute(delete(spec.table))
-        if rows:
-            connection.execute(insert(spec.table), rows)
+        rowCount = InsertBatches(connection, spec.table, rowBuilder(image, context))
+        # Reads any records the builder left, so the whole image is framed and validated and
+        # skippedCount is final before commit; a builder yielding one row per record leaves none.
+        deque(image, maxlen=0)
+        counts = {ROWS_LOADED_KEY: rowCount, RECORDS_SKIPPED_KEY: image.skippedCount}
+        result = JobResult(EXIT_OK, counts)
         # Records nothing for a context bound to no run, as a loader called directly is.
         run_ledger.FinishAtomicRun(connection, context, result)
+    return result
 
 
 def ReplaceTable(context: JobContext, spec: LoaderSpec, imagePath: Path | None = None) -> JobResult:
     """Replace spec's table with the records of its image, atomically, and return the counts.
 
-    imagePath overrides the sample image, as dalytran's --daily-file does. The result carries
-    rows_loaded and records_skipped, and is recorded COMPLETED in the load's own transaction
-    when the context is bound to a run. Raises JobFailure(EXIT_FAILURE) for an unsupported
-    encoding, a missing or malformed image, or an integrity violation, leaving the table and
-    the ledger unchanged.
+    imagePath overrides the sample image, as dalytran's --daily-file does. The image is opened
+    before the transaction and streamed into the table inside it, INSERT_BATCH_SIZE rows at a
+    time. The result carries rows_loaded and records_skipped, and is recorded COMPLETED in the
+    load's own transaction when the context is bound to a run. Raises JobFailure(EXIT_FAILURE)
+    for an unsupported encoding, a missing image, a malformed record anywhere in the image, or
+    an integrity violation, leaving the table and the ledger unchanged.
     """
     sourcePath, encoding = ResolveSource(context, spec, imagePath)
-    with MappedLoadErrors(spec, sourcePath):
-        rows, skippedCount = ReadRows(context, spec, sourcePath, encoding)
-        counts = {ROWS_LOADED_KEY: len(rows), RECORDS_SKIPPED_KEY: skippedCount}
-        result = JobResult(EXIT_OK, counts)
-        WriteRows(context, spec, rows, result)
-    LOGGER.info(LOAD_COMPLETE_TEMPLATE, spec.dataset, len(rows), skippedCount)
+    with (
+        MappedLoadErrors(spec, sourcePath),
+        StreamImage(sourcePath, spec.layout, encoding, spec.primingCheck) as image,
+    ):
+        result = WriteRows(context, spec, image)
+    LOGGER.info(
+        LOAD_COMPLETE_TEMPLATE,
+        spec.dataset,
+        result.counts[ROWS_LOADED_KEY],
+        result.counts[RECORDS_SKIPPED_KEY],
+    )
     return result

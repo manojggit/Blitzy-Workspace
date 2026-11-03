@@ -32,14 +32,20 @@ from app.core.errors import (
     HTTP_FILE_ERROR,
     HTTP_NOT_FOUND,
     LegacyMessageError,
-    RecordLockError,
+    LogFileCondition,
     RepositoryError,
 )
-from app.core.locks import FileNotOpenError
 from app.repositories.user_repository import USER_FILE_NAME, UserRepository
 from app.schemas.users import UserDetailResponse, UserMessageResponse
 
 LOGGER = logging.getLogger(__name__)
+
+# WS-TRANID (line 37).
+TRANSACTION_ID = "CU03"
+# The CICS commands of READ-USER-SEC-FILE and DELETE-USER-SEC-FILE, as their logged file
+# conditions name them.
+READ_OPERATION = "READ"
+DELETE_OPERATION = "DELETE"
 
 # COUSR03C message literals, verbatim.
 USER_ID_EMPTY_MESSAGE = "User ID can NOT be empty..."
@@ -53,13 +59,6 @@ USER_DELETED_TEMPLATE = "User {userId} has been deleted ..."
 # Cursor targets: MOVE -1 TO USRIDINL (the user ID) and MOVE -1 TO FNAMEL (the first name).
 USER_ID_FIELD = "user_id"
 FIRST_NAME_FIELD = "first_name"
-
-# The WHEN OTHER ``DISPLAY 'RESP:' WS-RESP-CD 'REAS:' WS-REAS-CD`` of both file paragraphs.
-FILE_ERROR_LOG = "RESP:%d REAS:%d"
-
-# The USRSEC conditions online use expects and clears by retrying: the batch window's NOTOPEN
-# and a record another task holds. Any other condition is an I/O failure, logged as an error.
-EXPECTED_FILE_CONDITIONS = (FileNotOpenError, RecordLockError)
 
 
 def RequireUserId(userId: str) -> None:
@@ -77,17 +76,14 @@ def RequireUserId(userId: str) -> None:
         )
 
 
-def FileErrorOutcome(error: RepositoryError, message: str) -> LegacyMessageError:
+def FileErrorOutcome(error: RepositoryError, operation: str, message: str) -> LegacyMessageError:
     """Return the WHEN OTHER outcome of a USRSEC command: 503, ``message``, cursor first name.
 
-    The condition is logged as the source's RESP and REAS DISPLAY. The batch window's NOTOPEN
-    (FileNotOpenError), a record lock (RecordLockError) and an I/O error all arrive here. The
-    first two are EXPECTED_FILE_CONDITIONS, logged at WARNING; every other condition, an I/O
-    error (FileIoError) among them, is logged at ERROR.
+    The condition is logged as the source's RESP and REAS DISPLAY, with ``operation``, the CICS
+    command that failed. The batch window's NOTOPEN (FileNotOpenError), a record lock
+    (RecordLockError) and an I/O error all arrive here.
     """
-    isExpectedCondition = isinstance(error, EXPECTED_FILE_CONDITIONS)
-    logLevel = logging.WARNING if isExpectedCondition else logging.ERROR
-    LOGGER.log(logLevel, FILE_ERROR_LOG, error.resp, error.resp2)
+    LogFileCondition(LOGGER, TRANSACTION_ID, operation, error)
     return LegacyMessageError(message, field=FIRST_NAME_FIELD, httpStatus=HTTP_FILE_ERROR)
 
 
@@ -115,7 +111,7 @@ async def ReadUserSecFile(context: OnlineContext, userId: str) -> Mapping[str, A
     try:
         userRecord = await UserRepository(context).GetUser(userId)
     except RepositoryError as error:
-        raise FileErrorOutcome(error, UNABLE_TO_LOOKUP_USER_MESSAGE) from error
+        raise FileErrorOutcome(error, READ_OPERATION, UNABLE_TO_LOOKUP_USER_MESSAGE) from error
     if userRecord is None:
         raise LegacyMessageError(
             USER_NOT_FOUND_MESSAGE, field=USER_ID_FIELD, httpStatus=HTTP_NOT_FOUND
@@ -156,7 +152,7 @@ async def DeleteUserSecFile(context: OnlineContext, userId: str) -> int:
         async with WriteUnit(context.engine, USER_FILE_NAME) as unit:
             deletedCount = await repository.DeleteUser(unit, userId)
     except RepositoryError as error:
-        raise FileErrorOutcome(error, UNABLE_TO_UPDATE_USER_MESSAGE) from error
+        raise FileErrorOutcome(error, DELETE_OPERATION, UNABLE_TO_UPDATE_USER_MESSAGE) from error
     return deletedCount
 
 

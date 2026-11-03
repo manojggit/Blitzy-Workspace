@@ -68,6 +68,8 @@ CYCLES = Table(
     Column("closed_at", DateTime(timezone=True), nullable=True),
     ValueCheck("status", CYCLE_STATUSES),
     ValueCheck("opened_by", CYCLE_OPENERS),
+    # The OPEN-cycle lookups (FindOpenCycle, AbandonOpenCycle) read no closed cycles.
+    Index("ix_cycles_cycle_id_open", "cycle_id", postgresql_where=text("status = 'OPEN'")),
     schema=BATCH_SCHEMA,
     comment="One pass of the 18-step batch chain; replaces scheduler cycle state",
 )
@@ -94,6 +96,8 @@ JOB_RUNS = Table(
     ValueCheck("status", RUN_STATUSES),
     # Run history: any number of rows per (cycle_id, step_no), so the index is not unique.
     Index("ix_job_runs_cycle_id_step_no", "cycle_id", "step_no"),
+    # The RUNNING runs ClassifyInterruptedRuns reclassifies, found without reading run history.
+    Index("ix_job_runs_run_id_running", "run_id", postgresql_where=text("status = 'RUNNING'")),
     schema=BATCH_SCHEMA,
     comment="Batch run history, one row per job execution; replaces job condition codes",
 )
@@ -139,6 +143,22 @@ GDG_GENERATIONS = Table(
     ),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     ValueCheck("state", GENERATION_STATES),
+    # Rolled-off and abandoned rows stay as history, so each catalog lookup has a partial index.
+    # COMMITTED discovery (ReconcileCatalog) and a run's publication (PublishRunGenerations).
+    Index(
+        "ix_gdg_generations_run_id_committed",
+        "run_id",
+        postgresql_where=text("state = 'COMMITTED'"),
+    ),
+    # The LOST generations of a cycle's runs (CheckNoLostGenerations, AbandonOpenCycle).
+    Index("ix_gdg_generations_run_id_lost", "run_id", postgresql_where=text("state = 'LOST'")),
+    # A base's PUBLISHED generations newest first (ResolveGeneration, RollOff).
+    Index(
+        "ix_gdg_generations_base_name_generation_published",
+        "base_name",
+        "generation",
+        postgresql_where=text("state = 'PUBLISHED'"),
+    ),
     schema=BATCH_SCHEMA,
     comment="Catalog of GDG generation files; replaces the GDG bases of catlg/LISTCAT.txt",
 )

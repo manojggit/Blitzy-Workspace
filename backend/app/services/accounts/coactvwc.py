@@ -11,6 +11,7 @@ coactupc.py reuses ``ReadAccountChain``, ``AccountReadResult``, the not-found an
 message builders and ``FormatRespCode`` from here.
 """
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -24,6 +25,7 @@ from app.core.errors import (
     HTTP_NOT_FOUND,
     LegacyErrorDetails,
     LegacyMessageError,
+    LogFileCondition,
     RepositoryError,
 )
 from app.core.security import MaskSsn
@@ -31,6 +33,8 @@ from app.repositories.account_repository import ACCOUNT_FILE_NAME, AccountReposi
 from app.repositories.card_xref_repository import XREF_ACCOUNT_PATH_NAME, CardXrefRepository
 from app.repositories.customer_repository import CUSTOMER_FILE_NAME, CustomerRepository
 from app.schemas.accounts import AccountViewResponse
+
+LOGGER = logging.getLogger(__name__)
 
 # LIT-THISPGM and LIT-THISTRANID (lines 143-146).
 PROGRAM_NAME = "COACTVWC"
@@ -227,6 +231,8 @@ class AccountReadResult:
     ``acctFilterOk`` is False once FLG-ACCTFILTER-NOT-OK is set, which marks the account key
     as the failing field. ``customerFound`` replaces FOUND-CUST-IN-MASTER. Records are the
     repositories' column-name dictionaries, or None when not read or not found.
+    ``transactionId`` is the transaction running the chain (CAVW, or CAUP for COACTUPC), which
+    its logged file conditions name.
     """
 
     acctId: str
@@ -237,6 +243,7 @@ class AccountReadResult:
     httpStatus: int = HTTP_OK
     acctFilterOk: bool = True
     customerFound: bool = False
+    transactionId: str = TRANSACTION_ID
 
     def SetGuarded(self, message: str, httpStatus: int) -> None:
         """Set the message only while none is set: the NOTFND ``IF WS-RETURN-MSG-OFF`` guard."""
@@ -250,10 +257,13 @@ class AccountReadResult:
         self.httpStatus = httpStatus
 
 
-async def ReadAccountChain(context: OnlineContext, acctId: str) -> AccountReadResult:
+async def ReadAccountChain(
+    context: OnlineContext, acctId: str, transactionId: str = TRANSACTION_ID
+) -> AccountReadResult:
     """Port of 9000-READ-ACCT (lines 687-722): CXACAIX, then ACCTDAT, then CUSTDAT.
 
-    ``acctId`` is the validated 11-digit key. A failed cross-reference read ends the chain
+    ``acctId`` is the validated 11-digit key and ``transactionId`` the transaction whose file
+    conditions are logged (CAUP passes its own). A failed cross-reference read ends the chain
     (``IF FLG-ACCTFILTER-NOT-OK``). A failed account read does not: the
     DID-NOT-FIND-ACCT-IN-ACCTDAT test is dead because its SET is commented out (line 792), so
     the customer of the cross-reference is still read. After an account file error the request
@@ -264,7 +274,7 @@ async def ReadAccountChain(context: OnlineContext, acctId: str) -> AccountReadRe
     those branches are reached only with stubbed repositories. Only RepositoryError is caught;
     FileNotOpenError from the batch window is one.
     """
-    readResult = AccountReadResult(acctId=acctId)
+    readResult = AccountReadResult(acctId=acctId, transactionId=transactionId)
     await ReadXrefStep(context, readResult)
     if not readResult.acctFilterOk:
         return readResult
@@ -278,6 +288,7 @@ async def ReadXrefStep(context: OnlineContext, readResult: AccountReadResult) ->
     try:
         xref = await CardXrefRepository(context).GetXrefByAccount(readResult.acctId)
     except RepositoryError as error:
+        LogFileCondition(LOGGER, readResult.transactionId, FILE_ERROR_OPERATION_READ, error)
         readResult.acctFilterOk = False
         readResult.SetUnconditional(FileErrorFor(XREF_ACCOUNT_PATH_NAME, error), HTTP_FILE_ERROR)
         return
@@ -297,6 +308,7 @@ async def ReadAccountStep(context: OnlineContext, readResult: AccountReadResult)
     try:
         account = await AccountRepository(context).GetAccount(readResult.acctId)
     except RepositoryError as error:
+        LogFileCondition(LOGGER, readResult.transactionId, FILE_ERROR_OPERATION_READ, error)
         readResult.acctFilterOk = False
         readResult.SetUnconditional(FileErrorFor(ACCOUNT_FILE_NAME, error), HTTP_FILE_ERROR)
         await RecoverRequestSession(context.session)
@@ -318,6 +330,7 @@ async def ReadCustomerStep(context: OnlineContext, readResult: AccountReadResult
     try:
         customer = await CustomerRepository(context).GetCustomer(custId)
     except RepositoryError as error:
+        LogFileCondition(LOGGER, readResult.transactionId, FILE_ERROR_OPERATION_READ, error)
         readResult.SetUnconditional(FileErrorFor(CUSTOMER_FILE_NAME, error), HTTP_FILE_ERROR)
         return
     if customer is None:

@@ -12,8 +12,10 @@ which are the images the JCL loads, inside env.py's single migration transaction
 passwords are stored only as bcrypt hashes, and the TRANFILE priming record is skipped, so
 transactions starts empty. The seed runs only when APP_ENV is local or test, so the sample
 users never reach a production database, where the skip is logged as a warning, and never in
-offline mode (alembic upgrade --sql), which has no connection to load through. Revision 0008
-records a seeded database as the first batch cycle.
+offline mode (alembic upgrade --sql), which has no connection to load through. A completed seed
+leaves SEED_MARKER_COMMENT on the batch schema in the same transaction, and downgrade() clears
+it with the truncate. Revision 0008 reads that marker and records only a seed it finds as the
+first batch cycle.
 
 Revision ID: 0002
 Revises: 0001
@@ -55,6 +57,15 @@ TRUNCATE_DATASET_TABLES = (
     " transactions.transaction_category_balances, disclosure.disclosure_groups,"
     " reference.transaction_types, reference.transaction_categories"
 )
+
+# The seed-provenance marker: the batch schema's comment, which revision 0001 leaves unset and
+# nothing else sets. Revision 0008 holds a frozen copy and records the seed cycle only when the
+# schema carries it. Each statement is a complete static SQL literal, never formatted.
+SEED_MARKER_COMMENT = "CardDemo sample seed loaded by Alembic revision 0002"
+RECORD_SEED_MARKER_SQL = (
+    "COMMENT ON SCHEMA batch IS 'CardDemo sample seed loaded by Alembic revision 0002'"
+)
+CLEAR_SEED_MARKER_SQL = "COMMENT ON SCHEMA batch IS NULL"
 
 
 def ShouldSeed(settings: MigrationSettings) -> bool:
@@ -133,17 +144,31 @@ def LogSeedCounts(counts: dict[str, int]) -> None:
     LOGGER.info("sample seed loaded %s", tableCounts)
 
 
+def RecordSeedMarker() -> None:
+    """Mark the batch schema as holding the sample seed, in the seed's own transaction."""
+    op.execute(RECORD_SEED_MARKER_SQL)
+
+
+def ClearSeedMarker() -> None:
+    """Remove the seed marker from the batch schema, in the truncate's own transaction."""
+    op.execute(CLEAR_SEED_MARKER_SQL)
+
+
 def upgrade() -> None:
-    """Load the sample images when ShouldSeed allows it; otherwise log the skip and load nothing."""
+    """Load the sample images when ShouldSeed allows it; otherwise log the skip and load nothing.
+
+    Only a completed load leaves the seed marker: a failed one raises before it is written.
+    """
     settings = MigrationSettings()
     if not ShouldSeed(settings):
         LogSeedSkipped(settings, "sample seed")
         return
     LogSeedCounts(LoadImages(settings))
+    RecordSeedMarker()
 
 
 def downgrade() -> None:
-    """Empty the eleven dataset tables wherever upgrade() seeds them.
+    """Empty the eleven dataset tables wherever upgrade() seeds them, then clear the seed marker.
 
     The truncate is gated like the seed: where upgrade() loaded nothing (production, offline
     mode) the tables may hold real data the seed never wrote, so it is left in place.
@@ -153,3 +178,4 @@ def downgrade() -> None:
         LogSeedSkipped(settings, "sample seed truncate")
         return
     op.execute(TRUNCATE_DATASET_TABLES)
+    ClearSeedMarker()

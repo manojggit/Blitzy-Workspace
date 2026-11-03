@@ -2,19 +2,24 @@
 TRANTYPE, TRANCATG, DISCGRP, TCATBALF and DUSRSECJ; copybooks CVACT01Y, CVACT02Y, CVACT03Y,
 CVCUS01Y, CVTRA01Y, CVTRA02Y, CVTRA03Y, CVTRA04Y, CVTRA05Y, CVTRA06Y, CSUSR01Y.
 
-ReadImage is the only reader of the legacy seed images in data/EBCDIC and data/ASCII, and of
-the DALYTRAN daily file. It reads an image in place, never writes it, frames it into records,
-skips a priming record when the caller supplies a check, and decodes every other record by
-copybook offset through record_layouts.DecodeRecord, in file order:
+StreamImage is the only reader of the legacy seed images in data/EBCDIC and data/ASCII, and of
+the DALYTRAN daily file; ReadImage collects its records. It reads an image in place, never
+writes it, frames it into records, skips a priming record when the caller supplies a check, and
+decodes every other record by copybook offset through record_layouts.DecodeRecord, in file
+order:
 - EBCDIC images are fixed-length code page 037 records with no terminators, read one
     LRECL-byte record at a time.
 - ASCII images are CRLF-separated lines; the final terminator may be CRLF or a lone LF. They
     are read one line at a time, and a line too long for any record is measured in chunks.
     A line that lacks only its layout's trailing FILLER is padded with spaces.
-Only one record's raw bytes are held at a time; the decoded records are kept. Every length,
-terminator, charset or field problem raises ImageFormatError naming the file and the record.
-A framing problem anywhere in the image outranks a field problem in an earlier record. Records
-are never logged: USRSEC records carry plaintext passwords.
+Only one record's raw bytes are held at a time. StreamImage yields the decoded records one at a
+time and holds only the current one, so a batch loader's memory does not grow with the image;
+ReadImage keeps them all, for the sample seed. Every length, terminator, charset or field
+problem raises ImageFormatError naming the file and the record. A framing problem anywhere in
+the image outranks a field problem in an earlier record. A stream yields every record before
+the failing one and then raises, so a consumer that writes what it receives must do so in a
+transaction it can roll back. Records are never logged: USRSEC records carry plaintext
+passwords.
 
 The module is synchronous, imports no database or settings code, and reads no SECRET_KEY.
 """
@@ -22,7 +27,8 @@ The module is synchronous, imports no database or settings code, and reads no SE
 import os
 import stat
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BufferedReader
 from pathlib import Path
@@ -119,28 +125,103 @@ class ImageSource:
     encoding: str
 
 
-def ReadImage(
+class ImageStream:
+    """The decoded records of one open image, yielded lazily in file order, one at a time.
+
+    The stream is a single pass: every iteration continues the same one, and only the current
+    record is held. Priming records primingCheck accepts are skipped and counted in
+    skippedCount, which is final once iteration has ended. After the first field error the rest
+    of the image is only framed, never priming-checked or decoded, and the field error is raised
+    once framing reaches end of file without an error of its own.
+    """
+
+    def __init__(
+        self,
+        source: ImageSource,
+        rawRecords: Generator[bytes],
+        primingCheck: Callable[[bytes], bool] | None,
+    ) -> None:
+        self.skippedCount = 0
+        self._rawRecords = rawRecords
+        self._records = self._DecodeRecords(source, primingCheck)
+
+    def __iter__(self) -> Iterator[dict[str, object]]:
+        return self._records
+
+    def Close(self) -> None:
+        """End the stream, releasing its record generators; later iteration yields nothing."""
+        self._records.close()
+        self._rawRecords.close()
+
+    def _DecodeRecords(
+        self, source: ImageSource, primingCheck: Callable[[bytes], bool] | None
+    ) -> Generator[dict[str, object]]:
+        """Skip the raw records primingCheck accepts and yield the others decoded, in order."""
+        fieldError: ImageFormatError | None = None
+        for recordNumber, rawRecord in enumerate(self._rawRecords, start=1):
+            if primingCheck is not None and primingCheck(rawRecord):
+                self.skippedCount += 1
+                continue
+            try:
+                record = DecodeRawRecord(source, recordNumber, rawRecord)
+            except ImageFormatError as error:
+                fieldError = error
+                break
+            yield record
+        if fieldError is not None:
+            deque(self._rawRecords, maxlen=0)
+            raise fieldError
+
+
+@contextmanager
+def StreamImage(
     path: str | Path,
     layout: RecordLayout,
     encoding: str,
     primingCheck: Callable[[bytes], bool] | None = None,
-) -> ImageContents:
-    """Read and decode every record of the image at path, in file order.
+) -> Iterator[ImageStream]:
+    """Open the image at path and yield an ImageStream of its decoded records, in file order.
 
     A relative path resolves under the repository root, never the working directory. encoding
-    is ENCODING_EBCDIC or ENCODING_ASCII. The image is read one record at a time through its
-    RECORD_READERS entry, so only the decoded records accumulate. primingCheck, when given,
-    sees each record's raw bytes before any decoding; a record it accepts is skipped and
-    counted in skippedCount. Raises ImageFormatError for any file, framing or field problem,
-    and ValueError or TypeError for an unsupported encoding or a layout that is not a
-    RecordLayout, before the file is opened.
+    is ENCODING_EBCDIC or ENCODING_ASCII. Entering opens the image, so a file that cannot be
+    opened raises ImageFormatError, chained to the OSError, before the caller does any work;
+    ValueError or TypeError for an unsupported encoding or a layout that is not a RecordLayout
+    is raised before that. The image is then read one record at a time through its
+    RECORD_READERS entry as the stream is iterated; primingCheck, when given, sees each record's
+    raw bytes before any decoding. Iteration raises ImageFormatError for any read, framing or
+    field problem. Leaving the context closes the stream and the file.
     """
     _RequireEncoding(encoding)
     if not isinstance(layout, RecordLayout):
         raise TypeError(f"layout must be a RecordLayout, not {type(layout).__name__}")
     source = ImageSource(ResolveRepoPath(path), layout, encoding)
     with _ImageIo(source.path, lambda: source.path.open("rb")) as image:
-        return _CollectRecords(source, RECORD_READERS[encoding](source, image), primingCheck)
+        stream = ImageStream(source, RECORD_READERS[encoding](source, image), primingCheck)
+        try:
+            yield stream
+        finally:
+            stream.Close()
+
+
+def ReadImage(
+    path: str | Path,
+    layout: RecordLayout,
+    encoding: str,
+    primingCheck: Callable[[bytes], bool] | None = None,
+) -> ImageContents:
+    """Read and decode every record of the image at path, in file order, and keep them all.
+
+    A relative path resolves under the repository root, never the working directory. encoding
+    is ENCODING_EBCDIC or ENCODING_ASCII. The image is read through StreamImage, one record at
+    a time, so only the decoded records accumulate. primingCheck, when given, sees each
+    record's raw bytes before any decoding; a record it accepts is skipped and counted in
+    skippedCount. Raises ImageFormatError for any file, framing or field problem, and
+    ValueError or TypeError for an unsupported encoding or a layout that is not a
+    RecordLayout, before the file is opened.
+    """
+    with StreamImage(path, layout, encoding, primingCheck) as stream:
+        records = tuple(stream)
+    return ImageContents(records, stream.skippedCount)
 
 
 def SampleImagePath(sourceDir: str | Path, dataset: str, encoding: str) -> tuple[Path, str]:
@@ -173,7 +254,7 @@ def IsTranfilePrimingRecord(rawRecordBytes: bytes) -> bool:
     return rawRecordBytes[:TRANFILE_PRIMING_NUL_LENGTH] == TRANFILE_PRIMING_PREFIX
 
 
-def ReadEbcdicRecords(source: ImageSource, image: BufferedReader) -> Iterator[bytes]:
+def ReadEbcdicRecords(source: ImageSource, image: BufferedReader) -> Generator[bytes]:
     """Yield the LRECL-byte records of a terminator-free fixed-length image, one read each.
 
     A regular file's size is checked against the layout's LRECL before the first record is
@@ -195,7 +276,7 @@ def ReadEbcdicRecords(source: ImageSource, image: BufferedReader) -> Iterator[by
         yield rawRecord
 
 
-def ReadAsciiRecords(source: ImageSource, image: BufferedReader) -> Iterator[bytes]:
+def ReadAsciiRecords(source: ImageSource, image: BufferedReader) -> Generator[bytes]:
     """Yield the records of a CRLF-separated image, checked by CheckAsciiRecord, line by line.
 
     Exactly one terminator, CRLF or a lone LF, is removed at end of file, and a file without a
@@ -262,35 +343,6 @@ def _ImageIo[ResultT](path: Path, operation: Callable[[], ResultT]) -> ResultT:
     except OSError as error:
         reason = f"cannot read image: {error.strerror or error}"
         raise ImageFormatError(path, 0, reason) from error
-
-
-def _CollectRecords(
-    source: ImageSource,
-    rawRecords: Iterator[bytes],
-    primingCheck: Callable[[bytes], bool] | None,
-) -> ImageContents:
-    """Skip the raw records primingCheck accepts and decode the others, in file order.
-
-    A framing problem anywhere in the image outranks a field problem in an earlier record: after
-    the first field error the rest of the image is only framed, never priming-checked, decoded
-    or kept, and the field error is raised once framing reaches end of file without an error.
-    """
-    records: list[dict[str, object]] = []
-    skippedCount = 0
-    fieldError: ImageFormatError | None = None
-    for recordNumber, rawRecord in enumerate(rawRecords, start=1):
-        if primingCheck is not None and primingCheck(rawRecord):
-            skippedCount += 1
-            continue
-        try:
-            records.append(DecodeRawRecord(source, recordNumber, rawRecord))
-        except ImageFormatError as error:
-            fieldError = error
-            break
-    if fieldError is not None:
-        deque(rawRecords, maxlen=0)
-        raise fieldError
-    return ImageContents(tuple(records), skippedCount)
 
 
 def _RequireWholeRecords(source: ImageSource, size: int) -> None:
@@ -368,8 +420,8 @@ def _AsciiLengthReason(layout: RecordLayout, length: int) -> str:
     return reason
 
 
-# The per-encoding record iterators ReadImage drives over the open image.
-RECORD_READERS: dict[str, Callable[[ImageSource, BufferedReader], Iterator[bytes]]] = {
+# The per-encoding record iterators StreamImage drives over the open image.
+RECORD_READERS: dict[str, Callable[[ImageSource, BufferedReader], Generator[bytes]]] = {
     ENCODING_EBCDIC: ReadEbcdicRecords,
     ENCODING_ASCII: ReadAsciiRecords,
 }

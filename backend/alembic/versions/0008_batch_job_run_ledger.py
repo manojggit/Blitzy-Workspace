@@ -3,10 +3,14 @@
 Replaces: CA-7 and Control-M job tracking and condition codes (scheduler/CardDemo.ca7,
     scheduler/CardDemo.controlm) and the JES job history of the CardDemo batch chain.
 
-- ``batch.cycles``: one row per pass of the 18-step chain, OPEN until step 18 completes.
+- ``batch.cycles``: one row per pass of the 18-step chain, OPEN until step 18 completes. The
+  partial index ix_cycles_cycle_id_open covers only OPEN rows, so finding or abandoning the
+  OPEN cycle reads no closed history.
 - ``batch.job_runs``: run history, one row per job execution with its status, exit code and
   counts. Any number of rows may share a (cycle_id, step_no), so ix_job_runs_cycle_id_step_no
-  is deliberately not unique.
+  is deliberately not unique. The partial index ix_job_runs_run_id_running covers only RUNNING
+  rows, so classifying interrupted runs at the start of every command reads no finished runs.
+  Neither partial index is unique.
 - ``batch.cycle_steps``: the authoritative state of each (cycle_id, step_no) identity and its
   last run. The two TRANBKP occurrences are steps 6 and 15, so each has its own identity.
 
@@ -16,9 +20,13 @@ nothing from app or batch, so it keeps creating exactly these tables as the mode
 
 When revision 0002 seeded the dataset tables, the seed is recorded as the first cycle: OPEN,
 opened by SEED, with one COMPLETED run for each seeded loader (steps 1-5 and 7-12) and steps 6
-and 13-18 PENDING, so ``carddemo-batch run-all`` resumes at the first TRANBKP. Under
-APP_ENV=production, and in offline mode (``alembic upgrade --sql``), nothing was seeded or
-nothing can be counted, so the three tables are created empty.
+and 13-18 PENDING, so ``carddemo-batch run-all`` resumes at the first TRANBKP. Revision 0002
+proves its seed by the marker it leaves as the batch schema's comment in the seed's own
+transaction; rows alone prove nothing, since tables can be filled without it. The cycle is
+recorded only when that marker is present and accounts.accounts still holds rows. Under
+APP_ENV=production, where 0002 loads nothing and leaves no marker whatever the tables hold, and
+in offline mode (``alembic upgrade --sql``), where nothing can be read, the three tables are
+created empty.
 
 Revision ID: 0008
 Revises: 0007
@@ -49,6 +57,14 @@ CYCLES_TABLE = "cycles"
 JOB_RUNS_TABLE = "job_runs"
 CYCLE_STEPS_TABLE = "cycle_steps"
 JOB_RUNS_STEP_INDEX = "ix_job_runs_cycle_id_step_no"
+
+# Partial indexes of the active states every command looks up, with the exact predicate texts of
+# app.models.support_tables. Each predicate is a complete static SQL literal, never formatted from
+# variables; each name passes through op.f(), so the naming convention keeps it as written.
+OPEN_CYCLE_INDEX = "ix_cycles_cycle_id_open"
+OPEN_CYCLE_PREDICATE = "status = 'OPEN'"
+RUNNING_RUN_INDEX = "ix_job_runs_run_id_running"
+RUNNING_RUN_PREDICATE = "status = 'RUNNING'"
 
 CYCLES_COMMENT = "One pass of the 18-step batch chain; replaces scheduler cycle state"
 JOB_RUNS_COMMENT = "Batch run history, one row per job execution; replaces job condition codes"
@@ -166,10 +182,23 @@ ROWS_LOADED_COUNT = "rows_loaded"
 # The 18 chain steps; the cycle_steps rows of a cycle are created when it opens.
 CHAIN_STEP_NUMBERS = range(1, 19)
 
-# Revision 0002 loads every dataset table in one atomic transaction, so a populated
-# accounts.accounts means the whole seed is present.
+# Frozen copy of revision 0002's SEED_MARKER_COMMENT, which 0002 sets as the batch schema's
+# comment in the transaction that loads the seed, and only then. The query is static and bound.
+SEED_MARKER_COMMENT = "CardDemo sample seed loaded by Alembic revision 0002"
+SCHEMA_COMMENT_QUERY = sa.text(
+    "SELECT pg_catalog.obj_description(n.oid, 'pg_namespace')"
+    " FROM pg_catalog.pg_namespace AS n WHERE n.nspname = :schemaName"
+)
+
+# The marker proves 0002 loaded the seed; the probe proves the seed is still there. Revision 0002
+# loads every dataset table in one atomic transaction, so a populated accounts.accounts under the
+# marker means the whole seed is present.
 SEED_PROBE_SCHEMA = "accounts"
 SEED_PROBE_TABLE = "accounts"
+NO_SEED_MARKER_REASON = (
+    "the batch schema has no seed marker, so revision 0002 loaded no sample data"
+)
+EMPTIED_SEED_REASON = "revision 0002's seed marker is present but accounts.accounts holds no rows"
 
 
 class SeededLoaderStep(NamedTuple):
@@ -266,7 +295,7 @@ def BuildForeignKeys(
 
 
 def CreateCyclesTable() -> None:
-    """Create batch.cycles: BIGSERIAL key pk_cycles, its two value checks and its comment."""
+    """Create batch.cycles: key pk_cycles, two value checks, comment and the OPEN-cycle index."""
     op.create_table(
         CYCLES_TABLE,
         *BuildColumns(CYCLES_COLUMNS),
@@ -275,13 +304,20 @@ def CreateCyclesTable() -> None:
         schema=BATCH_SCHEMA,
         comment=CYCLES_COMMENT,
     )
+    op.create_index(
+        op.f(OPEN_CYCLE_INDEX),
+        CYCLES_TABLE,
+        ["cycle_id"],
+        schema=BATCH_SCHEMA,
+        postgresql_where=sa.text(OPEN_CYCLE_PREDICATE),
+    )
 
 
 def CreateJobRunsTable() -> None:
-    """Create batch.job_runs with pk_job_runs, its cycle key, status check and step index.
+    """Create batch.job_runs: pk_job_runs, cycle key, status check, step and RUNNING-run indexes.
 
-    The index name is passed through op.f(): the convention alone would name it after the first
-    column only, ix_job_runs_cycle_id.
+    The index names are passed through op.f(): the convention alone would name each after its
+    first column only, ix_job_runs_cycle_id and ix_job_runs_run_id.
     """
     op.create_table(
         JOB_RUNS_TABLE,
@@ -294,6 +330,13 @@ def CreateJobRunsTable() -> None:
     )
     op.create_index(
         op.f(JOB_RUNS_STEP_INDEX), JOB_RUNS_TABLE, ["cycle_id", "step_no"], schema=BATCH_SCHEMA
+    )
+    op.create_index(
+        op.f(RUNNING_RUN_INDEX),
+        JOB_RUNS_TABLE,
+        ["run_id"],
+        schema=BATCH_SCHEMA,
+        postgresql_where=sa.text(RUNNING_RUN_PREDICATE),
     )
 
 
@@ -316,9 +359,26 @@ def CountRows(connection: sa.Connection, schemaName: str, tableName: str) -> int
     return connection.execute(countStatement).scalar_one()
 
 
+def SeedMarkerPresent(connection: sa.Connection) -> bool:
+    """Return True when the batch schema's comment is revision 0002's seed marker."""
+    schemaComment = connection.execute(
+        SCHEMA_COMMENT_QUERY, {"schemaName": BATCH_SCHEMA}
+    ).scalar_one_or_none()
+    return schemaComment == SEED_MARKER_COMMENT
+
+
 def SeedWasLoaded(connection: sa.Connection) -> bool:
-    """Return True when revision 0002 seeded the dataset tables, judged by accounts.accounts."""
+    """Return True when revision 0002's seed marker is present and accounts.accounts has rows."""
+    if not SeedMarkerPresent(connection):
+        return False
     return CountRows(connection, SEED_PROBE_SCHEMA, SEED_PROBE_TABLE) > 0
+
+
+def SeedSkipReason(connection: sa.Connection) -> str:
+    """Return why SeedWasLoaded is False: no seed marker, or a marked seed since emptied."""
+    if SeedMarkerPresent(connection):
+        return EMPTIED_SEED_REASON
+    return NO_SEED_MARKER_REASON
 
 
 def InsertSeedCycle(connection: sa.Connection) -> int:
@@ -376,15 +436,17 @@ def InsertCycleSteps(
 def RecordSeedCycle() -> None:
     """Record revision 0002's seed as the OPEN batch cycle, when a seed was loaded.
 
-    Offline mode has no connection to count rows through, and a database that 0002 left empty
-    (APP_ENV=production) has no seed to record, so both leave the ledger empty.
+    Offline mode has no connection to read through. A database without 0002's seed marker
+    (0002 skipped under APP_ENV=production or offline, whatever rows the tables hold) or whose
+    marked seed has since been emptied has no seed to record. Each leaves the ledger empty and
+    logs why.
     """
     if context.is_offline_mode():
         LOGGER.info("seed cycle skipped: offline mode has no connection to the tables")
         return
     connection = op.get_bind()
     if not SeedWasLoaded(connection):
-        LOGGER.info("seed cycle skipped: accounts.accounts holds no seeded rows")
+        LOGGER.info("seed cycle skipped: %s", SeedSkipReason(connection))
         return
     cycleId = InsertSeedCycle(connection)
     runIdsByStep = {
@@ -404,8 +466,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Drop the three ledger tables child-first; any seed-cycle rows go with them."""
+    """Drop the three ledger tables and their indexes child-first; any seed-cycle rows go too."""
     op.drop_table(CYCLE_STEPS_TABLE, schema=BATCH_SCHEMA)
+    op.drop_index(op.f(RUNNING_RUN_INDEX), table_name=JOB_RUNS_TABLE, schema=BATCH_SCHEMA)
     op.drop_index(op.f(JOB_RUNS_STEP_INDEX), table_name=JOB_RUNS_TABLE, schema=BATCH_SCHEMA)
     op.drop_table(JOB_RUNS_TABLE, schema=BATCH_SCHEMA)
+    op.drop_index(op.f(OPEN_CYCLE_INDEX), table_name=CYCLES_TABLE, schema=BATCH_SCHEMA)
     op.drop_table(CYCLES_TABLE, schema=BATCH_SCHEMA)

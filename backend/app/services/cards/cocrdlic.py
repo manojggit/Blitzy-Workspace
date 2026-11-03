@@ -14,6 +14,7 @@ lists alike (ported unchanged). The Style B reset of the COMMAREA user type to U
 superseded by the session identity. CARDDAT is no batch-window file, so CCLI lists during batch.
 """
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -26,6 +27,7 @@ from app.core.errors import (
     HTTP_FILE_ERROR,
     LegacyErrorDetails,
     LegacyMessageError,
+    LogFileCondition,
     RepositoryError,
 )
 from app.core.security import DecodeCardRef, EncodeCardRef, MaskCardNumber
@@ -62,6 +64,17 @@ from app.services.cards.cocrdslc import (
 if TYPE_CHECKING:
     # Type-only: the Settings that OnlineContext.settings carries and the token codecs expect.
     from app.core.config import Settings
+
+LOGGER = logging.getLogger(__name__)
+
+# LIT-THISTRANID (lines 181-182).
+TRANSACTION_ID = "CCLI"
+# The CICS commands of the 9000-READ-FORWARD and 9100-READ-BACKWARDS browses, which one
+# repository call runs, as their logged file conditions name them.
+BROWSE_OPERATIONS = {
+    BROWSE_FORWARD: "STARTBR/READNEXT",
+    BROWSE_BACKWARD: "STARTBR/READPREV",
+}
 
 # WS-MAX-SCREEN-LINES (lines 177-178).
 PAGE_SIZE = 7
@@ -363,6 +376,7 @@ async def BrowseOrRaise(
             filters, startCard or None, direction, PAGE_SIZE
         )
     except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, BROWSE_OPERATIONS[direction], error)
         raise FileErrorOf(error) from error
 
 

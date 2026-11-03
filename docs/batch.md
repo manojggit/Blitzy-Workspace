@@ -507,7 +507,8 @@ The module's interface:
 - `ResolveGeneration(base, relative)`: resolves `(0)` or `(-n)`, counting `PUBLISHED` rows only.
     It refuses a base with a `LOST` row in the `OPEN` cycle.
 - `RollOff(base, limit=5)`: applies retention.
-- `ReconcileCatalog()`: completes or condemns interrupted publications.
+- `ReconcileCatalog()`: completes or condemns interrupted publications, then completes
+    interrupted retention for every base.
 
 ### Recovery
 
@@ -518,7 +519,15 @@ interrupted runs are classified and before any resolution, skip or retention:
 - a `COMMITTED` row whose `.part` file exists with the right hash has the file renamed, then
     becomes `PUBLISHED`;
 - any other `COMMITTED` row becomes `LOST`;
-- a `.part` file with no catalog row, left by a crash before commit, is deleted.
+- a `.part` file with no catalog row, left by a crash before commit, is deleted;
+- `LIMIT 5` retention ([Retention](#retention-and-the-scratch-conflict)) is applied to every
+    base, whether or not it gained a generation in this call;
+- the final file of a `ROLLED_OFF` generation of a `SCRATCH` base is deleted. TRANSACT.BKUP
+    files are kept.
+
+An interruption between publication and retention, or between `ROLLED_OFF` and the deletion of
+the file, is therefore completed by the next command. Each step finds nothing to do once the
+catalog is consistent, so running it again changes nothing.
 
 ### Lost generations
 
@@ -551,6 +560,12 @@ When a sixth generation is published, the oldest `PUBLISHED` one is rolled off:
     becomes `ROLLED_OFF`;
 - for TRANSACT.BKUP (`NOSCRATCH`), the row becomes `ROLLED_OFF`, so the generation is no longer
     resolvable, and the file is kept.
+
+The `ROLLED_OFF` state commits before a `SCRATCH` file is deleted, so an interruption never
+leaves a resolvable generation without its file. `gdg.ReconcileCatalog()` completes retention
+([Recovery](#recovery)): after a crash once a sixth generation is published, or before a
+rolled-off file is deleted, the next command rolls off and deletes what remains. TRANSACT.BKUP
+files are still kept.
 
 ## Batch window
 

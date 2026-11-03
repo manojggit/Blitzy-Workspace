@@ -37,6 +37,7 @@ from app.core.errors import (
     DuplicateKeyError,
     LegacyErrorDetails,
     LegacyMessageError,
+    LogFileCondition,
     RecordNotFoundError,
     RepositoryError,
 )
@@ -48,6 +49,17 @@ from app.utils.decimal_utils import COBOL_CONTEXT, StoreInto
 from app.utils.record_layouts import TIMESTAMP_FORMAT_SPACE
 
 LOGGER = logging.getLogger(__name__)
+
+# WS-TRANID (line 38).
+TRANSACTION_ID = "CB00"
+# The CICS commands of READ-ACCTDAT-FILE, UPDATE-ACCTDAT-FILE, READ-CXACAIX-FILE, the
+# STARTBR/READPREV of the TRAN-ID allocation and WRITE-TRANSACT-FILE, as their logged file
+# conditions name them.
+READ_UPDATE_OPERATION = "READ UPDATE"
+REWRITE_OPERATION = "REWRITE"
+READ_OPERATION = "READ"
+BROWSE_BACKWARD_OPERATION = "STARTBR/READPREV"
+WRITE_OPERATION = "WRITE"
 
 # The WS-MESSAGE literals, verbatim (source lines in brackets).
 ACCT_ID_EMPTY_MESSAGE = "Acct ID can NOT be empty..."  # [161]
@@ -109,10 +121,6 @@ CURRENT_BALANCE_BODY_KEY = "current_balance"
 # The status of a screen sent without ERR-FLG set; anything from 400 up is a legacy error body.
 HTTP_OK = 200
 ERROR_STATUS_FLOOR = 400
-
-# Replaces DISPLAY 'RESP:' WS-RESP-CD 'REAS:' WS-REAS-CD of the WHEN OTHER branches. A file
-# condition carries only the file name and the codes, never a card number.
-FILE_CONDITION_LOG = "CB00 file %s condition RESP:%s REAS:%s"
 
 
 @dataclass
@@ -209,20 +217,15 @@ def HandleAccountUnitError(state: PaymentState, error: RepositoryError) -> None:
         LegacyMessageError: 503 ``Unable to lookup Account...`` for a failed read.
     """
     if not state.rewriteStarted:
-        LogFileCondition(error)
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_UPDATE_OPERATION, error)
         raise ScreenError(
             ACCOUNT_LOOKUP_FAILED_MESSAGE, CURSOR_ACCT_ID, HTTP_FILE_ERROR, None
         ) from error
     if isinstance(error, RecordNotFoundError):
         RecordMessage(state, ACCOUNT_NOT_FOUND_MESSAGE, HTTP_NOT_FOUND)
         return
-    LogFileCondition(error)
+    LogFileCondition(LOGGER, TRANSACTION_ID, REWRITE_OPERATION, error)
     RecordMessage(state, UPDATE_ACCOUNT_FAILED_MESSAGE, HTTP_FILE_ERROR)
-
-
-def LogFileCondition(error: RepositoryError) -> None:
-    """Log a WHEN OTHER file condition: the file name, RESP and RESP2 only."""
-    LOGGER.warning(FILE_CONDITION_LOG, error.fileName, error.resp, error.resp2)
 
 
 async def ReadAccountForUpdate(
@@ -289,7 +292,7 @@ async def LookupXref(context: OnlineContext, state: PaymentState) -> None:
     try:
         xref = await CardXrefRepository(context).GetXrefByAccount(state.acctId)
     except RepositoryError as error:
-        LogFileCondition(error)
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         RecordMessage(state, XREF_LOOKUP_FAILED_MESSAGE, HTTP_FILE_ERROR)
         return
     if xref is None:
@@ -328,13 +331,13 @@ def HandleTransactionWriteError(state: PaymentState, error: RepositoryError) -> 
         # READPREV WHEN OTHER leaves TRAN-ID at the HIGH-VALUES of line 212, so the ADD 1 TO
         # WS-TRAN-ID-NUM of lines 216-217 meets non-numeric data and abends the task before
         # lines 218-235 run: nothing is written and this is the only literal sent.
-        LogFileCondition(error)
+        LogFileCondition(LOGGER, TRANSACTION_ID, BROWSE_BACKWARD_OPERATION, error)
         RecordMessage(state, TRANSACTION_LOOKUP_FAILED_MESSAGE, HTTP_FILE_ERROR)
         return False
     if isinstance(error, DuplicateKeyError):
         RecordMessage(state, TRAN_ID_EXISTS_MESSAGE, HTTP_RECORD_CHANGED)
         return True
-    LogFileCondition(error)
+    LogFileCondition(LOGGER, TRANSACTION_ID, WRITE_OPERATION, error)
     RecordMessage(state, ADD_PAYMENT_FAILED_MESSAGE, HTTP_FILE_ERROR)
     return True
 
