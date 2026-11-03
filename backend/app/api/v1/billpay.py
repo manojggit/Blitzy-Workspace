@@ -16,12 +16,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 
-from app.api.v1 import LegacyErrorResponses
+from app.api.v1 import LegacyErrorResponses, SessionFirstRoute
 from app.core.dependencies import GetRegularContext, OnlineContext
 from app.schemas.billpay import BillPayRequest, BillPayResponse
 from app.services.billpay import cobil00c
 
-ROUTER = APIRouter(prefix="/billpay", tags=["billpay"])
+ROUTER = APIRouter(prefix="/billpay", tags=["billpay"], route_class=SessionFirstRoute)
 
 PAY_BILL_DESCRIPTION = (
     "Shows the account's current balance and asks for Y/N confirmation. On Y, records a"

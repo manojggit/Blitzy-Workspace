@@ -287,17 +287,22 @@ function TranIdFor(rowNumber: number): string {
     return String(rowNumber).padStart(16, "0");
 }
 
-function TranIdsFrom(firstRowNumber: number): string[] {
-    return RowNumbersFrom(firstRowNumber).map(TranIdFor);
+// TAMTnnn as the server serialises TRAN-AMT, a signed decimal string with two decimals: negative
+// on odd rows, so both signs are shown.
+function AmountFor(rowNumber: number): string {
+    const sign = rowNumber % 2 === 1 ? "-" : "";
+    return `${sign}${rowNumber}.${String(rowNumber).padStart(2, "0")}`;
 }
 
-// One COTRN00 row as the server sends it: TRNIDnn, TDATEnn (MM/DD/YY), TDESCnn and TAMTnnn.
+// One COTRN00 row as the server sends it: TRNIDnn, TDATEnn (MM/DD/YY), TDESCnn (at most 26
+// characters) and TAMTnnn. Every cell value differs from the row's other cells and from every
+// other row's, so a cell bound to the wrong property or left blank fails.
 function BuildRow(rowNumber: number): TransactionListRow {
     return {
         tran_id: TranIdFor(rowNumber),
-        tran_date: "06/10/22",
+        tran_date: `06/${String(rowNumber).padStart(2, "0")}/22`,
         tran_desc: `Purchase at merchant ${rowNumber}`,
-        tran_amt: `${rowNumber}.50`,
+        tran_amt: AmountFor(rowNumber),
     };
 }
 
@@ -377,10 +382,26 @@ function SelectionField(rowNumber: number): HTMLElement {
     return screen.getByRole("combobox", { name: `Selection for row ${rowNumber}` });
 }
 
-// The Transaction ID cell of every body row, in screen order.
-function ShownTranIds(): string[] {
+// The TRNIDnn, TDATEnn, TDESCnn and TAMTnnn cells after the Sel cell of every body row, in
+// screen order.
+function ShownRows(): TransactionListRow[] {
     const bodyRows = screen.getAllByRole("row").slice(1);
-    return bodyRows.map((row) => within(row).getAllByRole("cell")[1]?.textContent ?? "");
+    return bodyRows.map((row) => {
+        const cellTexts = within(row)
+            .getAllByRole("cell")
+            .map((cell) => cell.textContent ?? "");
+        return {
+            tran_id: cellTexts[1] ?? "",
+            tran_date: cellTexts[2] ?? "",
+            tran_desc: cellTexts[3] ?? "",
+            tran_amt: cellTexts[4] ?? "",
+        };
+    });
+}
+
+// The ten rows from firstRowNumber are shown, every cell as the server sent it.
+function ExpectShownRows(firstRowNumber: number): void {
+    expect(ShownRows()).toEqual(BuildRows(firstRowNumber));
 }
 
 // A legend key pressed through its FunctionKeyBar button or as the physical key.
@@ -593,7 +614,7 @@ describe("COTRN00C first entry on /transactions", () => {
         expect(screen.getByRole("heading", { level: 1, name: SCREEN_TITLE })).toBeVisible();
         expect(screen.getByText("Tran: CT00")).toBeVisible();
         expect(screen.getByText("Prog: COTRN00C")).toBeVisible();
-        expect(ShownTranIds()).toEqual(TranIdsFrom(1));
+        ExpectShownRows(1);
         expect(screen.getByText("Page:")).toBeVisible();
         expect(screen.getByText("1")).toBeVisible();
         expect(screen.queryByRole("alert")).toBeNull();
@@ -651,7 +672,7 @@ describe("COTRN00C ENTER with a non-numeric search key", () => {
             await PressKey(user, "ENTER", "button");
             await ExpectAlert(NUMERIC_SEARCH, "error");
             ExpectSearchOnlyRequest(searchKey);
-            expect(ShownTranIds()).toEqual(TranIdsFrom(1));
+            ExpectShownRows(1);
             expect(screen.getByText("1")).toBeVisible();
             expect(SearchField()).toHaveAttribute("aria-invalid", "true");
             expect(SearchField()).toHaveFocus();
@@ -675,7 +696,7 @@ describe("COTRN00C ENTER answered 400 with an invalid selection code", () => {
         await user.type(SearchField(), SEARCH_KEY);
         await PressKey(user, "ENTER", "button");
         await ExpectAlert(INVALID_SELECTION, "error");
-        expect(ShownTranIds()).toEqual(TranIdsFrom(FOUND_FIRST_ROW_NUMBER));
+        ExpectShownRows(FOUND_FIRST_ROW_NUMBER);
         expect(screen.getByText("1")).toBeVisible();
         expect(SearchField()).toHaveAttribute("aria-invalid", "true");
         expect(SearchField()).toHaveFocus();
@@ -726,7 +747,7 @@ describe("COTRN00C ENTER browses from the search key", () => {
             await PressKey(user, "ENTER", "button");
             await screen.findByText(TranIdFor(FOUND_FIRST_ROW_NUMBER + PAGE_SIZE - 1));
             ExpectSearchOnlyRequest(searchKey);
-            expect(ShownTranIds()).toEqual(TranIdsFrom(FOUND_FIRST_ROW_NUMBER));
+            ExpectShownRows(FOUND_FIRST_ROW_NUMBER);
             expect(mockRouterPush).not.toHaveBeenCalled();
         },
     );
@@ -744,7 +765,7 @@ describe("COTRN00C F7 and F8 paging", () => {
             await screen.findByText(TranIdFor(20));
             expect(mockListTransactions).toHaveBeenCalledTimes(2);
             expect(mockListTransactions).toHaveBeenLastCalledWith(query, READ_OPTIONS);
-            expect(ShownTranIds()).toEqual(TranIdsFrom(11));
+            ExpectShownRows(11);
             expect(screen.getByText("2")).toBeVisible();
         },
     );
@@ -758,7 +779,7 @@ describe("COTRN00C ERRMSG literals", () => {
             MockKeyOutcome(literalCase);
             await PressKey(user, literalCase.key, "button");
             await ExpectAlert(literalCase.literal, "error");
-            expect(ShownTranIds()).toEqual(TranIdsFrom(1));
+            ExpectShownRows(1);
             expect(mockRouterPush).not.toHaveBeenCalled();
         },
     );
@@ -767,7 +788,7 @@ describe("COTRN00C ERRMSG literals", () => {
         mockListTransactions.mockResolvedValueOnce(BuildListResponse({ message: REACHED_BOTTOM }));
         RenderScreen();
         await ExpectAlert(REACHED_BOTTOM, "error");
-        expect(ShownTranIds()).toEqual(TranIdsFrom(1));
+        ExpectShownRows(1);
     });
 });
 
@@ -884,7 +905,7 @@ describe("COTRN00C F3 while a request is out", () => {
             resolve(PENDING_ANSWER);
             await new Promise((resolveTick) => setTimeout(resolveTick, 0));
         });
-        expect(ShownTranIds()).toEqual(TranIdsFrom(1));
+        ExpectShownRows(1);
         expect(mockRouterPush).toHaveBeenCalledTimes(1);
     });
 });
@@ -911,7 +932,7 @@ describe("COTRN00C TRNIDIN error mark and cursor", () => {
         await ExpectAlert(LOOKUP_FAILED, "error");
         expect(SearchField()).toHaveAttribute("aria-invalid", "true");
         expect(SearchField()).toHaveFocus();
-        expect(ShownTranIds()).toEqual(TranIdsFrom(1));
+        ExpectShownRows(1);
     });
 });
 
@@ -1030,7 +1051,7 @@ describe("COTRN00C cancelled read", () => {
             await FlushPendingAnswers();
             expect(mockListTransactions).toHaveBeenCalledTimes(2);
             expect(screen.queryByRole("alert")).toBeNull();
-            expect(ShownTranIds()).toEqual(TranIdsFrom(1));
+            ExpectShownRows(1);
             ExpectRequestKeysDisabled(false);
             mockListTransactions.mockResolvedValueOnce(BuildListResponse(LATEST_PAGE));
             await PressKey(user, key, "button");

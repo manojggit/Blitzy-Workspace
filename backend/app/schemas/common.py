@@ -270,6 +270,57 @@ class LegacyErrorResponse(ScreenFeedback):
     message: str = Field(description="The program's message literal for the outcome, verbatim.")
 
 
+class ValidationErrorDetail(BaseModel):
+    """One item of the ``detail`` list of a 422 body: where the request is malformed, and how.
+
+    ``app.core.errors.SanitisedDetail`` keeps only these three keys of FastAPI's validation
+    error, so the rejected input, which may be a password, card number or SSN, is never echoed.
+    """
+
+    loc: list[str | int] = Field(
+        description=(
+            "FastAPI's error location: the request part (body, query or path), followed by the "
+            "field name, list index or JSON decode position."
+        ),
+    )
+    msg: str = Field(
+        description="FastAPI's error message, for example String should have at most 8 characters."
+    )
+    type: str = Field(
+        description="FastAPI's error type, for example string_too_long, enum or json_invalid."
+    )
+
+
+class LegacyValidationErrorResponse(BaseModel):
+    """The 422 body of a structurally invalid request, built by HandleRequestValidationError.
+
+    ``app.core.errors.HandleRequestValidationError`` answers every request FastAPI's
+    validation rejects with it: malformed or unreadable JSON (not valid UTF-8, or nested too
+    deeply), screen text over its BMS LENGTH or outside the code-page-037 repertoire, a value
+    outside an enum, or a wrong JSON type. A 3270 terminal could never send such a request, so
+    no program edit runs. FastAPI's ``detail`` list sits beside the four standard legacy keys,
+    and every body carries all five. ``app.main`` declares this model as the 422 response of
+    every operation FastAPI validates.
+    """
+
+    detail: list[ValidationErrorDetail] = Field(
+        description="FastAPI's validation errors, each holding only loc, msg and type."
+    )
+    message: str = Field(description="Always empty: no legacy program edit ran.")
+    info_message: str = Field(description="Always empty: no legacy program edit ran.")
+    field_errors: list[str] = Field(
+        description=(
+            "The failing fields as their locations name them, de-duplicated in error order: the "
+            "snake_case attribute of a body field, or the wire name of a query or path parameter "
+            "(for example userId or reportType); empty when no location names a field, as for "
+            "malformed JSON."
+        ),
+    )
+    cursor_field: str = Field(
+        description="The first name in field_errors, or empty when field_errors is empty."
+    )
+
+
 class MessageResponse(BaseModel):
     """A success body carrying only the program's message literal.
 

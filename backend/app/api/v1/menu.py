@@ -17,12 +17,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 
-from app.api.v1 import LegacyErrorResponses
+from app.api.v1 import LegacyErrorResponses, SessionFirstRoute
 from app.core.dependencies import GetAdminContext, GetRegularContext, OnlineContext
 from app.schemas.menu import MenuResponse, MenuSelectionRequest, MenuSelectionResponse
 from app.services.menu import coadm01c, comen01c
 
-ROUTER = APIRouter(prefix="/menu", tags=["menu"])
+ROUTER = APIRouter(prefix="/menu", tags=["menu"], route_class=SessionFirstRoute)
 
 MAIN_MENU_DESCRIPTION = (
     "Lists the 11 options of the COMEN02Y table in table order, as COMEN01C builds them on map"

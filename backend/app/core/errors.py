@@ -9,8 +9,9 @@ Every error body this module builds carries the four standard legacy keys ``mess
 screen keys, the CT00 and CU00 invalid-selection refusals add their list page's ``rows``,
 ``page``, ``first_key`` and ``last_key`` (CT00 also ``search_cleared``), and the 422 body of a
 structurally invalid request adds FastAPI's ``detail`` list (``loc``, ``msg`` and ``type``
-only) beside them. A JSON body FastAPI cannot parse at all, such as one that is not valid UTF-8,
-gets the same 422 body as malformed JSON. The CSMSG02Y abend work area has no counterpart here:
+only) beside them, as ``app.schemas.common.LegacyValidationErrorResponse`` declares it. A JSON
+body FastAPI cannot parse at all, such as one that is not valid UTF-8, gets the same 422 body
+as malformed JSON. The CSMSG02Y abend work area has no counterpart here:
 no catch-all handler is registered, so an unexpected error is FastAPI's 500 and the frontend
 shows ``UNEXPECTED ABEND OCCURRED.``.
 
@@ -337,8 +338,8 @@ def SanitisedDetail(errors: Sequence[Mapping[str, Any]]) -> list[dict[str, objec
     """Keep only ``loc``, ``msg`` and ``type`` of each validation error.
 
     Pydantic's ``input``, ``ctx`` and ``url`` keys would echo the rejected value, which may be a
-    password, card number or SSN, so they are dropped. The items still satisfy FastAPI's
-    ``ValidationError`` schema, whose required keys are exactly these three.
+    password, card number or SSN, so they are dropped. Each item is the declared
+    ``app.schemas.common.ValidationErrorDetail``, whose keys are exactly these three.
     """
     return [
         {"loc": list(error["loc"]), "msg": str(error["msg"]), "type": str(error["type"])}
@@ -359,12 +360,14 @@ async def HandleRequestValidationError(
     the code-page-037 repertoire, which a 3270 terminal could never send (AAP 0.6.4). The legacy
     type, sign, range and format edits run in the services, never here.
 
-    The body is FastAPI's ``HTTPValidationError`` ``detail`` list, each item holding only
-    ``loc``, ``msg`` and ``type``, with the four standard legacy keys beside it. ``message`` and
-    ``info_message`` are empty. ``field_errors`` names each failing field as its location names
-    it: the snake_case attribute of a body field, or the wire name of a query or path parameter
-    (``reportType``, ``format``). A location that names no field, such as a malformed JSON
-    body, adds none. ``cursor_field`` is the first named field, or empty when there is none.
+    The body is ``app.schemas.common.LegacyValidationErrorResponse``, which app.main declares
+    as the 422 response of every operation FastAPI validates: FastAPI's ``detail`` list, each
+    item holding only ``loc``, ``msg`` and ``type``, with the four standard legacy keys beside
+    it, all five always present. ``message`` and ``info_message`` are empty. ``field_errors``
+    names each failing field as its location names it: the snake_case attribute of a body
+    field, or the wire name of a query or path parameter (``reportType``, ``format``). A
+    location that names no field, such as a malformed JSON body, adds none. ``cursor_field`` is
+    the first named field, or empty when there is none.
     """
     errors = exc.errors()
     fieldDetails = LegacyErrorDetails(fieldErrors=tuple(FieldErrorsOf(errors)))

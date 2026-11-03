@@ -15,6 +15,9 @@ happens per request. Admin is exactly A; every other stored type (U, u, a, X, ..
   with the COMEN01C literal ``No access - Admin Only option... ``.
 - RequireRegular guards CM00, CAVW, CAUP, CCLI, CCDL, CCUP, CT00-CT02, CR00 and CB00. An admin
   gets 403 with an empty message, and the client returns to the user's own menu.
+- RunSessionGuard runs one of SESSION_GUARDS on the cookie alone. app.api.v1.SessionFirstRoute
+  calls it before FastAPI reads a guarded route's body, so a missing or invalid cookie gives 401
+  and a wrong role 403 even when the body is malformed.
 - OnlineContext is the one parameter object services and repositories receive. Every context
   dependency releases the request's shared batch-window lock (core.locks) when the request ends,
   whether it succeeds, fails or is cancelled.
@@ -23,7 +26,7 @@ COMEN01C's own admin-only option check (CDEMO-USRTYP-USER, exactly U) is ported 
 service, not here.
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Annotated
 
@@ -101,6 +104,25 @@ async def RequireRegular(user: Annotated[CurrentUser, Depends(GetCurrentUser)]) 
     if user.IsAdmin():
         raise LegacyMessageError(NO_MESSAGE, httpStatus=HTTP_ACCESS_REFUSED)
     return user
+
+
+# A dependency that returns the verified session user or raises its 401 or 403.
+type SessionGuard = Callable[..., Awaitable[CurrentUser]]
+# The session guards, role guards first: a route that depends on RequireAdmin or RequireRegular
+# also depends on GetCurrentUser beneath it, and the role guard is the one it needs.
+SESSION_GUARDS: tuple[SessionGuard, ...] = (RequireAdmin, RequireRegular, GetCurrentUser)
+
+
+async def RunSessionGuard(request: Request, sessionGuard: SessionGuard) -> CurrentUser:
+    """Run ``sessionGuard``, one of SESSION_GUARDS, on the request's session cookie alone.
+
+    It returns the guard's user or raises the guard's own 401 or 403. GetCurrentUser reads
+    only the SESSION_COOKIE_NAME cookie, so the request body is neither read nor needed.
+    """
+    user = await GetCurrentUser(request, GetAppSettings(request))
+    if sessionGuard is GetCurrentUser:
+        return user
+    return await sessionGuard(user)
 
 
 @dataclass

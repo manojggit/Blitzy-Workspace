@@ -14,16 +14,20 @@ probes are served outside /api/v1. Specified in the Technical Specification, Sec
 This module only wires the shared components of app.core and app.api. CreateApp keeps the
 settings, the lazily connecting engine and the session factory on app.state, where the
 dependencies, the batch-window locks and the readiness probe read them, so tests build an app
-with their own settings. Uvicorn serves the module-level ``app``:
+with their own settings. InstallOpenApiGenerator declares the 422 body the request-validation
+handler sends, LegacyValidationErrorResponse, in place of FastAPI's HTTPValidationError, which
+lists only ``detail``. Uvicorn serves the module-level ``app``:
 ``cd backend && ../.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000``.
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.constants import REF_PREFIX
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.health import ROUTER as HEALTH_ROUTER
@@ -38,6 +42,7 @@ from app.core.errors import (
 )
 from app.core.logging import ConfigureLogging
 from app.core.middleware import OriginGuard
+from app.schemas.common import LegacyValidationErrorResponse
 
 API_TITLE = "CardDemo API"
 API_VERSION = "1.0.0"
@@ -47,7 +52,8 @@ API_DESCRIPTION = (
     " literals. Authentication is a session cookie (carddemo_session, HttpOnly) set by"
     " POST /api/v1/auth/login, and every cookie-authenticated POST, PUT and DELETE must carry"
     " an allow-listed Origin header. Error bodies are"
-    " {message, info_message, field_errors, cursor_field}."
+    " {message, info_message, field_errors, cursor_field}; a 422 also carries FastAPI's detail"
+    " list."
 )
 # One entry per router tag; each name equals the tag its router declares in app.api.
 OPENAPI_TAGS = [
@@ -80,6 +86,16 @@ CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
 CORS_ALLOWED_HEADERS = ["Content-Type", "Accept"]
 # The CR00 CSV and PDF exports name their file in Content-Disposition.
 CORS_EXPOSED_HEADERS = ["Content-Disposition"]
+# FastAPI declares this status on every operation it validates, with its HTTPValidationError.
+VALIDATION_ERROR_STATUS = "422"
+VALIDATION_ERROR_DESCRIPTION = (
+    "Structurally invalid request, which a 3270 terminal could never send: malformed or"
+    " unreadable JSON, or a parameter or field outside its declared type, length, enum or"
+    " code-page-037 repertoire."
+)
+JSON_MEDIA_TYPE = "application/json"
+# FastAPI's 422 components; HTTPValidationError references ValidationError, so it comes first.
+FASTAPI_VALIDATION_SCHEMAS = ("HTTPValidationError", "ValidationError")
 
 
 @asynccontextmanager
@@ -159,6 +175,107 @@ def IncludeRouters(application: FastAPI) -> None:
     application.include_router(API_V1_ROUTER, prefix=API_V1_PREFIX)
 
 
+def SchemaRefsIn(node: Any) -> Iterator[str]:
+    """Yield every ``$ref`` value inside ``node``, a part of the OpenAPI document."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                yield value
+            else:
+                yield from SchemaRefsIn(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from SchemaRefsIn(item)
+
+
+def LegacyValidationResponse() -> dict[str, Any]:
+    """Return a new 422 response entry declaring LegacyValidationErrorResponse."""
+    schemaRef = {"$ref": REF_PREFIX + LegacyValidationErrorResponse.__name__}
+    return {
+        "description": VALIDATION_ERROR_DESCRIPTION,
+        "content": {JSON_MEDIA_TYPE: {"schema": schemaRef}},
+    }
+
+
+def LegacyValidationSchemas() -> dict[str, Any]:
+    """Return the components of LegacyValidationErrorResponse and of the models it nests.
+
+    Pydantic puts the nested models under ``$defs``; they become sibling components, and every
+    reference points into ``components.schemas``, as FastAPI's own references do.
+    """
+    responseSchema = LegacyValidationErrorResponse.model_json_schema(
+        ref_template=REF_PREFIX + "{model}", mode="serialization"
+    )
+    nestedSchemas = responseSchema.pop("$defs", {})
+    return {**nestedSchemas, LegacyValidationErrorResponse.__name__: responseSchema}
+
+
+def RepointValidationResponses(document: dict[str, Any]) -> int:
+    """Replace every operation's 422 response with LegacyValidationResponse; return the count.
+
+    Only operations that already declare 422 change, and no other status is touched.
+    """
+    repointedCount = 0
+    for pathItem in document.get("paths", {}).values():
+        for operation in pathItem.values():
+            responses = operation.get("responses", {}) if isinstance(operation, dict) else {}
+            if VALIDATION_ERROR_STATUS in responses:
+                responses[VALIDATION_ERROR_STATUS] = LegacyValidationResponse()
+                repointedCount += 1
+    return repointedCount
+
+
+def DropUnreferencedSchemas(document: dict[str, Any], schemaNames: Sequence[str]) -> None:
+    """Remove, in order, each named component that no ``$ref`` in ``document`` points at.
+
+    A component that only an earlier, removed one referenced is removed too, so ``schemaNames``
+    lists a referring component before the components it references.
+    """
+    componentSchemas = document.get("components", {}).get("schemas", {})
+    for schemaName in schemaNames:
+        if REF_PREFIX + schemaName not in SchemaRefsIn(document):
+            componentSchemas.pop(schemaName, None)
+
+
+def DeclareLegacyValidationBody(document: dict[str, Any]) -> None:
+    """Declare, in place, the 422 body HandleRequestValidationError sends on every operation.
+
+    FastAPI declares 422 with its HTTPValidationError, which lists ``detail`` alone, while the
+    body sent also carries the four standard legacy keys. The components stay sorted by name,
+    as FastAPI writes them.
+    """
+    if RepointValidationResponses(document):
+        components = document.setdefault("components", {})
+        componentSchemas = {**components.get("schemas", {}), **LegacyValidationSchemas()}
+        components["schemas"] = dict(sorted(componentSchemas.items()))
+    DropUnreferencedSchemas(document, FASTAPI_VALIDATION_SCHEMAS)
+
+
+def InstallOpenApiGenerator(application: FastAPI) -> None:
+    """Make ``application`` publish the legacy 422 body in its OpenAPI document.
+
+    This is FastAPI's documented extension point. The replacement builds FastAPI's own
+    document once, completes it with DeclareLegacyValidationBody and keeps it in
+    ``openapi_schema``, as FastAPI caches its document, so /openapi.json, /docs and the
+    contract tests read the same document. It adds no route: with the docs disabled,
+    /openapi.json stays FastAPI's 404.
+    """
+    buildFastApiDocument = application.openapi
+
+    def BuildLegacyDocument() -> dict[str, Any]:
+        """Return the cached document, building and completing it on the first call."""
+        if application.openapi_schema:
+            return application.openapi_schema
+        document = buildFastApiDocument()
+        DeclareLegacyValidationBody(document)
+        application.openapi_schema = document
+        return document
+
+    # FastAPI reads this exact attribute name, so it stays lower-case: a framework-mandated
+    # exception to the MK_Modernization Rule's PascalCase method naming.
+    application.openapi = BuildLegacyDocument
+
+
 def CreateApp(settings: Settings | None = None) -> FastAPI:
     """Build the CardDemo backend app from ``settings``, or from the process-wide Settings.
 
@@ -173,6 +290,7 @@ def CreateApp(settings: Settings | None = None) -> FastAPI:
     AddMiddleware(application, appSettings)
     AddExceptionHandlers(application)
     IncludeRouters(application)
+    InstallOpenApiGenerator(application)
     return application
 
 

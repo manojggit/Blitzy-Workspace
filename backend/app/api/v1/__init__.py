@@ -17,24 +17,38 @@ Modules:
 
 ``LegacyErrorResponses`` declares the legacy error body, ``LegacyErrorResponse``, for each
 non-2xx status a route lists in its ``responses=``, so the OpenAPI document describes every
-legacy outcome. FastAPI declares 422 itself. This package imports no router, settings or
-service, because importing any router module loads this file first.
+legacy outcome. The 422 body is declared app-wide as ``LegacyValidationErrorResponse`` by
+app.main. This package imports no router, settings or service, because importing any router
+module loads this file first.
 
 ``LosslessKeyRoute`` is the route class of the routers whose path carries a raw screen key
 (accounts, cards, transactions, admin_users). A 3270 key may hold ``/``, which the client
 sends as ``%2F``; the server decodes the ASGI ``path`` before Starlette matches it, so the
 default ``[^/]+`` parameter would see two segments and FastAPI would answer 404
 ``{"detail": "Not Found"}`` instead of the program's key edit or lookup.
+
+``SessionFirstRoute`` is the route class of every router with a guarded JSON body route: menu
+and billpay directly, and the four raw-key routers through ``LosslessKeyRoute``, which extends
+it. FastAPI reads and parses a body before it solves any dependency, so ``SessionFirstRoute``
+runs the route's ``app.core.dependencies`` session guard on the cookie first: a missing or
+invalid cookie gives 401, and a wrong role 403, before a malformed body could give 422.
 """
 
+from collections.abc import Callable, Coroutine
 from typing import Any
 from urllib.parse import unquote
 
+from fastapi import Request, Response
+from fastapi.dependencies.models import Dependant
 from fastapi.routing import APIRoute
 from starlette.routing import Match
 from starlette.types import Scope
 
+from app.core.dependencies import SESSION_GUARDS, RunSessionGuard, SessionGuard
 from app.schemas.common import LegacyErrorResponse
+
+# The request handler APIRoute.get_route_handler returns and request_response wraps.
+type RouteHandler = Callable[[Request], Coroutine[Any, Any, Response]]
 
 ERROR_DESCRIPTIONS: dict[int, str] = {
     400: "Legacy field-edit failure: the message, the failing fields and the cursor field.",
@@ -88,7 +102,47 @@ def LosslessRoutePath(scope: Scope) -> str | None:
     return losslessPath
 
 
-class LosslessKeyRoute(APIRoute):
+def DependantCalls(dependant: Dependant) -> set[Callable[..., Any] | None]:
+    """Return the callable of ``dependant`` and of every dependency beneath it."""
+    calls = {dependant.call}
+    for subDependant in dependant.dependencies:
+        calls |= DependantCalls(subDependant)
+    return calls
+
+
+def FindSessionGuard(dependant: Dependant) -> SessionGuard | None:
+    """Return the first of SESSION_GUARDS that ``dependant`` depends on, else None."""
+    calls = DependantCalls(dependant)
+    return next((sessionGuard for sessionGuard in SESSION_GUARDS if sessionGuard in calls), None)
+
+
+class SessionFirstRoute(APIRoute):
+    """An APIRoute that refuses an unsigned or wrong-role request before it reads the body.
+
+    A route with a body whose dependencies include one of SESSION_GUARDS runs that guard on
+    the session cookie first, so its 401 or 403 is the answer whatever the body holds. The
+    guard then runs again among the route's own dependencies, unchanged. Every other route,
+    POST /auth/login and the body-less routes included, keeps APIRoute's handler.
+    """
+
+    # FastAPI's APIRoute.__init__ calls this exact name, so it stays lower-case: a
+    # framework-mandated exception to the MK_Modernization Rule's PascalCase method naming.
+    def get_route_handler(self) -> RouteHandler:
+        """Return APIRoute's handler, preceded by the session guard on a guarded body route."""
+        routeHandler = super().get_route_handler()
+        sessionGuard = FindSessionGuard(self.dependant)
+        if self.body_field is None or sessionGuard is None:
+            return routeHandler
+
+        async def GuardThenHandle(request: Request) -> Response:
+            """Run the session guard on the cookie alone, then APIRoute's handler."""
+            await RunSessionGuard(request, sessionGuard)
+            return await routeHandler(request)
+
+        return GuardThenHandle
+
+
+class LosslessKeyRoute(SessionFirstRoute):
     """An APIRoute whose path parameters receive the screen key exactly as the client keyed it.
 
     It matches the path built by ``LosslessRoutePath``, where a ``/`` inside a key is still

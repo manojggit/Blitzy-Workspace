@@ -94,6 +94,19 @@ const INVALID_ACTION_MESSAGE = "INVALID ACTION CODE";
 const NO_PREVIOUS_MESSAGE = "NO PREVIOUS PAGES TO DISPLAY";
 const NO_MORE_PAGES_MESSAGE = "NO MORE PAGES TO DISPLAY";
 const NO_RECORDS_MESSAGE = "NO RECORDS FOUND FOR THIS SEARCH CONDITION.";
+const NO_MORE_RECORDS_MESSAGE = "NO MORE RECORDS TO SHOW";
+// READPREV_ENDFILE_MESSAGE: the READ/CARDDAT file-error literal of the ENDFILE condition (RESP 20,
+// RESP2 90) that 9100-READ-BACKWARDS takes as WHEN OTHER, its blanks as BuildFileErrorMessage
+// pads them.
+const READPREV_ENDFILE_MESSAGE =
+    "File Error: READ     on CARDDAT   returned RESP 000000020 ,RESP2 000000090";
+// FileErrorOf for any other CARDDAT browse failure: core/errors.FileIoError, IOERR (RESP 17).
+const CARD_FILE_ERROR_MESSAGE =
+    "File Error: READ     on CARDDAT   returned RESP 000000017 ,RESP2 000000000";
+// The cocrdslc.NotFoundError TransferToCard raises for an invalid or expired card_ref, with its
+// PROMPT_FOR_KEYS_INFO information line.
+const CARD_NOT_FOUND_MESSAGE = "Did not find cards for this search condition";
+const PROMPT_FOR_KEYS_INFO = "Please enter Account and Card Number";
 // The COCRDLIC information line of every shown page (88 WS-INFORM-REC-ACTIONS).
 const RECORD_ACTIONS_INFO = "TYPE S FOR DETAIL, U TO UPDATE ANY RECORD";
 
@@ -105,6 +118,13 @@ const COLUMN_HEADERS = ["Select", "Account Number", "Card Number", "Active"];
 // ACCTSID LENGTH=11 and CARDSID LENGTH=16.
 const ACCOUNT_FILTER_MAX_LENGTH = "11";
 const CARD_FILTER_MAX_LENGTH = "16";
+// ACCTNOn LENGTH=11 shows the cards.acct_id VARCHAR(11) of each row; CRDNUMn LENGTH=16 shows its
+// card number masked as twelve asterisks and the last 4 digits (core/security.MaskCardNumber).
+const ACCT_ID_LENGTH = 11;
+const ACCOUNT_CELL_PATTERN = /^\d{11}$/;
+const MASKED_CARD_CELL_PATTERN = /^\*{12}\d{4}$/;
+// CRDSTSn holds Y or N; every third card of a fixture page is inactive.
+const INACTIVE_ROW_INTERVAL = 3;
 // WS-MAX-SCREEN-LINES (cbl/COCRDLIC.cbl lines 177-178).
 const PAGE_SIZE = 7;
 // The blank option and 88 SELECT-OK VALUES 'S', 'U'.
@@ -115,6 +135,8 @@ const CARD_NUM_FIELD = "card_num";
 const FIRST_KEY = "first-key-token";
 const LAST_KEY = "last-key-token";
 const SHOWN_PAGE = 2;
+// CA-FIRST-PAGE, the page F7 reads back to from SHOWN_PAGE.
+const FIRST_PAGE = 1;
 // The page F8 reads after SHOWN_PAGE, holding cards 8 to 14.
 const NEXT_PAGE = 3;
 const NEXT_PAGE_FIRST_ROW = 8;
@@ -123,12 +145,18 @@ const REDISPLAYED_PAGE = 1;
 const SELECTED_ROW = 3;
 const SELECTED_CARD_REF = "card-ref-3";
 const SELECTED_ACCT_ID = "00000000003";
+// The card of row 4, account 00000000004 and card number ending 4304, which valid filters find.
+const FILTERED_ROW = 4;
+const FILTERED_FIRST_KEY = "filtered-first-key";
+const FILTERED_LAST_KEY = "filtered-last-key";
 const MENU_ROUTE = "/menu";
 const URL_BASE = "http://127.0.0.1";
 
 const HTTP_OK = 200;
 const HTTP_BAD_REQUEST = 400;
 const HTTP_UNAUTHORIZED = 401;
+const HTTP_NOT_FOUND = 404;
+const HTTP_FILE_ERROR = 503;
 
 const KEY_BUTTON_NAMES: Readonly<Record<ScreenKey, string>> = {
     Enter: "Continue (Enter)",
@@ -149,6 +177,29 @@ const KEY_TRIGGERS: readonly KeyTrigger[] = ["click", "key"];
 // Every list read carries the AbortSignal of the controller that owns it.
 const READ_OPTIONS: ReadOptions = { signal: expect.any(AbortSignal) };
 
+// The ACCTSID and CARDSID filters as the user keys them.
+interface FilterTexts {
+    acctId: string;
+    cardNum: string;
+}
+
+interface FilterCase {
+    filterName: string;
+    filters: FilterTexts;
+}
+
+const BLANK_FILTERS: FilterTexts = { acctId: "", cardNum: "" };
+// Valid filters naming FILTERED_ROW's card; the 16-digit card number is assembled at run time.
+const KEYED_FILTERS: FilterTexts = {
+    acctId: String(FILTERED_ROW).padStart(ACCT_ID_LENGTH, "0"),
+    cardNum: "4000".repeat(3) + "4304",
+};
+// The server alone edits and applies the filters, so each request carries them as keyed.
+const FILTER_CASES: readonly FilterCase[] = [
+    { filterName: "blank", filters: BLANK_FILTERS },
+    { filterName: "keyed", filters: KEYED_FILTERS },
+];
+
 // A refused selection redisplays rows and page keys beside the legacy feedback, and on GET /cards
 // the page number after the redisplay.
 interface CardListErrorBody extends LegacyErrorResponse {
@@ -158,14 +209,16 @@ interface CardListErrorBody extends LegacyErrorResponse {
     page?: number;
 }
 
-// Row n of the shown page: its card_ref token, an 11-digit account and a masked card number.
+// Row n of a page: its card_ref token, an 11-digit account, a masked card number and a status.
+// Each row's account and card differ from every other row's, and statuses mix Y and N, so a cell
+// bound to the wrong field or left blank fails.
 function BuildListRow(rowNumber: number): CardListRow {
     const rowDigits = String(rowNumber).padStart(2, "0");
     return {
         card_ref: `card-ref-${rowNumber}`,
-        acct_id: `0000000000${rowNumber}`,
+        acct_id: String(rowNumber).padStart(ACCT_ID_LENGTH, "0"),
         card_num_masked: `************43${rowDigits}`,
-        active_status: "Y",
+        active_status: rowNumber % INACTIVE_ROW_INTERVAL === 0 ? "N" : "Y",
     };
 }
 
@@ -265,6 +318,19 @@ function FilterInput(label: string): HTMLInputElement {
     return input;
 }
 
+// Keys each non-blank filter as typed; a blank filter is left as the first entry shows it.
+async function KeyFilters(user: UserSession, filters: FilterTexts): Promise<void> {
+    const keyedTexts: readonly (readonly [string, string])[] = [
+        [ACCOUNT_FILTER_LABEL, filters.acctId],
+        [CARD_FILTER_LABEL, filters.cardNum],
+    ];
+    for (const [label, text] of keyedTexts) {
+        if (text !== "") {
+            await user.type(FilterInput(label), text);
+        }
+    }
+}
+
 function SelectionField(rowNumber: number): HTMLElement {
     return screen.getByRole("combobox", { name: SelectionLabelFor(rowNumber) });
 }
@@ -287,9 +353,26 @@ function ColumnHeaderTexts(): (string | null)[] {
     return screen.getAllByRole("columnheader").map((header) => header.textContent);
 }
 
-// The cells after the selection field: account number, card number, active status.
-function CardNumbersShown(): (string | null | undefined)[] {
-    return BodyRows().map((row) => within(row).getAllByRole("cell")[2]?.textContent);
+// The cells of one row after its selection field: ACCTNOn, CRDNUMn and CRDSTSn.
+type ShownCardRow = Omit<CardListRow, "card_ref">;
+
+function ShownCellsOf(row: CardListRow): ShownCardRow {
+    const { acct_id, card_num_masked, active_status } = row;
+    return { acct_id, card_num_masked, active_status };
+}
+
+// Each body row's account number, card number and active status, read from its own cells.
+function ShownRows(): ShownCardRow[] {
+    return BodyRows().map((row) => {
+        const cellTexts = within(row)
+            .getAllByRole("cell")
+            .map((cell) => cell.textContent ?? "");
+        return {
+            acct_id: cellTexts[1] ?? "",
+            card_num_masked: cellTexts[2] ?? "",
+            active_status: cellTexts[3] ?? "",
+        };
+    });
 }
 
 // The input root carries MUI's error state, as the map colours a flagged CRDSELn field red.
@@ -382,11 +465,15 @@ function ExpectCardRoute(route: string): void {
     expect(pushedUrl.searchParams.get("acctId")).toBe(SELECTED_ACCT_ID);
 }
 
-// Every row shown is sent with its code, blank for the rows the user left untouched.
-function ExpectedSelectionRequest(code: string): CardSelectionRequest {
+// Every row shown is sent with its code, blank for the rows the user left untouched, beside the
+// filters as keyed.
+function ExpectedSelectionRequest(
+    code: string,
+    filters: FilterTexts = BLANK_FILTERS,
+): CardSelectionRequest {
     return {
-        acct_id: "",
-        card_num: "",
+        acct_id: filters.acctId,
+        card_num: filters.cardNum,
         rows: BuildListRows(PAGE_SIZE).map((row, index) => ({
             card_ref: row.card_ref,
             selection: index + 1 === SELECTED_ROW ? code : "",
@@ -416,12 +503,27 @@ function ExpectFilterFields(): void {
     expect(FilterInput(CARD_FILTER_LABEL)).toHaveAttribute("maxlength", CARD_FILTER_MAX_LENGTH);
 }
 
-// Only masked card numbers are shown, and no 16-digit run appears anywhere on the page.
-function ExpectMaskedCardRows(): void {
-    const maskedNumbers = BuildListRows(PAGE_SIZE).map((row) => row.card_num_masked);
-    expect(ColumnHeaderTexts()).toEqual(COLUMN_HEADERS);
-    expect(CardNumbersShown()).toEqual(maskedNumbers);
+// Every account cell fits ACCTNOn and every card cell is a masked CRDNUMn.
+function ExpectMapWidths(shownRows: readonly ShownCardRow[]): void {
+    for (const shownRow of shownRows) {
+        expect(shownRow.acct_id).toMatch(ACCOUNT_CELL_PATTERN);
+        expect(shownRow.card_num_masked).toMatch(MASKED_CARD_CELL_PATTERN);
+    }
+}
+
+// Every row shows its own account, masked card number and status, in the order returned, and no
+// 16-digit run appears anywhere on the page.
+function ExpectShownRows(expectedRows: readonly CardListRow[]): void {
+    const shownRows = ShownRows();
+    expect(shownRows).toEqual(expectedRows.map(ShownCellsOf));
+    ExpectMapWidths(shownRows);
     expect(document.body.textContent).not.toMatch(PAN_PATTERN);
+}
+
+// The rows appear under the COCRDLI column headings.
+function ExpectMaskedCardRows(expectedRows: readonly CardListRow[]): void {
+    expect(ColumnHeaderTexts()).toEqual(COLUMN_HEADERS);
+    ExpectShownRows(expectedRows);
 }
 
 describe("COCRDLIC BMS COCRDLI content on /cards", () => {
@@ -431,7 +533,7 @@ describe("COCRDLIC BMS COCRDLI content on /cards", () => {
         expect(mockListCards).toHaveBeenCalledWith({}, READ_OPTIONS);
         ExpectScreenHeader();
         ExpectFilterFields();
-        ExpectMaskedCardRows();
+        ExpectMaskedCardRows(BuildListRows(PAGE_SIZE));
         await ExpectAlert(RECORD_ACTIONS_INFO, "info");
     });
 });
@@ -446,32 +548,37 @@ describe("COCRDLIC CRDSEL1-7 codes on /cards", () => {
     });
 });
 
-interface SelectionRouteCase {
+interface SelectionRouteCase extends FilterCase {
     code: string;
     action: CardSelectionAction;
     route: string;
     trigger: KeyTrigger;
 }
 
-const SELECTION_ROUTES: readonly Omit<SelectionRouteCase, "trigger">[] = [
+const SELECTION_ROUTES: readonly Pick<SelectionRouteCase, "code" | "action" | "route">[] = [
     { code: "S", action: "view", route: "/cards/view" },
     { code: "U", action: "update", route: "/cards/update" },
 ];
 
+// The keyed filters travel only in the selection body; the route names the card_ref and the
+// selected row's own account, never a filter.
 const SELECTION_ROUTE_CASES: readonly SelectionRouteCase[] = SELECTION_ROUTES.flatMap((routeCase) =>
-    KEY_TRIGGERS.map((trigger) => ({ ...routeCase, trigger })),
+    KEY_TRIGGERS.flatMap((trigger) =>
+        FILTER_CASES.map((filterCase) => ({ ...routeCase, trigger, ...filterCase })),
+    ),
 );
 
 describe("COCRDLIC selection on /cards", () => {
     it.each(SELECTION_ROUTE_CASES)(
-        "COCRDLIC selection $code with ENTER by $trigger routes to $route with cardRef only",
-        async ({ code, action, route, trigger }) => {
+        "COCRDLIC $code and ENTER by $trigger, $filterName filters, routes to $route by cardRef",
+        async ({ code, action, route, trigger, filters }) => {
             mockSelectCards.mockResolvedValueOnce(BuildSelectionResponse(action));
             const user = await RenderScreen();
+            await KeyFilters(user, filters);
             await ChooseSelection(user, SELECTED_ROW, code);
             await PressScreenKey(user, "Enter", trigger);
             expect(mockSelectCards).toHaveBeenCalledTimes(1);
-            expect(mockSelectCards).toHaveBeenCalledWith(ExpectedSelectionRequest(code));
+            expect(mockSelectCards).toHaveBeenCalledWith(ExpectedSelectionRequest(code, filters));
             expect(mockListCards).toHaveBeenCalledTimes(1);
             ExpectCardRoute(route);
             expect(mockRouterReplace).not.toHaveBeenCalled();
@@ -480,40 +587,88 @@ describe("COCRDLIC selection on /cards", () => {
     );
 });
 
-interface PagingCase {
+interface PagingCase extends FilterCase {
     key: ScreenKey;
     readName: string;
-    startKey: string;
+    startKeyField: "first_key" | "last_key";
     direction?: Direction;
+    answer: CardListResponse;
     trigger: KeyTrigger;
 }
 
-// ENTER re-reads the shown page from first_key; F7 and F8 page from first_key and last_key.
-const PAGING_KEYS: readonly Omit<PagingCase, "trigger">[] = [
-    { key: "F8", readName: "forward", startKey: LAST_KEY, direction: Direction.FORWARD },
-    { key: "F7", readName: "backward", startKey: FIRST_KEY, direction: Direction.BACKWARD },
-    { key: "Enter", readName: "re-read", startKey: FIRST_KEY },
+// The one-row page a paging key returns here: FILTERED_ROW's card, which the keyed filters name,
+// with fresh page keys and the page number and literals the service gives the key.
+function FilteredPage(page: number, message: string, infoMessage: string): CardListResponse {
+    return BuildListResponse({
+        rows: [BuildListRow(FILTERED_ROW)],
+        page,
+        first_key: FILTERED_FIRST_KEY,
+        last_key: FILTERED_LAST_KEY,
+        message,
+        info_message: infoMessage,
+    });
+}
+
+// ENTER re-reads the shown page from first_key; F7 and F8 page from first_key and last_key. Each
+// answer is the one-row page the service returns: F8 reads page 3 and ENTER page 2 to the end of
+// CARDDAT (NO MORE RECORDS TO SHOW beside the record-actions line); F7 reads back to page 1, where
+// NO PREVIOUS PAGES TO DISPLAY replaces the ENDFILE literal and blanks the information line.
+const PAGING_KEYS: readonly Omit<PagingCase, "trigger" | keyof FilterCase>[] = [
+    {
+        key: "F8",
+        readName: "forward",
+        startKeyField: "last_key",
+        direction: Direction.FORWARD,
+        answer: FilteredPage(NEXT_PAGE, NO_MORE_RECORDS_MESSAGE, RECORD_ACTIONS_INFO),
+    },
+    {
+        key: "F7",
+        readName: "backward",
+        startKeyField: "first_key",
+        direction: Direction.BACKWARD,
+        answer: FilteredPage(FIRST_PAGE, NO_PREVIOUS_MESSAGE, ""),
+    },
+    {
+        key: "Enter",
+        readName: "re-read",
+        startKeyField: "first_key",
+        answer: FilteredPage(SHOWN_PAGE, NO_MORE_RECORDS_MESSAGE, RECORD_ACTIONS_INFO),
+    },
 ];
 
 const PAGING_CASES: readonly PagingCase[] = PAGING_KEYS.flatMap((pagingKey) =>
-    KEY_TRIGGERS.map((trigger) => ({ ...pagingKey, trigger })),
+    KEY_TRIGGERS.flatMap((trigger) =>
+        FILTER_CASES.map((filterCase) => ({ ...pagingKey, trigger, ...filterCase })),
+    ),
 );
 
+// The query a paging key sends from the page shown: the filters as keyed, the shown page's
+// first_key or last_key as the key takes it, and the shown page's number.
+function PagingQuery(pagingCase: PagingCase, shownPage: CardListResponse): CardListQuery {
+    return {
+        acctId: pagingCase.filters.acctId,
+        cardNum: pagingCase.filters.cardNum,
+        startKey: shownPage[pagingCase.startKeyField],
+        direction: pagingCase.direction,
+        page: shownPage.page,
+    };
+}
+
+// The second press pages from the keys and page number of the page the first one returned.
 describe("COCRDLIC paging on /cards", () => {
     it.each(PAGING_CASES)(
-        "COCRDLIC $key by $trigger sends the $readName query with $startKey",
-        async ({ key, startKey, direction, trigger }) => {
+        "COCRDLIC $key by $trigger with $filterName filters pages from $startKeyField",
+        async (pagingCase) => {
+            const { key, trigger, answer } = pagingCase;
             const user = await RenderScreen();
+            await KeyFilters(user, pagingCase.filters);
+            mockListCards.mockResolvedValueOnce(answer);
             await PressScreenKey(user, key, trigger);
-            const expectedQuery: CardListQuery = {
-                acctId: "",
-                cardNum: "",
-                startKey,
-                direction,
-                page: SHOWN_PAGE,
-            };
-            expect(mockListCards).toHaveBeenCalledTimes(2);
-            expect(mockListCards).toHaveBeenLastCalledWith(expectedQuery, READ_OPTIONS);
+            ExpectLastListRead(PagingQuery(pagingCase, BuildListResponse()));
+            ExpectShownRows(answer.rows);
+            await PressScreenKey(user, key, trigger);
+            expect(mockListCards).toHaveBeenCalledTimes(3);
+            ExpectLastListRead(PagingQuery(pagingCase, answer));
             expect(mockSelectCards).not.toHaveBeenCalled();
         },
     );
@@ -624,6 +779,201 @@ describe("COCRDLIC selection literals on /cards", () => {
             await ExpectAlert(literalCase.literal, ERRMSG_SEVERITY);
             expect(FlaggedRowNumbers()).toEqual(literalCase.flaggedRows);
             expect(SelectionField(literalCase.cursorRow)).toHaveFocus();
+            expect(mockRouterPush).not.toHaveBeenCalled();
+        },
+    );
+});
+
+// The ERRMSG literal in red, then the information line as info when there is one, and no other
+// message line.
+async function ExpectFeedback(literal: string, infoMessage: string): Promise<void> {
+    await ExpectAlert(literal, ERRMSG_SEVERITY);
+    if (infoMessage === "") {
+        expect(AlertTexts()).toEqual([literal]);
+        return;
+    }
+    await ExpectAlert(infoMessage, "info");
+    expect(AlertTexts()).toEqual([literal, infoMessage]);
+}
+
+interface PagingLiteralCase {
+    literal: string;
+    key: Extract<ScreenKey, "F7" | "F8">;
+    shownPage: CardListResponse;
+    query: CardListQuery;
+    answer: CardListResponse;
+}
+
+// Fewer rows than the 7 of a full page, read up to an end of CARDDAT.
+const SHORT_PAGE_ROW_COUNT = 3;
+const SHORT_PAGE_FIRST_KEY = "short-page-first-key";
+const SHORT_PAGE_LAST_KEY = "short-page-last-key";
+
+// The 200 page that ends at an end of CARDDAT: its literal beside the record-actions line, the
+// short page's rows from firstRowNumber, its page number and fresh page keys.
+function ShortPageResponse(
+    literal: string,
+    page: number,
+    firstRowNumber: number,
+): CardListResponse {
+    return BuildListResponse({
+        rows: BuildListRows(SHORT_PAGE_ROW_COUNT, firstRowNumber),
+        page,
+        first_key: SHORT_PAGE_FIRST_KEY,
+        last_key: SHORT_PAGE_LAST_KEY,
+        message: literal,
+        info_message: RECORD_ACTIONS_INFO,
+    });
+}
+
+// 9000-READ-FORWARD sets NO MORE RECORDS TO SHOW when F8 reads the last cards with no look-ahead
+// card. 9100-READ-BACKWARDS moves the ENDFILE file error when F7 finds fewer than 7 cards before
+// the first card shown, and still shows them. 1400-SETUP-MESSAGE keeps the record-actions line
+// with both. F7 starts on page 3: from page 2 it reads back to page 1, where 1400-SETUP-MESSAGE
+// replaces the file error with NO PREVIOUS PAGES TO DISPLAY.
+const PAGING_LITERAL_CASES: readonly PagingLiteralCase[] = [
+    {
+        literal: NO_MORE_RECORDS_MESSAGE,
+        key: "F8",
+        shownPage: BuildListResponse(),
+        query: {
+            acctId: "",
+            cardNum: "",
+            startKey: LAST_KEY,
+            direction: Direction.FORWARD,
+            page: SHOWN_PAGE,
+        },
+        answer: ShortPageResponse(NO_MORE_RECORDS_MESSAGE, NEXT_PAGE, NEXT_PAGE_FIRST_ROW),
+    },
+    {
+        literal: READPREV_ENDFILE_MESSAGE,
+        key: "F7",
+        shownPage: NextPageResponse(PAGE_SIZE),
+        query: {
+            acctId: "",
+            cardNum: "",
+            startKey: FIRST_KEY,
+            direction: Direction.BACKWARD,
+            page: NEXT_PAGE,
+        },
+        answer: ShortPageResponse(READPREV_ENDFILE_MESSAGE, SHOWN_PAGE, 1),
+    },
+];
+
+describe("COCRDLIC end-of-file literals on /cards", () => {
+    it.each(PAGING_LITERAL_CASES)(
+        "COCRDLIC $key answered 200 shows $literal in red over the rows read",
+        async ({ literal, key, shownPage, query, answer }) => {
+            mockListCards.mockResolvedValueOnce(shownPage).mockResolvedValueOnce(answer);
+            const user = await RenderScreen();
+            await PressScreenKey(user, key, "click");
+            ExpectLastListRead(query);
+            await ExpectFeedback(literal, RECORD_ACTIONS_INFO);
+            ExpectShownRows(answer.rows);
+            expect(screen.getByText(`Page ${answer.page}`)).toBeVisible();
+            expect(mockRouterPush).not.toHaveBeenCalled();
+        },
+    );
+});
+
+interface RefusedLiteralCase {
+    literal: string;
+    status: number;
+    key: Extract<ScreenKey, "Enter" | "F8">;
+    selections: readonly (readonly [number, string])[];
+    body: CardListErrorBody;
+    listReads: number;
+    selectionPosts: number;
+}
+
+// ACCTSID and CARDSID by the field_errors name of each.
+const FILTER_LABELS: Readonly<Record<string, string>> = {
+    acct_id: ACCOUNT_FILTER_LABEL,
+    card_num: CARD_FILTER_LABEL,
+};
+
+// A CARDDAT browse failure is FileErrorOf's 503, LegacyMessageError(field="acct_id"), with no
+// information line. A selection whose card_ref is invalid or expired is TransferToCard's 404
+// cocrdslc.NotFoundError, which flags both filters. Neither body redisplays rows.
+const REFUSED_LITERAL_CASES: readonly RefusedLiteralCase[] = [
+    {
+        literal: CARD_FILE_ERROR_MESSAGE,
+        status: HTTP_FILE_ERROR,
+        key: "F8",
+        selections: [],
+        body: BuildErrorBody({
+            message: CARD_FILE_ERROR_MESSAGE,
+            field_errors: [ACCT_ID_FIELD],
+            cursor_field: ACCT_ID_FIELD,
+        }),
+        listReads: 2,
+        selectionPosts: 0,
+    },
+    {
+        literal: CARD_NOT_FOUND_MESSAGE,
+        status: HTTP_NOT_FOUND,
+        key: "Enter",
+        selections: [[SELECTED_ROW, "S"]],
+        body: BuildErrorBody({
+            message: CARD_NOT_FOUND_MESSAGE,
+            info_message: PROMPT_FOR_KEYS_INFO,
+            field_errors: [ACCT_ID_FIELD, CARD_NUM_FIELD],
+            cursor_field: ACCT_ID_FIELD,
+        }),
+        listReads: 1,
+        selectionPosts: 1,
+    },
+];
+
+// ENTER over a keyed code is the selection POST; any other key is a GET /cards read.
+function RefuseNextCall({ status, key, body }: RefusedLiteralCase): void {
+    const refusal = BuildAxiosError(status, body);
+    if (key === "Enter") {
+        mockSelectCards.mockRejectedValueOnce(refusal);
+        return;
+    }
+    mockListCards.mockRejectedValueOnce(refusal);
+}
+
+// The code each of the seven rows holds after the keyed selections, blank elsewhere.
+function RowCodesFor(selections: readonly (readonly [number, string])[]): string[] {
+    const codes = Array.from({ length: PAGE_SIZE }, () => "");
+    for (const [rowNumber, code] of selections) {
+        codes[rowNumber - 1] = code;
+    }
+    return codes;
+}
+
+// A refusal without rows keeps the page shown: its rows, its page number and the codes keyed.
+function ExpectShownPageKept(selections: readonly (readonly [number, string])[]): void {
+    ExpectShownRows(BuildListRows(PAGE_SIZE));
+    expect(SelectionCodesShown()).toEqual(RowCodesFor(selections));
+    expect(screen.getByText(`Page ${SHOWN_PAGE}`)).toBeVisible();
+}
+
+// aria-invalid marks exactly the filters field_errors names, as the map colours a flagged field.
+function ExpectFlaggedFilters(flaggedFields: readonly string[]): void {
+    for (const [field, label] of Object.entries(FILTER_LABELS)) {
+        const isFlagged = String(flaggedFields.includes(field));
+        expect(FilterInput(label)).toHaveAttribute("aria-invalid", isFlagged);
+    }
+}
+
+describe("COCRDLIC refused reads and selections on /cards", () => {
+    it.each(REFUSED_LITERAL_CASES)(
+        "COCRDLIC $key refused $status shows $literal in red and keeps the page shown",
+        async (refusedCase) => {
+            const { selections, body } = refusedCase;
+            const user = await RenderScreen();
+            await ChooseSelections(user, selections);
+            RefuseNextCall(refusedCase);
+            await PressScreenKey(user, refusedCase.key, "click");
+            await ExpectFeedback(refusedCase.literal, body.info_message ?? "");
+            ExpectShownPageKept(selections);
+            expect(mockListCards).toHaveBeenCalledTimes(refusedCase.listReads);
+            expect(mockSelectCards).toHaveBeenCalledTimes(refusedCase.selectionPosts);
+            ExpectFlaggedFilters(body.field_errors ?? []);
+            expect(FilterInput(ACCOUNT_FILTER_LABEL)).toHaveFocus();
             expect(mockRouterPush).not.toHaveBeenCalled();
         },
     );
@@ -806,8 +1156,7 @@ describe("COCRDLIC first page under React Strict Mode on /cards", () => {
         await AnswerPendingCall(abortedPage, BuildListResponse());
         expect(mockListCards).toHaveBeenCalledTimes(3);
         expect(screen.getByText(`Page ${NEXT_PAGE}`)).toBeVisible();
-        const nextRows = NextPageResponse(PAGE_SIZE).rows;
-        expect(CardNumbersShown()).toEqual(nextRows.map((row) => row.card_num_masked));
+        ExpectShownRows(NextPageResponse(PAGE_SIZE).rows);
     });
 });
 
@@ -932,7 +1281,7 @@ describe("COCRDLIC first page under the development remount on /cards", () => {
             settleLatestRead(BuildListResponse({ page: LATEST_PAGE, rows, info_message: "" })),
         );
         await WaitForIdle();
-        expect(CardNumbersShown()).toEqual(rows.map((row) => row.card_num_masked));
+        ExpectShownRows(rows);
         expect(screen.getByText(`Page ${LATEST_PAGE}`)).toBeVisible();
         expect(AlertTexts()).toEqual([PENDING_MESSAGE]);
     });
@@ -947,7 +1296,7 @@ describe("COCRDLIC cancelled list reads on /cards", () => {
             await PressScreenKey(user, key, "click");
             expect(mockListCards).toHaveBeenCalledTimes(2);
             expect(AlertTexts()).toEqual([RECORD_ACTIONS_INFO]);
-            ExpectMaskedCardRows();
+            ExpectMaskedCardRows(BuildListRows(PAGE_SIZE));
             expect(screen.getByText(`Page ${SHOWN_PAGE}`)).toBeVisible();
             expect(screen.getByRole("button", { name: KEY_BUTTON_NAMES[key] })).toBeEnabled();
         },
