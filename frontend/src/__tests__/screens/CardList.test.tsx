@@ -386,6 +386,18 @@ function FlaggedRowNumbers(): number[] {
         );
 }
 
+// The id of the MessageLine ERRMSG Alert, which a field named in field_errors is described by.
+const ERRMSG_ID = "message-line-errmsg";
+
+// The rows whose CRDSELn field is described by the ERRMSG line: exactly the flagged rows.
+function DescribedRowNumbers(): number[] {
+    return BodyRows()
+        .map((_row, index) => index + 1)
+        .filter(
+            (rowNumber) => SelectionField(rowNumber).getAttribute("aria-describedby") === ERRMSG_ID,
+        );
+}
+
 function InDocumentOrder(first: Node, second: Node): number {
     return first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
 }
@@ -778,6 +790,7 @@ describe("COCRDLIC selection literals on /cards", () => {
             await PressScreenKey(user, "Enter", "click");
             await ExpectAlert(literalCase.literal, ERRMSG_SEVERITY);
             expect(FlaggedRowNumbers()).toEqual(literalCase.flaggedRows);
+            expect(DescribedRowNumbers()).toEqual(literalCase.flaggedRows);
             expect(SelectionField(literalCase.cursorRow)).toHaveFocus();
             expect(mockRouterPush).not.toHaveBeenCalled();
         },
@@ -951,11 +964,14 @@ function ExpectShownPageKept(selections: readonly (readonly [number, string])[])
     expect(screen.getByText(`Page ${SHOWN_PAGE}`)).toBeVisible();
 }
 
-// aria-invalid marks exactly the filters field_errors names, as the map colours a flagged field.
+// aria-invalid marks exactly the filters field_errors names, as the map colours a flagged field,
+// and only those are described by the ERRMSG line.
 function ExpectFlaggedFilters(flaggedFields: readonly string[]): void {
     for (const [field, label] of Object.entries(FILTER_LABELS)) {
-        const isFlagged = String(flaggedFields.includes(field));
-        expect(FilterInput(label)).toHaveAttribute("aria-invalid", isFlagged);
+        const isFlagged = flaggedFields.includes(field);
+        expect(FilterInput(label)).toHaveAttribute("aria-invalid", String(isFlagged));
+        const description = FilterInput(label).getAttribute("aria-describedby");
+        expect(description).toBe(isFlagged ? ERRMSG_ID : null);
     }
 }
 
@@ -1014,7 +1030,7 @@ function FilterRefusalBody(): CardListErrorBody {
 }
 
 describe("COCRDLIC filter field errors on /cards", () => {
-    it("COCRDLIC flags both filters and puts the cursor on the account filter", async () => {
+    it("COCRDLIC flags both filters, ties them to ERRMSG and focuses the account", async () => {
         const user = await RenderScreen();
         mockListCards.mockRejectedValueOnce(BuildAxiosError(HTTP_BAD_REQUEST, FilterRefusalBody()));
         await user.type(FilterInput(ACCOUNT_FILTER_LABEL), "12A");
@@ -1028,8 +1044,7 @@ describe("COCRDLIC filter field errors on /cards", () => {
             page: SHOWN_PAGE,
         };
         expect(mockListCards).toHaveBeenLastCalledWith(expectedQuery, READ_OPTIONS);
-        expect(FilterInput(ACCOUNT_FILTER_LABEL)).toHaveAttribute("aria-invalid", "true");
-        expect(FilterInput(CARD_FILTER_LABEL)).toHaveAttribute("aria-invalid", "true");
+        ExpectFlaggedFilters([ACCT_ID_FIELD, CARD_NUM_FIELD]);
         expect(FilterInput(ACCOUNT_FILTER_LABEL)).toHaveFocus();
     });
 });

@@ -28,9 +28,13 @@ import {
 } from "react";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine, type MessageLineProps } from "@/components/MessageLine";
+import {
+    ErrorMessageReference,
+    MessageLine,
+    type MessageLineProps,
+} from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
-import { ViewCard, type CardDetailResponse } from "@/lib/api/cards";
+import { PROMPT_FOR_KEYS_INFO, ViewCard, type CardDetailResponse } from "@/lib/api/cards";
 import {
     IsCancelledRequest,
     LegacyErrorBody,
@@ -271,6 +275,13 @@ const EMPTY_FEEDBACK: CardViewFeedback = {
 
 const IDLE_LOOKUP_STATE: LookupState = { detail: null, feedback: EMPTY_FEEDBACK, isBusy: false };
 
+// 1200-SETUP-SCREEN-VARS sets the key prompt whenever no information line is set, so a first
+// entry from the menu shows it without a read.
+const MENU_ENTRY_LOOKUP_STATE: LookupState = {
+    ...IDLE_LOOKUP_STATE,
+    feedback: { ...EMPTY_FEEDBACK, infoMessage: PROMPT_FOR_KEYS_INFO },
+};
+
 // The server's lines verbatim: the info line keeps the leading spaces of its literal.
 function ToViewFeedback(screenFeedback: ScreenFeedback, isError: boolean): CardViewFeedback {
     return {
@@ -318,10 +329,18 @@ function EndLookup(previous: LookupState): LookupState {
     return previous.isBusy ? { ...previous, isBusy: false } : previous;
 }
 
-// A pending message is the refusal literal another screen stored: a red ERRMSG line.
+// A card list selection opens with a clear line, as its read on arrival brings the information
+// line; the menu opens with the key prompt.
+function InitialLookupState(entry: EntryKeys): LookupState {
+    return entry.cardRef === "" ? MENU_ENTRY_LOOKUP_STATE : IDLE_LOOKUP_STATE;
+}
+
+// A pending message is the refusal literal another screen stored: a red ERRMSG line beside the
+// information line the screen opened with.
 function WithPendingMessage(previous: LookupState, message: string): LookupState {
     const severity = SeverityForOutcome({ isError: true, isCompletedWrite: false });
-    return { ...previous, feedback: { ...EMPTY_FEEDBACK, message, severity } };
+    const { infoMessage } = previous.feedback;
+    return { ...previous, feedback: { ...EMPTY_FEEDBACK, message, severity, infoMessage } };
 }
 
 // Each lookup owns an AbortController, held in the ref while its read is in flight. Abandoning
@@ -410,9 +429,18 @@ function MessageLineFor({ message, severity, infoMessage }: CardViewFeedback): M
     return { message, severity, infoMessage };
 }
 
-// BMS PROT and ASKIP fields become read-only inputs; every field keeps its BMS LENGTH.
-function FieldSlotProps(isReadOnly: boolean, maxLength: number): TextFieldProps["slotProps"] {
-    return { input: { readOnly: isReadOnly }, htmlInput: { maxLength } };
+// BMS PROT and ASKIP fields become read-only inputs; every field keeps its BMS LENGTH. A field
+// the server names in field_errors is tied to the ERRMSG line, so assistive technology reads the
+// literal when the cursor lands on it.
+function FieldSlotProps(
+    isReadOnly: boolean,
+    maxLength: number,
+    isInvalid: boolean,
+): TextFieldProps["slotProps"] {
+    return {
+        input: { readOnly: isReadOnly },
+        htmlInput: { maxLength, ...ErrorMessageReference(isInvalid) },
+    };
 }
 
 // Read-only fields stay focusable, so the server's cursor reaches a protected key too.
@@ -433,8 +461,8 @@ function usePendingMessage(setLookupState: Dispatch<SetStateAction<LookupState>>
 // Leaving the screen abandons the lookup in flight. Cancelling also frees the one-at-a-time guard
 // and ends the busy state, which no aborted lookup ends itself, so the screen never stays busy
 // once its read is abandoned, and the read React's development remount starts is not refused.
-function useCardLookup(): CardLookup {
-    const [lookupState, setLookupState] = useState<LookupState>(IDLE_LOOKUP_STATE);
+function useCardLookup(entry: EntryKeys): CardLookup {
+    const [lookupState, setLookupState] = useState<LookupState>(() => InitialLookupState(entry));
     const lookupControllerRef = useRef<AbortController | null>(null);
     const runLookup = useCallback(
         (keys: LookupKeys) => RunGuardedLookup({ keys, lookupControllerRef, setLookupState }),
@@ -519,7 +547,7 @@ function useCardViewScreen(): CardViewScreenModel {
     const entry = useEntryKeys();
     const typedKeys = useTypedKeys();
     const inputRefs = useKeyInputRefs();
-    const { lookupState, RunLookup, CancelLookup } = useCardLookup();
+    const { lookupState, RunLookup, CancelLookup } = useCardLookup(entry);
     const { detail, feedback, isBusy } = lookupState;
     useListEntryLookup(entry, RunLookup, CancelLookup);
     useCursorFocus(inputRefs, feedback);
@@ -532,6 +560,7 @@ function useCardViewScreen(): CardViewScreenModel {
 
 function KeyField({ field, isProtected, fieldErrors }: KeyFieldProps) {
     const { definition } = field;
+    const isInvalid = fieldErrors.includes(definition.fieldName);
     return (
         <TextField
             label={definition.label}
@@ -540,11 +569,11 @@ function KeyField({ field, isProtected, fieldErrors }: KeyFieldProps) {
                 field.onTextChange(event.target.value)
             }
             variant={isProtected ? "filled" : "outlined"}
-            error={fieldErrors.includes(definition.fieldName)}
+            error={isInvalid}
             autoFocus={definition.isInitialCursor && !isProtected}
             inputRef={field.inputRef}
             fullWidth
-            slotProps={FieldSlotProps(isProtected, definition.maxLength)}
+            slotProps={FieldSlotProps(isProtected, definition.maxLength, isInvalid)}
         />
     );
 }
@@ -561,14 +590,15 @@ function CardKeyFields({ isListEntry, fieldErrors, fields }: CardKeyFieldsProps)
     );
 }
 
-// Every detail field is ASKIP on the map, so it is shown read-only.
+// Every detail field is ASKIP on the map, so it is shown read-only, and the server never names
+// one in field_errors.
 function DetailField({ definition, detail }: DetailFieldProps) {
     return (
         <TextField
             label={definition.label}
             value={detail?.[definition.fieldName] ?? ""}
             variant="filled"
-            slotProps={FieldSlotProps(true, definition.maxLength)}
+            slotProps={FieldSlotProps(true, definition.maxLength, false)}
         />
     );
 }
@@ -585,7 +615,8 @@ function ExpiryFields({ detail }: CardDetailFieldsProps) {
     );
 }
 
-// EXPMON, the "/" literal and EXPYEAR, announced together under the Expiry Date label.
+// EXPMON, the "/" literal and EXPYEAR, announced together under the Expiry Date label; the
+// literal is only a visual separator.
 function ExpiryParts({ labelId, detail }: ExpiryPartsProps) {
     return (
         <Stack
@@ -596,7 +627,9 @@ function ExpiryParts({ labelId, detail }: ExpiryPartsProps) {
             aria-labelledby={labelId}
         >
             <DetailField definition={EXPIRY_MONTH_FIELD} detail={detail} />
-            <Typography component="span">{EXPIRY_SEPARATOR}</Typography>
+            <Typography component="span" aria-hidden="true">
+                {EXPIRY_SEPARATOR}
+            </Typography>
             <DetailField definition={EXPIRY_YEAR_FIELD} detail={detail} />
         </Stack>
     );
@@ -637,7 +670,9 @@ function CardViewEntry() {
     return <CardViewScreen key={JSON.stringify([cardRef, acctId])} />;
 }
 
-// useSearchParams needs a Suspense boundary for the static prerender of the route.
+// useSearchParams needs a Suspense boundary wherever Next.js prerenders a page. The route layout
+// renders this one on demand, so the query is known on the first render and the empty fallback
+// never shows.
 export default function CardViewPage() {
     return (
         <Suspense fallback={null}>

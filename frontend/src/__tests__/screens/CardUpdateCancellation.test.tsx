@@ -3,7 +3,8 @@
 // is left, React's development remount fetches again or the query changes, while ENTER, F5 and
 // F12 stay writes that are never given a signal. A query change on the same route is a fresh
 // first entry: it shows only the new selection, or the empty key screen, and a write already sent
-// for the previous selection ends without reaching the new screen.
+// for the previous selection ends without reaching the new screen. An entry with no query, as
+// from the main menu, fetches nothing and shows the empty key screen with the key prompt.
 import { ThemeProvider } from "@mui/material/styles";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -13,7 +14,13 @@ import { StrictMode, type ReactElement, type ReactNode } from "react";
 import CardUpdatePage from "@/app/cards/update/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
 import { FetchCardForEdit, UpdateCard, type CardScreen } from "@/lib/api/cards";
-import { ABEND_MESSAGE, UpdateAction, UpdateScreenState, type ReadOptions } from "@/lib/apiClient";
+import {
+    ABEND_MESSAGE,
+    StorePendingMessage,
+    UpdateAction,
+    UpdateScreenState,
+    type ReadOptions,
+} from "@/lib/apiClient";
 import type { SessionContextValue } from "@/lib/session";
 
 type SignedOnUser = NonNullable<SessionContextValue["currentUser"]>;
@@ -116,6 +123,15 @@ const ENTER_BUTTON_NAME = "Process (Enter)";
 const MENU_ROUTE = "/menu";
 // The INFOMSG cocrdupc.py sends with a fetched card (FOUND-CARDS-FOR-ACCOUNT).
 const DETAILS_SHOWN_INFO = "Details of selected card shown above";
+// The INFOMSG of a fresh entry (PROMPT-FOR-SEARCH-KEYS), cocrdslc.PROMPT_FOR_KEYS_INFO verbatim.
+const PROMPT_FOR_KEYS_INFO = "Please enter Account and Card Number";
+// MUI 9 marks an info Alert as MuiAlert-colorInfo (Alert/alertClasses.d.ts).
+const INFO_ALERT_CLASS = "MuiAlert-colorInfo";
+// MUI 9 marks an error Alert as MuiAlert-colorError.
+const ERROR_ALERT_CLASS = "MuiAlert-colorError";
+// A refusal literal another page leaves for the next screen (StorePendingMessage), trailing
+// blank kept.
+const PENDING_REFUSAL = "No access - Admin Only option... ";
 // The ERRMSG an ENTER with no change is answered with.
 const NO_CHANGE_MESSAGE = "No change detected with respect to values fetched.";
 // The COCRDUP ACCTSID and CARDSID labels, verbatim.
@@ -291,8 +307,16 @@ function ExpectCardShown(shown: TestSelection, replaced: TestSelection): void {
     expect(screen.queryByDisplayValue(replaced.embossedName)).not.toBeInTheDocument();
 }
 
-// DETAILS_NOT_FETCHED as entered from the menu: both keys blank and typable, and neither the
-// details nor the information line of the card shown before.
+// The message-line Alert of this role (ERRMSG alert, INFOMSG status) holds exactly the text, in
+// the colour of its severity.
+function ExpectMessageLine(role: "alert" | "status", text: string, colourClass: string): void {
+    const line = screen.getByRole(role);
+    expect(line.textContent).toBe(text);
+    expect(line).toHaveClass(colourClass);
+}
+
+// DETAILS_NOT_FETCHED as entered from the menu: both keys blank and typable, the key prompt as
+// the information line, and neither the details nor the information line of a card shown before.
 function ExpectEmptyKeyScreen(): void {
     for (const label of KEY_LABELS) {
         expect(InputFor(label)).toHaveValue("");
@@ -300,6 +324,7 @@ function ExpectEmptyKeyScreen(): void {
     }
     expect(screen.queryByDisplayValue(TEST_EMBOSSED_NAME)).not.toBeInTheDocument();
     expect(screen.queryByText(DETAILS_SHOWN_INFO)).not.toBeInTheDocument();
+    ExpectMessageLine("status", PROMPT_FOR_KEYS_INFO, INFO_ALERT_CLASS);
 }
 
 // Both cards' fetches answered at once, and the first card's ENTER held until the case answers it.
@@ -324,6 +349,7 @@ beforeEach(() => {
     mockFetchCardForEdit.mockReset();
     mockUpdateCard.mockReset();
     mockUpdateCard.mockResolvedValue(BuildCardScreen());
+    window.sessionStorage.clear();
 });
 
 afterEach(() => {
@@ -430,6 +456,29 @@ describe("COCRDUPC entry without a selection after a fetched card on /cards/upda
         await page.user.type(InputFor(ACCOUNT_LABEL), TYPED_ACCOUNT_ID);
         await ClickEnter(page.user);
         ExpectTypedKeysEnter(TYPED_ACCOUNT_ID);
+    });
+});
+
+// 3250-SETUP-INFOMSG answers CDEMO-PGM-ENTER with PROMPT-FOR-SEARCH-KEYS, before any request.
+describe("COCRDUPC entered from the main menu on /cards/update", () => {
+    it("COCRDUPC shows the key prompt, fetches nothing and leaves the keys typable", async () => {
+        mockSearchParams = new URLSearchParams();
+        const { user } = RenderPage(false);
+        ExpectEmptyKeyScreen();
+        expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        await user.type(InputFor(ACCOUNT_LABEL), TYPED_ACCOUNT_ID);
+        expect(InputFor(ACCOUNT_LABEL)).toHaveValue(TYPED_ACCOUNT_ID);
+        expect(mockFetchCardForEdit).not.toHaveBeenCalled();
+        expect(mockUpdateCard).not.toHaveBeenCalled();
+    });
+
+    it("COCRDUPC shows a stored refusal in red and keeps the key prompt", () => {
+        StorePendingMessage(PENDING_REFUSAL);
+        mockSearchParams = new URLSearchParams();
+        RenderPage(false);
+        ExpectMessageLine("alert", PENDING_REFUSAL, ERROR_ALERT_CLASS);
+        ExpectMessageLine("status", PROMPT_FOR_KEYS_INFO, INFO_ALERT_CLASS);
+        expect(mockFetchCardForEdit).not.toHaveBeenCalled();
     });
 });
 

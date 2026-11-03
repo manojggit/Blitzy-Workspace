@@ -18,6 +18,8 @@ import {
 } from "@mui/material";
 import type { ReactElement } from "react";
 
+import { ErrorMessageReference } from "@/components/MessageLine";
+
 /** A protected display column of a list map; `field` is the key of `SelectionRow.cells`. */
 export interface SelectionColumn {
     field: string;
@@ -110,6 +112,15 @@ function SelectionOptionsFor(
     return [blankOption, ...codeOptions];
 }
 
+// A flagged code field is tied to the ERRMSG line, which MUI's SelectInput passes on to the
+// combobox, so assistive technology reads the literal when the cursor lands on the row.
+function SelectionInputProps(row: SelectionRow, rowNumber: number) {
+    return {
+        "aria-label": SelectionLabelFor(rowNumber),
+        ...ErrorMessageReference(row.isError ?? false),
+    };
+}
+
 // Select labels its open listbox only through a labelId, so the list takes its field's name.
 function SelectionMenuPropsFor(rowNumber: number): Partial<MenuProps> {
     return { slotProps: { list: { "aria-label": SelectionLabelFor(rowNumber) } } };
@@ -124,7 +135,7 @@ function SelectionCell({ row, rowNumber, tableProps }: SelectionCellProps) {
             sx={SELECTION_FIELD_STYLE}
             error={row.isError ?? false}
             value={row.selectedCode}
-            inputProps={{ "aria-label": SelectionLabelFor(rowNumber) }}
+            inputProps={SelectionInputProps(row, rowNumber)}
             MenuProps={SelectionMenuPropsFor(rowNumber)}
             onChange={(event: SelectChangeEvent<string>) =>
                 onSelectionChange(row.rowKey, event.target.value)

@@ -19,6 +19,7 @@ import { ViewCard, type CardDetailResponse } from "@/lib/api/cards";
 import {
     ABEND_MESSAGE,
     SIGN_ON_ROUTE,
+    StorePendingMessage,
     type LegacyErrorResponse,
     type MessageSeverity,
     type ReadOptions,
@@ -145,6 +146,9 @@ const CARD_FILE_ERROR_MESSAGE =
     "File Error: READ     on CARDDAT   returned RESP 000000017 ,RESP2 000000000";
 const DETAILS_SHOWN_INFO = "   Displaying requested details";
 const PROMPT_FOR_KEYS_INFO = "Please enter Account and Card Number";
+// A refusal literal another page leaves for the next screen (StorePendingMessage), trailing
+// blank kept.
+const PENDING_REFUSAL = "No access - Admin Only option... ";
 
 const HTTP_EDIT_FAILURE = 400;
 const HTTP_UNAUTHORIZED = 401;
@@ -199,6 +203,9 @@ const LITERAL_CASES: readonly [string, number, MessageSeverity][] = [
     [CARD_NOT_FOUND_MESSAGE, HTTP_NOT_FOUND, "error"],
     [CARD_FILE_ERROR_MESSAGE, HTTP_FILE_ERROR, "error"],
 ];
+
+// The id of the MessageLine ERRMSG Alert, which a field named in field_errors is described by.
+const ERRMSG_ID = "message-line-errmsg";
 
 // [field name, label] of the two keys the server can name in field_errors and cursor_field.
 const KEY_FIELD_LABELS: readonly [string, string][] = [
@@ -407,11 +414,14 @@ function ExpectNoCardNumberInUrls(): void {
     expect(window.location.href).not.toMatch(PAN_PATTERN);
 }
 
-// A key named in field_errors is shown in error (aria-invalid); the other key is not.
+// A key named in field_errors is shown in error (aria-invalid) and described by the ERRMSG line;
+// the other key is neither.
 function ExpectInvalidKeys(fieldErrors: readonly string[]): void {
     for (const [fieldName, label] of KEY_FIELD_LABELS) {
-        const isInvalid = String(fieldErrors.includes(fieldName));
-        expect(InputFor(label)).toHaveAttribute("aria-invalid", isInvalid);
+        const isInvalid = fieldErrors.includes(fieldName);
+        expect(InputFor(label)).toHaveAttribute("aria-invalid", String(isInvalid));
+        const description = InputFor(label).getAttribute("aria-describedby");
+        expect(description).toBe(isInvalid ? ERRMSG_ID : null);
     }
 }
 
@@ -427,6 +437,7 @@ beforeEach(() => {
     jest.useFakeTimers(CLOCK_ONLY_FAKE_TIMERS);
     mockSearchParams = new URLSearchParams();
     mockViewCard.mockReset();
+    window.sessionStorage.clear();
 });
 
 afterEach(() => {
@@ -471,7 +482,7 @@ describe("COCRDSLC BMS COCRDSL expiry group on /cards/view", () => {
         expect(screen.getByText(EXPIRY_LABEL, { normalizer: KeepRawText })).toBeInTheDocument();
         const expiryGroup = screen.getByRole("group", { name: EXPIRY_GROUP_NAME });
         expect(within(expiryGroup).getByLabelText(EXPIRY_MONTH_LABEL)).toBeInTheDocument();
-        expect(within(expiryGroup).getByText("/")).toBeInTheDocument();
+        expect(within(expiryGroup).getByText("/")).toHaveAttribute("aria-hidden", "true");
         expect(within(expiryGroup).getByLabelText(EXPIRY_YEAR_LABEL)).toBeInTheDocument();
     });
 });
@@ -488,12 +499,23 @@ describe("COCRDSLC BMS COCRDSL attributes from the menu on /cards/view", () => {
         }
     });
 
-    it("COCRDSLC places the cursor on ACCTSID (IC) and reads nothing before ENTER", () => {
+    it("COCRDSLC places the cursor on ACCTSID (IC) and reads nothing before ENTER", async () => {
         RenderScreen();
         expect(InputFor(ACCOUNT_LABEL)).toHaveFocus();
+        await ExpectAlert(PROMPT_FOR_KEYS_INFO, "info");
         expect(mockViewCard).not.toHaveBeenCalled();
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
-        expect(screen.queryAllByRole("status")).toHaveLength(0);
+    });
+});
+
+// 1200-SETUP-SCREEN-VARS sets WS-PROMPT-FOR-INPUT whenever no information line is set.
+describe("COCRDSLC a pending refusal from the main menu on /cards/view", () => {
+    it("COCRDSLC shows the stored refusal in red and keeps the key prompt", async () => {
+        StorePendingMessage(PENDING_REFUSAL);
+        RenderScreen();
+        await ExpectAlert(PENDING_REFUSAL, "error");
+        await ExpectAlert(PROMPT_FOR_KEYS_INFO, "info");
+        expect(mockViewCard).not.toHaveBeenCalled();
     });
 });
 
@@ -514,6 +536,19 @@ describe("COCRDSLC entered from the COCRDLIC card list on /cards/view", () => {
             expect(InputFor(label)).toHaveAttribute("readonly");
             expect(InputFor(label)).not.toHaveValue(expect.stringMatching(PAN_PATTERN));
         }
+    });
+});
+
+// The read on arrival answers with its own information line, so no key prompt is set first.
+describe("COCRDSLC information line from the COCRDLIC card list on /cards/view", () => {
+    it("COCRDSLC shows no key prompt while or after the selected card is read", async () => {
+        const releaseRead = HoldReads();
+        SelectFromCardList();
+        RenderScreen();
+        expect(screen.queryAllByRole("status")).toHaveLength(0);
+        releaseRead(BuildCardDetail());
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        expect(screen.queryByText(PROMPT_FOR_KEYS_INFO)).not.toBeInTheDocument();
     });
 });
 

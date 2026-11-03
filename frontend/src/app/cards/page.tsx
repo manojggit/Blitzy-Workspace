@@ -18,7 +18,7 @@ import {
 } from "react";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     SelectionLabelFor,
@@ -693,6 +693,12 @@ function PageIndicator({ pageState }: PageIndicatorProps) {
     );
 }
 
+// The BMS LENGTH and, while the server names the filter in field_errors, its tie to the ERRMSG
+// line, so assistive technology reads the literal when the cursor lands on the field.
+function FilterHtmlInputProps(definition: FilterFieldDefinition, isError: boolean) {
+    return { maxLength: definition.maxLength, ...ErrorMessageReference(isError) };
+}
+
 // The value is sent as typed: no trim, case change or digit filter, so every server literal
 // stays reachable. Only the BMS LENGTH is enforced.
 function CardFilterField({ definition, value, isError, handlers }: CardFilterFieldProps) {
@@ -708,7 +714,7 @@ function CardFilterField({ definition, value, isError, handlers }: CardFilterFie
                 autoFocus={definition.autoFocus}
                 onChange={(event) => handlers.onFilterChange(name, event.target.value)}
                 inputRef={(element: HTMLInputElement | null) => handlers.onInputRef(name, element)}
-                slotProps={{ htmlInput: { maxLength: definition.maxLength } }}
+                slotProps={{ htmlInput: FilterHtmlInputProps(definition, isError) }}
             />
         </Grid>
     );

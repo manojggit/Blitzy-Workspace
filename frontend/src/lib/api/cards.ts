@@ -26,6 +26,10 @@ const CARDS_PATH = "/cards";
 const SELECTION_PATH = `${CARDS_PATH}/selection`;
 const EDIT_SUFFIX = "/edit";
 
+// The server's key-prompt information line (cocrdslc.PROMPT_FOR_KEYS_INFO), verbatim. The CCDL
+// and CCUP pages show it on a first entry with no query, which makes no request.
+export const PROMPT_FOR_KEYS_INFO = "Please enter Account and Card Number";
+
 // The server reads a list as one repeated parameter per item (selections=&selections=S), so
 // array items are sent without axios's default "[]" suffix; blank items are kept.
 const REPEATED_PARAMS_SERIALIZER = { indexes: null };

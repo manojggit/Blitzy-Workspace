@@ -210,22 +210,41 @@ function IsMarkedAsError(rowNumber: number): boolean {
     return field.closest(".MuiInputBase-root")?.classList.contains("Mui-error") ?? false;
 }
 
+// Rows 2 and 3 of COCRDLI carry the server's flag; the other five do not.
+function RenderFlaggedCardRows() {
+    const rows = BuildRows(COCRDLI_CASE.columns, COCRDLI_CASE.rowCount).map((row, index) => ({
+        ...row,
+        isError: index === 1 || index === 2,
+    }));
+    RenderWithTheme(
+        <SelectionTable
+            columns={COCRDLI_CASE.columns}
+            rows={rows}
+            allowedCodes={COCRDLI_CASE.allowedCodes}
+            onSelectionChange={jest.fn()}
+        />,
+    );
+}
+
+// The id MessageLine gives the ERRMSG Alert, which a flagged code field is described by.
+const ERRMSG_ID = "message-line-errmsg";
+
+function DescriptionOf(rowNumber: number): string | null {
+    const field = screen.getByRole("combobox", { name: SelectionFieldName(rowNumber) });
+    return field.getAttribute("aria-describedby");
+}
+
 describe("SelectionTable field errors", () => {
     it("COCRDLI CRDSEL1-7 marks only the rows flagged by the server", () => {
-        const rows = BuildRows(COCRDLI_CASE.columns, COCRDLI_CASE.rowCount).map((row, index) => ({
-            ...row,
-            isError: index === 1 || index === 2,
-        }));
-        RenderWithTheme(
-            <SelectionTable
-                columns={COCRDLI_CASE.columns}
-                rows={rows}
-                allowedCodes={COCRDLI_CASE.allowedCodes}
-                onSelectionChange={jest.fn()}
-            />,
-        );
+        RenderFlaggedCardRows();
         const marked = RowNumbersUpTo(COCRDLI_CASE.rowCount).map(IsMarkedAsError);
         expect(marked).toEqual([false, true, true, false, false, false, false]);
+    });
+
+    it("COCRDLI CRDSEL1-7 ties only the flagged rows to the ERRMSG line", () => {
+        RenderFlaggedCardRows();
+        const descriptions = RowNumbersUpTo(COCRDLI_CASE.rowCount).map(DescriptionOf);
+        expect(descriptions).toEqual([null, ERRMSG_ID, ERRMSG_ID, null, null, null, null]);
     });
 });
 

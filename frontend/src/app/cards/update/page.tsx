@@ -3,8 +3,6 @@
 "use client";
 
 import {
-    FormControl,
-    FormLabel,
     Grid,
     Stack,
     TextField,
@@ -19,6 +17,7 @@ import {
     Suspense,
     useCallback,
     useEffect,
+    useId,
     useMemo,
     useRef,
     useState,
@@ -29,10 +28,11 @@ import {
 } from "react";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     FetchCardForEdit,
+    PROMPT_FOR_KEYS_INFO,
     UpdateCard,
     type CardScreen,
     type CardScreenFields,
@@ -72,14 +72,12 @@ const CANCEL_LABEL = "Cancel";
 const ENTRY_GRID_SIZE = { xs: 12, md: 6 } as const;
 // Theme spacing units: room between fields for an outlined field's raised label.
 const FIELD_SPACING = 4;
+const EXPIRY_LABEL_SPACING = 2;
 const EXPIRY_PART_SPACING = 2;
-const LEGEND_SPACING = 3;
 const EDITABLE_FIELD_KEY = "editable";
 const PROTECTED_FIELD_KEY = "protected";
-const EXPIRY_ROW_STYLE: SxProps<Theme> = {
-    alignItems: "center",
-    paddingBlockStart: LEGEND_SPACING,
-};
+// The month and year fields sit level with the separator between them.
+const EXPIRY_ROW_STYLE: SxProps<Theme> = { alignItems: "center" };
 
 type CardFieldName = keyof CardScreenFields;
 
@@ -98,7 +96,8 @@ interface CardFieldDefinition {
 const ACCT_ID_FIELD: CardFieldName = "acct_id";
 const CARD_NUM_FIELD: CardFieldName = "card_num";
 
-// The COCRDUP DFHMDF labels (INITIAL, trailing blank dropped) and LENGTHs.
+// The COCRDUP DFHMDF labels (INITIAL, trailing blank dropped) and LENGTHs. EXPMON and EXPYEAR
+// have no INITIAL of their own: under the Expiry Date label they are Month and Year, as on COCRDSL.
 const CARD_UPDATE_FIELDS: Readonly<Record<RenderedFieldName, CardFieldDefinition>> = Object.freeze({
     acct_id: { name: "acct_id", label: "Account Number    :", maxLength: 11 },
     card_num: { name: "card_num", label: "Card Number       :", maxLength: 16 },
@@ -109,13 +108,8 @@ const CARD_UPDATE_FIELDS: Readonly<Record<RenderedFieldName, CardFieldDefinition
         maxLength: 1,
         helperText: YES_NO_HELPER_TEXT,
     },
-    expiry_month: {
-        name: "expiry_month",
-        label: "Expiry Month",
-        maxLength: 2,
-        inputMode: "numeric",
-    },
-    expiry_year: { name: "expiry_year", label: "Expiry Year", maxLength: 4, inputMode: "numeric" },
+    expiry_month: { name: "expiry_month", label: "Month", maxLength: 2, inputMode: "numeric" },
+    expiry_year: { name: "expiry_year", label: "Year", maxLength: 4, inputMode: "numeric" },
 });
 
 // ACCTSID and CARDSID (rows 7 and 8); CRDNAME and CRDSTCD (rows 11 and 13); EXPMON / EXPYEAR.
@@ -282,6 +276,11 @@ interface FieldSectionProps {
     view: FieldView;
 }
 
+interface ExpiryPartsProps {
+    labelId: string;
+    view: FieldView;
+}
+
 interface FieldGridProps {
     definitions: readonly CardFieldDefinition[];
     view: FieldView;
@@ -394,6 +393,16 @@ function InitialModel(entry: EntryKeys): CardUpdateModel {
     };
 }
 
+// 3250-SETUP-INFOMSG answers a fresh entry (CDEMO-PGM-ENTER) with the key prompt, so the menu
+// entry shows it without a request. A card list selection fetches its card at once, and the
+// fetch's answer brings the information line.
+function InitialFeedback(entry: EntryKeys): ScreenFeedbackView {
+    if (entry.cardRef !== null) {
+        return INITIAL_FEEDBACK;
+    }
+    return { ...INITIAL_FEEDBACK, infoMessage: PROMPT_FOR_KEYS_INFO };
+}
+
 // "Changes committed to database" arrives as the INFOMSG of a completed save with ERRMSG blank;
 // it is shown once, as the green confirmation of the write.
 function BuildFeedback(source: ScreenFeedback, outcome: FeedbackOutcome): ScreenFeedbackView {
@@ -441,16 +450,17 @@ async function RunCardRequest(request: CardRequest, setters: ScreenSetters): Pro
     }
 }
 
+// The pending message joins the information line the screen opened with.
 function ShowPendingMessage(setters: ScreenSetters): void {
     const pendingMessage = TakePendingMessage();
     if (pendingMessage === "") {
         return;
     }
-    setters.setFeedback({
-        ...INITIAL_FEEDBACK,
+    setters.setFeedback((feedback) => ({
+        ...feedback,
         message: pendingMessage,
         severity: PENDING_MESSAGE_SEVERITY,
-    });
+    }));
 }
 
 // ENTER, F5 and F12 on COCRDUP. Every key reaches the server, whose state machine processes a
@@ -502,7 +512,7 @@ function useEntryKeys(): EntryKeys {
 
 function useScreenStore(entry: EntryKeys): ScreenStore {
     const [model, setModel] = useState<CardUpdateModel>(() => InitialModel(entry));
-    const [feedback, setFeedback] = useState<ScreenFeedbackView>(INITIAL_FEEDBACK);
+    const [feedback, setFeedback] = useState<ScreenFeedbackView>(() => InitialFeedback(entry));
     const [isBusy, setIsBusy] = useState(false);
     const setters = useMemo(() => ({ setModel, setFeedback, setIsBusy }), []);
     return { model, feedback, isBusy, setters };
@@ -638,13 +648,26 @@ function useCardUpdateScreen(): CardUpdateScreenModel {
     return { view, keys, isBusy: store.isBusy, feedback: store.feedback };
 }
 
-// The BMS UNPROT/PROT attribute: a protected field stays focusable, but cannot be changed.
+// A stable id per map field, so a field in error can name its own helper text after ERRMSG.
+function FieldIdOf(name: RenderedFieldName): string {
+    return `card-update-${name}`;
+}
+
+// The BMS UNPROT/PROT attribute: a protected field stays focusable, but cannot be changed. While
+// the server names the field in field_errors, it is tied to the ERRMSG line ahead of its hint,
+// so assistive technology reads the literal when the cursor lands on it.
 function FieldSlotProps(
     definition: CardFieldDefinition,
     readOnly: boolean,
+    hasError: boolean,
 ): TextFieldProps["slotProps"] {
+    const helperTextId = HelperTextIdOf(FieldIdOf(definition.name), definition.helperText);
     return {
-        htmlInput: { maxLength: definition.maxLength, inputMode: definition.inputMode },
+        htmlInput: {
+            maxLength: definition.maxLength,
+            inputMode: definition.inputMode,
+            ...ErrorMessageReference(hasError, helperTextId),
+        },
         input: { readOnly },
     };
 }
@@ -672,6 +695,7 @@ function CardTextField(props: CardTextFieldProps) {
     return (
         <TextField
             key={readOnly ? PROTECTED_FIELD_KEY : EDITABLE_FIELD_KEY}
+            id={FieldIdOf(definition.name)}
             fullWidth
             label={definition.label}
             value={props.value}
@@ -680,7 +704,7 @@ function CardTextField(props: CardTextFieldProps) {
             helperText={definition.helperText}
             inputRef={props.inputRef}
             onChange={(event) => props.onChange(event.target.value)}
-            slotProps={FieldSlotProps(definition, readOnly)}
+            slotProps={FieldSlotProps(definition, readOnly, props.error)}
         />
     );
 }
@@ -698,19 +722,36 @@ function FieldGrid({ definitions, view, children }: FieldGridProps) {
     );
 }
 
-// EXPMON, the "/" literal and EXPYEAR, announced together under the Expiry Date label.
+// The Expiry Date label over its parts, as COCRDSL shows the same INITIAL.
 function ExpiryDateGroup({ view }: FieldSectionProps) {
+    const labelId = useId();
     return (
-        <FormControl component="fieldset" fullWidth>
-            <FormLabel component="legend">{EXPIRY_DATE_LABEL}</FormLabel>
-            <Stack direction="row" spacing={EXPIRY_PART_SPACING} sx={EXPIRY_ROW_STYLE}>
-                <CardTextField {...CardTextFieldPropsFor(CARD_UPDATE_FIELDS.expiry_month, view)} />
-                <Typography component="span" aria-hidden="true">
-                    {EXPIRY_SEPARATOR}
-                </Typography>
-                <CardTextField {...CardTextFieldPropsFor(CARD_UPDATE_FIELDS.expiry_year, view)} />
-            </Stack>
-        </FormControl>
+        <Stack spacing={EXPIRY_LABEL_SPACING}>
+            <Typography id={labelId} variant="labelLarge" component="p">
+                {EXPIRY_DATE_LABEL}
+            </Typography>
+            <ExpiryParts labelId={labelId} view={view} />
+        </Stack>
+    );
+}
+
+// EXPMON, the "/" literal and EXPYEAR, announced together under the Expiry Date label; the
+// literal is only a visual separator.
+function ExpiryParts({ labelId, view }: ExpiryPartsProps) {
+    return (
+        <Stack
+            direction="row"
+            spacing={EXPIRY_PART_SPACING}
+            sx={EXPIRY_ROW_STYLE}
+            role="group"
+            aria-labelledby={labelId}
+        >
+            <CardTextField {...CardTextFieldPropsFor(CARD_UPDATE_FIELDS.expiry_month, view)} />
+            <Typography component="span" aria-hidden="true">
+                {EXPIRY_SEPARATOR}
+            </Typography>
+            <CardTextField {...CardTextFieldPropsFor(CARD_UPDATE_FIELDS.expiry_year, view)} />
+        </Stack>
     );
 }
 
@@ -758,7 +799,9 @@ function CardUpdateEntry() {
 }
 
 // CCUP: reached from main-menu option 5 and from a U selection on the card list (CCLI).
-// useSearchParams needs a Suspense boundary for the static prerender of npm run build.
+// useSearchParams needs a Suspense boundary wherever Next.js prerenders a page. The route layout
+// renders this one on demand, so the query is known on the first render and the empty fallback
+// never shows.
 export default function CardUpdatePage() {
     return (
         <Suspense fallback={null}>
