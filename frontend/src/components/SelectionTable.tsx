@@ -11,7 +11,10 @@ import {
     TableContainer,
     TableHead,
     TableRow,
+    type MenuProps,
     type SelectChangeEvent,
+    type SxProps,
+    type Theme,
 } from "@mui/material";
 import type { ReactElement } from "react";
 
@@ -68,6 +71,13 @@ const BLANK_SELECTION_LABEL = "No selection";
 // An empty MenuItem collapses to its padding; a zero-width space keeps one text line, the way
 // MUI renders an empty Select value, so the blank option is as tall as the code options.
 const ZERO_WIDTH_SPACE = "\u200b";
+// A content-sized field grows when a code replaces the blank, and the table's automatic layout
+// then shifts every column, so the field keeps one width: MUI's select padding plus the widest
+// glyph a one-character code can hold (code page 037), in theme spacing units of 4 dp each.
+const SELECTION_FIELD_WIDTH_UNITS = 16;
+const SELECTION_FIELD_STYLE: SxProps<Theme> = {
+    width: (theme) => theme.spacing(SELECTION_FIELD_WIDTH_UNITS),
+};
 
 /** The accessible name of a row's selection field; `rowNumber` counts from 1, as CRDSEL1. */
 export function SelectionLabelFor(rowNumber: number): string {
@@ -100,15 +110,22 @@ function SelectionOptionsFor(
     return [blankOption, ...codeOptions];
 }
 
+// Select labels its open listbox only through a labelId, so the list takes its field's name.
+function SelectionMenuPropsFor(rowNumber: number): Partial<MenuProps> {
+    return { slotProps: { list: { "aria-label": SelectionLabelFor(rowNumber) } } };
+}
+
 function SelectionCell({ row, rowNumber, tableProps }: SelectionCellProps) {
     const { allowedCodes, onSelectionChange } = tableProps;
     return (
         <Select
             size="small"
             displayEmpty
+            sx={SELECTION_FIELD_STYLE}
             error={row.isError ?? false}
             value={row.selectedCode}
             inputProps={{ "aria-label": SelectionLabelFor(rowNumber) }}
+            MenuProps={SelectionMenuPropsFor(rowNumber)}
             onChange={(event: SelectChangeEvent<string>) =>
                 onSelectionChange(row.rowKey, event.target.value)
             }

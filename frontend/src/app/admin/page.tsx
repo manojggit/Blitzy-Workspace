@@ -2,7 +2,7 @@
 // COCOM01Y, COTTL01Y, CSDAT01Y, CSMSG01Y, CSUSR01Y
 "use client";
 
-import { Grid, List, ListItemButton, ListItemText, TextField } from "@mui/material";
+import { Box, Grid, List, ListItem, ListItemButton, ListItemText, TextField } from "@mui/material";
 import axios from "axios";
 import { useRouter } from "next/navigation";
 import { Suspense, useCallback, useEffect, useRef, useState, type RefObject } from "react";
@@ -350,17 +350,20 @@ function useAdminMenu(): AdminMenuState {
 // below the 3:1 non-text guideline; kept as the library default and flagged for designer review.
 function AdminMenuOptions({ menuOptions, isBusy, onSelectOption }: AdminMenuOptionsProps) {
     return (
-        <List dense component="nav" aria-label={OPTION_LIST_LABEL}>
-            {menuOptions.map((option) => (
-                <ListItemButton
-                    key={option.number}
-                    disabled={isBusy}
-                    onClick={() => onSelectOption(String(option.number))}
-                >
-                    <ListItemText primary={option.label} secondary={String(option.number)} />
-                </ListItemButton>
-            ))}
-        </List>
+        <Box component="nav" aria-label={OPTION_LIST_LABEL}>
+            <List dense>
+                {menuOptions.map(({ number, label }) => (
+                    <ListItem key={number} disablePadding>
+                        <ListItemButton
+                            disabled={isBusy}
+                            onClick={() => onSelectOption(String(number))}
+                        >
+                            <ListItemText primary={label} secondary={String(number)} />
+                        </ListItemButton>
+                    </ListItem>
+                ))}
+            </List>
+        </Box>
     );
 }
 
@@ -377,7 +380,7 @@ function OptionInputProps(hasError: boolean) {
 function OptionEntryField(props: OptionEntryFieldProps) {
     return (
         <Grid container>
-            <Grid size={{ xs: 12, sm: 6, md: 4 }}>
+            <Grid size={{ xs: 12, md: 6 }}>
                 <TextField
                     label={OPTION_PROMPT}
                     value={props.optionText}

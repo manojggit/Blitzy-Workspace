@@ -2,7 +2,16 @@
 // COCOM01Y, COTTL01Y, CSDAT01Y, CSMSG01Y, CSUSR01Y
 "use client";
 
-import { List, ListItem, ListItemButton, ListItemText, Stack, TextField } from "@mui/material";
+import {
+    Box,
+    Grid,
+    List,
+    ListItem,
+    ListItemButton,
+    ListItemText,
+    Stack,
+    TextField,
+} from "@mui/material";
 import axios from "axios";
 import { useRouter } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
@@ -403,15 +412,20 @@ function useMainMenu(): MainMenuState {
 // Every option the server lists, in its order, the option number as secondary text.
 function MenuOptionList({ options, onSelect, disabled }: MenuOptionListProps) {
     return (
-        <List dense aria-label={MENU_OPTIONS_LABEL}>
-            {options.map((option) => (
-                <ListItem key={option.number} disablePadding>
-                    <ListItemButton disabled={disabled} onClick={() => onSelect(option)}>
-                        <ListItemText primary={option.label} secondary={String(option.number)} />
-                    </ListItemButton>
-                </ListItem>
-            ))}
-        </List>
+        <Box component="nav" aria-label={MENU_OPTIONS_LABEL}>
+            <List dense>
+                {options.map((option) => (
+                    <ListItem key={option.number} disablePadding>
+                        <ListItemButton disabled={disabled} onClick={() => onSelect(option)}>
+                            <ListItemText
+                                primary={option.label}
+                                secondary={String(option.number)}
+                            />
+                        </ListItemButton>
+                    </ListItem>
+                ))}
+            </List>
+        </Box>
     );
 }
 
@@ -428,15 +442,20 @@ function OptionInputProps(hasError: boolean) {
 // non-numeric, zero or out-of-range option is valid.
 function OptionEntryField({ value, onChange, error, inputRef }: OptionEntryFieldProps) {
     return (
-        <TextField
-            label={OPTION_PROMPT}
-            value={value}
-            onChange={(event) => onChange(event.target.value)}
-            error={error}
-            inputRef={inputRef}
-            autoFocus
-            slotProps={{ htmlInput: OptionInputProps(error) }}
-        />
+        <Grid container>
+            <Grid size={{ xs: 12, md: 6 }}>
+                <TextField
+                    label={OPTION_PROMPT}
+                    value={value}
+                    onChange={(event) => onChange(event.target.value)}
+                    error={error}
+                    inputRef={inputRef}
+                    autoFocus
+                    fullWidth
+                    slotProps={{ htmlInput: OptionInputProps(error) }}
+                />
+            </Grid>
+        </Grid>
     );
 }
 

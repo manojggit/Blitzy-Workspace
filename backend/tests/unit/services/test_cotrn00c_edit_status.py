@@ -17,7 +17,15 @@ are typed from those lines:
 - an invalid code the browse leaves on ERRMSG answers 400 with the page's rows, page, first_key,
     last_key and search_cleared, each amount a JSON decimal string; the code sets no ERR-FLG, so
     the browse blanks TRNIDIN (line 325) and search_cleared is true;
-- an invalid code a paging literal replaces answers 200 with that page;
+- an invalid code a paging literal replaces answers 200 with that page, page 1;
+- a STARTBR NOTFND from the list or the selection route answers 200 with the top-of-page
+    literal over the shown page read back from its first key, last_key HIGH-VALUES and TRNIDIN
+    blanked: page 1 for a numeric key, as a keyed search resets the page number to 1, and page 0
+    with no rows for a blank key, which finds nothing only on an empty TRANSACT;
+- an F8 refusal (lines 267-274) answers 200 with the bottom literal over the shown page read
+    back from its first key, TRNIDIN kept: from HIGH-VALUES or a blank last key, last_key stays
+    HIGH-VALUES, as the refusal leaves NEXT-PAGE-NO in the COMMAREA; from a real last key with no
+    record after it, last_key is that key;
 - S and s still route to the Transaction View without any read, even with a non-numeric key.
 
 app.services.transactions.cotrn00c's TransactionRepository is replaced by a stub whose browses
@@ -78,6 +86,8 @@ INVALID_SELECTION_MESSAGE = "Invalid selection. Valid value is S"
 TRAN_ID_NOT_NUMERIC_MESSAGE = "Tran ID must be Numeric ..."
 AT_TOP_OF_PAGE_MESSAGE = "You are at the top of the page..."
 REACHED_BOTTOM_MESSAGE = "You have reached the bottom of the page..."
+# PROCESS-PF8-KEY's NEXT-PAGE-NO refusal (line 270).
+ALREADY_AT_BOTTOM_MESSAGE = "You are already at the bottom of the page..."
 # Every path ends with MOVE -1 TO TRNIDINL: the cursor is on the search field.
 SEARCH_CURSOR_FIELD = "search_tran_id"
 EDIT_FAILURE_STATUS = 400
@@ -258,6 +268,7 @@ class ReplacedLiteral(NamedTuple):
     expectedMessage: str
     expectedRowCount: int
     expectedLastKey: str
+    expectedPage: int
 
 
 REPLACED_LITERALS = [
@@ -268,6 +279,7 @@ REPLACED_LITERALS = [
         REACHED_BOTTOM_MESSAGE,
         END_OF_FILE_ROWS,
         END_OF_FILE_LAST_KEY,
+        FIRST_PAGE,
     ),
     ReplacedLiteral(
         UNMATCHED_SEARCH_KEY,
@@ -279,6 +291,7 @@ REPLACED_LITERALS = [
         AT_TOP_OF_PAGE_MESSAGE,
         PAGE_ROWS,
         HIGH_VALUES_KEY,
+        FIRST_PAGE,
     ),
 ]
 REPLACED_LITERAL_IDS = ["page-ends-file", "search-finds-nothing"]
@@ -296,7 +309,141 @@ async def test_invalid_selection_replaced_by_a_paging_literal_answers_the_page(
     assert shownRows == ExpectedRows(SHOWN_FIRST_NUMBER, replaced.expectedRowCount)
     assert (listPage.message, listPage.route) == (replaced.expectedMessage, None)
     assert (listPage.first_key, listPage.last_key) == (SHOWN_FIRST_KEY, replaced.expectedLastKey)
+    assert (listPage.page, listPage.search_cleared) == (replaced.expectedPage, True)
     assert transactionRepository.BrowseForward.await_args_list == replaced.expectedBrowses
+
+
+async def FirstEntry(context: OnlineContext, searchKey: str) -> TransactionListResponse:
+    """Press ENTER through the list route with no page shown, as the first entry from the menu."""
+    return await cotrn00c.ListTransactions(context, TransactionListQuery(searchTranId=searchKey))
+
+
+class StartNotFound(NamedTuple):
+    """An ENTER whose STARTBR is NOTFND, the browses it reads, and the page it leaves shown."""
+
+    searchPress: SearchPress
+    browseResults: list[list[dict[str, object]] | None]
+    expectedBrowses: list[object]
+    expectedPage: int
+    expectedRowCount: int
+    expectedFirstKey: str
+
+
+# The STARTBR of a numeric or blank key, and the re-read of the page shown from its first key.
+UNMATCHED_BROWSE = call(UNMATCHED_SEARCH_KEY, inclusive=True, limit=PAGE_ROWS)
+LOW_VALUES_BROWSE = call(LOW_VALUES_KEY, inclusive=True, limit=PAGE_ROWS)
+SHOWN_PAGE_REREAD = call(SHOWN_FIRST_KEY, inclusive=True, limit=SHOWN_PAGE_READ_LIMIT)
+# NOTFND, then the ten rows of the page shown, which a numeric key finds still in place.
+UNMATCHED_THEN_SHOWN_PAGE = [None, BrowseRecords(SHOWN_FIRST_NUMBER, PAGE_ROWS)]
+UNMATCHED_THEN_SHOWN_PAGE_BROWSES = [UNMATCHED_BROWSE, SHOWN_PAGE_REREAD]
+# A blank key finds nothing only on an empty TRANSACT, so no row is shown.
+NO_ROWS = 0
+
+START_NOT_FOUND_SEARCHES = [
+    StartNotFound(
+        SearchPress(ListSearch, UNMATCHED_SEARCH_KEY),
+        UNMATCHED_THEN_SHOWN_PAGE,
+        UNMATCHED_THEN_SHOWN_PAGE_BROWSES,
+        FIRST_PAGE,
+        PAGE_ROWS,
+        SHOWN_FIRST_KEY,
+    ),
+    StartNotFound(
+        SearchPress(SelectWithNoCode, UNMATCHED_SEARCH_KEY),
+        UNMATCHED_THEN_SHOWN_PAGE,
+        UNMATCHED_THEN_SHOWN_PAGE_BROWSES,
+        FIRST_PAGE,
+        PAGE_ROWS,
+        SHOWN_FIRST_KEY,
+    ),
+    StartNotFound(
+        SearchPress(FirstEntry, BLANK_SEARCH_KEY),
+        [None],
+        [LOW_VALUES_BROWSE],
+        ENTER_PAGE,
+        NO_ROWS,
+        NO_KEY,
+    ),
+    StartNotFound(
+        SearchPress(ListSearch, BLANK_SEARCH_KEY),
+        [None, None],
+        [LOW_VALUES_BROWSE, SHOWN_PAGE_REREAD],
+        ENTER_PAGE,
+        NO_ROWS,
+        NO_KEY,
+    ),
+]
+START_NOT_FOUND_IDS = [
+    "list-numeric",
+    "selection-none-numeric",
+    "first-entry-empty-file",
+    "list-blank-emptied-file",
+]
+
+
+@pytest.mark.parametrize("notFound", START_NOT_FOUND_SEARCHES, ids=START_NOT_FOUND_IDS)
+async def test_search_start_not_found_sets_the_page_number(transactionRepository, notFound):
+    """STARTBR NOTFND: page 1 for a numeric key, page 0 for a blank key on an empty TRANSACT."""
+    transactionRepository.BrowseForward.side_effect = notFound.browseResults
+    searchPress = notFound.searchPress
+    listPage = await searchPress.pressEnter(BuildContext(), searchPress.searchKey)
+    shownRows = [row.model_dump(mode="json") for row in listPage.rows]
+    assert shownRows == ExpectedRows(SHOWN_FIRST_NUMBER, notFound.expectedRowCount)
+    assert (listPage.page, listPage.message) == (notFound.expectedPage, AT_TOP_OF_PAGE_MESSAGE)
+    assert (listPage.first_key, listPage.last_key) == (notFound.expectedFirstKey, HIGH_VALUES_KEY)
+    assert (listPage.search_cleared, listPage.cursor_field) == (True, SEARCH_CURSOR_FIELD)
+    assert transactionRepository.BrowseForward.await_args_list == notFound.expectedBrowses
+    transactionRepository.BrowseBackward.assert_not_awaited()
+
+
+async def PressF8(context: OnlineContext, lastKey: str) -> TransactionListResponse:
+    """Press F8 on page 1 after ``lastKey``, with the shown page's first key."""
+    query = TransactionListQuery(
+        startKey=lastKey, firstKey=SHOWN_FIRST_KEY, direction="forward", page=FIRST_PAGE
+    )
+    return await cotrn00c.ListTransactions(context, query)
+
+
+class BottomRefusal(NamedTuple):
+    """An F8 refused with NEXT-PAGE-NO: the last key sent, its browse, and the last key left."""
+
+    lastKey: str
+    browseKey: str
+    browseResult: list[dict[str, object]] | None
+    expectedLastKey: str
+
+
+# F8's browse reads the last key shown, the ten page rows and the look-ahead READNEXT.
+F8_READ_LIMIT = PAGE_ROWS + 1
+# A last key of only spaces, which PROCESS-PF8-KEY replaces with HIGH-VALUES (line 260).
+SPACES_LAST_KEY = " " * 16
+# The only record at or after the real last key shown is that key: no page follows it.
+ONLY_SHOWN_LAST_RECORD = BrowseRecords(PAGE_ROWS, 1)
+
+BOTTOM_REFUSALS = [
+    BottomRefusal(HIGH_VALUES_KEY, HIGH_VALUES_KEY, None, HIGH_VALUES_KEY),
+    BottomRefusal(SPACES_LAST_KEY, HIGH_VALUES_KEY, None, HIGH_VALUES_KEY),
+    BottomRefusal(SHOWN_LAST_KEY, SHOWN_LAST_KEY, ONLY_SHOWN_LAST_RECORD, SHOWN_LAST_KEY),
+]
+BOTTOM_REFUSAL_IDS = ["high-values-marker", "blank-last-key", "real-last-key-ends-file"]
+
+
+@pytest.mark.parametrize("refusal", BOTTOM_REFUSALS, ids=BOTTOM_REFUSAL_IDS)
+async def test_f8_refusal_keeps_next_page_no(transactionRepository, refusal):
+    """NEXT-PAGE-NO outlives the refusal: HIGH-VALUES stays last_key, a real last key is kept."""
+    shownPage = BrowseRecords(SHOWN_FIRST_NUMBER, PAGE_ROWS)
+    transactionRepository.BrowseForward.side_effect = [refusal.browseResult, shownPage]
+    listPage = await PressF8(BuildContext(), refusal.lastKey)
+    shownRows = [row.model_dump(mode="json") for row in listPage.rows]
+    assert shownRows == ExpectedRows(SHOWN_FIRST_NUMBER, PAGE_ROWS)
+    assert (listPage.page, listPage.message) == (FIRST_PAGE, ALREADY_AT_BOTTOM_MESSAGE)
+    assert (listPage.first_key, listPage.last_key) == (SHOWN_FIRST_KEY, refusal.expectedLastKey)
+    assert (listPage.search_cleared, listPage.cursor_field) == (False, SEARCH_CURSOR_FIELD)
+    assert transactionRepository.BrowseForward.await_args_list == [
+        call(refusal.browseKey, inclusive=True, limit=F8_READ_LIMIT),
+        SHOWN_PAGE_REREAD,
+    ]
+    transactionRepository.BrowseBackward.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

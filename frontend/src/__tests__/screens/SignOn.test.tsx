@@ -12,6 +12,7 @@ import type { ReactNode } from "react";
 
 import SignOnPage from "@/app/signon/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
+import { MESSAGE_LINE_ERROR_ID } from "@/components/MessageLine";
 import type * as AuthModule from "@/lib/api/auth";
 import {
     FetchCurrentUser,
@@ -639,6 +640,51 @@ describe("COSGN00C pending sign-off message on /signon", () => {
         expect(window.sessionStorage.getItem(PENDING_MESSAGE_KEY)).toBeNull();
         expect(loginMock).not.toHaveBeenCalled();
     });
+});
+
+// MUI marks every Paper, the Alert's own root included, as MuiPaper-root.
+const PAPER_CLASS = "MuiPaper-root";
+
+interface SignOffPathCase {
+    name: string;
+    SignOff: () => Promise<void>;
+}
+
+// The two ways the CSMSG01Y literal reaches COSGN00: a menu's F3 stores it before returning here,
+// and this screen's own F3 receives it from the logout.
+const SIGN_OFF_PATHS: readonly SignOffPathCase[] = [
+    {
+        name: "a menu's stored F3 sign-off literal",
+        SignOff: async () => {
+            StorePendingMessage(THANK_YOU_MESSAGE);
+            await RenderScreen();
+        },
+    },
+    {
+        name: "the Exit (F3) sign-off",
+        SignOff: async () => {
+            const { user } = await RenderScreen();
+            await user.click(ExitButton());
+        },
+    },
+];
+
+describe("COSGN00C sign-off notice on /signon", () => {
+    it.each(SIGN_OFF_PATHS)(
+        "COSGN00 shows $name as the info Alert inside a Paper, in the message line's place",
+        async ({ SignOff }) => {
+            await SignOff();
+            await ExpectAlert(THANK_YOU_MESSAGE, "info");
+            await WaitForIdle();
+            const notice = screen.getByRole("alert");
+            expect(notice.parentElement).toHaveClass(PAPER_CLASS);
+            expect(notice).not.toHaveAttribute("id", MESSAGE_LINE_ERROR_ID);
+            expect(document.getElementById(MESSAGE_LINE_ERROR_ID)).toBeNull();
+            const keyBar = screen.getByRole("group", { name: FUNCTION_KEY_GROUP });
+            expect(notice.parentElement?.nextElementSibling).toBe(keyBar);
+            expect(CredentialInput("user_id")).toHaveFocus();
+        },
+    );
 });
 
 // next_route values the backend's Literal["/admin", "/menu"] never sends: other sites, a script,

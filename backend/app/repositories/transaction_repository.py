@@ -120,8 +120,12 @@ def BackwardBrowseStatement(startKey: str, rowLimit: int) -> Select[Any]:
 
 
 def StartPositionStatement(startKey: str | None) -> Select[Any]:
-    """Return the probe for any record at or after startKey: STARTBR GTEQ positioning."""
-    statement = select(Transaction.tran_id)
+    """Return the STARTBR GTEQ probe: the first key at or after startKey in tran_id_sort order.
+
+    The order makes the probe one read of the tran_id_sort index. None (LOW-VALUES) reads the
+    lowest key.
+    """
+    statement = select(Transaction.tran_id).order_by(Transaction.tran_id_sort.asc())
     if startKey is not None:
         statement = statement.where(Transaction.tran_id_sort >= StartKeySort(startKey))
     return statement.limit(1)

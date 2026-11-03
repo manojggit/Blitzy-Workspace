@@ -145,6 +145,14 @@ const SEVERITY_CLASSES: Readonly<Record<MessageSeverity, string>> = {
     info: "MuiAlert-colorInfo",
 };
 
+// MUI 9 Grid classes: every Grid has MuiGrid-root, a container MuiGrid-container, and each size
+// breakpoint MuiGrid-grid-<breakpoint>-<columns>. The OPTION field is full width below md and
+// half width from md (size xs 12, md 6), with no other breakpoint set; sorted for comparison.
+const GRID_ROOT_CLASS = "MuiGrid-root";
+const GRID_CONTAINER_CLASS = "MuiGrid-container";
+const GRID_SIZE_CLASS_PREFIX = "MuiGrid-grid-";
+const OPTION_GRID_SIZE_CLASSES: readonly string[] = ["MuiGrid-grid-md-6", "MuiGrid-grid-xs-12"];
+
 interface CallOrderSource {
     mock: { invocationCallOrder: number[] };
 }
@@ -233,8 +241,12 @@ function OptionInput(): HTMLElement {
     return screen.getByRole("textbox", { name: OPTION_PROMPT });
 }
 
+function MenuNavigation(): HTMLElement {
+    return screen.getByRole("navigation", { name: MENU_OPTIONS_LABEL });
+}
+
 function MenuList(): HTMLElement {
-    return screen.getByRole("list", { name: MENU_OPTIONS_LABEL });
+    return within(MenuNavigation()).getByRole("list");
 }
 
 // The ListItemButton at one list position (1 = first), in the order the server listed them.
@@ -244,6 +256,22 @@ function OptionButton(position: number): HTMLElement {
         throw new Error(`No option button at list position ${position}`);
     }
     return optionButton;
+}
+
+// The Grid item holding the OPTION field: its nearest Grid ancestor.
+function OptionGridItem(): Element {
+    const gridItem = OptionInput().closest(`.${GRID_ROOT_CLASS}`);
+    if (gridItem === null) {
+        throw new Error("The OPTION field sits in no Grid item");
+    }
+    return gridItem;
+}
+
+// The Grid size classes the item carries, MuiGrid-grid-<breakpoint>-<columns>, sorted.
+function GridSizeClasses(gridItem: Element): string[] {
+    return Array.from(gridItem.classList)
+        .filter((className) => className.startsWith(GRID_SIZE_CLASS_PREFIX))
+        .sort();
 }
 
 function KeyButton(name: string): HTMLElement {
@@ -385,6 +413,19 @@ it.each(MAIN_MENU_OPTIONS)("COMEN01C lists option $number $label", async ({ numb
     const optionButton = OptionButton(number);
     expect(within(optionButton).getByText(label)).toBeInTheDocument();
     expect(within(optionButton).getByText(String(number))).toBeInTheDocument();
+});
+
+it("COMEN01C nests one list item per option in the named nav; OPTION is xs 12, md 6", async () => {
+    await RenderLoadedScreen();
+    expect(screen.queryByRole("list", { name: MENU_OPTIONS_LABEL })).toBeNull();
+    const optionItems = within(MenuList()).getAllByRole("listitem");
+    expect(optionItems).toHaveLength(MAIN_MENU_LABELS.length);
+    optionItems.forEach((optionItem) => {
+        expect(within(optionItem).getAllByRole("button")).toHaveLength(1);
+    });
+    const gridItem = OptionGridItem();
+    expect(gridItem.parentElement).toHaveClass(GRID_CONTAINER_CLASS);
+    expect(GridSizeClasses(gridItem)).toEqual(OPTION_GRID_SIZE_CLASSES);
 });
 
 it("COMEN01C option click posts option number 1 and routes to /accounts/view", async () => {

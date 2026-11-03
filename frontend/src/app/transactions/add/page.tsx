@@ -314,10 +314,19 @@ function IsInputName(name: string | null): name is AddFieldName {
 
 // Replaces MOVE -1 TO <field>L: the input the server names takes the cursor. Any other name, or
 // none (the abend text), puts it on ACTIDIN, the map's IC field, because the keyboard lock took
-// the focus from whatever held it while the call ran.
+// the focus from whatever held it while the call ran. The lock disables the inputs, and MUI drops
+// the focused state of a disabled input while the browser may keep it as the active element;
+// focusing the active element fires no focus event, so it is blurred first and the focus event
+// restores the outline and the shrunk label.
 function FocusCursorField(inputs: AddInputElements, cursorField: string | null): void {
-    const focusedInput = IsInputName(cursorField) ? cursorField : FIRST_FIELD;
-    inputs[focusedInput]?.focus();
+    const cursorInput = inputs[IsInputName(cursorField) ? cursorField : FIRST_FIELD];
+    if (cursorInput === null || cursorInput === undefined) {
+        return;
+    }
+    if (cursorInput.ownerDocument.activeElement === cursorInput) {
+        cursorInput.blur();
+    }
+    cursorInput.focus();
 }
 
 // The flat COTRN02 body: the key pressed beside the 14 fields exactly as keyed, because every

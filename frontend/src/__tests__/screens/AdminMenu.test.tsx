@@ -135,6 +135,14 @@ const SEVERITY_CLASSES: Readonly<Record<MessageSeverity, string>> = {
     info: "MuiAlert-colorInfo",
 };
 
+// MUI 9 Grid classes: every Grid has MuiGrid-root, a container MuiGrid-container, and each size
+// breakpoint MuiGrid-grid-<breakpoint>-<columns>. The OPTION field is full width below md and
+// half width from md (size xs 12, md 6), with no other breakpoint set; sorted for comparison.
+const GRID_ROOT_CLASS = "MuiGrid-root";
+const GRID_CONTAINER_CLASS = "MuiGrid-container";
+const GRID_SIZE_CLASS_PREFIX = "MuiGrid-grid-";
+const OPTION_GRID_SIZE_CLASSES: readonly string[] = ["MuiGrid-grid-md-6", "MuiGrid-grid-xs-12"];
+
 // The header clock (CURDATE/CURTIME) reads Date.now(); a fixed local instant keeps the header
 // still, so its one-second interval never re-renders outside act.
 const HEADER_CLOCK_MILLISECONDS = new Date(2022, 6, 18, 9, 5, 7).getTime();
@@ -224,6 +232,22 @@ function OptionList(): HTMLElement {
 // The ListItemButton of one option, named by its label followed by its number.
 function OptionButton(number: number, label: string): HTMLElement {
     return within(OptionList()).getByRole("button", { name: `${label} ${number}` });
+}
+
+// The Grid item holding the OPTION field: its nearest Grid ancestor.
+function OptionGridItem(): Element {
+    const gridItem = OptionField().closest(`.${GRID_ROOT_CLASS}`);
+    if (gridItem === null) {
+        throw new Error("The OPTION field sits in no Grid item");
+    }
+    return gridItem;
+}
+
+// The Grid size classes the item carries, MuiGrid-grid-<breakpoint>-<columns>, sorted.
+function GridSizeClasses(gridItem: Element): string[] {
+    return Array.from(gridItem.classList)
+        .filter((className) => className.startsWith(GRID_SIZE_CLASS_PREFIX))
+        .sort();
 }
 
 // The message line's Alert, compared on its raw text so every blank of the literal counts.
@@ -361,6 +385,22 @@ describe("COADM01C COADM02Y option list", () => {
         const optionButton = OptionButton(number, label);
         expect(within(optionButton).getByText(label)).toBeInTheDocument();
         expect(within(optionButton).getByText(String(number))).toBeInTheDocument();
+    });
+});
+
+describe("COADM01C menu layout", () => {
+    it("COADM01C nests one list item per option in the named nav; OPTION xs 12, md 6", async () => {
+        await RenderLoadedScreen();
+        expect(screen.queryByRole("list", { name: OPTION_LIST_LABEL })).toBeNull();
+        const optionList = within(OptionList()).getByRole("list");
+        const optionItems = within(optionList).getAllByRole("listitem");
+        expect(optionItems).toHaveLength(LABEL_CASES.length);
+        optionItems.forEach((optionItem) => {
+            expect(within(optionItem).getAllByRole("button")).toHaveLength(1);
+        });
+        const gridItem = OptionGridItem();
+        expect(gridItem.parentElement).toHaveClass(GRID_CONTAINER_CLASS);
+        expect(GridSizeClasses(gridItem)).toEqual(OPTION_GRID_SIZE_CLASSES);
     });
 });
 

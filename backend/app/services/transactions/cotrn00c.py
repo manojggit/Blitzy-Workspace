@@ -14,7 +14,12 @@ NEXT-PAGE-FLG is derived, not carried: F8 pages on only when a record follows th
 shown, which holds after a forward page that ended with its look-ahead READNEXT and after every
 backward page; otherwise F8 answers ``You are already at the bottom of the page...``. A search
 that finds nothing sets NEXT-PAGE-NO over a page it leaves in place, so its response carries
-last_key HIGH-VALUES, after which no record follows.
+last_key HIGH-VALUES, after which no record follows. That page is page 1 for a numeric key, as
+a keyed search resets the page number to 1, and page 0 with no rows for a blank key, which
+finds nothing only on an empty TRANSACT. PROCESS-PF8-KEY's refusal leaves NEXT-PAGE-NO in the
+COMMAREA, so every F8 refusal from HIGH-VALUES, or from a blank last key, keeps last_key
+HIGH-VALUES over the rows it re-reads; only F7, which sets NEXT-PAGE-YES, or ENTER, which
+browses a new page, replaces it.
 
 Rows not rebuilt. Where COTRN00C re-sends the received map with only a paging literal changed
 on ERRMSG (F7 on page 1, F8 with no page after the last key, a STARTBR NOTFND), the service
@@ -302,7 +307,9 @@ async def _ProcessEnterKey(
 
     A blank key is LOW-VALUES, the lowest key (line 207). A non-numeric key sets ERR-FLG, so
     the list is not rebuilt. Otherwise the page number goes to 0 and PROCESS-PAGE-FORWARD reads
-    from the first TRAN-ID at or after the key, as ENTER skips no READNEXT (line 285).
+    from the first TRAN-ID at or after the key, as ENTER skips no READNEXT (line 285), so the
+    page it reads is page 1. A STARTBR NOTFND is page 1 for a numeric key and page 0 for a
+    blank key, which finds nothing only on an empty TRANSACT.
     """
     if not _IsBlank(searchTranId) and not _IsNumericKey(searchTranId):
         await _ProcessNonNumericSearch(repository, state)
@@ -312,7 +319,7 @@ async def _ProcessEnterKey(
     browse = repository.BrowseForward(startKey, inclusive=True, limit=PAGE_SIZE)
     records = await _Lookup(browse, BROWSE_FORWARD_OPERATION)
     if records is None:
-        await _ProcessStartNotFound(repository, state)
+        await _ProcessStartNotFound(repository, state, startKey)
         return
     _ApplyForwardRows(state, records)
 
@@ -343,15 +350,21 @@ async def _TransactFileIsEmpty(repository: TransactionRepository) -> bool:
     return await _Lookup(browse, STARTBR_OPERATION) is None
 
 
-async def _ProcessStartNotFound(repository: TransactionRepository, state: ListState) -> None:
+async def _ProcessStartNotFound(
+    repository: TransactionRepository, state: ListState, startKey: str | None
+) -> None:
     """ENTER's STARTBR NOTFND: no TRAN-ID at or after the search key (lines 605-611, 314-326).
 
-    It sets TRANSACT-EOF but not ERR-FLG, so PROCESS-PAGE-FORWARD reads no row, sets
-    NEXT-PAGE-NO and shows page 0 over the unchanged rows with TRNIDIN blanked (line 325).
-    last_key becomes HIGH-VALUES, after which no record follows, so the next F8 answers ``You
-    are already at the bottom of the page...``.
+    It sets TRANSACT-EOF but not ERR-FLG, so PROCESS-PAGE-FORWARD reads no row and sets
+    NEXT-PAGE-NO over the unchanged rows with TRNIDIN blanked (line 325). A numeric
+    ``startKey`` shows page 1, as a keyed search resets the page number to 1. A blank search
+    key, ``startKey`` None for LOW-VALUES, finds nothing only on an empty TRANSACT, which keeps
+    page 0 with no rows. last_key becomes HIGH-VALUES, after which no record follows, so the
+    next F8 answers ``You are already at the bottom of the page...``.
     """
     state.message = AT_TOP_OF_PAGE_MESSAGE
+    if startKey is not None:
+        state.page = FIRST_PAGE
     await _RereadShownPage(repository, state)
     state.lastKey = NO_NEXT_PAGE_KEY
     state.searchCleared = True
@@ -363,7 +376,9 @@ async def _ProcessPf8Key(repository: TransactionRepository, state: ListState) ->
     A blank last key is HIGH-VALUES (line 260). The READNEXT issued right after STARTBR (line
     286) discards the first record at or after the last key. With no record after that one,
     the program holds NEXT-PAGE-NO and answers ``You are already at the bottom of the page...``
-    over the unchanged rows (lines 267-274).
+    over the unchanged rows (lines 267-274). The refusal leaves NEXT-PAGE-FLG in the COMMAREA
+    as it was, so an F8 from HIGH-VALUES sends HIGH-VALUES back as last_key over the re-read
+    rows, and every later F8 refuses again until F7 sets NEXT-PAGE-YES or ENTER browses a page.
     """
     startKey = NO_NEXT_PAGE_KEY if _IsBlank(state.lastKey) else state.lastKey
     browse = repository.BrowseForward(startKey, inclusive=True, limit=PAGE_SIZE + 1)
@@ -371,6 +386,8 @@ async def _ProcessPf8Key(repository: TransactionRepository, state: ListState) ->
     if records is None or len(records) <= 1:
         state.message = ALREADY_AT_BOTTOM_MESSAGE
         await _RereadBottomPage(repository, state, records)
+        if startKey == NO_NEXT_PAGE_KEY:
+            state.lastKey = NO_NEXT_PAGE_KEY
         return
     _ApplyForwardRows(state, records[1:])
 

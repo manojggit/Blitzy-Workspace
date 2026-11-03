@@ -399,8 +399,8 @@ function TranIdInput(): HTMLInputElement {
     return screen.getByLabelText<HTMLInputElement>(TRAN_ID_LABEL);
 }
 
-function DetailInput(label: string): HTMLInputElement {
-    return screen.getByLabelText<HTMLInputElement>(label);
+function DetailInput(label: string): HTMLTextAreaElement {
+    return screen.getByLabelText<HTMLTextAreaElement>(label);
 }
 
 function DetailValues(): string[] {
@@ -513,9 +513,11 @@ describe("COTRN01C BMS COTRN01 fields", () => {
         expect(mockViewTransaction).not.toHaveBeenCalled();
     });
 
+    // A multi-line text box wraps a value wider than the field instead of clipping it.
     it.each(DETAIL_FIELD_CASES)("$label is a protected field of LENGTH $maxLength", (field) => {
         RenderScreen();
         const input = DetailInput(field.label);
+        expect(input).toBeInstanceOf(HTMLTextAreaElement);
         expect(input).toHaveAttribute("maxlength", String(field.maxLength));
         expect(input).toHaveAttribute("readonly");
         expect(input).toHaveValue("");

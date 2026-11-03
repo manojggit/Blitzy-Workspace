@@ -180,6 +180,16 @@ describe("SelectionTable offered codes", () => {
     });
 });
 
+describe("SelectionTable open list name", () => {
+    it.each(MAP_CASES)("$mapName $fieldNames names the open list as its row", async (mapCase) => {
+        const user = userEvent.setup();
+        RenderTable(mapCase);
+        const lastRowName = SelectionFieldName(mapCase.rowCount);
+        await user.click(screen.getByRole("combobox", { name: lastRowName }));
+        expect(screen.getByRole("listbox", { name: lastRowName })).toBeInTheDocument();
+    });
+});
+
 describe("SelectionTable selection", () => {
     it.each(CODE_CASES)(
         "$mapName $fieldNames passes code $code unchanged",
@@ -343,6 +353,36 @@ async function OffersOneBlankAndEachCodeOnce(mapCase: MapCase) {
     expect(offeredValues).toEqual(["", ...mapCase.allowedCodes]);
 }
 
+// Every field keeps this width in theme spacing units, so a chosen code never shifts the columns.
+const SELECTION_FIELD_WIDTH_UNITS = 16;
+
+function FieldWidth(rowNumber: number): string {
+    const field = screen.getByRole("combobox", { name: SelectionFieldName(rowNumber) });
+    const fieldRoot = field.closest(".MuiInputBase-root");
+    if (fieldRoot === null) {
+        throw new Error(`${SelectionFieldName(rowNumber)} has no input root`);
+    }
+    return getComputedStyle(fieldRoot).width;
+}
+
+function ExpectFixedFieldWidths(rowCount: number) {
+    const fixedWidth = CARD_DEMO_THEME.spacing(SELECTION_FIELD_WIDTH_UNITS);
+    const rowNumbers = RowNumbersUpTo(rowCount);
+    expect(rowNumbers.map(FieldWidth)).toEqual(rowNumbers.map(() => fixedWidth));
+}
+
+async function KeepsFieldWidthWithEchoedCode({ code, mapCase }: CodeCase) {
+    const user = userEvent.setup();
+    const onSelectionChange: SelectionChangeMock = jest.fn();
+    const rows = BuildRows(mapCase.columns, mapCase.rowCount);
+    const { rerender } = render(TableTree(mapCase, rows, onSelectionChange));
+    ExpectFixedFieldWidths(mapCase.rowCount);
+    await ChooseOption(user, code);
+    EchoReportedCode(rerender, mapCase, onSelectionChange);
+    expect(DisplayedCode(CONTROLLED_ROW_NUMBER)).toBe(code);
+    ExpectFixedFieldWidths(mapCase.rowCount);
+}
+
 describe("SelectionTable controlled selectedCode", () => {
     beforeEach(SpyOnConsoleWarnings);
     afterEach(ExpectNoConsoleWarnings);
@@ -362,5 +402,15 @@ describe("SelectionTable controlled selectedCode", () => {
     it.each(MAP_CASES)(
         "$mapName $fieldNames offers one blank and each code once from repeated and blank codes",
         OffersOneBlankAndEachCodeOnce,
+    );
+});
+
+describe("SelectionTable field width", () => {
+    beforeEach(SpyOnConsoleWarnings);
+    afterEach(ExpectNoConsoleWarnings);
+
+    it.each(CODE_CASES)(
+        "$mapName $fieldNames keeps every field one width, blank and with echoed code $code",
+        KeepsFieldWidthWithEchoedCode,
     );
 });

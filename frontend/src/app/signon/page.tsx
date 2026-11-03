@@ -163,6 +163,12 @@ function IsCredentialName(fieldName: string | null): fieldName is CredentialName
     return FIELD_DEFINITIONS.some((definition) => definition.name === fieldName);
 }
 
+// The trim only decides whether the sign-off notice shows, as on the message line; the text itself
+// is rendered untouched.
+function IsBlankText(text: string): boolean {
+    return text.trim() === "";
+}
+
 // The server's literal, field flags and cursor, unchanged. Anything other than an axios error
 // is a defect and propagates.
 function FeedbackFromError(error: unknown): SignOnFeedback {
@@ -332,15 +338,16 @@ function useCursorFocus(fieldRefs: FieldRefs, feedback: SignOnFeedback): void {
     }, [fieldRefs, feedback]);
 }
 
-// A menu's F3 sign-off stores its CSMSG01Y literal before it returns here. The stored text
-// carries no severity, and a sign-off is information, so it shows as info.
-function usePendingMessage(setFeedback: Dispatch<SetStateAction<SignOnFeedback>>): void {
+// A menu's F3 sign-off stores its CSMSG01Y literal before it returns here. The stored text is
+// taken once and shows as the sign-off notice, as this screen's own F3 shows it; blank text shows
+// nothing. The fresh screen's feedback already puts the cursor on USERID.
+function usePendingMessage(setThankYouText: Dispatch<SetStateAction<string>>): void {
     useEffect(() => {
         const pendingMessage = TakePendingMessage();
-        if (pendingMessage !== "") {
-            setFeedback({ ...FRESH_SCREEN_FEEDBACK, message: pendingMessage });
+        if (!IsBlankText(pendingMessage)) {
+            setThankYouText(pendingMessage);
         }
-    }, [setFeedback]);
+    }, [setThankYouText]);
 }
 
 function useSignOnForm(): SignOnForm {
@@ -348,7 +355,7 @@ function useSignOnForm(): SignOnForm {
     const screenState = useScreenState();
     const fieldRefs = useFieldRefs();
     useCursorFocus(fieldRefs, screenState.feedback);
-    usePendingMessage(screenState.SetFeedback);
+    usePendingMessage(screenState.SetThankYouText);
     return useMemo(
         () => ({ ...credentialState, ...screenState, fieldRefs }),
         [credentialState, screenState, fieldRefs],
@@ -419,9 +426,6 @@ function CredentialFields({ form }: SignOnFormProps) {
 }
 
 function ThankYouNotice({ text }: ThankYouNoticeProps) {
-    if (text === "") {
-        return null;
-    }
     return (
         <Paper>
             <Alert severity="info">{text}</Alert>
@@ -429,17 +433,18 @@ function ThankYouNotice({ text }: ThankYouNoticeProps) {
     );
 }
 
-// The thank-you notice, then the ERRMSG line below the form.
+// The ERRMSG line below the form. A sign-off, from this screen's F3 or a menu's, leaves that line
+// blank, and its thank-you notice takes the line's place until the next ENTER or F3 clears it.
 function SignOnMessages({ form }: SignOnFormProps) {
+    if (!IsBlankText(form.thankYouText)) {
+        return <ThankYouNotice text={form.thankYouText} />;
+    }
     return (
-        <>
-            <ThankYouNotice text={form.thankYouText} />
-            <MessageLine
-                message={form.feedback.message}
-                severity={form.feedback.severity}
-                infoMessage={form.feedback.infoMessage}
-            />
-        </>
+        <MessageLine
+            message={form.feedback.message}
+            severity={form.feedback.severity}
+            infoMessage={form.feedback.infoMessage}
+        />
     );
 }
 

@@ -523,7 +523,9 @@ function KeyField(props: KeyFieldProps) {
 }
 
 // A protected (ASKIP) field: read-only yet focusable, so keyboard and screen-reader users reach
-// every value. maxLength only exposes the BMS LENGTH; it never cuts a displayed value.
+// every value. It keeps one row while the value fits, and at narrow widths the value wraps onto
+// further rows instead of being cut off. maxLength only exposes the BMS LENGTH; it never cuts a
+// displayed value.
 function DetailField({ field, detail }: DetailFieldProps) {
     return (
         <TextField
@@ -531,6 +533,7 @@ function DetailField({ field, detail }: DetailFieldProps) {
             label={field.label}
             variant="filled"
             fullWidth
+            multiline
             value={DisplayValue(detail, field.responseKey)}
             slotProps={{
                 input: { readOnly: true },

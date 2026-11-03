@@ -101,8 +101,12 @@ def ForwardSelect(startKey: str | None, readCount: int) -> Select[Any]:
 
 
 def PositionSelect(startKey: str | None) -> Select[Any]:
-    """Return the existence probe of STARTBR GTEQ: one key at or after ``startKey``."""
-    statement = select(USERS_TABLE.c.user_id).limit(1)
+    """Return the existence probe of STARTBR GTEQ: the first key at or after ``startKey``.
+
+    It reads in user_id_sort order, so the probe is one read of the user_id_sort index. A
+    ``startKey`` of None is LOW-VALUES: the probe reads the lowest key.
+    """
+    statement = select(USERS_TABLE.c.user_id).order_by(SORT_COLUMN.asc()).limit(1)
     if startKey is None:
         return statement
     return statement.where(SORT_COLUMN >= SortKeyOf(startKey))
