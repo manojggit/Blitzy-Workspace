@@ -2,7 +2,7 @@
 // page /reports/transactions.
 import { alertClasses, tableCellClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { PointerEventsCheckLevel, type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
@@ -17,15 +17,18 @@ import TransactionReportsPage from "@/app/reports/transactions/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
 import {
     BuildReportExportUrl,
+    DownloadReportExport,
     ExportFormat,
     FetchTransactionReport,
     ReportLineKind,
     ReportType,
+    type ReportExportFile,
     type ReportLine,
     type ReportQuery,
     type TransactionReportResponse,
 } from "@/lib/api/reports";
 import {
+    ABEND_MESSAGE,
     SIGN_ON_ROUTE,
     type LegacyErrorResponse,
     type MessageSeverity,
@@ -77,10 +80,12 @@ jest.mock("@/lib/api/reports", () => ({
     ...jest.requireActual<Record<string, unknown>>("@/lib/api/reports"),
     FetchTransactionReport: jest.fn(),
     BuildReportExportUrl: jest.fn(),
+    DownloadReportExport: jest.fn(),
 }));
 
 const mockFetchTransactionReport = jest.mocked(FetchTransactionReport);
 const mockBuildReportExportUrl = jest.mocked(BuildReportExportUrl);
+const mockDownloadReportExport = jest.mocked(DownloadReportExport);
 
 const HTTP_OK = 200;
 const HTTP_BAD_REQUEST = 400;
@@ -317,13 +322,15 @@ const LINE_KIND_CASES: readonly LineKindCase[] = [
 ];
 
 // One CORPT00C outcome: the literal, its HTTP status, the message-line severity, the field the
-// cursor goes to and, for a 200, the report lines returned with it.
+// cursor goes to and, for a 200, the report lines returned with it. isCleared marks the screen
+// INITIALIZE-ALL-FIELDS leaves after confirm N, which corpt00c answers with blank dates.
 interface LiteralCase {
     literal: string;
     status: number;
     severity: MessageSeverity;
     cursorField: string;
     lines: readonly ReportLine[];
+    isCleared?: boolean;
 }
 
 function EditFailure(literal: string, cursorField: string): LiteralCase {
@@ -403,7 +410,7 @@ const LOCKED_CALL_CASES: readonly LockedCallCase[] = [
         outcome: SubmittedOutcome("Custom report submitted for printing ...", REPORT_LINES),
         FocusedControl: MonthlyButton,
     },
-    // Confirm N clears every field and the message (INITIALIZE-ALL-FIELDS).
+    // Confirm N clears every field, both dates and the message (INITIALIZE-ALL-FIELDS).
     {
         answer: "the confirm N reset",
         confirm: "N",
@@ -413,6 +420,7 @@ const LOCKED_CALL_CASES: readonly LockedCallCase[] = [
             severity: "info",
             cursorField: "reportType",
             lines: [],
+            isCleared: true,
         },
         FocusedControl: MonthlyButton,
     },
@@ -659,9 +667,17 @@ function BuildAxiosError(status: number, body: LegacyErrorResponse): AxiosError 
     return new AxiosError("Request failed", code, config, null, response);
 }
 
-// The 200 body of an outcome.
-function OutcomeResponse({ literal, cursorField, lines }: LiteralCase): TransactionReportResponse {
-    return BuildReportResponse({ message: literal, cursor_field: cursorField, lines: [...lines] });
+// The 200 body of an outcome. The prompt and a submitted report carry the range; the cleared
+// screen carries blank dates, as corpt00c's ClearedResponse sends them.
+function OutcomeResponse(outcome: LiteralCase): TransactionReportResponse {
+    const { literal, cursorField, lines, isCleared } = outcome;
+    const dates = isCleared === true ? { start_date: "", end_date: "" } : {};
+    return BuildReportResponse({
+        ...dates,
+        message: literal,
+        cursor_field: cursorField,
+        lines: [...lines],
+    });
 }
 
 // The rejection of a non-2xx outcome; a blank cursor field is a body that names none.
@@ -931,6 +947,17 @@ beforeEach(() => {
     window.sessionStorage.clear();
     mockFetchTransactionReport.mockReset();
     mockBuildReportExportUrl.mockImplementation((_query, format) => EXPORT_URL_PREFIX + format);
+    mockDownloadReportExport.mockReset();
+});
+
+// The download tests stub the object-URL functions jsdom lacks and record the saving link's
+// click; each test removes them again and returns to real timers.
+afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+    for (const name of OBJECT_URL_FUNCTIONS) {
+        Reflect.deleteProperty(URL, name);
+    }
 });
 
 it("CORPT00 shows the CR00 header, the map title and the ENTER and F3 legend", async () => {
@@ -1016,6 +1043,78 @@ it("CORPT00C ENTER sends the Custom date parts and confirm exactly as keyed", as
         confirm: "y",
     });
 });
+
+const YEARLY_CONFIRMED_QUERY: ReportQuery = {
+    ...BLANK_TEXT_QUERY,
+    reportType: ReportType.YEARLY,
+    confirm: "Y",
+};
+const YEARLY_SUBMITTED_MESSAGE = "Yearly report submitted for printing ...";
+// corpt00c's SubmittedResponse for Yearly in 2022: 1 January to 31 December, with the lines.
+const YEARLY_SUBMITTED_RESPONSE: TransactionReportResponse = BuildReportResponse({
+    start_date: "2022-01-01",
+    end_date: "2022-12-31",
+    message: YEARLY_SUBMITTED_MESSAGE,
+    cursor_field: "reportType",
+});
+const YEARLY_RANGE_HEADING = "Date Range: 2022-01-01 to 2022-12-31";
+// An invalid CONFIRM in either case, so neither case folding nor filtering can pass unseen.
+const INVALID_CONFIRM_VALUES: readonly string[] = ["X", "x"];
+
+// corpt00c's invalid-CONFIRM literal, which echoes the value as keyed.
+function InvalidConfirmMessage(confirm: string): string {
+    return `"${confirm}" is not a valid value to confirm...`;
+}
+
+// corpt00c's 400 for an invalid CONFIRM, with the cursor on CONFIRM.
+function InvalidConfirmError(confirm: string): AxiosError {
+    const errorBody = BuildErrorBody({
+        message: InvalidConfirmMessage(confirm),
+        field_errors: ["confirm"],
+        cursor_field: "confirm",
+    });
+    return BuildAxiosError(HTTP_BAD_REQUEST, errorBody);
+}
+
+it("CORPT00C ENTER sends Yearly confirmed with Y and shows the year's range", async () => {
+    mockFetchTransactionReport.mockResolvedValue(YEARLY_SUBMITTED_RESPONSE);
+    const user = await RenderScreen();
+    await user.click(ReportTypeButton(YEARLY_LABEL));
+    await user.type(ConfirmInput(), "Y");
+    await PressScreenKey(user, ENTER_KEY, "click");
+    await ExpectAlert(YEARLY_SUBMITTED_MESSAGE, "success");
+    expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
+    expect(mockFetchTransactionReport.mock.calls[0]?.[0]).toStrictEqual(YEARLY_CONFIRMED_QUERY);
+    expect(mockFetchTransactionReport).toHaveBeenCalledWith(
+        YEARLY_CONFIRMED_QUERY,
+        READ_SIGNAL_OPTIONS,
+    );
+    expect(
+        screen.getByRole("heading", { level: 2, name: YEARLY_RANGE_HEADING }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: REPORT_TABLE_LABEL })).toBeInTheDocument();
+});
+
+it.each(INVALID_CONFIRM_VALUES)(
+    "CORPT00C ENTER sends CONFIRM %s as keyed and shows its invalid-value literal",
+    async (confirm) => {
+        mockFetchTransactionReport.mockRejectedValue(InvalidConfirmError(confirm));
+        const user = await RenderScreen();
+        await user.click(MonthlyButton());
+        await user.type(ConfirmInput(), confirm);
+        await PressScreenKey(user, ENTER_KEY, "click");
+        await ExpectAlert(InvalidConfirmMessage(confirm), "error");
+        expect(mockFetchTransactionReport.mock.calls[0]?.[0]).toStrictEqual({
+            ...BLANK_TEXT_QUERY,
+            reportType: ReportType.MONTHLY,
+            confirm,
+        });
+        expect(ConfirmInput()).toHaveValue(confirm);
+        expect(ConfirmInput()).toHaveAttribute("aria-invalid", "true");
+        expect(MonthlyButton()).toHaveAttribute("aria-pressed", "true");
+        await waitFor(() => expect(ConfirmInput()).toHaveFocus());
+    },
+);
 
 it.each(LITERAL_CASES)(
     "CORPT00C ENTER shows $literal ($status) as $severity on /reports/transactions",
@@ -1154,6 +1253,120 @@ it("CORPT00C confirm N clears every field and the message (INITIALIZE-ALL-FIELDS
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
 });
+
+// Any range heading, the old one or one built from another answer's dates.
+const DATE_RANGE_HEADING_PATTERN = /^Date Range: /;
+
+// The ClearedResponse corpt00c sends for confirm N: no dates, no message, no lines.
+const CONFIRM_N_CLEARED_RESPONSE: TransactionReportResponse = BuildReportResponse({
+    start_date: "",
+    end_date: "",
+    message: "",
+    cursor_field: "reportType",
+    lines: [],
+});
+
+// The report ShowMonthlyReport put on screen: its range heading, its table and both downloads.
+function ExpectMonthlyReportShown(): void {
+    expect(screen.getByRole("heading", { level: 2, name: DATE_RANGE_HEADING })).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: REPORT_TABLE_LABEL })).toBeInTheDocument();
+    for (const [, linkName] of DOWNLOAD_CASES) {
+        expect(screen.getByRole("link", { name: linkName })).toBeInTheDocument();
+    }
+}
+
+// Nothing of a report is left to read or download.
+function ExpectReportRemoved(): void {
+    const rangeHeading = screen.queryByRole("heading", { name: DATE_RANGE_HEADING_PATTERN });
+    expect(rangeHeading).not.toBeInTheDocument();
+    expect(screen.queryByRole("table", { name: REPORT_TABLE_LABEL })).not.toBeInTheDocument();
+    for (const [, linkName] of DOWNLOAD_CASES) {
+        expect(screen.queryByRole("link", { name: linkName })).not.toBeInTheDocument();
+    }
+}
+
+// The map as INITIALIZE-ALL-FIELDS leaves it: no report type pressed, every date part and
+// CONFIRM blank.
+function ExpectCriteriaCleared(): void {
+    for (const label of REPORT_TYPE_LABELS) {
+        expect(ReportTypeButton(label)).toHaveAttribute("aria-pressed", "false");
+    }
+    for (const part of DATE_PARTS) {
+        expect(DatePartInput(part)).toHaveValue("");
+    }
+    expect(ConfirmInput()).toHaveValue("");
+}
+
+// An ENTER refused after a shown report: the keys pressed on the cleared form, the query they
+// send and the CORPT00C outcome answering it.
+interface RefusalAfterReportCase {
+    name: string;
+    KeyAndSubmit: (user: UserEvent) => Promise<void>;
+    query: ReportQuery;
+    outcome: LiteralCase;
+}
+
+async function SubmitMonthlyUnconfirmed(user: UserEvent): Promise<void> {
+    await user.click(MonthlyButton());
+    await PressScreenKey(user, ENTER_KEY, "click");
+}
+
+const REFUSALS_AFTER_REPORT: readonly RefusalAfterReportCase[] = [
+    {
+        name: "the no-selection edit (400) on the cleared form",
+        KeyAndSubmit: (user) => PressScreenKey(user, ENTER_KEY, "click"),
+        query: BLANK_TEXT_QUERY,
+        outcome: EditFailure(SELECT_REPORT_TYPE_MESSAGE, "reportType"),
+    },
+    {
+        name: "the blank-confirm prompt (200) for Monthly",
+        KeyAndSubmit: SubmitMonthlyUnconfirmed,
+        query: { ...BLANK_TEXT_QUERY, reportType: ReportType.MONTHLY },
+        outcome: PromptOutcome("Please confirm to print the Monthly report..."),
+    },
+    {
+        name: "the file error (503) for Monthly confirmed again",
+        KeyAndSubmit: SubmitMonthlyReport,
+        query: MONTHLY_CONFIRMED_QUERY,
+        outcome: {
+            literal: "Unable to Write TDQ (JOBS)...",
+            status: HTTP_SERVICE_UNAVAILABLE,
+            severity: "error",
+            cursorField: "reportType",
+            lines: [],
+        },
+    },
+];
+
+it("CORPT00C confirm N after a shown report clears the report with every field", async () => {
+    const user = await ShowMonthlyReport();
+    ExpectMonthlyReportShown();
+    mockFetchTransactionReport.mockResolvedValue(CONFIRM_N_CLEARED_RESPONSE);
+    await user.click(ReportTypeButton(CUSTOM_LABEL));
+    await FillDateParts(user, CUSTOM_DATE_PARTS);
+    await user.type(ConfirmInput(), "N");
+    await PressScreenKey(user, ENTER_KEY, "click");
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(mockFetchTransactionReport).toHaveBeenCalledTimes(2);
+    ExpectReportRemoved();
+    ExpectCriteriaCleared();
+    await waitFor(() => expect(MonthlyButton()).toHaveFocus());
+});
+
+it.each(REFUSALS_AFTER_REPORT)(
+    "CORPT00C $name removes the shown report and its downloads",
+    async ({ KeyAndSubmit, query, outcome }) => {
+        const user = await ShowMonthlyReport();
+        ExpectMonthlyReportShown();
+        MockReportOutcome(outcome);
+        await KeyAndSubmit(user);
+        await screen.findByText(outcome.literal);
+        await ExpectAlert(outcome.literal, outcome.severity);
+        ExpectReportRemoved();
+        expect(mockFetchTransactionReport).toHaveBeenCalledTimes(2);
+        expect(mockFetchTransactionReport.mock.calls[1]?.[0]).toStrictEqual(query);
+    },
+);
 
 it("CORPT00C Y shows the CBTRN03C report below the cleared form", async () => {
     await ShowMonthlyReport();
@@ -1308,4 +1521,265 @@ it("CORPT00C discards a cancelled report read and keeps the report shown", async
     const table = screen.getByRole("table", { name: REPORT_TABLE_LABEL });
     expect(within(table).getAllByRole("row")).toHaveLength(REPORT_LINES.length + 1);
     expect(screen.getByRole("button", { name: ENTER_KEY.buttonName })).toBeEnabled();
+});
+
+// The CR00 downloads. Activating a link runs DownloadReportExport, the API-client wrapper, with
+// the shown report's confirmed query, and the page saves the file the server names. jsdom has no
+// object URLs and does not navigate, so the probe stubs both object-URL functions and records the
+// saving link's click instead of following it.
+const OBJECT_URL_FUNCTIONS = ["createObjectURL", "revokeObjectURL"] as const;
+const SAVED_FILE_URL = "blob:http://127.0.0.1:8001/2f6c1d0e-cr00-report";
+const EXPORT_FILE_NAMES: Readonly<Record<ExportFormat, string>> = {
+    [ExportFormat.CSV]: "TRANREPT_2022-07-01_2022-07-31.csv",
+    [ExportFormat.PDF]: "TRANREPT_2022-07-01_2022-07-31.pdf",
+};
+const CSV_LINK_NAME = "Download CSV";
+const PDF_LINK_NAME = "Download PDF";
+
+interface FileSavingProbe {
+    createObjectUrl: jest.Mock;
+    revokeObjectUrl: jest.Mock;
+    linkClick: jest.SpyInstance;
+}
+
+function ProbeFileSaving(): FileSavingProbe {
+    const createObjectUrl = jest.fn(() => SAVED_FILE_URL);
+    const revokeObjectUrl = jest.fn();
+    for (const [name, value] of [
+        [OBJECT_URL_FUNCTIONS[0], createObjectUrl],
+        [OBJECT_URL_FUNCTIONS[1], revokeObjectUrl],
+    ] as const) {
+        Object.defineProperty(URL, name, { configurable: true, writable: true, value });
+    }
+    const linkClick = jest.spyOn(HTMLAnchorElement.prototype, "click");
+    linkClick.mockImplementation(() => undefined);
+    return { createObjectUrl, revokeObjectUrl, linkClick };
+}
+
+function BuildExportFile(format: ExportFormat): ReportExportFile {
+    return { fileName: EXPORT_FILE_NAMES[format], content: new Blob([`TRANREPT ${format}`]) };
+}
+
+function DownloadLink(linkName: string): HTMLElement {
+    return screen.getByRole("link", { name: linkName });
+}
+
+// A download that never answers: like axios, it rejects with CanceledError once its signal is
+// aborted.
+function PendDownloadUntilAborted(
+    _query: ReportQuery,
+    _format: ExportFormat,
+    options?: ReadOptions,
+): Promise<ReportExportFile> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new CanceledError()));
+    });
+}
+
+// The signal the page handed to its first download.
+function FirstDownloadSignal(): AbortSignal | undefined {
+    return mockDownloadReportExport.mock.calls[0]?.[2]?.signal;
+}
+
+// Both links locked while a request runs, or both free to start a download.
+function ExpectDownloadLinksLocked(isLocked: boolean): void {
+    for (const [, linkName] of DOWNLOAD_CASES) {
+        const link = DownloadLink(linkName);
+        if (isLocked) {
+            expect(link).toHaveAttribute("aria-disabled", "true");
+        } else {
+            expect(link).not.toHaveAttribute("aria-disabled");
+        }
+    }
+}
+
+// The report ShowMonthlyReport confirmed: its range, its table and both downloads, ready again.
+async function ExpectMonthlyReportKept(): Promise<void> {
+    expect(screen.getByRole("heading", { level: 2, name: DATE_RANGE_HEADING })).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: REPORT_TABLE_LABEL })).toBeInTheDocument();
+    ExpectCompleteDownloads(MONTHLY_CONFIRMED_QUERY);
+    await waitFor(() => ExpectDownloadLinksLocked(false));
+}
+
+// A rejected download, the message line it leaves and the control that takes the cursor.
+interface DownloadFailureCase {
+    name: string;
+    error: AxiosError;
+    shown: string;
+    FocusedControl: () => HTMLElement;
+}
+
+const DOWNLOAD_FAILURE_CASES: readonly DownloadFailureCase[] = [
+    {
+        name: "a 400 date edit literal",
+        error: OutcomeError(EditFailure(START_MONTH_INVALID_MESSAGE, "startMm")),
+        shown: START_MONTH_INVALID_MESSAGE,
+        FocusedControl: () => DatePartInput(START_MONTH_PART),
+    },
+    {
+        name: "the 503 file-error literal",
+        error: BuildAxiosError(
+            HTTP_SERVICE_UNAVAILABLE,
+            BuildErrorBody({
+                message: "Unable to Write TDQ (JOBS)...",
+                cursor_field: "reportType",
+            }),
+        ),
+        shown: "Unable to Write TDQ (JOBS)...",
+        FocusedControl: MonthlyButton,
+    },
+    {
+        name: "a 500",
+        error: BuildAxiosError(FIRST_SERVER_ERROR_STATUS, BuildErrorBody({ message: "Boom" })),
+        shown: ABEND_MESSAGE,
+        FocusedControl: MonthlyButton,
+    },
+    {
+        name: "a timeout with no answer",
+        error: new AxiosError("timeout of 60000ms exceeded", AxiosError.ECONNABORTED),
+        shown: ABEND_MESSAGE,
+        FocusedControl: MonthlyButton,
+    },
+];
+
+// The saving link is the page's own transient link; its blob URL outlives the click.
+it.each(DOWNLOAD_CASES)(
+    "CORPT00C activating the %s link fetches the confirmed report and saves the server's file",
+    async (format, linkName) => {
+        jest.useFakeTimers({ advanceTimers: true });
+        const probe = ProbeFileSaving();
+        const file = BuildExportFile(format);
+        mockDownloadReportExport.mockResolvedValue(file);
+        const user = await ShowMonthlyReport();
+        await user.click(DownloadLink(linkName));
+        await waitFor(() => expect(probe.linkClick).toHaveBeenCalledTimes(1));
+        expect(mockDownloadReportExport.mock.calls).toEqual([
+            [MONTHLY_CONFIRMED_QUERY, format, READ_SIGNAL_OPTIONS],
+        ]);
+        expect(probe.createObjectUrl.mock.calls).toEqual([[file.content]]);
+        const savingLink = probe.linkClick.mock.contexts[0] as HTMLAnchorElement;
+        expect(savingLink.getAttribute("href")).toBe(SAVED_FILE_URL);
+        expect(savingLink.download).toBe(file.fileName);
+        expect(probe.revokeObjectUrl).not.toHaveBeenCalled();
+        act(() => jest.runOnlyPendingTimers());
+        expect(probe.revokeObjectUrl.mock.calls).toEqual([[SAVED_FILE_URL]]);
+        await ExpectAlert(MONTHLY_SUBMITTED_MESSAGE, "success");
+    },
+);
+
+// The link keeps the export address, yet its activation is never followed: the browser would
+// replace the screen with any error body the export answers.
+it("CORPT00C a download link activation never follows the export address", async () => {
+    mockDownloadReportExport.mockImplementation(PendDownloadUntilAborted);
+    await ShowMonthlyReport();
+    const isFollowed = fireEvent.click(DownloadLink(CSV_LINK_NAME));
+    expect(isFollowed).toBe(false);
+    expect(mockDownloadReportExport).toHaveBeenCalledTimes(1);
+    expect(DownloadLink(CSV_LINK_NAME)).toHaveAttribute("href", EXPORT_URL_PREFIX + "csv");
+});
+
+it.each(DOWNLOAD_FAILURE_CASES)(
+    "CORPT00C a download failing with $name shows $shown in red and keeps the report",
+    async ({ error, shown, FocusedControl }) => {
+        mockDownloadReportExport.mockRejectedValue(error);
+        const user = await ShowMonthlyReport();
+        await user.click(DownloadLink(PDF_LINK_NAME));
+        await screen.findByText(shown);
+        await ExpectAlert(shown, "error");
+        await ExpectMonthlyReportKept();
+        await waitFor(() => expect(FocusedControl()).toHaveFocus());
+        expect(mockDownloadReportExport).toHaveBeenCalledTimes(1);
+        expect(mockRouterPush).not.toHaveBeenCalled();
+    },
+);
+
+// The apiClient interceptor owns the 401 redirect to sign-on, which the mocked wrapper bypasses,
+// so the page neither routes nor shows a message for the empty 401 body.
+it("CORPT00C a download refused with 401 leaves the redirect to the interceptor", async () => {
+    mockDownloadReportExport.mockRejectedValue(
+        BuildAxiosError(HTTP_UNAUTHORIZED, BuildErrorBody()),
+    );
+    const user = await ShowMonthlyReport();
+    await user.click(DownloadLink(CSV_LINK_NAME));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(mockDownloadReportExport).toHaveBeenCalledTimes(1);
+    expect(mockRouterPush).not.toHaveBeenCalled();
+    expect(mockRouterReplace).not.toHaveBeenCalled();
+});
+
+// A cancelled download is discarded before ToScreenFeedback, which would show the abend text.
+it("CORPT00C discards a cancelled download and keeps the report and its message", async () => {
+    const probe = ProbeFileSaving();
+    mockDownloadReportExport.mockRejectedValue(new CanceledError());
+    const user = await ShowMonthlyReport();
+    await user.click(DownloadLink(CSV_LINK_NAME));
+    await waitFor(() => expect(mockDownloadReportExport).toHaveBeenCalledTimes(1));
+    await ExpectMonthlyReportKept();
+    await ExpectAlert(MONTHLY_SUBMITTED_MESSAGE, "success");
+    expect(probe.createObjectUrl).not.toHaveBeenCalled();
+});
+
+// One activation is one request: while it runs, both links, ENTER and the criteria are locked and
+// the busy bar shows, and a click on the locked links starts nothing.
+it("CORPT00C locks both downloads and ENTER while a download runs", async () => {
+    mockDownloadReportExport.mockImplementation(PendDownloadUntilAborted);
+    const user = await ShowMonthlyReport();
+    await user.click(DownloadLink(CSV_LINK_NAME));
+    await screen.findByRole("progressbar");
+    ExpectDownloadLinksLocked(true);
+    ExpectKeyboardLocked();
+    const lockedUser = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
+    for (const [, linkName] of DOWNLOAD_CASES) {
+        await lockedUser.click(DownloadLink(linkName));
+    }
+    expect(mockDownloadReportExport).toHaveBeenCalledTimes(1);
+    expect(mockDownloadReportExport).toHaveBeenCalledWith(
+        MONTHLY_CONFIRMED_QUERY,
+        ExportFormat.CSV,
+        READ_SIGNAL_OPTIONS,
+    );
+    expect(FirstDownloadSignal()?.aborted).toBe(false);
+});
+
+// Leaving the screen while a download runs aborts it, so no file arrives for a screen nobody sees.
+it.each(LEAVE_CASES)(
+    "CORPT00C $leaving during a download abandons it without a message or a file",
+    async ({ LeaveScreen, routes }) => {
+        const probe = ProbeFileSaving();
+        mockDownloadReportExport.mockImplementation(PendDownloadUntilAborted);
+        const user = await ShowMonthlyReport();
+        await user.click(DownloadLink(PDF_LINK_NAME));
+        await screen.findByRole("progressbar");
+        expect(FirstDownloadSignal()?.aborted).toBe(false);
+        await LeaveScreen(user);
+        expect(FirstDownloadSignal()?.aborted).toBe(true);
+        expect(mockRouterPush.mock.calls).toEqual(routes.map((route) => [route]));
+        expect(screen.queryByText(ABEND_MESSAGE)).not.toBeInTheDocument();
+        expect(probe.createObjectUrl).not.toHaveBeenCalled();
+    },
+);
+
+// The page tells a confirmed report from the prompt and the cleared screen by the dates and the
+// cursor corpt00c sets, never by the message, which it only shows: a confirmed range with no
+// transaction keeps its range and downloads whatever words its message uses.
+const UNSUFFIXED_SUBMITTED_MESSAGE = "Custom report ready ...";
+const UNSUFFIXED_EMPTY_RANGE_RESPONSE: TransactionReportResponse = BuildReportResponse({
+    start_date: "2021-01-01",
+    end_date: "2021-01-31",
+    message: UNSUFFIXED_SUBMITTED_MESSAGE,
+    cursor_field: "reportType",
+    lines: [],
+});
+
+it("CORPT00C tells a confirmed empty range by its dates and cursor, not its message", async () => {
+    mockFetchTransactionReport.mockResolvedValue(UNSUFFIXED_EMPTY_RANGE_RESPONSE);
+    const user = await RenderScreen();
+    await SubmitMonthlyReport(user);
+    await screen.findByText(UNSUFFIXED_SUBMITTED_MESSAGE);
+    await ExpectAlert(UNSUFFIXED_SUBMITTED_MESSAGE, "success");
+    expect(
+        screen.getByRole("heading", { level: 2, name: EMPTY_RANGE_HEADING }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    ExpectCompleteDownloads(MONTHLY_CONFIRMED_QUERY);
 });

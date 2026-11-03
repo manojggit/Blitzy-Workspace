@@ -1,6 +1,16 @@
 // Jest setup for the CardDemo frontend suites: jest-dom matchers and minimal jsdom gaps
-// used by MUI.
+// used by MUI and the API wrappers.
 import "@testing-library/jest-dom";
+import { TextDecoder as NodeTextDecoder } from "node:util";
+
+// jsdom implements no TextDecoder, which every browser has and the CR00 export download decodes
+// its legacy error bodies with. Node's implementation of the same WHATWG API fills the gap.
+if (typeof globalThis.TextDecoder === "undefined") {
+    Object.defineProperty(globalThis, "TextDecoder", {
+        writable: true,
+        value: NodeTextDecoder,
+    });
+}
 
 // jsdom implements no window.matchMedia, yet MUI useMediaQuery and the responsive layout
 // components call it on render. The stub reports that no media query matches.

@@ -60,10 +60,12 @@ import {
 } from "@/lib/apiClient";
 import {
     BuildReportExportUrl,
+    DownloadReportExport,
     ExportFormat,
     FetchTransactionReport,
     ReportLineKind,
     ReportType,
+    type ReportExportFile,
     type ReportLine,
     type ReportQuery,
     type TransactionReportResponse,
@@ -151,9 +153,6 @@ const CODE_DESCRIPTION_SEPARATOR = "-";
 // CVTRA07Y REPORT-NAME-HEADER: 'Date Range: ' <start> ' to ' <end>.
 const DATE_RANGE_PREFIX = "Date Range: ";
 const DATE_RANGE_SEPARATOR = " to ";
-// The STRING suffix of the success literal (CORPT00C line 450). A confirmed range that matched no
-// transaction still answers it, with no lines.
-const REPORT_SUBMITTED_SUFFIX = " report submitted for printing ...";
 
 interface DownloadOption {
     format: ExportFormat;
@@ -164,6 +163,9 @@ const DOWNLOAD_OPTIONS: readonly DownloadOption[] = [
     { format: ExportFormat.CSV, label: "Download CSV" },
     { format: ExportFormat.PDF, label: "Download PDF" },
 ];
+// Safari fails a download whose blob URL is revoked while the click is still starting it, so a
+// saved file's URL is released only once the browser has had ample time to read it.
+const OBJECT_URL_RELEASE_DELAY_MILLISECONDS = 40000;
 
 // The ReportQuery wire names, which corpt00c names as cursor_field (MOVE -1 TO <field>L).
 type CursorField =
@@ -183,6 +185,9 @@ const CURSOR_FIELDS: readonly CursorField[] = [
 ];
 // MONTHLY carries IC, and CORPT00C moves -1 to MONTHLYL whenever it names no other field.
 const DEFAULT_CURSOR_FIELD: CursorField = "reportType";
+// Of the 200 screens, only the blank-confirm prompt puts the cursor on CONFIRM (MOVE -1 TO
+// CONFIRML, line 472); the invalid-value literal that also does is a 400.
+const CONFIRM_CURSOR_FIELD: CursorField = "confirm";
 
 interface ReportInputs {
     reportType: ReportType | null;
@@ -303,11 +308,6 @@ function BuildQueryFromInputs(inputs: ReportInputs): ReportQuery {
     return { reportType, ...textInputs };
 }
 
-// A confirmed report, including a range that matched no transaction (no lines, green literal).
-function IsSubmittedReport(response: TransactionReportResponse): boolean {
-    return response.lines.length > 0 || response.message.endsWith(REPORT_SUBMITTED_SUFFIX);
-}
-
 // CORPT00C lines 445-453: INITIALIZE-ALL-FIELDS, the green literal and the cursor on MONTHLY. The
 // report stays shown below the cleared form.
 function ApplySuccess(
@@ -352,25 +352,44 @@ function ApplyPrompt(response: TransactionReportResponse, setters: ScreenSetters
     setters.requestFocus(response.cursor_field);
 }
 
+// INITIALIZE-ALL-FIELDS after a confirm of N leaves both dates blank.
+function IsClearedScreen(response: TransactionReportResponse): boolean {
+    return response.start_date === "" && response.end_date === "";
+}
+
+function IsConfirmPrompt(response: TransactionReportResponse): boolean {
+    return response.cursor_field === CONFIRM_CURSOR_FIELD;
+}
+
+// The three 200 screens are told apart by the state the server sets, never by the message, which
+// is shown as sent: the cleared screen has no dates, the prompt keeps the range with the cursor on
+// CONFIRM, and a confirmed report keeps the range with the cursor elsewhere, its lines empty for
+// a range that matched no transaction.
 function ApplyResponse(
     response: TransactionReportResponse,
     query: ReportQuery,
     setters: ScreenSetters,
 ): void {
-    if (IsSubmittedReport(response)) {
-        ApplySuccess(response, query, setters);
-    } else if (IsBlank(response.message)) {
+    if (IsClearedScreen(response)) {
         ApplyReset(response, setters);
-    } else {
+    } else if (IsConfirmPrompt(response)) {
         ApplyPrompt(response, setters);
+    } else {
+        ApplySuccess(response, query, setters);
     }
 }
 
 // A 400 edit literal or the 503 file-error literal: red, the keyed fields kept and the cursor on
 // the field the server names. The interceptor has already redirected a 401 or 403.
 function ApplyError(error: AxiosError, setters: ScreenSetters): void {
-    const feedback = ToScreenFeedback(error);
     setters.setResult(null);
+    ShowErrorFeedback(error, setters);
+}
+
+// The legacy outcome of a failed call, or the abend text, red: every field the server names is
+// marked and the cursor goes to its cursor_field. Nothing else on the screen changes.
+function ShowErrorFeedback(error: AxiosError, setters: ScreenSetters): void {
+    const feedback = ToScreenFeedback(error);
     setters.setFeedback({
         message: feedback.message,
         severity: ERROR_SEVERITY,
@@ -387,9 +406,10 @@ interface FunctionKeyHandlers {
     isBusy: boolean;
 }
 
-// ENTER=Continue  F3=Back, the map's whole legend. ENTER is inactive while a request runs, as the
-// 3270 keyboard stays locked until the program answers, so one ENTER is one request; the criteria
-// fields are locked with it (ReportCriteriaSection). F3 still leaves the screen.
+// ENTER=Continue  F3=Back, the map's whole legend. ENTER is inactive while a request runs, a
+// report read or a download, as the 3270 keyboard stays locked until the program answers, so one
+// ENTER is one request; the criteria fields are locked with it (ReportCriteriaSection). F3 still
+// leaves the screen.
 function BuildFunctionKeys({
     onEnter,
     onBack,
@@ -426,15 +446,35 @@ interface ReportSubmission {
     abortRead: ReadAborter;
 }
 
-interface ReportForm {
+// Downloads the shown report's confirmed query in one format.
+type DownloadStarter = (query: ReportQuery, format: ExportFormat) => Promise<void>;
+
+interface ReportDownload {
+    isDownloading: boolean;
+    startDownload: DownloadStarter;
+    abortDownload: ReadAborter;
+}
+
+// What the download links need: whether a request runs, which locks them, and how to download.
+interface ReportDownloads {
+    disabled: boolean;
+    startDownload: DownloadStarter;
+}
+
+// The requests of the screen: ENTER's report read and the downloads share one lock.
+interface ReportRequests {
+    isBusy: boolean;
+    keys: readonly FunctionKeyDefinition[];
+    downloads: ReportDownloads;
+}
+
+interface ReportForm extends ReportRequests {
     inputs: ReportInputs;
     setReportType: ReportTypeSetter;
     setTextInput: TextInputSetter;
     feedback: FeedbackState;
     result: ReportResult | null;
-    isBusy: boolean;
     bindRef: FieldRefBinder;
-    keys: readonly FunctionKeyDefinition[];
 }
 
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
@@ -548,9 +588,18 @@ function useReadController(): ReadController {
     return { startRead, abortRead };
 }
 
+// Shows the outcome of a failed call on the screen.
+type ErrorApplier = (error: AxiosError, setters: ScreenSetters) => void;
+
 // An abandoned read is discarded silently, before ToScreenFeedback would show it as the abend
-// text. Only axios errors carry a legacy outcome; any other error is a defect and propagates.
-function ApplyReadError(error: unknown, signal: AbortSignal, setters: ScreenSetters): void {
+// text. Only axios errors carry a legacy outcome, which applyError shows; any other error is a
+// defect and propagates.
+function ApplyReadError(
+    error: unknown,
+    signal: AbortSignal,
+    setters: ScreenSetters,
+    applyError: ErrorApplier,
+): void {
     if (IsCancelledRequest(error)) {
         return;
     }
@@ -558,7 +607,7 @@ function ApplyReadError(error: unknown, signal: AbortSignal, setters: ScreenSett
         throw error;
     }
     if (!signal.aborted) {
-        ApplyError(error, setters);
+        applyError(error, setters);
     }
 }
 
@@ -575,8 +624,63 @@ async function RunReportRead(
             ApplyResponse(response, query, setters);
         }
     } catch (error) {
-        ApplyReadError(error, signal, setters);
+        ApplyReadError(error, signal, setters, ApplyError);
     }
+}
+
+// The browser saves the received document under the server's file name through a transient
+// link to it; the screen does not navigate.
+function SaveReportFile(file: ReportExportFile): void {
+    const objectUrl = URL.createObjectURL(file.content);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = file.fileName;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), OBJECT_URL_RELEASE_DELAY_MILLISECONDS);
+}
+
+interface DownloadRequest {
+    query: ReportQuery;
+    format: ExportFormat;
+    signal: AbortSignal;
+}
+
+// A file that arrives after its download was aborted belongs to a disposed or replaced screen, so
+// it is not saved. A failed download shows its legacy outcome, or the abend text, and leaves the
+// report shown: the confirmed report it repeats is unchanged.
+async function RunReportDownload(request: DownloadRequest, setters: ScreenSetters): Promise<void> {
+    const { query, format, signal } = request;
+    try {
+        const file = await DownloadReportExport(query, format, { signal });
+        if (!signal.aborted) {
+            SaveReportFile(file);
+        }
+    } catch (error) {
+        ApplyReadError(error, signal, setters, ShowErrorFeedback);
+    }
+}
+
+// Each download owns an AbortController, as a report read does: a new download aborts the one it
+// replaces, and F3 and the unmount abort the one in flight. An aborted download leaves the busy
+// state to the download replacing it. A download is never retried.
+function useReportDownload(setters: ScreenSetters): ReportDownload {
+    const [isDownloading, setIsDownloading] = useState(false);
+    const { startRead, abortRead } = useReadController();
+    const startDownload = useCallback(
+        async (query: ReportQuery, format: ExportFormat) => {
+            const signal = startRead();
+            setIsDownloading(true);
+            try {
+                await RunReportDownload({ query, format, signal }, setters);
+            } finally {
+                if (!signal.aborted) {
+                    setIsDownloading(false);
+                }
+            }
+        },
+        [setters, startRead],
+    );
+    return { isDownloading, startDownload, abortDownload: abortRead };
 }
 
 // An aborted read leaves the busy state alone: the read replacing it owns that state, and a screen
@@ -599,12 +703,19 @@ function useReportSubmit(inputs: ReportInputs, setters: ScreenSetters): ReportSu
     return { isBusy, submit, abortRead };
 }
 
-// The same definitions drive the physical keys and the on-screen buttons. F3 aborts the read in
-// flight before it leaves, because the route change keeps this screen mounted until the menu has
-// loaded.
-function useScreenKeys(submission: ReportSubmission): readonly FunctionKeyDefinition[] {
+// What the PF keys act on: ENTER submits; F3 aborts every request in flight before it leaves.
+interface ScreenKeyActions {
+    submit: SubmitAction;
+    abortRequests: ReadAborter;
+    isBusy: boolean;
+}
+
+// The same definitions drive the physical keys and the on-screen buttons. F3 aborts the read or
+// download in flight before it leaves, because the route change keeps this screen mounted until
+// the menu has loaded.
+function useScreenKeys(actions: ScreenKeyActions): readonly FunctionKeyDefinition[] {
     const router = useRouter();
-    const { submit, isBusy, abortRead } = submission;
+    const { submit, isBusy, abortRequests } = actions;
     const keys = useMemo(
         () =>
             BuildFunctionKeys({
@@ -612,15 +723,30 @@ function useScreenKeys(submission: ReportSubmission): readonly FunctionKeyDefini
                     void submit();
                 },
                 onBack: () => {
-                    abortRead();
+                    abortRequests();
                     router.push(MENU_ROUTE);
                 },
                 isBusy,
             }),
-        [submit, abortRead, router, isBusy],
+        [submit, abortRequests, router, isBusy],
     );
     useFunctionKeys(keys);
     return keys;
+}
+
+// One request runs at a time: while ENTER's read or a download runs, ENTER, the criteria and the
+// download links are all locked and the busy bar shows.
+function useReportRequests(inputs: ReportInputs, setters: ScreenSetters): ReportRequests {
+    const { isBusy: isReading, submit, abortRead } = useReportSubmit(inputs, setters);
+    const { isDownloading, startDownload, abortDownload } = useReportDownload(setters);
+    const isBusy = isReading || isDownloading;
+    const abortRequests = useCallback(() => {
+        abortRead();
+        abortDownload();
+    }, [abortRead, abortDownload]);
+    const keys = useScreenKeys({ submit, abortRequests, isBusy });
+    const downloads = useMemo(() => ({ disabled: isBusy, startDownload }), [isBusy, startDownload]);
+    return { isBusy, keys, downloads };
 }
 
 function useReportForm(): ReportForm {
@@ -632,10 +758,8 @@ function useReportForm(): ReportForm {
         () => ({ setInputs, setFeedback, setResult, requestFocus }),
         [setInputs, setFeedback, setResult, requestFocus],
     );
-    const submission = useReportSubmit(inputs, setters);
-    const keys = useScreenKeys(submission);
-    const { isBusy } = submission;
-    return { inputs, setReportType, setTextInput, feedback, result, isBusy, bindRef, keys };
+    const requests = useReportRequests(inputs, setters);
+    return { inputs, setReportType, setTextInput, feedback, result, bindRef, ...requests };
 }
 
 interface ReportTypeSelectorProps {
@@ -1040,26 +1164,60 @@ function ReportLinesTable({ lines }: ReportLinesTableProps) {
     );
 }
 
-interface ReportDownloadButtonsProps {
+interface ReportDownloadButtonProps {
+    option: DownloadOption;
     query: ReportQuery;
+    downloads: ReportDownloads;
 }
 
-// The confirmed query again, as CSV or PDF; the session cookie travels on the same-site download
-// and the server names the file.
-function ReportDownloadButtons({ query }: ReportDownloadButtonsProps) {
+type DownloadClickHandler = (event: MouseEvent<HTMLElement>) => void;
+
+// Activating a link fetches its file through the API client instead of following the address,
+// so a refused or failed export redirects or shows its legacy message rather than replacing the
+// screen. A locked link, still focused from its own click, starts nothing.
+function BuildDownloadClickHandler(props: ReportDownloadButtonProps): DownloadClickHandler {
+    return (event) => {
+        event.preventDefault();
+        if (!props.downloads.disabled) {
+            void props.downloads.startDownload(props.query, props.option.format);
+        }
+    };
+}
+
+// The link keeps the export address, the download it stands for, as its semantics.
+function ReportDownloadButton(props: ReportDownloadButtonProps) {
+    return (
+        <Button
+            component="a"
+            href={BuildReportExportUrl(props.query, props.option.format)}
+            download
+            disabled={props.downloads.disabled}
+            onClick={BuildDownloadClickHandler(props)}
+            variant="outlined"
+            startIcon={<DownloadIcon />}
+        >
+            {props.option.label}
+        </Button>
+    );
+}
+
+interface ReportDownloadButtonsProps {
+    query: ReportQuery;
+    downloads: ReportDownloads;
+}
+
+// The confirmed query again, as CSV or PDF; the session cookie travels with the client's call and
+// the server names the file.
+function ReportDownloadButtons({ query, downloads }: ReportDownloadButtonsProps) {
     return (
         <Stack direction="row" spacing={2} useFlexGap>
             {DOWNLOAD_OPTIONS.map((option) => (
-                <Button
+                <ReportDownloadButton
                     key={option.format}
-                    component="a"
-                    href={BuildReportExportUrl(query, option.format)}
-                    download
-                    variant="outlined"
-                    startIcon={<DownloadIcon />}
-                >
-                    {option.label}
-                </Button>
+                    option={option}
+                    query={query}
+                    downloads={downloads}
+                />
             ))}
         </Stack>
     );
@@ -1067,11 +1225,12 @@ function ReportDownloadButtons({ query }: ReportDownloadButtonsProps) {
 
 interface ReportResultSectionProps {
     result: ReportResult | null;
+    downloads: ReportDownloads;
 }
 
 // A confirmed range that matched no transaction shows its range and no table, as CBTRN03C
 // prints nothing for an empty input; its downloads still give that empty report.
-function ReportResultSection({ result }: ReportResultSectionProps) {
+function ReportResultSection({ result, downloads }: ReportResultSectionProps) {
     if (result === null) {
         return null;
     }
@@ -1081,15 +1240,19 @@ function ReportResultSection({ result }: ReportResultSectionProps) {
                 {DATE_RANGE_PREFIX + result.startDate + DATE_RANGE_SEPARATOR + result.endDate}
             </Typography>
             {result.lines.length > 0 ? <ReportLinesTable lines={result.lines} /> : null}
-            <ReportDownloadButtons query={result.submittedQuery} />
+            <ReportDownloadButtons query={result.submittedQuery} downloads={downloads} />
         </Stack>
     );
 }
 
 function TransactionReportsScreen() {
     const form = useReportForm();
-    // The report renders again only for a new result, never for a criteria keystroke.
-    const resultView = useMemo(() => <ReportResultSection result={form.result} />, [form.result]);
+    // The report renders again only for a new result or when a request locks or frees its
+    // downloads, never for a criteria keystroke.
+    const resultView = useMemo(
+        () => <ReportResultSection result={form.result} downloads={form.downloads} />,
+        [form.result, form.downloads],
+    );
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}
