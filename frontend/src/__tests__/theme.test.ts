@@ -51,6 +51,14 @@ interface ButtonThemeEntry {
     styleOverrides?: { root?: unknown };
 }
 
+type StyleRecord = Record<string, unknown>;
+
+interface SegmentStateExpectation {
+    state: string;
+    selectorPath: readonly string[];
+    expectedStyle: StyleRecord;
+}
+
 const PRIMARY_CONTAINER_HEX = "#EADDFF";
 const ON_PRIMARY_CONTAINER_HEX = "#4F378B";
 
@@ -123,6 +131,39 @@ const M3_TYPE_EXPECTATIONS: readonly TypeRoleExpectation[] = [
 
 const TONAL_VARIANT_NAME = "tonal";
 const OUTLINED_VARIANT_NAME = "outlined";
+
+const SELECTED_SELECTOR = "&.Mui-selected";
+const DISABLED_SELECTOR = "&.Mui-disabled";
+const HOVER_SELECTOR = "&:hover";
+
+const SELECTED_ENABLED_SEGMENT_STYLE = {
+    backgroundColor: CARD_DEMO_THEME.palette.m3.primaryContainer,
+    color: CARD_DEMO_THEME.palette.m3.onPrimaryContainer,
+};
+
+const SELECTED_DISABLED_SEGMENT_STYLE = {
+    backgroundColor: CARD_DEMO_THEME.palette.action.disabledBackground,
+    backgroundImage: "none",
+    color: CARD_DEMO_THEME.palette.action.disabled,
+};
+
+const SEGMENT_STATE_EXPECTATIONS: readonly SegmentStateExpectation[] = [
+    {
+        state: "selected enabled",
+        selectorPath: [SELECTED_SELECTOR],
+        expectedStyle: SELECTED_ENABLED_SEGMENT_STYLE,
+    },
+    {
+        state: "selected disabled",
+        selectorPath: [SELECTED_SELECTOR, DISABLED_SELECTOR],
+        expectedStyle: SELECTED_DISABLED_SEGMENT_STYLE,
+    },
+    {
+        state: "hovered selected disabled",
+        selectorPath: [SELECTED_SELECTOR, DISABLED_SELECTOR, HOVER_SELECTOR],
+        expectedStyle: SELECTED_DISABLED_SEGMENT_STYLE,
+    },
+];
 
 function FontSizeToPixels(value: string | number | undefined): number {
     if (typeof value === "number") {
@@ -207,6 +248,23 @@ function FindVariantStyle(variantName: string): Record<string, unknown> | undefi
     return resolvedStyle as Record<string, unknown>;
 }
 
+function AsStyleRecord(value: unknown): StyleRecord | undefined {
+    if (typeof value !== "object" || value === null) {
+        return undefined;
+    }
+    return value as StyleRecord;
+}
+
+// Walks the resolved ToggleButton root override down a chain of nested selectors.
+function ReadSegmentRule(selectorPath: readonly string[]): StyleRecord | undefined {
+    const segmentRoot = CARD_DEMO_THEME.components?.MuiToggleButton?.styleOverrides?.root;
+    const resolvedRoot = AsStyleRecord(ResolveStyle(segmentRoot, { theme: CARD_DEMO_THEME }));
+    return selectorPath.reduce<StyleRecord | undefined>(
+        (rule, selector) => AsStyleRecord(rule?.[selector]),
+        resolvedRoot,
+    );
+}
+
 describe("M3 colour roles (AAP 0.5.3)", () => {
     it.each(M3_COLOR_EXPECTATIONS)("$token is $expected", ({ read, expected }) => {
         expect(NormaliseColour(read(CARD_DEMO_THEME))).toBe(expected.toUpperCase());
@@ -260,4 +318,13 @@ describe("Material Design 3 gap resolutions (AAP 0.5.4)", () => {
         const textFieldDefaults = CARD_DEMO_THEME.components?.MuiTextField?.defaultProps;
         expect(textFieldDefaults?.variant).toBe(OUTLINED_VARIANT_NAME);
     });
+});
+
+describe("M3 segmented-button states (gap 0.5.4)", () => {
+    it.each(SEGMENT_STATE_EXPECTATIONS)(
+        "a $state segment uses its theme tokens",
+        ({ selectorPath, expectedStyle }) => {
+            expect(ReadSegmentRule(selectorPath)).toMatchObject(expectedStyle);
+        },
+    );
 });

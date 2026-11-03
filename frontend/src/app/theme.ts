@@ -132,6 +132,19 @@ function BuildTonalButtonStyle({ theme }: ThemedStyleProps): CSSObject {
 }
 
 /**
+ * A segment that is selected and disabled: the disabled tokens with no state layer, on hover as
+ * well, so neither selected rule restores the enabled colours over MUI's disabled text.
+ */
+function BuildDisabledSegmentStyle(theme: StyleTheme): CSSObject {
+    const disabledStyle = {
+        backgroundColor: theme.palette.action.disabledBackground,
+        backgroundImage: "none",
+        color: theme.palette.action.disabled,
+    };
+    return { ...disabledStyle, "&:hover": disabledStyle };
+}
+
+/**
  * One M3 segmented-button segment. Every segment gets the full extra-large radius and
  * ToggleButtonGroup squares the inner corners, so only the first and last segments keep
  * rounded outer corners, in either orientation.
@@ -149,6 +162,7 @@ function BuildSegmentStyle({ theme }: ThemedStyleProps): CSSObject {
             ...selectedStyle,
             "&:hover": selectedStyle,
             "@media (hover: hover)": { "&:hover": BuildHoverStateLayer(theme) },
+            "&.Mui-disabled": BuildDisabledSegmentStyle(theme),
         },
     };
 }
