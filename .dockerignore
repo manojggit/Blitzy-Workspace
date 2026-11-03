@@ -1,0 +1,23 @@
+# Build-context filter for backend/Dockerfile, which is built from the repository root
+# (Compose services `migrator` and `backend`). The context is an allow-list: only backend/ and
+# batch/ are sent to the builder. The frontend image uses frontend/.dockerignore instead.
+#
+# data/ and var/ stay out on purpose: Compose mounts ./data read-only at /app/data and
+# ./var/batch-output at /srv/var/batch-output at run time.
+*
+!backend
+!batch
+
+# Secrets and local environment files, at any depth. backend/.env holds SECRET_KEY and the
+# database URLs, which reach containers only from the Compose environment at run time.
+**/.env*
+
+# Local virtual environments, bytecode, tool caches, coverage data and egg-info left by the
+# host's editable installs. The image builds its own.
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.coverage
+**/*.egg-info
