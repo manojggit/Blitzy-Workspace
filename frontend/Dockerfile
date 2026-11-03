@@ -22,8 +22,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
 # Stage builder: compile the application into .next/standalone. The context is filtered by
-# frontend/.dockerignore, so no host node_modules, .next or .env file reaches this stage. The
-# build downloads Roboto through next/font/google and therefore needs network access.
+# frontend/.dockerignore, so no host node_modules or .next and no real .env file reaches this
+# stage; the .env*.example templates are the only .env* files copied. The build downloads
+# Roboto through next/font/google and therefore needs network access.
 FROM node:22-slim AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules

@@ -17,12 +17,12 @@ blob-report
 e2e
 src/__tests__
 
-# Secrets and local environment files. The *.example templates are not matched
-# and stay in the context.
-.env
-.env.local
-.env.e2e
-.env*.local
+# Secrets and local environment files: every .env* file is excluded at any
+# depth. Only the committed templates .env.local.example and .env.e2e.example
+# are re-included.
+**/.env*
+!.env.local.example
+!.env.e2e.example
 
 # Logs, editor and VCS noise, and the Docker files themselves.
 npm-debug.log*
