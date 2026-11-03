@@ -29,7 +29,8 @@ from app.schemas.common import (
 class UserListQuery(QueryModel):
     """Query parameters of ``GET /admin/users``, the COUSR00 browse (COUSR00C, CU00).
 
-    Replaces the USRIDIN search field and the CDEMO-CU00 COMMAREA paging keys.
+    Replaces the USRIDIN search field and the CDEMO-CU00 COMMAREA paging keys. A query with no
+    ``direction`` is ENTER, or the first entry, and browses from ``searchUserId``.
     """
 
     search_user_id: ScreenText(8) = Field(
@@ -44,21 +45,30 @@ class UserListQuery(QueryModel):
         default="",
         alias="startKey",
         description=(
-            "The shown page's first_key (direction backward, F7) or last_key (direction "
-            "forward, F8); empty reads the first page. A raw user ID of at most 8 characters, "
-            "which may hold spaces or any code-page-037 character."
+            "Read only with a direction: the shown page's first_key (direction backward, F7) "
+            "or last_key (direction forward, F8). An empty or blank key on F8 answers "
+            "'You are already at the bottom of the page...'. A raw user ID of at most 8 "
+            "characters, which may hold spaces or any code-page-037 character."
         ),
     )
-    direction: Direction = Field(
-        default=Direction.FORWARD,
+    direction: Direction | None = Field(
+        default=None,
         alias="direction",
-        description="F8 reads forward after startKey (READNEXT); F7 reads backward (READPREV).",
+        description=(
+            "F8 reads forward after startKey (READNEXT); F7 reads backward (READPREV). Omitted "
+            "for ENTER and the first entry, which browse from searchUserId (PROCESS-ENTER-KEY)."
+        ),
     )
     page: int = Field(
         default=0,
         ge=0,
         alias="page",
-        description="The page number shown when the key was pressed (CDEMO-CU00-PAGE-NUM).",
+        description=(
+            "The page number shown when the key was pressed (CDEMO-CU00-PAGE-NUM). 0 is the "
+            "screen an ENTER left when no user ID was at or after the search key, from which "
+            "F8 answers 'You are already at the bottom of the page...' and F7 "
+            "'You are already at the top of the page...'."
+        ),
     )
 
 

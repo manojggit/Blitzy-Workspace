@@ -5,10 +5,14 @@ search key with ENTER, paged with F8 and F7, and the U or D row selection that o
 update (COUSR02C) or delete (COUSR03C) screen.
 
 The COMMAREA paging state (CDEMO-CU00-PAGE-NUM, -USRID-FIRST, -USRID-LAST) comes back from the
-client as ``page`` and ``startKey``. NEXT-PAGE-FLG is derived instead: F8 reads past the last
-key shown, and finding nothing is the flag's ``N``. A browse that reads no row re-sent the
-screen with its old rows and only the message changed (SEND-ERASE-NO, or rows left in place),
-so it raises LegacyMessageError: the error body has no rows, and the page keeps its table.
+client as ``page`` and ``startKey``, and the browse key's EIBAID as ``direction``: none for
+ENTER and the first entry, forward for F8, backward for F7. NEXT-PAGE-FLG is derived instead:
+F8 reads past the last key shown, and a blank key or finding nothing is the flag's ``N``; page
+0, the screen an ENTER that read no row leaves, is the flag's ``N`` too. A browse that reads
+no row re-sent the screen with its old rows and only the message changed (SEND-ERASE-NO, or
+rows left in place), so it raises LegacyMessageError: the error body has no rows, and the page
+keeps its table. The one such refusal that moves the page number, ENTER's STARTBR NOTFND,
+carries ``page`` 0 in its body.
 
 Legacy paths with no code here: ``EIBCALEN = 0`` (back to sign-on) is the RequireAdmin session
 guard; PF3 (``XCTL COADM01C``) is frontend navigation; other AID keys cannot reach the server;
@@ -23,6 +27,7 @@ from app.core.dependencies import OnlineContext
 from app.core.errors import (
     HTTP_EDIT_FAILURE,
     HTTP_FILE_ERROR,
+    LegacyErrorDetails,
     LegacyMessageError,
     RepositoryError,
 )
@@ -67,6 +72,8 @@ LOOKUP_ERROR_STATUS = HTTP_FILE_ERROR
 NO_MESSAGE = ""
 # ENTER moves 0 to CDEMO-CU00-PAGE-NUM before PROCESS-PAGE-FORWARD adds 1 (line 227).
 ENTER_BASE_PAGE = 0
+# The error-body key of that page number when ENTER reads no row, as PageState names it.
+PAGE_BODY_KEY = "page"
 FIRST_PAGE = 1
 BLANK_CHARACTER = " "
 
@@ -81,9 +88,9 @@ async def ListUsers(context: OnlineContext, query: UserListQuery) -> UserListRes
 
     Args:
         context: The admin request context; its session serves the USRSEC browse.
-        query: Direction forward with an empty ``start_key`` is ENTER from ``search_user_id``;
-            forward with a ``start_key`` is F8 after that last key; backward is F7 before the
-            first key, from page ``page``.
+        query: No ``direction`` is ENTER and the first entry, browsing from
+            ``search_user_id``; forward is F8 after the last key ``start_key``; backward is F7
+            before the first key ``start_key``; both from page ``page``.
 
     Returns:
         The page of at most 10 users, its page number, its first and last user IDs, and the
@@ -91,19 +98,18 @@ async def ListUsers(context: OnlineContext, query: UserListQuery) -> UserListRes
 
     Raises:
         LegacyMessageError: 400 with ``You are already at the top of the page...`` (F7 on page
-            1), ``You are already at the bottom of the page...`` (F8 with nothing after the
-            last key), ``You are at the top of the page...`` (STARTBR NOTFND) or
+            1 or 0), ``You are already at the bottom of the page...`` (F8 from page 0, with a
+            blank last key, or with nothing after it), ``You are at the top of the page...``
+            (STARTBR NOTFND; on ENTER its body carries ``page`` 0) or
             ``You have reached the top of the page...`` (nothing before the first key); 503
             with ``Unable to lookup User...`` while the batch window holds USRSEC or on a
             database failure.
     """
     repository = UserRepository(context)
+    if query.direction is None:
+        return await _BrowseFromSearch(repository, query.search_user_id, NO_MESSAGE)
     if query.direction == Direction.BACKWARD:
         return await _PageBackward(repository, query.start_key, query.page)
-    # UserListQuery has no ENTER direction: forward with an empty startKey reads the first page,
-    # so it is ENTER (and the first entry) and browses from the search key.
-    if query.start_key == "":
-        return await _BrowseFromSearch(repository, query.search_user_id, NO_MESSAGE)
     return await _PageForward(repository, query.start_key, query.page)
 
 
@@ -128,8 +134,9 @@ async def ProcessUserSelection(
 
     Raises:
         LegacyMessageError: 400 ``You are at the top of the page...`` when no user ID is at or
-            after the search key; 503 ``Unable to lookup User...`` while the batch window
-            holds USRSEC or on a database failure.
+            after the search key, its body carrying ``page`` 0, from which F8 answers
+            ``You are already at the bottom of the page...``; 503 ``Unable to lookup User...``
+            while the batch window holds USRSEC or on a database failure.
     """
     selection = _FindFirstSelection(request.selections)
     priorMessage = NO_MESSAGE
@@ -203,24 +210,47 @@ async def _BrowseFromSearch(
 
     A blank search key is LOW-VALUES, the lowest key (line 219); ENTER skips no READNEXT
     (line 288), so the first user ID at or after the key is shown. STARTBR NOTFND (lines
-    600-606) leaves the shown rows in place with ``You are at the top of the page...``.
+    600-606) sets USER-SEC-EOF and not ERR-FLG, so PROCESS-PAGE-FORWARD continues with no row
+    read: NEXT-PAGE-NO, and the page stays at the 0 ENTER moved (lines 227, 317-322). The
+    screen then shows ``You are at the top of the page...`` on page 0 with its rows left in
+    place, CDEMO-CU00-USRID-FIRST and -LAST unchanged because POPULATE-USER-DATA never ran
+    (lines 384-441), and the search field blanked as the browse ran to its end (lines 230-232,
+    327-328). The ENDBR that follows (line 325) has no counterpart here, as no browse is held
+    open, so that coded continuation is what is ported.
     """
     startKey = None if _IsBlank(searchUserId) else searchUserId
     browse = repository.BrowseForward(startKey, inclusive=True, limit=PAGE_SIZE)
     records = await _Lookup(browse)
     if records is None:
-        raise _Refusal(AT_TOP_OF_PAGE_MESSAGE)
+        raise _SearchNotFound()
     return _BuildForwardPage(records, ENTER_BASE_PAGE, priorMessage)
+
+
+def _SearchNotFound() -> LegacyMessageError:
+    """Return ENTER's STARTBR NOTFND refusal: ``You are at the top of the page...`` on page 0.
+
+    The body adds ``page`` 0 and no keys, so the client keeps its rows and first and last keys
+    and shows page 0. F8 then refuses as NEXT-PAGE-NO, and F7 as a page not above 1.
+    """
+    pageState = LegacyErrorDetails(extraBody={PAGE_BODY_KEY: ENTER_BASE_PAGE})
+    return LegacyMessageError(
+        AT_TOP_OF_PAGE_MESSAGE,
+        field=SEARCH_CURSOR_FIELD,
+        httpStatus=REFUSAL_STATUS,
+        details=pageState,
+    )
 
 
 async def _PageForward(repository: UserRepository, lastKey: str, page: int) -> UserListResponse:
     """F8: the page after the last key shown (PROCESS-PF8-KEY, PROCESS-PAGE-FORWARD).
 
     The READNEXT skipped after STARTBR (line 289) makes the browse exclusive of the last key.
-    No key, or no user ID after it, is NEXT-PAGE-NO: ``You are already at the bottom of the
-    page...`` with the shown rows kept (lines 270-276).
+    Page 0, no key, or no user ID after it, is NEXT-PAGE-NO: ``You are already at the bottom
+    of the page...`` with the shown rows kept (lines 270-276). Page 0 exists only after an
+    ENTER that read no row, and that path always sets NEXT-PAGE-NO (line 318), so it is
+    refused before any read.
     """
-    if _IsBlank(lastKey):
+    if page == ENTER_BASE_PAGE or _IsBlank(lastKey):
         raise _Refusal(ALREADY_AT_BOTTOM_MESSAGE)
     browse = repository.BrowseForward(lastKey, inclusive=False, limit=PAGE_SIZE)
     records = await _Lookup(browse)
