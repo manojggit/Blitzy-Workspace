@@ -33,3 +33,12 @@ if (typeof window.matchMedia === "undefined") {
         value: CreateMediaQueryListStub,
     });
 }
+
+// jsdom implements no Element.scrollIntoView, which MessageLine calls to bring each new outcome
+// into view. jsdom lays nothing out, so the stub scrolls nothing; suites can spy on it.
+if (typeof Element.prototype.scrollIntoView === "undefined") {
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+        writable: true,
+        value: () => undefined,
+    });
+}

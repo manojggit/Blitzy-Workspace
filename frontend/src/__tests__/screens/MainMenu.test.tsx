@@ -2,7 +2,7 @@
 // Literals verbatim from backend/app/services/menu/comen01c.py, menu_options.py,
 // backend/app/core/messages.py and cbl/COMEN01C.cbl; option labels from cpy/COMEN02Y.cpy.
 import { ThemeProvider } from "@mui/material/styles";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { AxiosError, AxiosHeaders, CanceledError, type InternalAxiosRequestConfig } from "axios";
 import type * as NavigationModule from "next/navigation";
@@ -314,6 +314,18 @@ function RejectOnAbort(options?: ReadOptions): Promise<MenuResponse> {
     });
 }
 
+// A menu read held in flight until the test answers it through the returned function.
+function HoldMenuRead(): (response: MenuResponse) => void {
+    let answerRead: (response: MenuResponse) => void = () => undefined;
+    mockFetchMainMenu.mockImplementation(
+        () =>
+            new Promise<MenuResponse>((resolve) => {
+                answerRead = resolve;
+            }),
+    );
+    return (response) => answerRead(response);
+}
+
 // The AbortSignal the page gave one FetchMainMenu call (0 = the first).
 function MenuReadSignal(callIndex: number): AbortSignal {
     const signal = mockFetchMainMenu.mock.calls[callIndex]?.[0]?.signal;
@@ -483,6 +495,21 @@ it("COMEN01C shows the refusal another screen's 403 stored, once, as an error", 
     StorePendingMessage(ADMIN_ONLY_MESSAGE);
     await RenderLoadedScreen();
     await ExpectAlert(ADMIN_ONLY_MESSAGE, "error");
+    expect(TakePendingMessage()).toBe("");
+});
+
+it("COMEN01C shows a stored refusal only once its options load, in one update", async () => {
+    StorePendingMessage(ADMIN_ONLY_MESSAGE);
+    const answerMenuRead = HoldMenuRead();
+    RenderScreen();
+    expect(screen.getByRole("progressbar")).toBeInTheDocument();
+    expect(within(MenuList()).queryAllByRole("button")).toHaveLength(0);
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    await act(async () => {
+        answerMenuRead(BuildMenuResponse());
+    });
+    await ExpectAlert(ADMIN_ONLY_MESSAGE, "error");
+    expect(within(MenuList()).getAllByRole("button")).toHaveLength(MAIN_MENU_LABELS.length);
     expect(TakePendingMessage()).toBe("");
 });
 

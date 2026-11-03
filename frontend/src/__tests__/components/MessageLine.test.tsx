@@ -2,8 +2,8 @@
 // INFOMSG line (INFOMSGI PIC X(45)) of bms/COACTUP.bms, cpy-bms/COACTUP.CPY and COCRDLI.CPY.
 import { TextField } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen } from "@testing-library/react";
-import type { ReactElement } from "react";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode, type ReactElement, type ReactNode } from "react";
 
 import { CARD_DEMO_THEME } from "@/app/theme";
 import {
@@ -21,6 +21,8 @@ import type { MessageSeverity } from "@/lib/apiClient";
 const ACCOUNT_FILTER_MESSAGE = "Account Filter must  be a non-zero 11 digit number";
 const ADMIN_ONLY_MESSAGE = "No access - Admin Only option... ";
 const CHANGES_VALIDATED_INFO = "Changes validated.Press F5 to save";
+// COCRDLIC's standing INFOMSG prompt, shown with every card-list page.
+const CARD_LIST_PROMPT_INFO = "TYPE S FOR DETAIL, U TO UPDATE ANY RECORD";
 // COUSR01C's duplicate-key literal, which flags USERID.
 const USER_ID_EXISTS_MESSAGE = "User ID already exist...";
 
@@ -122,6 +124,198 @@ const LIVE_REGION_SELECTOR = '[role="alert"], [role="status"], [aria-live]';
 // Keeps every blank of a literal visible on screen while long lines still wrap at blanks.
 const PRESERVED_WHITE_SPACE = "pre-wrap";
 
+// The least scroll that shows the whole line, and none while it is already in view.
+const REVEAL_SCROLL_OPTIONS: ScrollIntoViewOptions = { block: "nearest" };
+// One theme spacing unit (4 dp) of scroll margin around the line.
+const REVEAL_MARGIN = "4px";
+
+// Two responses of one screen, as CAUP passes each response's feedback object as outcomeKey.
+const FIRST_OUTCOME = { response: 1 };
+const SECOND_OUTCOME = { response: 2 };
+
+interface WrapperProps {
+    children: ReactNode;
+}
+
+// How a screen mounts the line: plainly, or under StrictMode, which repeats the mount effects.
+interface MountCase {
+    mode: string;
+    Wrapper: (props: WrapperProps) => ReactElement;
+}
+
+// One outcome replacing another on the same screen, and whether the line scrolls into view with
+// nothing focused: before the user has acted on the screen, and after a keydown.
+interface RevealCase {
+    caseName: string;
+    before: MessageLineProps;
+    after: MessageLineProps;
+    revealsBeforeAction: boolean;
+    revealsAfterAction: boolean;
+}
+
+// The line is cleared to each blank text, which shows nothing and so is not brought into view.
+const CLEARED_CASES: readonly RevealCase[] = BLANK_TEXTS.map((text) => ({
+    caseName: `ERRMSG cleared to ${JSON.stringify(text)}`,
+    before: { message: ADMIN_ONLY_MESSAGE },
+    after: { message: text },
+    revealsBeforeAction: false,
+    revealsAfterAction: false,
+}));
+
+// ERRMSG reports an outcome, so it is revealed before the user acts; INFOMSG, the standing
+// prompt, waits for the user's first action.
+const REVEAL_CASES: readonly RevealCase[] = [
+    {
+        caseName: "a first ERRMSG",
+        before: {},
+        after: { message: ADMIN_ONLY_MESSAGE },
+        revealsBeforeAction: true,
+        revealsAfterAction: true,
+    },
+    {
+        caseName: "another ERRMSG",
+        before: { message: ACCOUNT_FILTER_MESSAGE },
+        after: { message: ADMIN_ONLY_MESSAGE },
+        revealsBeforeAction: true,
+        revealsAfterAction: true,
+    },
+    {
+        caseName: "the same ERRMSG under a new outcomeKey",
+        before: { message: ADMIN_ONLY_MESSAGE, outcomeKey: FIRST_OUTCOME },
+        after: { message: ADMIN_ONLY_MESSAGE, outcomeKey: SECOND_OUTCOME },
+        revealsBeforeAction: true,
+        revealsAfterAction: true,
+    },
+    {
+        caseName: "a first INFOMSG alone",
+        before: {},
+        after: { infoMessage: CARD_LIST_PROMPT_INFO },
+        revealsBeforeAction: false,
+        revealsAfterAction: true,
+    },
+    {
+        caseName: "a new INFOMSG beside the same ERRMSG",
+        before: { message: ACCOUNT_FILTER_MESSAGE },
+        after: { message: ACCOUNT_FILTER_MESSAGE, infoMessage: CHANGES_VALIDATED_INFO },
+        revealsBeforeAction: false,
+        revealsAfterAction: true,
+    },
+    {
+        caseName: "the same INFOMSG under a new outcomeKey",
+        before: { infoMessage: CHANGES_VALIDATED_INFO, outcomeKey: FIRST_OUTCOME },
+        after: { infoMessage: CHANGES_VALIDATED_INFO, outcomeKey: SECOND_OUTCOME },
+        revealsBeforeAction: false,
+        revealsAfterAction: true,
+    },
+    {
+        caseName: "the same ERRMSG under the same outcomeKey",
+        before: { message: ADMIN_ONLY_MESSAGE, outcomeKey: FIRST_OUTCOME },
+        after: { message: ADMIN_ONLY_MESSAGE, outcomeKey: FIRST_OUTCOME },
+        revealsBeforeAction: false,
+        revealsAfterAction: false,
+    },
+    {
+        caseName: "a new outcomeKey with both lines blank",
+        before: { outcomeKey: FIRST_OUTCOME },
+        after: { message: "", outcomeKey: SECOND_OUTCOME },
+        revealsBeforeAction: false,
+        revealsAfterAction: false,
+    },
+    ...CLEARED_CASES,
+];
+
+// The outcome a screen mounts with, and the ones that arrive after it: an ERRMSG refusal, and
+// the standing INFOMSG prompt alone.
+const NO_OUTCOME: MessageLineProps = {};
+const ADMIN_ONLY_OUTCOME: MessageLineProps = { message: ADMIN_ONLY_MESSAGE };
+const PROMPT_ONLY_OUTCOME: MessageLineProps = { infoMessage: CARD_LIST_PROMPT_INFO };
+
+// A new outcome by the line that shows it.
+interface OutcomeLineCase {
+    outcome: string;
+    nextOutcome: MessageLineProps;
+    showsErrorLine: boolean;
+}
+
+const OUTCOME_LINE_CASES: readonly OutcomeLineCase[] = [
+    { outcome: "an ERRMSG", nextOutcome: ADMIN_ONLY_OUTCOME, showsErrorLine: true },
+    { outcome: "an INFOMSG alone", nextOutcome: PROMPT_ONLY_OUTCOME, showsErrorLine: false },
+];
+
+// The jsdom viewport, against which the laid-out rows below are placed.
+const VIEWPORT_HEIGHT = window.innerHeight;
+// An outlined field's height, a one-line Alert's height, and offsets in CSS pixels.
+const FIELD_HEIGHT = 56;
+const LINE_HEIGHT = 48;
+const EDGE_GAP = 16;
+const FIELD_ABOVE_FOLD = 200;
+const FAR_OUTSIDE_VIEWPORT = 600;
+
+// A row laid out in the viewport from its top edge; width plays no part in a block reveal.
+function RowAt(top: number, height: number): DOMRect {
+    return new DOMRect(0, top, 0, height);
+}
+
+// Where the focused field and the message line sit, and whether an ERRMSG reveal before any user
+// action happens: only when the field stays wholly in view after the scroll the reveal needs.
+interface FocusLayout {
+    layout: string;
+    field: DOMRect;
+    line: DOMRect;
+    reveals: boolean;
+}
+
+// CAUP entered with ?acctId=: Account Number focused at the top, the line far below the fold.
+const FIELD_LEFT_ABOVE: FocusLayout = {
+    layout: "a field at the top, the line far below the fold",
+    field: RowAt(EDGE_GAP, FIELD_HEIGHT),
+    line: RowAt(VIEWPORT_HEIGHT + FAR_OUTSIDE_VIEWPORT, LINE_HEIGHT),
+    reveals: false,
+};
+
+const PRE_ACTION_LAYOUTS: readonly FocusLayout[] = [
+    FIELD_LEFT_ABOVE,
+    {
+        layout: "a field near the bottom, the line far above the top",
+        field: RowAt(VIEWPORT_HEIGHT - FIELD_HEIGHT - EDGE_GAP, FIELD_HEIGHT),
+        line: RowAt(-FAR_OUTSIDE_VIEWPORT, LINE_HEIGHT),
+        reveals: false,
+    },
+    // The menu after a 403: the OPTION field just above a line that crosses the fold.
+    {
+        layout: "a field just above the line crossing the fold",
+        field: RowAt(VIEWPORT_HEIGHT - FIELD_ABOVE_FOLD, FIELD_HEIGHT),
+        line: RowAt(VIEWPORT_HEIGHT - LINE_HEIGHT / 2, LINE_HEIGHT),
+        reveals: true,
+    },
+];
+
+// Each layout with each new outcome line: an ERRMSG is revealed where the layout allows it, an
+// INFOMSG alone in no layout before the user acts.
+const PRE_ACTION_CASES = PRE_ACTION_LAYOUTS.flatMap((focusLayout) =>
+    OUTCOME_LINE_CASES.map((outcomeCase) => ({
+        ...focusLayout,
+        ...outcomeCase,
+        reveals: focusLayout.reveals && outcomeCase.showsErrorLine,
+    })),
+);
+
+// An action of the user's on the screen, after which every new outcome is brought into view.
+interface UserActionCase {
+    action: string;
+    Act: (field: HTMLElement) => void;
+}
+
+const USER_ACTION_CASES: readonly UserActionCase[] = [
+    { action: "a keydown", Act: (field) => fireEvent.keyDown(field, { key: "Enter" }) },
+    { action: "a pointerdown", Act: (field) => fireEvent.pointerDown(field) },
+];
+
+// Each action followed by each new outcome line, INFOMSG alone included.
+const ACTED_OUTCOME_CASES = USER_ACTION_CASES.flatMap((actionCase) =>
+    OUTCOME_LINE_CASES.map((outcomeCase) => ({ ...actionCase, ...outcomeCase })),
+);
+
 function RenderWithTheme(ui: ReactElement) {
     return render(<ThemeProvider theme={CARD_DEMO_THEME}>{ui}</ThemeProvider>);
 }
@@ -157,6 +351,85 @@ function RenderFieldBesideMessage(hasError: boolean) {
             <MessageLine message={USER_ID_EXISTS_MESSAGE} />
         </>,
     );
+}
+
+function ThemeWrapper({ children }: WrapperProps) {
+    return <ThemeProvider theme={CARD_DEMO_THEME}>{children}</ThemeProvider>;
+}
+
+function StrictThemeWrapper({ children }: WrapperProps) {
+    return (
+        <StrictMode>
+            <ThemeWrapper>{children}</ThemeWrapper>
+        </StrictMode>
+    );
+}
+
+const MOUNT_CASES: readonly MountCase[] = [
+    { mode: "a plain mount", Wrapper: ThemeWrapper },
+    { mode: "a StrictMode mount", Wrapper: StrictThemeWrapper },
+];
+
+// Resolves in a frame requested after the line's own, which jsdom runs in request order.
+function NextAnimationFrame(): Promise<void> {
+    return new Promise((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+    });
+}
+
+// The wrapper around both lines, which the providers render as the container's only element.
+function MessageLineWrapper(container: HTMLElement): Element | null {
+    return container.firstElementChild;
+}
+
+interface FieldBesideLineProps {
+    line: MessageLineProps;
+}
+
+// A screen's focused cursor field above its message line.
+function FieldBesideLine({ line }: FieldBesideLineProps) {
+    return (
+        <>
+            <TextField id={FIELD_ID} label={FIELD_LABEL} autoFocus />
+            <MessageLine {...line} />
+        </>
+    );
+}
+
+// The message line's wrapper, which follows the field as the container's last element.
+function WrapperAfterField(container: HTMLElement): Element {
+    const wrapper = container.lastElementChild;
+    if (wrapper === null) {
+        throw new Error("The message line wrapper is not rendered.");
+    }
+    return wrapper;
+}
+
+// Mounts the field and a blank line, then lays both out as focusLayout places them.
+function RenderLaidOutScreen(focusLayout: FocusLayout) {
+    const view = render(<FieldBesideLine line={NO_OUTCOME} />, { wrapper: ThemeWrapper });
+    const field = screen.getByLabelText(FIELD_LABEL);
+    const wrapper = WrapperAfterField(view.container);
+    jest.spyOn(field, "getBoundingClientRect").mockReturnValue(focusLayout.field);
+    jest.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(focusLayout.line);
+    return { field, wrapper, rerender: view.rerender };
+}
+
+// Mounts the line with the case's first outcome, lets the user press a key first when asked,
+// then shows the case's next outcome and waits for the frame the reveal runs in.
+async function ShowNextOutcome(
+    revealCase: RevealCase,
+    userActsFirst: boolean,
+): Promise<Element | null> {
+    const { container, rerender } = render(<MessageLine {...revealCase.before} />, {
+        wrapper: ThemeWrapper,
+    });
+    if (userActsFirst) {
+        fireEvent.keyDown(container, { key: "Enter" });
+    }
+    rerender(<MessageLine {...revealCase.after} />);
+    await NextAnimationFrame();
+    return MessageLineWrapper(container);
 }
 
 describe("MessageLine ERRMSG severity", () => {
@@ -275,4 +548,97 @@ describe("MessageLine field error description", () => {
         expect(screen.getByText(FIELD_HINT)).toHaveAttribute("id", FIELD_HINT_ID);
         expect(screen.getByLabelText(FIELD_LABEL)).toHaveAccessibleDescription(expected);
     });
+});
+
+// Element.scrollIntoView, spied afresh for every test; jest.setup.ts stubs it, as jsdom has none.
+let scrollIntoViewSpy: jest.SpiedFunction<Element["scrollIntoView"]>;
+
+beforeEach(() => {
+    scrollIntoViewSpy = jest.spyOn(Element.prototype, "scrollIntoView");
+});
+
+afterEach(() => {
+    scrollIntoViewSpy.mockRestore();
+});
+
+describe("MessageLine on mount", () => {
+    it.each(MOUNT_CASES)("the lines of $mode stay where they are", async ({ Wrapper }) => {
+        render(<MessageLine message={ADMIN_ONLY_MESSAGE} infoMessage={CHANGES_VALIDATED_INFO} />, {
+            wrapper: Wrapper,
+        });
+        await NextAnimationFrame();
+        expect(screen.getByRole("alert")).toBeInTheDocument();
+        expect(scrollIntoViewSpy).not.toHaveBeenCalled();
+    });
+});
+
+describe("MessageLine brings each new outcome into view before the user acts", () => {
+    it.each(REVEAL_CASES)(
+        "$caseName: brings the line into view = $revealsBeforeAction",
+        async (revealCase) => {
+            const wrapper = await ShowNextOutcome(revealCase, false);
+            ExpectRevealed(wrapper, revealCase.revealsBeforeAction);
+        },
+    );
+});
+
+describe("MessageLine brings each new outcome into view after a keydown", () => {
+    it.each(REVEAL_CASES)(
+        "$caseName: brings the line into view = $revealsAfterAction",
+        async (revealCase) => {
+            const wrapper = await ShowNextOutcome(revealCase, true);
+            ExpectRevealed(wrapper, revealCase.revealsAfterAction);
+        },
+    );
+});
+
+describe("MessageLine reveal margin", () => {
+    it("keeps a scroll margin of one spacing unit, so whole-pixel scrolling clips no edge", () => {
+        const { container } = RenderWithTheme(<MessageLine message={ADMIN_ONLY_MESSAGE} />);
+        expect(MessageLineWrapper(container)).toHaveStyle({ scrollMarginBlock: REVEAL_MARGIN });
+    });
+});
+
+describe("MessageLine left before the next frame", () => {
+    it("a screen left before the next frame cancels the pending scroll", async () => {
+        const { rerender, unmount } = render(<MessageLine />, { wrapper: ThemeWrapper });
+        rerender(<MessageLine message={ADMIN_ONLY_MESSAGE} />);
+        unmount();
+        await NextAnimationFrame();
+        expect(scrollIntoViewSpy).not.toHaveBeenCalled();
+    });
+});
+
+// The wrapper's reveal calls: one with the reveal options, or none.
+function ExpectRevealed(wrapper: Element | null, reveals: boolean): void {
+    const expectedCalls = reveals ? [[REVEAL_SCROLL_OPTIONS]] : [];
+    expect(scrollIntoViewSpy.mock.calls).toEqual(expectedCalls);
+    const wrapperCalls = scrollIntoViewSpy.mock.contexts.filter((self) => self === wrapper);
+    expect(wrapperCalls).toHaveLength(expectedCalls.length);
+}
+
+describe("MessageLine before the user acts on the screen", () => {
+    it.each(PRE_ACTION_CASES)(
+        "$layout: brings $outcome into view = $reveals",
+        async (preActionCase) => {
+            const { field, wrapper, rerender } = RenderLaidOutScreen(preActionCase);
+            expect(field).toHaveFocus();
+            rerender(<FieldBesideLine line={preActionCase.nextOutcome} />);
+            await NextAnimationFrame();
+            ExpectRevealed(wrapper, preActionCase.reveals);
+        },
+    );
+});
+
+describe("MessageLine after the user acts on the screen", () => {
+    it.each(ACTED_OUTCOME_CASES)(
+        "after $action $outcome is brought into view, though the field leaves it",
+        async ({ Act, nextOutcome }) => {
+            const { field, wrapper, rerender } = RenderLaidOutScreen(FIELD_LEFT_ABOVE);
+            Act(field);
+            rerender(<FieldBesideLine line={nextOutcome} />);
+            await NextAnimationFrame();
+            ExpectRevealed(wrapper, true);
+        },
+    );
 });

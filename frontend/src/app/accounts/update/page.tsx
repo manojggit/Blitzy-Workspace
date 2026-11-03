@@ -186,6 +186,10 @@ interface ScreenFieldProps {
     view: FieldView;
 }
 
+interface AccountMessageLineProps {
+    feedback: ScreenFeedbackView;
+}
+
 const TRANSACTION_ID = "CAUP";
 const PROGRAM_NAME = "COACTUPC";
 const SCREEN_TITLE = "Update Account";
@@ -864,6 +868,19 @@ function AccountDetailSections({ view }: SectionProps) {
     );
 }
 
+// The ERRMSG and INFOMSG lines. Every response sets a new feedback object, so its identity is
+// the outcome: ENTER answered again with the same literal still brings the line into view.
+function AccountMessageLine({ feedback }: AccountMessageLineProps) {
+    return (
+        <MessageLine
+            message={feedback.message}
+            severity={feedback.severity}
+            infoMessage={feedback.infoMessage}
+            outcomeKey={feedback}
+        />
+    );
+}
+
 function AccountUpdateScreen() {
     const { view, feedback, isBusy, keys } = useAccountUpdateScreen();
     useFunctionKeys(keys);
@@ -875,11 +892,7 @@ function AccountUpdateScreen() {
             isBusy={isBusy}
         >
             <AccountDetailSections view={view} />
-            <MessageLine
-                message={feedback.message}
-                severity={feedback.severity}
-                infoMessage={feedback.infoMessage}
-            />
+            <AccountMessageLine feedback={feedback} />
             <FunctionKeyBar keys={keys} />
         </ScreenShell>
     );

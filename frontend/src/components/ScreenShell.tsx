@@ -4,6 +4,7 @@
 
 import {
     AppBar,
+    Box,
     Container,
     LinearProgress,
     Paper,
@@ -46,6 +47,21 @@ const HEADER_TOOLBAR_STYLE: SxProps<Theme> = { py: 2 };
 // row of their own once the header wraps.
 const APP_TITLE_STYLE: SxProps<Theme> = { flexGrow: 1, alignItems: "center", textAlign: "center" };
 
+// Keeps the Date/Time group, and its lines, at the right edge of whichever row it wraps onto.
+const DATE_TIME_META_STYLE: SxProps<Theme> = { marginLeft: "auto", textAlign: "end" };
+
+// A zero-height slot below the header that sticks to the viewport top: the busy bar overlays the
+// page instead of pushing it down, and stays in view on a scrolled page.
+const BUSY_SLOT_STYLE: SxProps<Theme> = {
+    position: "sticky",
+    top: 0,
+    height: 0,
+    zIndex: "appBar",
+};
+
+// Out of flow inside the slot, across its full width, so showing it never moves the page.
+const BUSY_BAR_STYLE: SxProps<Theme> = { position: "absolute", top: 0, left: 0, right: 0 };
+
 export interface ScreenShellProps {
     // The legacy transaction ID shown in TRNNAME, for example CT02.
     transactionId: string;
@@ -65,11 +81,16 @@ interface ShellHeaderProps {
 interface HeaderMetaProps {
     lines: readonly string[];
     children?: ReactNode;
+    sx?: SxProps<Theme>;
 }
 
 interface HeaderClock {
     dateText: string;
     timeText: string;
+}
+
+interface BusyIndicatorProps {
+    isBusy?: boolean;
 }
 
 function PadTwo(value: number): string {
@@ -126,9 +147,9 @@ function useHeaderClock(): HeaderClock {
 // Each line is one text node, label and value together, for example "Tran: CT02". Lines keep
 // fixed positions, so the position is the key: a key holding the text would remount the Time
 // line on every tick.
-function HeaderMeta({ lines, children }: HeaderMetaProps) {
+function HeaderMeta({ lines, children, sx }: HeaderMetaProps) {
     return (
-        <Stack>
+        <Stack sx={sx}>
             {lines.map((line, linePosition) => (
                 <Typography key={linePosition} variant="labelMedium" component="p">
                     {line}
@@ -176,22 +197,45 @@ function ShellHeader({ transactionId, programName }: ShellHeaderProps) {
                         <SignedInUser />
                     </HeaderMeta>
                     <AppTitle />
-                    <HeaderMeta lines={[`Date: ${dateText}`, `Time: ${timeText}`]} />
+                    <HeaderMeta
+                        lines={[`Date: ${dateText}`, `Time: ${timeText}`]}
+                        sx={DATE_TIME_META_STYLE}
+                    />
                 </Stack>
             </Toolbar>
         </AppBar>
     );
 }
 
+// The browser tab names the screen first, then the application (CCDA-TITLE02), so every screen's
+// tab and history entry is told apart from the others.
+function ScreenTabTitle(screenTitle: string): string {
+    return `${screenTitle} - ${APP_TITLE_LINE_2}`;
+}
+
+// The slot renders whether or not a call is running, so the busy state never changes the layout.
+function BusyIndicator({ isBusy }: BusyIndicatorProps) {
+    return (
+        <Box sx={BUSY_SLOT_STYLE}>
+            {isBusy ? (
+                <LinearProgress
+                    variant="indeterminate"
+                    aria-label="Processing"
+                    sx={BUSY_BAR_STYLE}
+                />
+            ) : null}
+        </Box>
+    );
+}
+
 // The page frame every BMS-map page renders inside; each page places its own MessageLine and
-// FunctionKeyBar in children.
+// FunctionKeyBar in children. React places the title in the document head.
 export function ScreenShell(props: ScreenShellProps) {
     return (
         <>
+            <title>{ScreenTabTitle(props.screenTitle)}</title>
             <ShellHeader transactionId={props.transactionId} programName={props.programName} />
-            {props.isBusy ? (
-                <LinearProgress variant="indeterminate" aria-label="Processing" />
-            ) : null}
+            <BusyIndicator isBusy={props.isBusy} />
             <Container component="main" maxWidth="lg" sx={{ py: 6 }}>
                 <Paper sx={{ p: 6 }}>
                     <Stack spacing={4}>

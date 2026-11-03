@@ -1,5 +1,4 @@
-// Root layout for the CardDemo pages replacing the BMS mapsets (AAP 0.5, 0.6.3);
-// title per COTTL01Y.
+// Root layout for the CardDemo pages replacing the BMS mapsets (AAP 0.5, 0.6.3).
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { Roboto } from "next/font/google";
@@ -17,10 +16,9 @@ const roboto = Roboto({
 });
 
 // Next.js reads this export only under the name metadata, so it stays camelCase as a
-// framework-mandated exception to the MK_Modernization Rule's upper-case constants. The tab
-// title is CCDA-TITLE02, the application name every legacy screen header shows.
+// framework-mandated exception to the MK_Modernization Rule's upper-case constants. Each screen's
+// tab title comes from ScreenShell; a title here would add a second <title> ahead of it.
 export const metadata: Metadata = {
-    title: "CardDemo",
     icons: { icon: "/favicon.svg" },
 };
 

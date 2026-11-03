@@ -119,6 +119,8 @@ interface MenuFeedbackState {
 interface MenuLoad {
     callContext: ScreenCallContext;
     SetOptions: (options: readonly MenuOption[]) => void;
+    // The refusal another screen's 403 left for this menu, or "" when there is none.
+    pendingMessage: string;
     signal: AbortSignal;
 }
 
@@ -250,14 +252,24 @@ function useScreenCall(): ScreenCallState {
     return { isBusy, feedback, inputRef, callContext };
 }
 
-// SEND-MENU-SCREEN's option list. Cleaning up the effect aborts the read, so its GET stops and
-// nothing it answers is shown; the cancellation is discarded silently, and the busy state and
-// message line belong to the effect's next run, if any.
+// The options and the carried-over refusal arrive in one update, as one SEND-MENU-SCREEN paints
+// both, so the message line is placed below the whole list when it is shown.
+function ShowLoadedMenu(load: MenuLoad, options: readonly MenuOption[]): void {
+    load.SetOptions(options);
+    if (load.pendingMessage.trim() !== "") {
+        load.callContext.ShowFeedback(PendingFeedback(load.pendingMessage));
+    }
+}
+
+// SEND-MENU-SCREEN's option list, with the carried-over refusal or, when the read fails, the
+// failure's message in its place, as the screen has one ERRMSG line. Cleaning up the effect aborts
+// the read, so its GET stops and nothing it answers is shown; the cancellation is discarded
+// silently, and the busy state and message line belong to the effect's next run, if any.
 async function LoadMenuOptions(load: MenuLoad): Promise<void> {
     try {
         const response = await FetchMainMenu({ signal: load.signal });
         if (!load.signal.aborted) {
-            load.SetOptions(response.options);
+            ShowLoadedMenu(load, response.options);
         }
     } catch (error) {
         if (IsCancelledRequest(error)) {
@@ -275,21 +287,17 @@ async function LoadMenuOptions(load: MenuLoad): Promise<void> {
 }
 
 // A refusal carried over from another screen by apiClient's 403 handling. Taking it empties the
-// store, so it is set only when present: a second run of the mount effect never clears it.
-function ShowPendingMessage(callContext: ScreenCallContext): void {
-    const pendingMessage = TakePendingMessage();
-    if (pendingMessage.trim() !== "") {
-        callContext.ShowFeedback(PendingFeedback(pendingMessage));
-    }
-}
-
+// store, so it is taken once and kept in a ref: a StrictMode re-run of the effect still shows it.
 function useMenuOptions(callContext: ScreenCallContext): readonly MenuOption[] {
     const [options, setOptions] = useState<readonly MenuOption[]>([]);
+    const pendingMessageRef = useRef<string | null>(null);
     useEffect(() => {
         const controller = new AbortController();
-        ShowPendingMessage(callContext);
+        pendingMessageRef.current ??= TakePendingMessage();
+        const pendingMessage = pendingMessageRef.current;
         callContext.SetIsBusy(true);
-        void LoadMenuOptions({ callContext, SetOptions: setOptions, signal: controller.signal });
+        const signal = controller.signal;
+        void LoadMenuOptions({ callContext, SetOptions: setOptions, pendingMessage, signal });
         return () => {
             controller.abort();
         };
