@@ -81,13 +81,21 @@ def IssueSessionToken(userId: str, userType: str, settings: "Settings") -> str:
 
 
 def ReadSessionToken(token: str, settings: "Settings") -> SessionClaims:
-    """Return the identity in a valid session token; raise jwt.InvalidTokenError otherwise."""
-    claims = jwt.decode(
-        token,
-        settings.SECRET_KEY,
-        algorithms=[SESSION_SIGNING_ALGORITHM],
-        options={"require": list(SESSION_REQUIRED_CLAIMS)},
-    )
+    """Return the identity in a valid session token; raise jwt.InvalidTokenError otherwise.
+
+    A token whose header is nested too deeply to parse is refused as InvalidTokenError too:
+    PyJWT parses the unverified header with json.loads and turns only its ValueError into a
+    DecodeError, so the RecursionError of an over-nested header is converted here.
+    """
+    try:
+        claims = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[SESSION_SIGNING_ALGORITHM],
+            options={"require": list(SESSION_REQUIRED_CLAIMS)},
+        )
+    except RecursionError:
+        raise jwt.InvalidTokenError("token nested too deeply to parse") from None
     userType = claims["typ"]
     if not isinstance(userType, str):
         raise jwt.InvalidTokenError("invalid typ claim")

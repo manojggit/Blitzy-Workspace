@@ -49,8 +49,8 @@ WINDOW_CLOSED_LOG = "BATCH WINDOW CLOSED TO ONLINE (CLOSEFIL)"
 WINDOW_OPENED_LOG = "BATCH WINDOW OPEN TO ONLINE (OPENFIL)"
 UNLOCK_FAILED_LOG = "Batch-window unlock failed (%s); closing the connection releases the lock"
 
-# is_local false: the autocommit connection has no transaction for a local setting to live in.
-SET_LOCK_TIMEOUT_STATEMENT = text("SELECT set_config('lock_timeout', :timeout, false)")
+# is_local FALSE: the autocommit connection has no transaction for a local setting to live in.
+SET_LOCK_TIMEOUT_STATEMENT = text("SELECT set_config('lock_timeout', :timeout, FALSE)")
 ACQUIRE_WINDOW_STATEMENT = text("SELECT pg_advisory_lock(:lockKey)").bindparams(
     bindparam("lockKey", type_=BigInteger)
 )

@@ -16,23 +16,22 @@ value as a parameter.
 A database error becomes the CICS file condition of app.core.errors.MapDatabaseError: 23505 is
 DuplicateKeyError (DUPREC), 55P03 is RecordLockError and any other, or a connection that cannot
 be opened, is FileIoError. Records are returned as dictionaries keyed by column name;
-``tran_amt`` stays a Decimal and the timestamps stay datetimes beside their format codes.
+``tran_amt`` stays a Decimal and the timestamps stay datetimes beside their format codes. Report
+rows hold only the columns the report builder reads, plus ``xref_acct_id``.
 """
 
 from collections.abc import Mapping
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from sqlalchemy import (
     BigInteger,
     ColumnElement,
-    Date,
     Executable,
     Result,
     Select,
     Text,
     bindparam,
-    cast,
     func,
     insert,
     select,
@@ -56,6 +55,15 @@ TRAN_ID_MODULUS = 10**TRAN_ID_DIGITS
 GENERATED_COLUMNS = ("tran_id_sort",)
 
 TRANSACTION_COLUMNS = tuple(Transaction.__table__.columns)
+# The only transaction fields cbtrn03c.BuildReport reads from a report row.
+REPORT_COLUMNS = (
+    Transaction.tran_id,
+    Transaction.card_num,
+    Transaction.tran_type_cd,
+    Transaction.tran_cat_cd,
+    Transaction.tran_source,
+    Transaction.tran_amt,
+)
 # The label stays snake_case like the column names; cbtrn03c.BuildReport reads it.
 XREF_ACCT_ID_LABEL = "xref_acct_id"
 
@@ -104,22 +112,37 @@ def StartPositionStatement(startKey: str | None) -> Select[Any]:
     return statement.limit(1)
 
 
+def ProcTsEndBound(endDate: date) -> ColumnElement[bool]:
+    """Return the end of the report range: proc_ts before the midnight that follows endDate.
+
+    9999-12-31 has no following day, so its end is proc_ts at or before 23:59:59.999999, the
+    same set of TIMESTAMP(6) values, which hold microseconds at most.
+    """
+    if endDate == date.max:
+        return Transaction.proc_ts <= datetime.combine(date.max, time.max)
+    return Transaction.proc_ts < datetime.combine(endDate + timedelta(days=1), time.min)
+
+
 def ReportStatement(startDate: date, endDate: date) -> Select[Any]:
     """Return the TRANREPT STEP05R input: the INCLUDE on PROC-TS(1:10) and SORT on TRAN-CARD-NUM.
 
-    Every non-blank stored PROC-TS form begins with its YYYY-MM-DD date, so the date of the
-    stored value is the INCLUDE's text comparison; a blank (NULL) PROC-TS never passes it.
+    Every non-blank stored PROC-TS form begins with its YYYY-MM-DD date, so the INCLUDE's text
+    comparison is the date of the stored value lying from startDate to endDate inclusive: proc_ts
+    from startDate's midnight up to, not including, the midnight after endDate. Comparing the
+    bare column lets ix_transactions_proc_ts serve both bounds. A blank (NULL) PROC-TS never
+    passes the INCLUDE.
     """
     # Ordered by the generated cards.card_num_sort column, which every key-ordered read uses for
     # EBCDIC order, rather than recomputing ebcdic_sort_key(card_num). The card foreign key on
     # transactions.card_num means the inner join drops no transaction.
     return (
-        select(*TRANSACTION_COLUMNS, CardXref.acct_id.label(XREF_ACCT_ID_LABEL))
+        select(*REPORT_COLUMNS, CardXref.acct_id.label(XREF_ACCT_ID_LABEL))
         .select_from(Transaction)
         .join(Card, Card.card_num == Transaction.card_num)
         .outerjoin(CardXref, CardXref.card_num == Transaction.card_num)
         .where(Transaction.proc_ts.is_not(None))
-        .where(cast(Transaction.proc_ts, Date).between(startDate, endDate))
+        .where(Transaction.proc_ts >= datetime.combine(startDate, time.min))
+        .where(ProcTsEndBound(endDate))
         .order_by(Card.card_num_sort, Transaction.tran_id_sort)
     )
 
@@ -244,8 +267,10 @@ class TransactionRepository:
         """Replace the TRANREPT STEP05R SORT and the CBTRN03C 1500-A-LOOKUP-XREF reads.
 
         Returns the transactions whose PROC-TS date lies from startDate to endDate inclusive,
-        in TRAN-CARD-NUM order and then TRANSACT key order, each with ``xref_acct_id``, the
-        XREF-ACCT-ID of its card, or None when the card has no cross-reference (INVALID KEY).
+        in TRAN-CARD-NUM order and then TRANSACT key order. Each row carries only the fields
+        cbtrn03c.BuildReport reads, tran_id, card_num, tran_type_cd, tran_cat_cd, tran_source and
+        tran_amt, and ``xref_acct_id``, the XREF-ACCT-ID of its card, or None when the card has
+        no cross-reference (INVALID KEY).
 
         This read never enters the batch window: CR00 only submitted a job to TDQ JOBS and never
         opened TRANSACT, so a closed window does not stop the report.

@@ -11,8 +11,10 @@ without one is answered 403 with the legacy error body and an empty message. POS
 /api/v1/auth/login is the only exemption, because it runs before any session exists and its
 body carries only credentials. GET, HEAD and OPTIONS, the CORS preflight, are never guarded.
 
-The guard is pure ASGI rather than BaseHTTPMiddleware, which buffers responses and so breaks
-streamed ones such as the CR00 report export, and it never reads the request body.
+The guard is pure ASGI and inspects only the scope's method, path and Origin header. A request
+it passes reaches the app with receive and send untouched, so the guard never consumes the
+request body, and responses, streamed ones such as the CR00 report export included, flow through
+unchanged. A refused request is answered by the guard itself with the 403 JSONResponse.
 main.CreateApp adds it before CORSMiddleware, so CORS is the outer layer and its headers
 decorate the 403 as well.
 """

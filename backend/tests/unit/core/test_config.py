@@ -4,8 +4,9 @@ The unit replaces the CICS region settings of csd/CARDDEMO.CSD and the configura
 travelled in the COMMAREA (cpy/COCOM01Y.cpy), as specified in the Technical Specification,
 Sections 0.7.1 and 0.7.6. These tests pin that a settings object never renders SECRET_KEY or
 a database-URL password, while its attributes keep the raw values the engines and the token
-signer read. Every key and password is generated at run time with the secrets module, and
-backend/.env is never read (_env_file=None).
+signer read, and that LOGIN_MAX_ATTEMPTS is accepted only within the SMALLINT range of
+security.login_attempts.failure_count. Every key and password is generated at run time with
+the secrets module, and backend/.env is never read (_env_file=None).
 """
 
 import io
@@ -13,10 +14,14 @@ import logging
 import secrets
 
 import pytest
+from pydantic import ValidationError
 
 from app.core.config import MigrationSettings, Settings
 
 SETTINGS_LOGGER_NAME = "carddemo.tests.unit.core.config"
+# The PostgreSQL SMALLINT maximum, the type of security.login_attempts.failure_count.
+SMALLINT_MAXIMUM = 32767
+LOGIN_MAX_ATTEMPTS_LOCATION = [("LOGIN_MAX_ATTEMPTS",)]
 
 
 def BuildDatabaseUrl(driverName, databasePassword):
@@ -41,6 +46,21 @@ def RenderThroughLogRecord(settingsObject):
     finally:
         settingsLogger.removeHandler(logHandler)
     return logStream.getvalue()
+
+
+def LoginMaxAttemptsOutcome(attemptLimit, secretKey, databasePassword):
+    """Return the LOGIN_MAX_ATTEMPTS Settings keeps for attemptLimit, or the rejected locations."""
+    try:
+        builtSettings = Settings(
+            _env_file=None,
+            SECRET_KEY=secretKey,
+            DATABASE_URL=BuildDatabaseUrl("asyncpg", databasePassword),
+            SYNC_DATABASE_URL=BuildDatabaseUrl("psycopg2", databasePassword),
+            LOGIN_MAX_ATTEMPTS=attemptLimit,
+        )
+    except ValidationError as error:
+        return [fieldError["loc"] for fieldError in error.errors()]
+    return builtSettings.LOGIN_MAX_ATTEMPTS
 
 
 @pytest.fixture(name="secretKey")
@@ -110,3 +130,19 @@ def test_settings_attributes_keep_raw_values(
     assert runtimeSettings.DATABASE_URL == BuildDatabaseUrl("asyncpg", databasePassword)
     assert runtimeSettings.SYNC_DATABASE_URL == syncDatabaseUrl
     assert migrationSettings.SYNC_DATABASE_URL == syncDatabaseUrl
+
+
+@pytest.mark.parametrize(
+    ("attemptLimit", "expectedOutcome"),
+    [
+        (1, 1),
+        (SMALLINT_MAXIMUM, SMALLINT_MAXIMUM),
+        (0, LOGIN_MAX_ATTEMPTS_LOCATION),
+        (SMALLINT_MAXIMUM + 1, LOGIN_MAX_ATTEMPTS_LOCATION),
+    ],
+    ids=["one", "smallint-maximum", "zero", "above-smallint-maximum"],
+)
+def test_login_max_attempts_stays_within_failure_count_range(
+    attemptLimit, expectedOutcome, secretKey, databasePassword
+):
+    assert LoginMaxAttemptsOutcome(attemptLimit, secretKey, databasePassword) == expectedOutcome

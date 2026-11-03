@@ -4,9 +4,11 @@ key SEC-USR-ID X(08) of copybook CSUSR01Y.
 Every failed sign-on adds one to the failure count of its user ID in security.login_attempts,
 whether or not the user exists; cosgn00c passes the ID upper-cased, as COSGN00C reads USRSEC.
 The failure that reaches LOGIN_MAX_ATTEMPTS locks the ID for LOGIN_LOCKOUT_SECONDS, and while
-the lock lasts sign-on answers 429 with LOGIN_LOCKED_MESSAGE. A successful sign-on deletes the
-row; the first failure after a lock has expired starts the count again at one. The table is not
-a batch-window file, so the throttle keeps working while the batch window is closed.
+the lock lasts sign-on answers 429 with LOGIN_LOCKED_MESSAGE. The count saturates at
+LOGIN_MAX_ATTEMPTS, so a failure counted at the limit keeps it there and the SMALLINT
+failure_count never overflows. A successful sign-on deletes the row; the first failure after a
+lock has expired starts the count again at one. The table is not a batch-window file, so the
+throttle keeps working while the batch window is closed.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -58,22 +60,30 @@ async def CheckLocked(context: OnlineContext, userId: str) -> None:
         )
 
 
-def BuildFailureUpsert(userId: str, now: datetime) -> Insert:
+def BuildFailureUpsert(userId: str, now: datetime, maxAttempts: int) -> Insert:
     """Build the upsert that counts one failure and returns the new failure count.
 
     One atomic statement, so concurrent first failures of one user ID never collide on the
     primary key. A lock that has expired by ``now`` is cleared and the count restarts at one.
+    Otherwise the count saturates at ``maxAttempts`` (LOGIN_MAX_ATTEMPTS): a row already at
+    the limit, as after concurrent failures, keeps it instead of adding one, so the SMALLINT
+    failure_count never overflows.
     """
     lockExpired = and_(
         LOGIN_ATTEMPTS.c.locked_until.is_not(None), LOGIN_ATTEMPTS.c.locked_until <= now
     )
+    limitReached = LOGIN_ATTEMPTS.c.failure_count >= maxAttempts
     firstFailure = insert(LOGIN_ATTEMPTS).values(
         user_id=userId, failure_count=1, locked_until=None, last_failure_at=now
     )
     return firstFailure.on_conflict_do_update(
         index_elements=[LOGIN_ATTEMPTS.c.user_id],
         set_={
-            "failure_count": case((lockExpired, 1), else_=LOGIN_ATTEMPTS.c.failure_count + 1),
+            "failure_count": case(
+                (lockExpired, 1),
+                (limitReached, maxAttempts),
+                else_=LOGIN_ATTEMPTS.c.failure_count + 1,
+            ),
             "locked_until": case((lockExpired, None), else_=LOGIN_ATTEMPTS.c.locked_until),
             "last_failure_at": now,
         },
@@ -94,10 +104,11 @@ async def RecordFailure(context: OnlineContext, userId: str) -> None:
     """Count one failed sign-on for the user ID, locking it once the attempt limit is reached."""
     now = UtcNow()
     settings = context.settings
+    failureUpsert = BuildFailureUpsert(userId, now, settings.LOGIN_MAX_ATTEMPTS)
     # The unit commits when the block exits, before cosgn00c raises its sign-on error, so the
     # failure stays recorded although the request itself ends in an error.
     async with WriteUnit(context.engine, LOGIN_ATTEMPTS_FILE_NAME) as unit:
-        failureCount = (await unit.execute(BuildFailureUpsert(userId, now))).scalar_one()
+        failureCount = (await unit.execute(failureUpsert)).scalar_one()
         if failureCount >= settings.LOGIN_MAX_ATTEMPTS:
             lockedUntil = now + timedelta(seconds=settings.LOGIN_LOCKOUT_SECONDS)
             await ApplyLockout(unit, userId, lockedUntil)

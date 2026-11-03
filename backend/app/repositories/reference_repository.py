@@ -19,8 +19,9 @@ from typing import Any
 from sqlalchemy import Row, Select, select
 from sqlalchemy.exc import DBAPIError
 
+from app.core.database import CONNECTION_FAILURES
 from app.core.dependencies import OnlineContext
-from app.core.errors import MapDatabaseError
+from app.core.errors import FileIoError, MapDatabaseError
 from app.models import TransactionCategory, TransactionType
 
 # The legacy file names (TRANTYPE and TRANCATG DD names of proc/TRANREPT.prc) that a database
@@ -38,14 +39,20 @@ class ReferenceRepository:
     async def _ReadRows(self, statement: Select[Any], fileName: str) -> Sequence[Row[Any]]:
         """Run an unlocked read on the request session and return its column rows.
 
-        A database error is raised as the CICS file condition of ``fileName``
-        (``core.errors.MapDatabaseError``).
+        A database error is raised as the CICS file condition of ``fileName``, TRANTYPE or
+        TRANCATG (``core.errors.MapDatabaseError``). The asyncpg dialect passes connect-time
+        rejections, pool timeouts and the ``command_timeout`` TimeoutError through unwrapped
+        (``core.database.CONNECTION_FAILURES``); they are FileIoError (IOERR) of ``fileName``
+        too, so the report service meets the RepositoryError a database I/O error raises
+        rather than an unexpected 500.
         """
         try:
             result = await self.context.session.execute(statement)
             return result.all()
         except DBAPIError as exc:
             raise MapDatabaseError(exc, fileName) from exc
+        except CONNECTION_FAILURES as exc:
+            raise FileIoError(fileName) from exc
 
     async def GetTypeDescriptions(self) -> dict[str, str]:
         """Return every TRANTYPE description keyed by its two-character type code.

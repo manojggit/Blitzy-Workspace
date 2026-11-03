@@ -125,12 +125,15 @@ class LegacyMessageError(Exception):
 
 
 class RepositoryError(Exception):
-    """A CICS file condition (RESP and RESP2) raised against a legacy CICS file name.
+    """A CICS file condition (RESP and RESP2) raised against a legacy file name.
 
-    ``fileName`` is the file the program addressed: USRSEC, ACCTDAT, CUSTDAT, CARDDAT, CARDAIX,
-    CCXREF, CXACAIX or TRANSACT. Each service catches the family and builds its program's
-    literal from it, as the program's ``EVALUATE WS-RESP-CD`` did. The exception text holds only
-    the file name and the codes, never row data, card numbers or SSNs.
+    ``fileName`` is the legacy file the program addressed: the CICS file USRSEC, ACCTDAT,
+    CUSTDAT, CARDDAT, CARDAIX, CCXREF, CXACAIX or TRANSACT, or the TRANTYPE or TRANCATG DD name
+    of proc/TRANREPT.prc for the CBTRN03C reference reads. The sign-on throttle, whose
+    security.login_attempts table replaces no legacy file, uses LOGINATT. Each service catches
+    the family and builds its program's literal from it, as the program's
+    ``EVALUATE WS-RESP-CD`` did. The exception text holds only the file name and the codes,
+    never row data, card numbers or SSNs.
     """
 
     def __init__(self, fileName: str, resp: int, resp2: int = 0) -> None:

@@ -16,7 +16,10 @@ CUSTDAT open, so no read here enters the batch window (core.locks.EnterOnlineWin
 
 Records are dictionaries keyed by snake_case column names. A database error is raised as the
 CICS file condition core.errors.MapDatabaseError gives it: RecordLockError when the unit's lock
-timeout ends a wait for the record, FileIoError for any other failure.
+timeout ends a wait for the record, FileIoError for any other failure. The asyncpg dialect
+passes connect-time rejections, pool timeouts and the ``command_timeout`` TimeoutError through
+unwrapped (core.database.CONNECTION_FAILURES); they are FileIoError (IOERR) too, so the service
+still answers with its program's ``WHEN OTHER`` literal rather than an abend.
 """
 
 from collections.abc import Mapping
@@ -26,8 +29,9 @@ from sqlalchemy import CursorResult, Executable, Select, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
+from app.core.database import CONNECTION_FAILURES
 from app.core.dependencies import OnlineContext
-from app.core.errors import MapDatabaseError, RecordNotFoundError
+from app.core.errors import FileIoError, MapDatabaseError, RecordNotFoundError
 from app.models import Customer
 
 CUSTOMER_FILE_NAME = "CUSTDAT"
@@ -59,11 +63,20 @@ class CustomerRepository:
     async def _Execute(
         self, executor: AsyncConnection | AsyncSession, statement: Executable
     ) -> CursorResult[Any]:
-        """Run one statement, raising a database error as its CUSTDAT file condition."""
+        """Run one statement, raising a database failure as its CUSTDAT file condition.
+
+        A wrapped database error maps by SQLSTATE through MapDatabaseError (55P03 gives
+        RecordLockError). The asyncpg dialect passes connect-time rejections, pool timeouts and
+        the ``command_timeout`` TimeoutError through unwrapped; they are CICS IOERR too, as in
+        ``WriteUnit``, so the service still answers with its program's ``WHEN OTHER`` literal
+        rather than an abend.
+        """
         try:
             return await executor.execute(statement)
         except DBAPIError as exc:
             raise MapDatabaseError(exc, CUSTOMER_FILE_NAME) from exc
+        except CONNECTION_FAILURES as exc:
+            raise FileIoError(CUSTOMER_FILE_NAME) from exc
 
     async def GetCustomer(self, custId: str) -> dict[str, Any] | None:
         """Replace ``EXEC CICS READ DATASET(CUSTDAT) RIDFLD(cust id)`` of 9400-GETCUSTDATA-BYCUST.

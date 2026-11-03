@@ -89,11 +89,8 @@ def ParseOptionNumber(optionText: str, optionCount: int) -> int | None:
     """Port the option edit of COMEN01C lines 117-134 and COADM01C lines 121-138.
 
     Return the option number, or ``None`` where the program sets ``INVALID_OPTION_MESSAGE``: a
-    non-numeric, zero or out-of-range option. Text longer than the 2-byte OPTION field cannot
-    come from the map, so it is rejected rather than truncated.
+    non-numeric, zero or out-of-range option.
     """
-    if len(optionText) > OPTION_FIELD_LENGTH:
-        return None
     zeroFilledText = _JustifyOptionField(optionText.ljust(OPTION_FIELD_LENGTH))
     if not all(character in OPTION_DIGITS for character in zeroFilledText):
         return None

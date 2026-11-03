@@ -47,6 +47,13 @@ KEY_COLUMN = "user_id"
 
 USERS_TABLE = User.__table__
 SORT_COLUMN = USERS_TABLE.c.user_id_sort
+# The four SEC-USER-DATA fields COUSR00C POPULATE-USER-DATA moves to a list row.
+BROWSE_COLUMNS = (
+    USERS_TABLE.c.user_id,
+    USERS_TABLE.c.first_name,
+    USERS_TABLE.c.last_name,
+    USERS_TABLE.c.user_type,
+)
 
 
 def TrimmedKey(userId: str) -> str:
@@ -82,11 +89,12 @@ def KeyedSelect(userId: str) -> Select[Any]:
 
 
 def ForwardSelect(startKey: str | None, readCount: int) -> Select[Any]:
-    """Return up to ``readCount`` records at or after ``startKey``, in ascending key order.
+    """Return up to ``readCount`` browse rows at or after ``startKey``, in ascending key order.
 
-    A ``startKey`` of None is LOW-VALUES: the browse starts at the first record.
+    Each row holds only the BROWSE_COLUMNS. A ``startKey`` of None is LOW-VALUES: the browse
+    starts at the first record.
     """
-    statement = select(USERS_TABLE).order_by(SORT_COLUMN.asc()).limit(readCount)
+    statement = select(*BROWSE_COLUMNS).order_by(SORT_COLUMN.asc()).limit(readCount)
     if startKey is None:
         return statement
     return statement.where(SORT_COLUMN >= SortKeyOf(startKey))
@@ -101,9 +109,12 @@ def PositionSelect(startKey: str | None) -> Select[Any]:
 
 
 def BackwardSelect(startKey: str, readCount: int) -> Select[Any]:
-    """Return up to ``readCount`` records before ``startKey``, nearest first."""
+    """Return up to ``readCount`` browse rows before ``startKey``, nearest first.
+
+    Each row holds only the BROWSE_COLUMNS.
+    """
     return (
-        select(USERS_TABLE)
+        select(*BROWSE_COLUMNS)
         .where(SORT_COLUMN < SortKeyOf(startKey))
         .order_by(SORT_COLUMN.desc())
         .limit(readCount)
@@ -137,8 +148,9 @@ class UserRepository:
     """The USRSEC access paths of one online request.
 
     Records are returned as ``dict`` objects keyed by snake_case column name, or None when
-    absent. A record includes ``password_hash``: services verify or replace it, and never put
-    it in a response.
+    absent. Keyed and locked reads return the full record, ``password_hash`` included: services
+    verify or replace it, and never put it in a response. Browse rows carry only ``user_id``,
+    ``first_name``, ``last_name`` and ``user_type``.
     """
 
     def __init__(self, context: OnlineContext) -> None:
@@ -220,8 +232,9 @@ class UserRepository:
         Returns None for STARTBR NOTFND: no record at or after ``startKey``, or the HIGH-VALUES
         key. When ``inclusive`` is False (F8), the first record at or after ``startKey`` is the
         discarded READNEXT and is dropped, even when ``startKey`` itself no longer exists. The
-        list then holds up to ``limit`` page records plus element ``limit``, the look-ahead
-        READNEXT; an empty list is READNEXT ENDFILE on the discarded read.
+        list then holds up to ``limit`` page rows plus element ``limit``, the look-ahead
+        READNEXT; an empty list is READNEXT ENDFILE on the discarded read. Each row is a browse
+        row: ``user_id``, ``first_name``, ``last_name`` and ``user_type`` only.
         """
         await EnterOnlineWindow(self.context.request, USER_FILE_NAME)
         if startKey == HIGH_VALUES_USER_ID:
@@ -236,9 +249,10 @@ class UserRepository:
         """STARTBR GTEQ at ``startKey``, then READPREV: COUSR00C PROCESS-PAGE-BACKWARD (F7).
 
         Returns None for STARTBR NOTFND. The discarded READPREV re-reads the positioned record,
-        so the list holds the records before ``startKey``, nearest first: up to ``limit`` page
-        records plus element ``limit``, the look-ahead READPREV. Fewer than ``limit`` records
-        is READPREV ENDFILE. A ``startKey`` of None (LOW-VALUES) has no record before it.
+        so the list holds the browse rows before ``startKey``, nearest first: up to ``limit``
+        page rows plus element ``limit``, the look-ahead READPREV. Fewer than ``limit`` rows is
+        READPREV ENDFILE. A ``startKey`` of None (LOW-VALUES) has no record before it. Each row
+        carries ``user_id``, ``first_name``, ``last_name`` and ``user_type`` only.
         """
         await EnterOnlineWindow(self.context.request, USER_FILE_NAME)
         if not await self._PositionExists(startKey):

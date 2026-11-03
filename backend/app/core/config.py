@@ -33,6 +33,9 @@ REJECTED_KEY_MESSAGE = (
     f"SECRET_KEY must be set to at least {MINIMUM_SECRET_KEY_LENGTH} characters"
     " (generate one with: openssl rand -hex 32)"
 )
+# The largest count security.login_attempts.failure_count holds: the PostgreSQL SMALLINT
+# maximum. LOGIN_MAX_ATTEMPTS above it could never be counted to, so no lockout would follow.
+MAXIMUM_LOGIN_FAILURE_COUNT = 32767
 
 
 class CommonSettings(BaseSettings):
@@ -88,7 +91,7 @@ class Settings(CommonSettings):
     SECRET_KEY: str = Field(default="", validate_default=True, repr=False, exclude=True)
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60, gt=0)
     SESSION_COOKIE_NAME: str = "carddemo_session"
-    LOGIN_MAX_ATTEMPTS: int = Field(default=5, gt=0)
+    LOGIN_MAX_ATTEMPTS: int = Field(default=5, gt=0, le=MAXIMUM_LOGIN_FAILURE_COUNT)
     LOGIN_LOCKOUT_SECONDS: int = Field(default=900, gt=0)
     # A plain comma-separated string: a list field would make pydantic-settings expect JSON.
     BACKEND_CORS_ORIGINS: str = "http://127.0.0.1:3000"
