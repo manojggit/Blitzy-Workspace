@@ -66,6 +66,11 @@ const DISABLED_STATE_CASES: readonly DisabledStateCase[] = [
     { disabledState: "disabled omitted", isEnabled: true },
 ];
 
+// Every error state with every keyboard-lock state, as the prompt label shows them.
+const PROMPT_STATE_CASES = ERROR_STATE_CASES.flatMap((errorCase) =>
+    DISABLED_STATE_CASES.map((disabledCase) => ({ ...errorCase, ...disabledCase })),
+);
+
 interface ConfirmRenderOptions {
     label?: string;
     onChange?: (value: string) => void;
@@ -91,8 +96,8 @@ function RenderConfirm(options: ConfirmRenderOptions = {}): HTMLInputElement {
             inputRef={options.inputRef}
         />,
     );
-    // The outlined notch repeats the label in a legend, so the input is found by role and name;
-    // the accessible name is the label text trimmed.
+    // The prompt is a separate label above the field that names the input through for=, so the
+    // input is found by role and name; the accessible name is the label text trimmed.
     return screen.getByRole<HTMLInputElement>("textbox", { name: label.trim() });
 }
 
@@ -108,6 +113,24 @@ describe("ConfirmField field shape", () => {
         const input = RenderConfirm({ label: prompt });
         expect(input.labels?.[0]?.textContent).toBe(prompt);
     });
+});
+
+// A form label outside the outlined field wraps; the field's floating label would cut the prompt
+// to one line with an ellipsis on narrow screens.
+describe("ConfirmField prompt label", () => {
+    it.each(PROMPT_STATE_CASES)(
+        "COBIL00 prompt with $errorState and $disabledState is a form label outside the field",
+        ({ error, disabled, ariaInvalid, isEnabled }) => {
+            const input = RenderConfirm({ error, disabled });
+            const prompt = input.labels?.[0];
+            expect(input.labels).toHaveLength(1);
+            expect(prompt).toHaveClass("MuiFormLabel-root");
+            expect(prompt).not.toHaveClass("MuiInputLabel-root");
+            expect(prompt?.closest(".MuiTextField-root")).toBeNull();
+            expect(prompt?.classList.contains("Mui-error")).toBe(ariaInvalid === "true");
+            expect(prompt?.classList.contains("Mui-disabled")).toBe(!isEnabled);
+        },
+    );
 });
 
 describe("ConfirmField keystrokes", () => {
