@@ -12,7 +12,7 @@
         "start": "node .next/standalone/server.js",
         "lint": "eslint .",
         "type-check": "tsc --noEmit",
-        "format:check": "prettier --check src e2e \"*.{ts,mjs,json}\" \"!package-lock.json\" \"!next-env.d.ts\"",
+        "format:check": "prettier -c --no-error-on-unmatched-pattern src e2e \"*.{ts,mjs,json}\"",
         "test": "jest",
         "test:e2e": "playwright test"
     },
