@@ -19,10 +19,38 @@ fields. The builder needs no database, settings or environment variables, and im
 standard library and ``legacy_oracle``, never ``app`` or ``batch`` production code. A second run
 writes byte-identical files. A human review of the committed fixture diff is the gate for every
 later change.
+
+Every fixture is rendered in memory first, and the printed counts come from that rendering.
+Each one is then staged beside its target as a hidden ``.<name>.<random>.tmp`` file, and only
+when all 22 are staged is each renamed into place with ``os.replace``. A reader therefore sees
+a whole fixture, old or new, never a partial one, and a target that is a symlink is replaced
+rather than written through.
+
+A missing or malformed image, an oracle abend, a target that exists but is not a regular file,
+or a failure while staging leaves every existing fixture untouched. The builder then prints one
+line, ``build_expected: <reason>``, to stderr; an image error reads
+``<image path>: record <n>: <reason>``. It exits with the oracle's status when the chain stops
+(16 for an abend) and 12 for any other failure. A failure during the final renames, or a hard
+kill, can leave some fixtures new and some old, and only a hard kill can leave a ``.tmp`` file
+behind. Rerunning the command restores the complete fixture set, and a leftover ``.tmp`` file
+is safe to delete.
+
+To delete leftover staged files, run the following command from the repository root:
+
+```bash
+find batch/tests/fixtures/expected -name '.*.tmp' -type f -delete
+```
 """
 
 import csv
+import errno
+import io
+import os
+import stat
+import sys
+import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import legacy_oracle
@@ -36,7 +64,22 @@ LINE_TERMINATOR = "\n"
 CSV_ENCODING = "utf-8"
 RECORD_ENCODING = "latin-1"
 REPORT_ENCODING = "utf-8"
-CSV_SUFFIX = ".csv"
+CSV_COUNT_UNIT = "rows"
+RECORD_COUNT_UNIT = "records"
+
+# Staged files are hidden, named after their target, and created in the target's directory, so
+# os.replace publishes them atomically on the same file system.
+STAGED_PREFIX = "."
+STAGED_SUFFIX = ".tmp"
+# A published fixture gets the mode a plain open() would give it (0o666 less the umask), not the
+# owner-only mode of a mkstemp file.
+NEW_FILE_MODE = 0o666
+NOT_REPLACEABLE_REASON = "exists and is not a regular file; remove it, then rerun the builder"
+
+MESSAGE_PREFIX = "build_expected: "
+# Exit status for an unreadable or malformed image or an unwritable fixture: the batch loaders'
+# status for an image format error. An oracle abend exits with its own status instead.
+FAILURE_EXIT = 12
 
 # (file name, table) of the loader_rows CSVs, in output order. Daily rows come from the staged
 # DALYTRAN records; every other table comes from the state the loaders leave.
@@ -62,20 +105,42 @@ POSTTRAN_TABLE_FIXTURES = (
 INTCALC_TABLE_FIXTURES = (("intcalc_accounts.csv", legacy_oracle.ACCOUNTS_TABLE),)
 
 
-def WriteCsvFixture(path: Path, tableName: str, rows: Iterable[Mapping[str, object]]) -> Path:
-    """Write one table as CSV: the TableSpec columns as header, then one CsvValue row per row.
+@dataclass(frozen=True)
+class RenderedFixture:
+    """One fixture rendered in memory, ready to publish.
 
-    Rows are written in the order given, which StateRows and DailyRows already make the
+    Attributes:
+        path: The target file under EXPECTED_RELATIVE_DIR.
+        content: The exact bytes of the file.
+        count: The data rows of a CSV, header excluded, or the records or lines of any other file.
+        unit: CSV_COUNT_UNIT for a CSV, RECORD_COUNT_UNIT for any other file.
+    """
+
+    path: Path
+    content: bytes
+    count: int
+    unit: str
+
+
+def RenderCsvFixture(
+    path: Path, tableName: str, rows: Iterable[Mapping[str, object]]
+) -> RenderedFixture:
+    """Render one table as CSV: the TableSpec columns as header, then one CsvValue row per row.
+
+    Rows are rendered in the order given, which StateRows and DailyRows already make the
     fixture order (VSAM key order, or record_seq for daily rows).
+
+    Raises:
+        UnicodeEncodeError: A value has no CSV_ENCODING form.
     """
     columns = legacy_oracle.ResolveTableSpec(tableName).columns
-    with path.open("w", encoding=CSV_ENCODING, newline="") as handle:
-        writer = csv.writer(handle, lineterminator=LINE_TERMINATOR)
-        writer.writerow(columns)
-        writer.writerows(
-            [legacy_oracle.CsvValue(row[column]) for column in columns] for row in rows
-        )
-    return path
+    csvRows = [[legacy_oracle.CsvValue(row[column]) for column in columns] for row in rows]
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, lineterminator=LINE_TERMINATOR)
+    writer.writerow(columns)
+    writer.writerows(csvRows)
+    content = buffer.getvalue().encode(CSV_ENCODING)
+    return RenderedFixture(path, content, len(csvRows), CSV_COUNT_UNIT)
 
 
 def RequireSingleLineRecords(path: Path, records: Sequence[str]) -> None:
@@ -89,12 +154,16 @@ def RequireSingleLineRecords(path: Path, records: Sequence[str]) -> None:
             raise ValueError(f"{path}: record {recordNumber} contains a line-break character")
 
 
-def WriteRecordFixture(path: Path, records: Sequence[str], encoding: str) -> Path:
-    """Write fixed-width records or lines, each followed by one LF; no records give 0 bytes."""
+def RenderRecordFixture(path: Path, records: Sequence[str], encoding: str) -> RenderedFixture:
+    """Render fixed-width records or lines, each followed by one LF; no records give 0 bytes.
+
+    Raises:
+        ValueError: A record contains a line-break character.
+        UnicodeEncodeError: A record has no form in encoding.
+    """
     RequireSingleLineRecords(path, records)
-    content = "".join(record + LINE_TERMINATOR for record in records)
-    path.write_bytes(content.encode(encoding))
-    return path
+    content = "".join(record + LINE_TERMINATOR for record in records).encode(encoding)
+    return RenderedFixture(path, content, len(records), RECORD_COUNT_UNIT)
 
 
 def LoaderTableRows(chain: legacy_oracle.ChainOutcome, tableName: str) -> list[dict[str, object]]:
@@ -104,88 +173,104 @@ def LoaderTableRows(chain: legacy_oracle.ChainOutcome, tableName: str) -> list[d
     return legacy_oracle.StateRows(chain.loadedState, tableName)
 
 
-def WriteLoaderRows(directory: Path, chain: legacy_oracle.ChainOutcome) -> list[Path]:
-    """Write the eleven loader_rows CSVs; users.csv carries no password or hash column."""
+def RenderLoaderRows(directory: Path, chain: legacy_oracle.ChainOutcome) -> list[RenderedFixture]:
+    """Render the eleven loader_rows CSVs; users.csv carries no password or hash column."""
     return [
-        WriteCsvFixture(directory / fileName, tableName, LoaderTableRows(chain, tableName))
+        RenderCsvFixture(directory / fileName, tableName, LoaderTableRows(chain, tableName))
         for fileName, tableName in LOADER_ROW_FIXTURES
     ]
 
 
-def WriteStateCsvFixtures(
+def RenderStateCsvFixtures(
     expectedDir: Path, state: legacy_oracle.OracleState, fixtures: Iterable[tuple[str, str]]
-) -> list[Path]:
-    """Write one CSV per (file name, table) pair from a job's output state, in VSAM key order."""
+) -> list[RenderedFixture]:
+    """Render one CSV per (file name, table) pair from a job's output state, in VSAM key order."""
     return [
-        WriteCsvFixture(
+        RenderCsvFixture(
             expectedDir / fileName, tableName, legacy_oracle.StateRows(state, tableName)
         )
         for fileName, tableName in fixtures
     ]
 
 
-def WritePosttranFixtures(expectedDir: Path, chain: legacy_oracle.ChainOutcome) -> list[Path]:
-    """Write the POSTTRAN (CBTRN02C) tables and its 430-byte DALYREJS(+1) generation."""
-    paths = WriteStateCsvFixtures(expectedDir, chain.posttran.state, POSTTRAN_TABLE_FIXTURES)
+def RenderPosttranFixtures(
+    expectedDir: Path, chain: legacy_oracle.ChainOutcome
+) -> list[RenderedFixture]:
+    """Render the POSTTRAN (CBTRN02C) tables and its 430-byte DALYREJS(+1) generation."""
+    fixtures = RenderStateCsvFixtures(expectedDir, chain.posttran.state, POSTTRAN_TABLE_FIXTURES)
     rejectsPath = expectedDir / "posttran_dalyrejs.dat"
-    paths.append(WriteRecordFixture(rejectsPath, chain.posttran.rejectRecords, RECORD_ENCODING))
-    return paths
+    fixtures.append(RenderRecordFixture(rejectsPath, chain.posttran.rejectRecords, RECORD_ENCODING))
+    return fixtures
 
 
-def WriteIntcalcFixtures(expectedDir: Path, chain: legacy_oracle.ChainOutcome) -> list[Path]:
-    """Write the INTCALC (CBACT04C) SYSTRAN(+1) generation and the accounts it rewrote."""
+def RenderIntcalcFixtures(
+    expectedDir: Path, chain: legacy_oracle.ChainOutcome
+) -> list[RenderedFixture]:
+    """Render the INTCALC (CBACT04C) SYSTRAN(+1) generation and the accounts it rewrote."""
     systranPath = expectedDir / "intcalc_systran.dat"
-    paths = [WriteRecordFixture(systranPath, chain.intcalc.systranRecords, RECORD_ENCODING)]
-    paths.extend(WriteStateCsvFixtures(expectedDir, chain.intcalc.state, INTCALC_TABLE_FIXTURES))
-    return paths
+    fixtures = [RenderRecordFixture(systranPath, chain.intcalc.systranRecords, RECORD_ENCODING)]
+    fixtures.extend(
+        RenderStateCsvFixtures(expectedDir, chain.intcalc.state, INTCALC_TABLE_FIXTURES)
+    )
+    return fixtures
 
 
-def WriteTranbkpFixtures(expectedDir: Path, chain: legacy_oracle.ChainOutcome) -> list[Path]:
-    """Write the TRANSACT.BKUP(+1) generation of the second TRANBKP (chain step 15)."""
+def RenderTranbkpFixtures(
+    expectedDir: Path, chain: legacy_oracle.ChainOutcome
+) -> list[RenderedFixture]:
+    """Render the TRANSACT.BKUP(+1) generation of the second TRANBKP (chain step 15)."""
     return [
-        WriteRecordFixture(
+        RenderRecordFixture(
             expectedDir / "tranbkp_run2_bkup.dat", chain.bkupRun2.bkupRecords, RECORD_ENCODING
         ),
     ]
 
 
-def WriteCombtranFixtures(expectedDir: Path, chain: legacy_oracle.ChainOutcome) -> list[Path]:
-    """Write the TRANSACT.COMBINED(+1) generation: BKUP(0) and SYSTRAN(0) sorted by TRAN-ID."""
+def RenderCombtranFixtures(
+    expectedDir: Path, chain: legacy_oracle.ChainOutcome
+) -> list[RenderedFixture]:
+    """Render the TRANSACT.COMBINED(+1) generation: BKUP(0) and SYSTRAN(0) sorted by TRAN-ID."""
     return [
-        WriteRecordFixture(
+        RenderRecordFixture(
             expectedDir / "combtran_combined.dat", chain.combinedRecords, RECORD_ENCODING
         ),
     ]
 
 
-def WriteCreastmtFixtures(expectedDir: Path, chain: legacy_oracle.ChainOutcome) -> list[Path]:
-    """Write the CREASTMT (CBSTM03A) STATEMNT.PS (80) and STATEMNT.HTML (100) lines."""
+def RenderCreastmtFixtures(
+    expectedDir: Path, chain: legacy_oracle.ChainOutcome
+) -> list[RenderedFixture]:
+    """Render the CREASTMT (CBSTM03A) STATEMNT.PS (80) and STATEMNT.HTML (100) lines."""
     statements = chain.statements
     return [
-        WriteRecordFixture(
+        RenderRecordFixture(
             expectedDir / "creastmt_STATEMNT.PS", statements.psLines, RECORD_ENCODING
         ),
-        WriteRecordFixture(
+        RenderRecordFixture(
             expectedDir / "creastmt_STATEMNT.HTML", statements.htmlLines, RECORD_ENCODING
         ),
     ]
 
 
-def WriteTranreptFixtures(expectedDir: Path, chain: legacy_oracle.ChainOutcome) -> list[Path]:
-    """Write the 133-column CBTRN03C report lines for 2022-07-18 to 2022-07-18."""
+def RenderTranreptFixtures(
+    expectedDir: Path, chain: legacy_oracle.ChainOutcome
+) -> list[RenderedFixture]:
+    """Render the 133-column CBTRN03C report lines for 2022-07-18 to 2022-07-18."""
     return [
-        WriteRecordFixture(expectedDir / "tranrept_lines.txt", chain.reportLines, REPORT_ENCODING),
+        RenderRecordFixture(expectedDir / "tranrept_lines.txt", chain.reportLines, REPORT_ENCODING),
     ]
 
 
-# The job fixture writers in output order, after the loader_rows CSVs.
-JOB_FIXTURE_WRITERS: tuple[Callable[[Path, legacy_oracle.ChainOutcome], list[Path]], ...] = (
-    WritePosttranFixtures,
-    WriteIntcalcFixtures,
-    WriteTranbkpFixtures,
-    WriteCombtranFixtures,
-    WriteCreastmtFixtures,
-    WriteTranreptFixtures,
+# The job fixture renderers in output order, after the loader_rows CSVs.
+JOB_FIXTURE_RENDERERS: tuple[
+    Callable[[Path, legacy_oracle.ChainOutcome], list[RenderedFixture]], ...
+] = (
+    RenderPosttranFixtures,
+    RenderIntcalcFixtures,
+    RenderTranbkpFixtures,
+    RenderCombtranFixtures,
+    RenderCreastmtFixtures,
+    RenderTranreptFixtures,
 )
 
 
@@ -207,44 +292,142 @@ def RequireCleanChain(chain: legacy_oracle.ChainOutcome) -> None:
         )
 
 
-def BuildAllFixtures(repoRoot: Path) -> list[Path]:
-    """Run the oracle's sample chain and write all 22 fixtures under EXPECTED_RELATIVE_DIR.
-
-    Returns:
-        The written paths: the loader_rows CSVs, then the job fixtures, in chain order.
+def RenderAllFixtures(
+    expectedDir: Path, chain: legacy_oracle.ChainOutcome
+) -> list[RenderedFixture]:
+    """Render all 22 fixtures in memory: the loader_rows CSVs, then the job fixtures.
 
     Raises:
-        FileNotFoundError: A sample image is missing from data/EBCDIC.
+        ValueError: A record contains a line-break character, or a value cannot be encoded.
+    """
+    fixtures = RenderLoaderRows(expectedDir / LOADER_ROWS_DIR_NAME, chain)
+    for renderJobFixtures in JOB_FIXTURE_RENDERERS:
+        fixtures.extend(renderJobFixtures(expectedDir, chain))
+    return fixtures
+
+
+def IsReplaceableTarget(path: Path) -> bool:
+    """Return True when os.replace can publish to path: it is absent, a regular file or a symlink.
+
+    Raises:
+        OSError: path cannot be examined, for example because a parent is a regular file.
+    """
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return True
+    return stat.S_ISREG(mode) or stat.S_ISLNK(mode)
+
+
+def RequireReplaceableTargets(fixtures: Iterable[RenderedFixture]) -> None:
+    """Refuse, before anything is staged, a target that exists and is not a regular file.
+
+    Raises:
+        FileExistsError: A target is a directory, a FIFO, a socket or a device; it names the path.
+    """
+    for fixture in fixtures:
+        if not IsReplaceableTarget(fixture.path):
+            raise FileExistsError(errno.EEXIST, NOT_REPLACEABLE_REASON, str(fixture.path))
+
+
+def NewFileMode() -> int:
+    """Return the mode open() gives a new file: NEW_FILE_MODE less the process umask."""
+    processUmask = os.umask(0)
+    os.umask(processUmask)
+    return NEW_FILE_MODE & ~processUmask
+
+
+def StageFixture(fixture: RenderedFixture, fileMode: int, stagedPaths: list[Path]) -> None:
+    """Write a fixture's bytes to a new hidden file beside its target, and record that file.
+
+    The staged path is appended to stagedPaths before any byte is written, so the caller can
+    delete a partly written file.
+
+    Raises:
+        OSError: The directory cannot be created, or the staged file cannot be written.
+    """
+    fixture.path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, stagedName = tempfile.mkstemp(
+        suffix=STAGED_SUFFIX,
+        prefix=f"{STAGED_PREFIX}{fixture.path.name}.",
+        dir=fixture.path.parent,
+    )
+    stagedPaths.append(Path(stagedName))
+    with os.fdopen(descriptor, "wb") as stagedFile:
+        os.fchmod(stagedFile.fileno(), fileMode)
+        stagedFile.write(fixture.content)
+
+
+def PublishFixtures(fixtures: Sequence[RenderedFixture]) -> None:
+    """Stage every fixture beside its target, then rename each into place with os.replace.
+
+    No target changes until every fixture is staged, so a failure up to then leaves every
+    existing fixture untouched. Each os.replace is atomic: a reader sees the old file or the new
+    one, never a partial one. A staged file still present when this returns or raises is deleted.
+
+    Raises:
+        FileExistsError: A target exists and is not a regular file; nothing is staged.
+        OSError: A directory or a staged file cannot be created or written, or a rename fails.
+    """
+    RequireReplaceableTargets(fixtures)
+    fileMode = NewFileMode()
+    stagedPaths: list[Path] = []
+    try:
+        for fixture in fixtures:
+            StageFixture(fixture, fileMode, stagedPaths)
+        for fixture, stagedPath in zip(fixtures, stagedPaths, strict=True):
+            os.replace(stagedPath, fixture.path)
+    finally:
+        for stagedPath in stagedPaths:
+            stagedPath.unlink(missing_ok=True)
+
+
+def BuildAllFixtures(repoRoot: Path) -> list[RenderedFixture]:
+    """Run the oracle's sample chain, render all 22 fixtures, then publish them together.
+
+    Returns:
+        The published fixtures: the loader_rows CSVs, then the job fixtures, in chain order.
+
+    Raises:
+        FileNotFoundError: A sample image is missing from data/EBCDIC; no fixture is written.
+        legacy_oracle.ImageRecordError: An image is malformed; it names the image and the
+            record, and no fixture is written.
         legacy_oracle.OracleAbend: The chain abended, so no fixture is written.
+        ValueError: A fixture cannot be rendered, so no fixture is written.
+        OSError: A target is not a regular file, or staging or a rename failed.
     """
     chain = legacy_oracle.RunSampleChain(
         repoRoot / EBCDIC_RELATIVE_DIR, legacy_oracle.DB2_CLOCK_TEXT
     )
     RequireCleanChain(chain)
-    expectedDir = repoRoot / EXPECTED_RELATIVE_DIR
-    loaderRowsDir = expectedDir / LOADER_ROWS_DIR_NAME
-    loaderRowsDir.mkdir(parents=True, exist_ok=True)
-    writtenPaths = WriteLoaderRows(loaderRowsDir, chain)
-    for writeJobFixtures in JOB_FIXTURE_WRITERS:
-        writtenPaths.extend(writeJobFixtures(expectedDir, chain))
-    return writtenPaths
+    fixtures = RenderAllFixtures(repoRoot / EXPECTED_RELATIVE_DIR, chain)
+    PublishFixtures(fixtures)
+    return fixtures
 
 
-def CountFixtureRecords(path: Path) -> int:
-    """Return the data rows of a CSV fixture, header excluded, or the lines of any other one."""
-    if path.suffix == CSV_SUFFIX:
-        with path.open(encoding=CSV_ENCODING, newline="") as handle:
-            return len(list(csv.reader(handle))) - 1
-    return path.read_bytes().count(LINE_TERMINATOR.encode(RECORD_ENCODING))
+def ReportFailure(message: str, exitCode: int) -> int:
+    """Print one diagnostic line, MESSAGE_PREFIX then message, to stderr and return exitCode."""
+    print(MESSAGE_PREFIX + message, file=sys.stderr)
+    return exitCode
 
 
 def Main() -> int:
-    """Build every fixture and print each written path with its row or record count."""
+    """Build every fixture and print each published path with its row or record count.
+
+    Returns:
+        0 when every fixture is published; the abend status when the oracle chain stops; and
+        FAILURE_EXIT when an image, a record or a fixture cannot be read, decoded or written.
+    """
     repoRoot = Path(__file__).resolve().parents[REPO_ROOT_DEPTH]
-    for path in BuildAllFixtures(repoRoot):
-        unit = "rows" if path.suffix == CSV_SUFFIX else "records"
-        print(f"{path.relative_to(repoRoot).as_posix()}: {CountFixtureRecords(path)} {unit}")
-    return 0
+    try:
+        fixtures = BuildAllFixtures(repoRoot)
+    except legacy_oracle.OracleAbend as abend:
+        return ReportFailure(abend.message, abend.exitCode)
+    except (OSError, ValueError) as error:
+        return ReportFailure(str(error), FAILURE_EXIT)
+    for fixture in fixtures:
+        print(f"{fixture.path.relative_to(repoRoot).as_posix()}: {fixture.count} {fixture.unit}")
+    return legacy_oracle.EXIT_OK
 
 
 if __name__ == "__main__":

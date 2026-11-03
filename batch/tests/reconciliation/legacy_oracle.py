@@ -619,17 +619,76 @@ def FormatRecord(values: Mapping[str, object], fields: Sequence[FieldSpec], lrec
     return "".join(canvas)
 
 
+class ImageRecordError(ValueError):
+    """A legacy image that cannot be loaded, located to one of its records.
+
+    The message is "<path>: record <recordNumber>: <reason>". A decoding reason is the text of
+    the ParseRecord error. For a 9(n) field it names the field without quoting its content,
+    because SSNs pass through RequireDigits, while a zoned decimal or timestamp error quotes the
+    malformed field text.
+
+    Attributes:
+        path: The image file.
+        recordNumber: The 1-based number of the record, in file order.
+        reason: What is wrong with that record.
+    """
+
+    def __init__(self, path: Path, recordNumber: int, reason: str) -> None:
+        """Keep the image, the record number and the reason, and build the message."""
+        super().__init__(f"{path}: record {recordNumber}: {reason}")
+        self.path = path
+        self.recordNumber = recordNumber
+        self.reason = reason
+
+
 def ReadEbcdicRecords(path: Path, lrecl: int) -> list[str]:
     """Read a fixed-length code page 037 image with no terminators into record texts.
 
     Raises:
         FileNotFoundError: The image does not exist.
-        ValueError: The file size is not a multiple of lrecl.
+        ValueError: lrecl is not positive.
+        ImageRecordError: The file size is not a multiple of lrecl; the error names the
+            incomplete last record and the bytes it holds.
     """
     raw = path.read_bytes()
-    if lrecl <= 0 or len(raw) % lrecl != 0:
-        raise ValueError(f"{path}: size {len(raw)} is not a multiple of LRECL {lrecl}")
+    if lrecl <= 0:
+        raise ValueError(f"{path}: LRECL {lrecl} is not positive")
+    if len(raw) % lrecl != 0:
+        raise ImageRecordError(
+            path,
+            len(raw) // lrecl + 1,
+            f"{len(raw) % lrecl} of {lrecl} bytes present; the image size {len(raw)} is not a "
+            f"multiple of LRECL {lrecl}",
+        )
     return [DecodeCp037(raw[start : start + lrecl]) for start in range(0, len(raw), lrecl)]
+
+
+def ParseImageRecord(
+    path: Path, recordNumber: int, record: str, fields: Sequence[FieldSpec]
+) -> dict[str, object]:
+    """ParseRecord one record of an image, naming the image and the record when it fails.
+
+    Raises:
+        ImageRecordError: The record does not decode with fields.
+    """
+    try:
+        return ParseRecord(record, fields)
+    except ValueError as error:
+        raise ImageRecordError(path, recordNumber, str(error)) from error
+
+
+def ParseImageRecords(
+    path: Path, records: Sequence[str], fields: Sequence[FieldSpec]
+) -> list[dict[str, object]]:
+    """ParseRecord every record of an image, in file order, numbering the records from 1.
+
+    Raises:
+        ImageRecordError: A record does not decode with fields.
+    """
+    return [
+        ParseImageRecord(path, recordNumber, record, fields)
+        for recordNumber, record in enumerate(records, start=1)
+    ]
 
 
 @dataclass(frozen=True)
@@ -890,26 +949,70 @@ def ImagePath(ebcdicDir: Path, imageName: str) -> Path:
 
 
 def ReadImageRows(ebcdicDir: Path, imageName: str, layoutName: str) -> list[dict[str, object]]:
-    """Read one EBCDIC image and parse every record with the named layout, in file order."""
+    """Read one EBCDIC image and parse every record with the named layout, in file order.
+
+    Raises:
+        FileNotFoundError: The image does not exist.
+        ImageRecordError: The image size is not a multiple of the LRECL, or a record does not
+            decode with the layout.
+    """
     fields, lrecl = LAYOUTS[layoutName]
-    records = ReadEbcdicRecords(ImagePath(ebcdicDir, imageName), lrecl)
-    return [ParseRecord(record, fields) for record in records]
+    path = ImagePath(ebcdicDir, imageName)
+    return ParseImageRecords(path, ReadEbcdicRecords(path, lrecl), fields)
+
+
+class DuplicateKeyError(ValueError):
+    """Two rows share a key, which the IDCAMS REPRO into a KSDS refuses.
+
+    Rows are numbered from 1 in the order IndexRows receives them, which is file order for the
+    rows of an image. The message names the key columns, never the key value, which may be a
+    card or account number.
+
+    Attributes:
+        rowNumber: The row that repeats the key.
+        firstRowNumber: The earlier row that holds the same key.
+        reason: The message without its leading "record <rowNumber>: ".
+    """
+
+    def __init__(self, rowNumber: int, firstRowNumber: int, keyColumns: Sequence[str]) -> None:
+        """Keep both row numbers and build the reason from the key column names."""
+        self.rowNumber = rowNumber
+        self.firstRowNumber = firstRowNumber
+        self.reason = f"duplicate key ({', '.join(keyColumns)}) of record {firstRowNumber}"
+        super().__init__(f"record {rowNumber}: {self.reason}")
 
 
 def IndexRows(rows: Iterable[dict[str, object]], keyColumns: tuple[str, ...]) -> dict:
     """Index rows by their key: the value itself for one key column, else a tuple.
 
     Raises:
-        ValueError: Two rows share a key, which the IDCAMS REPRO into a KSDS refuses.
+        DuplicateKeyError: Two rows share a key, which the IDCAMS REPRO into a KSDS refuses. It
+            is a ValueError and names both 1-based row numbers.
     """
     indexed: dict = {}
-    for row in rows:
+    firstRowNumbers: dict = {}
+    for rowNumber, row in enumerate(rows, start=1):
         values = tuple(row[column] for column in keyColumns)
         key = values[0] if len(values) == 1 else values
         if key in indexed:
-            raise ValueError(f"duplicate key {key!r}")
+            raise DuplicateKeyError(rowNumber, firstRowNumbers[key], keyColumns)
         indexed[key] = row
+        firstRowNumbers[key] = rowNumber
     return indexed
+
+
+def IndexImageRows(
+    path: Path, rows: Sequence[dict[str, object]], keyColumns: tuple[str, ...]
+) -> dict:
+    """IndexRows the rows of one image, kept in file order, naming the image on a duplicate key.
+
+    Raises:
+        ImageRecordError: A record repeats the key of an earlier record.
+    """
+    try:
+        return IndexRows(rows, keyColumns)
+    except DuplicateKeyError as error:
+        raise ImageRecordError(path, error.rowNumber, error.reason) from error
 
 
 def IsPrimingRecord(record: str) -> bool:
@@ -921,12 +1024,17 @@ def LoadTransactionImage(ebcdicDir: Path) -> dict[str, str]:
     """Replay TRANFILE STEP15 (jcl/TRANFILE.jcl): REPRO DALYTRAN.PS.INIT into TRANSACT.
 
     The only record is the priming record, which is skipped, so the result is empty.
+
+    Raises:
+        FileNotFoundError: The image does not exist.
+        ImageRecordError: The image size is not a multiple of 350, or a record that is not the
+            priming record does not decode with CVTRA05Y.
     """
-    records = ReadEbcdicRecords(ImagePath(ebcdicDir, DALYTRAN_INIT_IMAGE), TRANSACTION_LRECL)
+    path = ImagePath(ebcdicDir, DALYTRAN_INIT_IMAGE)
     loaded: dict[str, str] = {}
-    for record in records:
+    for recordNumber, record in enumerate(ReadEbcdicRecords(path, TRANSACTION_LRECL), start=1):
         if not IsPrimingRecord(record):
-            ParseRecord(record, TRANSACTION_FIELDS)
+            ParseImageRecord(path, recordNumber, record, TRANSACTION_FIELDS)
             loaded[record[:16]] = record
     return loaded
 
@@ -945,9 +1053,18 @@ def LoadSampleState(ebcdicDir: Path) -> OracleState:
 
     Expected counts: users 10, accounts 50, customers 50, cards 50, xrefs 50, types 7,
     categories 18, disclosure groups 51, category balances 50 and transactions 0.
+
+    Raises:
+        FileNotFoundError: An image does not exist.
+        ImageRecordError: An image size is not a multiple of its LRECL, or one of its records
+            does not decode or repeats the key of an earlier record.
     """
     tables = {
-        attribute: IndexRows(ReadImageRows(ebcdicDir, image, layout), TABLE_SPECS[table].keyColumns)
+        attribute: IndexImageRows(
+            ImagePath(ebcdicDir, image),
+            ReadImageRows(ebcdicDir, image, layout),
+            TABLE_SPECS[table].keyColumns,
+        )
         for attribute, table, image, layout in STATE_TABLE_SOURCES
     }
     users = [
@@ -957,13 +1074,25 @@ def LoadSampleState(ebcdicDir: Path) -> OracleState:
     return OracleState(
         **tables,
         transactions=LoadTransactionImage(ebcdicDir),
-        users=IndexRows(users, TABLE_SPECS[USERS_TABLE].keyColumns),
+        users=IndexImageRows(
+            ImagePath(ebcdicDir, USRSEC_IMAGE), users, TABLE_SPECS[USERS_TABLE].keyColumns
+        ),
     )
 
 
 def ReadDailyRecords(path: Path) -> list[str]:
-    """Return the DALYTRAN image as 350-character record texts in file order (300 records)."""
-    return ReadEbcdicRecords(path, TRANSACTION_LRECL)
+    """Return the DALYTRAN image as 350-character record texts in file order (300 records).
+
+    Every record is first decoded with DAILY_FIELDS, as the DALYTRAN staging load (chain step
+    12) decodes each field and refuses a malformed image. The texts are returned unchanged.
+
+    Raises:
+        FileNotFoundError: The image does not exist.
+        ImageRecordError: The image size is not a multiple of 350, or a record does not decode.
+    """
+    records = ReadEbcdicRecords(path, TRANSACTION_LRECL)
+    ParseImageRecords(path, records, DAILY_FIELDS)
+    return records
 
 
 def StateSourceRows(state: OracleState, spec: TableSpec) -> list[Mapping[str, object]]:
