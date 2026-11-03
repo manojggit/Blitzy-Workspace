@@ -1,13 +1,17 @@
 """Replaces: CBSTM03A (statement writer); copybooks COSTM01, CUSTREC, CVACT01Y, CVACT03Y.
 
-A pure builder: it takes the rows cbstm03b.py reads, keyed by PostgreSQL column names, does no
-I/O, and returns the exact record images. STATEMNT.PS lines are the 80-column ST-LINE0 to
-ST-LINE15 layouts; STATEMNT.HTML lines are 100 columns, rendered through
-templates/statement.html.j2. The TRNXFILE table keeps CBSTM03A's 51-card by 10-transaction
-bound, and larger input raises StatementCapacityError before any statement is built.
+The statement builder: it takes the rows cbstm03b.py reads, keyed by PostgreSQL column names,
+and returns the exact record images, with no database or output-file I/O. The one file it
+reads is templates/statement.html.j2, loaded through FileSystemLoader on the first HTML
+rendering and cached. STATEMNT.PS records are the 80-column ST-LINE0 to ST-LINE15 layouts;
+STATEMNT.HTML records are exactly 100 columns, an escaped field value being shortened by whole
+characters to fit. The TRNXFILE table loader checks CBSTM03A's 51-card by 10-transaction bound
+record by record and raises StatementCapacityError at the first record beyond it, before any
+statement is built. Statements are then built one at a time, for the job's writer,
+creastmt.py, to stream into its files.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from functools import lru_cache
@@ -27,6 +31,10 @@ HTML_LINE_WIDTH = 100
 # WS-CARD-TBL OCCURS 51 TIMES and WS-TRAN-TBL OCCURS 10 TIMES (lines 225-233).
 MAX_STATEMENT_CARDS = 51
 MAX_TRANSACTIONS_PER_CARD = 10
+# The most TRNXFILE records cbstm03b reads: one past a full table. In read order the first
+# record past a full table always breaks the bound, so the refusal and its message are those of
+# the full read; input of 510 or fewer records is read whole.
+TRANSACTION_TABLE_READ_LIMIT = MAX_STATEMENT_CARDS * MAX_TRANSACTIONS_PER_CARD + 1
 TEMPLATE_DIRECTORY = Path(__file__).resolve().parent / "templates"
 TEMPLATE_NAME = "statement.html.j2"
 
@@ -66,6 +74,14 @@ RECORD_NOT_FOUND_STATUS = "23"
 HTML_FIXED_LINE_COUNT = 64
 HTML_LINES_PER_TRANSACTION = 11
 
+# MarkFieldValue brackets each escaped field value in these two private-use code points, so
+# FitHtmlRecord can tell field text from template literals. Every value is cp037 text, decoded
+# from the EBCDIC images or keyed within the code-page-037 repertoire, so none holds them.
+FIELD_VALUE_START = "\ue000"
+FIELD_VALUE_END = "\ue001"
+# The entities EscapeFieldValue writes; each stands for one raw character of a field value.
+ESCAPED_ENTITIES = ("&amp;", "&lt;", "&gt;")
+
 type RecordMapping = Mapping[str, object]
 type TransactionTable = Mapping[str, tuple[RecordMapping, ...]]
 
@@ -88,10 +104,11 @@ class MissingStatementRecordError(StatementAbendError):
 
 @dataclass(frozen=True)
 class StatementData:
-    """The records of one statement.
+    """The records of one statement, each keyed by PostgreSQL column name.
 
-    xref, customer and account are CARD-XREF-RECORD, CUSTOMER-RECORD and ACCOUNT-RECORD;
-    transactions is the TRNXFILE table entry of the xref card, empty when it has none.
+    xref, customer and account are the CARD-XREF-RECORD, CUSTOMER-RECORD and ACCOUNT-RECORD
+    that cbstm03b.ReadXrefsInCardOrder reads together; transactions is the TRNXFILE table entry
+    of the xref card, empty when it has none.
     """
 
     xref: RecordMapping
@@ -101,15 +118,14 @@ class StatementData:
 
 
 @dataclass(frozen=True)
-class StatementOutput:
-    """The STATEMNT.PS and STATEMNT.HTML record images, and what they hold.
+class StatementRecords:
+    """One statement's STATEMNT.PS and STATEMNT.HTML records, in write order.
 
-    transactionCount is the number of ST-LINE14 transaction lines across all statements.
+    transactionCount is the number of its ST-LINE14 transaction lines.
     """
 
     psLines: tuple[str, ...]
     htmlLines: tuple[str, ...]
-    statementCount: int
     transactionCount: int
 
 
@@ -220,21 +236,21 @@ ADDRESS_LINE_3_COLUMN_WIDTHS = (
 
 
 def LoadTransactionTable(
-    transactions: Sequence[RecordMapping],
+    transactions: Iterable[RecordMapping],
 ) -> dict[str, tuple[RecordMapping, ...]]:
     """Load WS-TRNX-TABLE as 8100-TRNXFILE-OPEN, 8500-READTRNX-READ and 8599-EXIT do.
 
     transactions are in TRXFL key order: card number, then TRAN-ID. Each run of one card number
     is a table entry, and the result maps the card number, padded to X(16), to its records in
-    read order. Raises EmptyTransactionFileError when there is no record, and
-    StatementCapacityError beyond 51 entries or 10 records in one entry, before returning.
+    read order. Records are taken one at a time and none after the first that breaks the
+    bound. Raises EmptyTransactionFileError when there is no record, and StatementCapacityError
+    beyond 51 entries or 10 records in one entry, before returning.
     """
-    records = tuple(transactions)
-    if not records:
-        raise EmptyTransactionFileError(ReadErrorMessage("TRNXFILE", END_OF_FILE_STATUS))
     entries: list[tuple[str, list[RecordMapping]]] = []
-    for record in records:
+    for record in transactions:
         AppendTableEntry(entries, record)
+    if not entries:
+        raise EmptyTransactionFileError(ReadErrorMessage("TRNXFILE", END_OF_FILE_STATUS))
     table: dict[str, tuple[RecordMapping, ...]] = {}
     # TRXFL is a KSDS keyed by card and TRAN-ID, so a card forms one entry. Input out of that
     # order keeps every record: the 4000 scan prints each entry equal to the xref card.
@@ -288,25 +304,27 @@ def AssembleStatementData(
 
 
 def BuildStatementFiles(
-    table: TransactionTable, statements: Sequence[StatementData]
-) -> StatementOutput:
+    table: TransactionTable, statements: Iterable[StatementData]
+) -> Iterator[StatementRecords]:
     """Build both statement files, one statement per cross-reference, as 1000-MAINLINE does.
 
-    statements are in XREFFILE (card) order. A table card with no cross-reference is never
-    printed, and a cross-reference with no table entry gets an empty transaction summary.
+    statements are in XREFFILE (card) order. The result takes and builds one statement each
+    time it is advanced, so the writer streams the files a statement at a time. A table card
+    with no cross-reference is never printed, and a cross-reference with no table entry gets an
+    empty transaction summary.
     """
     # 8100-TRNXFILE-OPEN loads the table before the first statement and abends on an empty
-    # TRNXFILE, so no statement is built without a loaded table.
+    # TRNXFILE, so no statement is built without a loaded table. The check runs on the call,
+    # before any statement is taken.
     if not table:
         raise EmptyTransactionFileError(ReadErrorMessage("TRNXFILE", END_OF_FILE_STATUS))
-    psLines: list[str] = []
-    htmlLines: list[str] = []
-    for statement in statements:
-        statementPsLines, statementHtmlLines = BuildStatement(statement)
-        psLines.extend(statementPsLines)
-        htmlLines.extend(statementHtmlLines)
-    transactionCount = sum(len(statement.transactions) for statement in statements)
-    return StatementOutput(tuple(psLines), tuple(htmlLines), len(statements), transactionCount)
+    return map(BuildStatementRecords, statements)
+
+
+def BuildStatementRecords(data: StatementData) -> StatementRecords:
+    """Return one statement's PS and HTML records with its transaction count."""
+    psLines, htmlLines = BuildStatement(data)
+    return StatementRecords(psLines, htmlLines, len(data.transactions))
 
 
 def BuildStatement(data: StatementData) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -467,7 +485,7 @@ def RenderHtmlLines(
     Ports 5100-WRITE-HTML-HEADER, 5200-WRITE-HTML-NMADBS, 6000-WRITE-TRANS and the closing
     lines of 4000-TRNXFILE-GET. Raises ValueError when the rendering does not have the
     64 + 11 * n records CBSTM03A writes, which a defective template or a field value holding a
-    line break would cause.
+    line break would cause. FitHtmlRecord then makes each line a record of exactly 100 columns.
     """
     template = BuildTemplateEnvironment().get_template(TEMPLATE_NAME)
     renderedText = template.render(BuildHtmlContext(fields, transactionFields))
@@ -480,13 +498,76 @@ def RenderHtmlLines(
             f"{TEMPLATE_NAME} rendered {len(renderedLines)} lines for"
             f" {len(transactionFields)} transactions; CBSTM03A writes {expectedCount}"
         )
-    # Padded to the record width and never cut: escaping lengthens a field value, and a cut at
-    # column 100 could split an entity. Unescaped records stay within 89 columns.
-    return tuple(line.ljust(HTML_LINE_WIDTH) for line in renderedLines)
+    return tuple(FitHtmlRecord(line) for line in renderedLines)
+
+
+def FitHtmlRecord(renderedLine: str) -> str:
+    """Return one rendered line as the X(100) FD-HTMLFILE-REC that CBSTM03A WRITEs.
+
+    Escaping makes a field value longer than the raw text CBSTM03A writes, so a line over the
+    width loses whole raw characters from the end of its last field value, then of the one
+    before, until it fits: an entity is never split and the closing markup is kept. A line that
+    fits is only padded. Raises ValueError when the field markers do not pair up, or when the
+    template literals alone are over the width.
+    """
+    literals, fieldTexts = SplitFieldValues(renderedLine)
+    excess = sum(map(len, literals)) + sum(map(len, fieldTexts)) - HTML_LINE_WIDTH
+    for index in reversed(range(len(fieldTexts))):
+        fieldTexts[index], excess = DropTrailingCharacters(fieldTexts[index], excess)
+    fittedTexts = (text + literal for text, literal in zip(fieldTexts, literals[1:], strict=True))
+    record = (literals[0] + "".join(fittedTexts)).ljust(HTML_LINE_WIDTH)
+    if len(record) != HTML_LINE_WIDTH:
+        raise ValueError(
+            f"{TEMPLATE_NAME} literal text is {len(record)} columns; HTML-FILE records are"
+            f" {HTML_LINE_WIDTH}"
+        )
+    return record
+
+
+def SplitFieldValues(renderedLine: str) -> tuple[list[str], list[str]]:
+    """Split a rendered line at the markers MarkFieldValue puts around each field value.
+
+    Returns the template literals, one more than the field values, and the escaped field
+    values, both in line order. Raises ValueError when the markers do not pair up.
+    """
+    leadingLiteral, *markedPieces = renderedLine.split(FIELD_VALUE_START)
+    if FIELD_VALUE_END in leadingLiteral or any(
+        piece.count(FIELD_VALUE_END) != 1 for piece in markedPieces
+    ):
+        raise ValueError(f"{TEMPLATE_NAME} rendered a field value marker that does not pair up")
+    pieces = [piece.partition(FIELD_VALUE_END) for piece in markedPieces]
+    literals = [leadingLiteral] + [literal for _, _, literal in pieces]
+    return literals, [fieldText for fieldText, _, _ in pieces]
+
+
+def DropTrailingCharacters(fieldText: str, excess: int) -> tuple[str, int]:
+    """Drop whole raw characters from the end of an escaped field value while excess is over 0.
+
+    excess is the number of columns the record is over its width, and an entity is one raw
+    character. Returns the shortened value and the columns still over, 0 or less once it fits.
+    """
+    characters = SplitEscapedCharacters(fieldText)
+    while excess > 0 and characters:
+        excess -= len(characters.pop())
+    return "".join(characters), excess
+
+
+def SplitEscapedCharacters(fieldText: str) -> list[str]:
+    """Split an escaped field value into its raw characters: each entity, or one character."""
+    characters: list[str] = []
+    position = 0
+    while position < len(fieldText):
+        character = next(
+            (entity for entity in ESCAPED_ENTITIES if fieldText.startswith(entity, position)),
+            fieldText[position],
+        )
+        characters.append(character)
+        position += len(character)
+    return characters
 
 
 def EscapeFieldValue(value: object) -> str:
-    """Escape &, < and > in a template field value, the Jinja2 finalize hook.
+    """Escape &, < and > in a template field value, for the finalize hook MarkFieldValue.
 
     Apostrophes and quotes stay as CBSTM03A wrote them, for byte parity; the three escaped
     characters keep user-entered text, such as a CT02 description, from injecting markup.
@@ -494,13 +575,26 @@ def EscapeFieldValue(value: object) -> str:
     return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def MarkFieldValue(value: object) -> str:
+    """Escape a template field value and bracket it in the field markers: the finalize hook.
+
+    FitHtmlRecord finds each field value by its markers and removes them. Raises ValueError
+    when the value itself holds a marker character, which would misplace the field.
+    """
+    text = str(value)
+    if FIELD_VALUE_START in text or FIELD_VALUE_END in text:
+        raise ValueError("A statement field value holds a field marker character")
+    return FIELD_VALUE_START + EscapeFieldValue(text) + FIELD_VALUE_END
+
+
 @lru_cache(maxsize=1)
 def BuildTemplateEnvironment() -> Environment:
     """Return the Jinja2 environment for templates/statement.html.j2, built on first use."""
     # autoescape stays off because HTML autoescaping also rewrites the apostrophes in the
-    # sample customer and transaction text, which breaks byte parity with CBSTM03A. Field
-    # values are cleaned by EscapeFieldValue through finalize instead (MK_Modernization Rule
-    # clause 4). auto_reload is off so a cached template is never re-checked on disk.
+    # sample customer and transaction text, which breaks byte parity with CBSTM03A. The
+    # finalize hook MarkFieldValue cleans each field value with EscapeFieldValue instead
+    # (MK_Modernization Rule clause 4) and marks it, so FitHtmlRecord can fit the record.
+    # auto_reload is off so a cached template is never re-checked on disk.
     return Environment(
         loader=FileSystemLoader(TEMPLATE_DIRECTORY),
         autoescape=False,
@@ -509,7 +603,7 @@ def BuildTemplateEnvironment() -> Environment:
         trim_blocks=True,
         lstrip_blocks=True,
         undefined=StrictUndefined,
-        finalize=EscapeFieldValue,
+        finalize=MarkFieldValue,
     )
 
 

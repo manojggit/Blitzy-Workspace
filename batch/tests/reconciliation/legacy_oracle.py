@@ -1869,29 +1869,38 @@ def PsHeadSlots(texts: StatementTexts) -> dict[LineSlot, str]:
     }
 
 
-def HtmlField(text: str, delimiter: str) -> str:
-    """Return a STRING source cut at its delimiter, then HTML-escaped (field values only)."""
-    return EscapeHtml(CutAtDelimiter(text, delimiter))
+def HtmlFittedLine(prefix: str, fieldText: str, suffix: str) -> str:
+    """Return prefix, the HTML-escaped field text and suffix, within STATEMENT_HTML_WIDTH.
+
+    Escaping lengthens &, < and >, so raw characters are dropped from the end of the field text
+    until the escaped line fits the 100-column record; the literals are kept whole.
+    """
+    while fieldText and len(prefix + EscapeHtml(fieldText) + suffix) > STATEMENT_HTML_WIDTH:
+        fieldText = fieldText[:-1]
+    return prefix + EscapeHtml(fieldText) + suffix
 
 
 def HtmlNameLine(prefix: str, text: str) -> str:
     """Return a 5200 name or address line: the field DELIMITED BY '  ', then '  ' and </p>."""
-    fieldText = HtmlField(text, HTML_NAME_DELIMITER)
-    return prefix + fieldText + HTML_NAME_DELIMITER + HTML_PARAGRAPH_CLOSE
+    fieldText = CutAtDelimiter(text, HTML_NAME_DELIMITER)
+    return HtmlFittedLine(prefix, fieldText, HTML_NAME_DELIMITER + HTML_PARAGRAPH_CLOSE)
 
 
 def HtmlFieldLine(prefix: str, text: str) -> str:
     """Return a 5200 or 6000 field line: the literal, the field DELIMITED BY '*', then </p>."""
-    return prefix + HtmlField(text, HTML_FIELD_DELIMITER) + HTML_PARAGRAPH_CLOSE
+    fieldText = CutAtDelimiter(text, HTML_FIELD_DELIMITER)
+    return HtmlFittedLine(prefix, fieldText, HTML_PARAGRAPH_CLOSE)
 
 
 def HtmlHeadSlots(texts: StatementTexts) -> dict[LineSlot, str]:
     """Return HTML-L11 (5100, lines 529-530) and the name, address and basic-detail lines of
     5200-WRITE-HTML-NMADBS (cbl/CBSTM03A.CBL lines 560-633).
     """
-    accountHeader = HTML_ACCOUNT_HEADER_PREFIX + EscapeHtml(texts.accountId)
+    accountHeader = HtmlFittedLine(
+        HTML_ACCOUNT_HEADER_PREFIX, texts.accountId, HTML_ACCOUNT_HEADER_SUFFIX
+    )
     return {
-        SLOT_HTML_ACCOUNT_HEADER: accountHeader + HTML_ACCOUNT_HEADER_SUFFIX,
+        SLOT_HTML_ACCOUNT_HEADER: accountHeader,
         SLOT_HTML_NAME: HtmlNameLine(HTML_NAME_PREFIX, texts.name[:L23_NAME_WIDTH]),
         SLOT_HTML_ADDRESS_1: HtmlNameLine(HTML_PARAGRAPH_OPEN, texts.address1),
         SLOT_HTML_ADDRESS_2: HtmlNameLine(HTML_PARAGRAPH_OPEN, texts.address2),
@@ -1924,7 +1933,8 @@ def RenderLines(
 ) -> list[str]:
     """Write a line table: literals as they are, slots from the dict, each right-padded to width.
 
-    Lines are never truncated; escaped HTML values may make a line longer than its LRECL.
+    Lines are never truncated here: every slot text already fits its LRECL, the escaped HTML
+    field lines through HtmlFittedLine, so each line comes out exactly width columns.
     """
     lines = []
     for item in sequence:
