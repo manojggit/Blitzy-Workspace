@@ -58,7 +58,11 @@ ROUTER = APIRouter(prefix="/cards", tags=["cards"])
     description=(
         "Lists at most 7 cards in card number order, filtered by acctId and cardNum, with each "
         "card number masked and no CVV. A page's first_key or last_key is an opaque token sent "
-        "back as startKey: omit direction for ENTER, or send backward (F7) or forward (F8)."
+        "back as startKey: omit direction for ENTER, or send backward (F7) or forward (F8). "
+        "The rows' selection codes travel as repeated selections parameters and are edited "
+        "after the filters: more than one S or U, or any other code, is a 400 carrying the "
+        "rows redisplayed from the first card, the page keys and page. A single S or U never "
+        "transfers here; POST /cards/selection does."
     ),
     responses=LegacyErrorResponses(400, 401, 403, 503),
 )

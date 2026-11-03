@@ -6,8 +6,11 @@
 // field; only the shared ScreenFeedback and PageState keys stay optional, as apiClient.ts defines
 // them. Every screen field travels as typed, never trimmed, padded or masked: the server runs the
 // filter and key edits, the selection checks, the 7-row paging, the card_ref resolution and the
-// CCUP state machine, and every legacy outcome reaches the caller as a rejected call. No type has
-// a card verification code, and a full card number appears only where the user keyed it.
+// CCUP state machine. The CCLI paging literals and the information lines arrive in message and
+// info_message of successful responses; filter, selection, key and field edit, not-found, lock,
+// record-changed and file-error outcomes reach the caller as a rejected call carrying the legacy
+// error body. No type has a card verification code, and a full card number appears only where
+// the user keyed it.
 import {
     API_CLIENT,
     type Direction,
@@ -26,6 +29,10 @@ const EDIT_SUFFIX = "/edit";
 // edits cannot tell apart, because the server pads every key with spaces to its BMS LENGTH.
 const UNSENDABLE_PATH_SEGMENTS: readonly string[] = ["", ".", ".."];
 
+// The server reads a list as one repeated parameter per item (selections=&selections=S), so
+// array items are sent without axios's default "[]" suffix; blank items are kept.
+const REPEATED_PARAMS_SERIALIZER = { indexes: null };
+
 // The GET /cards query (COCRDLI). Without a direction it is ENTER or the first entry, re-reading
 // the page from startKey; F7 and F8 send the shown page's first_key or last_key as startKey, an
 // opaque token rather than a card number.
@@ -35,6 +42,9 @@ export interface CardListQuery {
     startKey?: string;
     direction?: Direction;
     page?: number;
+    // The CRDSEL1-7 code of every row shown, in row order and blank ("") where none was keyed.
+    // The server edits them before paging and never transfers on this call.
+    selections?: string[];
 }
 
 // The GET /cards/{cardNum} and /cards/{cardNum}/edit query: the ACCTSID field as keyed.
@@ -128,7 +138,10 @@ function CardPath(cardNum: string): string {
 
 // CCLI (COCRDLIC): ENTER, F7 and F8 on the card list.
 export async function ListCards(query: CardListQuery): Promise<CardListResponse> {
-    const response = await API_CLIENT.get<CardListResponse>(CARDS_PATH, { params: query });
+    const response = await API_CLIENT.get<CardListResponse>(CARDS_PATH, {
+        params: query,
+        paramsSerializer: REPEATED_PARAMS_SERIALIZER,
+    });
     return response.data;
 }
 

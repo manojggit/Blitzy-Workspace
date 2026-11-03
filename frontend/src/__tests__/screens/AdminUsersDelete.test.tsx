@@ -3,7 +3,7 @@
 // cbl/COUSR03C.cbl PROCESS-ENTER-KEY, DELETE-USER-INFO, READ-USER-SEC-FILE and
 // DELETE-USER-SEC-FILE.
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { AxiosError, AxiosHeaders, type InternalAxiosRequestConfig } from "axios";
 import type { ReactNode } from "react";
@@ -111,11 +111,21 @@ interface FocusCase {
     status: number;
 }
 
+interface NavigableView {
+    user: UserEvent;
+    // Renders the page again under the current mockSearchParams, as the App Router does on a
+    // same-route push or a history step that changes the query.
+    Rerender: () => void;
+}
+
 const TEST_USER_ID = "TESTUSR1";
+// A second user COUSR00C can select, with details unlike the first user's.
+const OTHER_USER_ID = "TESTUSR2";
 // USRIDIN as keyed: mixed case with an embedded space, never trimmed or case-folded.
 const TYPED_USER_ID = "tstUsr 9";
 const PRESS_PF5_MESSAGE = "Press PF5 key to delete this user ...";
 const DELETED_MESSAGE = "User TESTUSR1 has been deleted ...";
+const OTHER_DELETED_MESSAGE = "User TESTUSR2 has been deleted ...";
 // STRING ... DELIMITED BY SPACE keeps the typed ID up to its first space.
 const TYPED_DELETED_MESSAGE = "User tstUsr has been deleted ...";
 const NOT_FOUND_MESSAGE = "User ID NOT found...";
@@ -175,6 +185,14 @@ const EMPTY_SCREEN_VALUES: ScreenValues = {
     first_name: "",
     last_name: "",
     user_type: "",
+};
+
+// The second user's record, as fetched and as shown.
+const OTHER_USER_VALUES: ScreenValues = {
+    user_id: OTHER_USER_ID,
+    first_name: "Grace",
+    last_name: "Hopper",
+    user_type: "A",
 };
 
 // USRIDIN is UNPROT LENGTH 8; FNAME and LNAME are ASKIP LENGTH 20; USRTYPE is ASKIP LENGTH 1.
@@ -300,14 +318,49 @@ function ShownValues(): ScreenValues {
     };
 }
 
-function RenderScreen(): UserEvent {
-    const user = userEvent.setup();
-    render(
+function ScreenTree() {
+    return (
         <ThemeProvider theme={CARD_DEMO_THEME}>
             <AdminUsersDeletePage />
-        </ThemeProvider>,
+        </ThemeProvider>
     );
+}
+
+function RenderScreen(): UserEvent {
+    const user = userEvent.setup();
+    render(<ScreenTree />);
     return user;
+}
+
+// Opened from COUSR00C with the given user, under a query the test changes afterwards.
+function RenderNavigable(userId: string): NavigableView {
+    mockSearchParams = new URLSearchParams({ userId });
+    const user = userEvent.setup();
+    const { rerender } = render(<ScreenTree />);
+    return { user, Rerender: () => rerender(<ScreenTree />) };
+}
+
+// A same-route push or history step to the given userId query.
+function NavigateToUser(view: NavigableView, userId: string): void {
+    mockSearchParams = new URLSearchParams({ userId });
+    view.Rerender();
+}
+
+// The next fetch or delete stays in flight until the returned function settles it with the
+// first user's record or the deleted literal.
+function DeferCall(call: ScreenCall): () => void {
+    let settle: () => void = () => undefined;
+    const pending = new Promise<void>((resolve) => {
+        settle = resolve;
+    });
+    if (call === "fetch") {
+        mockFetchUser.mockReturnValueOnce(pending.then(() => BuildUserDetail()));
+    } else {
+        mockDeleteUser.mockReturnValueOnce(
+            pending.then(() => BuildDeleteResponse(DELETED_MESSAGE)),
+        );
+    }
+    return () => settle();
 }
 
 // The busy bar is gone once a call has settled and every button is pressable again.
@@ -336,11 +389,30 @@ async function RenderFromList(): Promise<UserEvent> {
     return user;
 }
 
+// COUSR00C selects the second user while this screen is shown, on the same route.
+async function SwitchToOtherUser(view: NavigableView): Promise<void> {
+    mockFetchUser.mockResolvedValue(BuildUserDetail(OTHER_USER_VALUES));
+    NavigateToUser(view, OTHER_USER_ID);
+    await waitFor(() => {
+        expect(ShownValues()).toEqual(OTHER_USER_VALUES);
+    });
+    await ExpectIdle();
+}
+
 // Opened from the admin menu, with the user ID keyed on USRIDIN.
 async function RenderWithTypedId(userIdText: string): Promise<UserEvent> {
     const user = RenderScreen();
     await user.type(screen.getByLabelText(USER_ID_LABEL), userIdText);
     return user;
+}
+
+// Keys another user ID over the whole USRIDIN text, so its LENGTH 8 never blocks the typing.
+async function TypeOverUserId(user: UserEvent, userIdText: string): Promise<void> {
+    const input = screen.getByLabelText<HTMLInputElement>(USER_ID_LABEL);
+    await user.type(input, userIdText, {
+        initialSelectionStart: 0,
+        initialSelectionEnd: input.value.length,
+    });
 }
 
 // The physical key, as the 3270 attention key arrives as a KeyboardEvent.key.
@@ -432,6 +504,50 @@ describe("COUSR03C first entry from COUSR00C (CDEMO-CU03-USR-SELECTED)", () => {
     });
 });
 
+// Every arrival with another CDEMO-CU03-USR-SELECTED is a fresh first entry, as every XCTL is.
+describe("COUSR03C same-route push that selects another user", () => {
+    it("COUSR03C fetches the newly selected user and PF5 deletes that user", async () => {
+        const view = RenderNavigable(TEST_USER_ID);
+        await ExpectAlert(PRESS_PF5_MESSAGE, "info");
+        await SwitchToOtherUser(view);
+        expect(mockFetchUser).toHaveBeenLastCalledWith(OTHER_USER_ID, UserFetchScreen.DELETE);
+        mockDeleteUser.mockResolvedValue(BuildDeleteResponse(OTHER_DELETED_MESSAGE));
+        await PressFunction(view.user, "F5", "key");
+        await ExpectAlert(OTHER_DELETED_MESSAGE, "success");
+        expect(mockDeleteUser).toHaveBeenCalledTimes(1);
+        expect(mockDeleteUser).toHaveBeenCalledWith(OTHER_USER_ID);
+    });
+});
+
+describe("COUSR03C late answer for the user selected before a same-route push", () => {
+    it("COUSR03C discards the previous user's answer that arrives after the switch", async () => {
+        const settleFirstFetch = DeferCall("fetch");
+        const view = RenderNavigable(TEST_USER_ID);
+        await SwitchToOtherUser(view);
+        await act(async () => {
+            settleFirstFetch();
+        });
+        expect(ShownValues()).toEqual(OTHER_USER_VALUES);
+        expect(screen.queryByRole("progressbar")).toBeNull();
+    });
+});
+
+describe("COUSR03C history step back to the previously selected user", () => {
+    it("COUSR03C re-enters and fetches the first user again on a history step back", async () => {
+        const view = RenderNavigable(TEST_USER_ID);
+        await ExpectAlert(PRESS_PF5_MESSAGE, "info");
+        await SwitchToOtherUser(view);
+        mockFetchUser.mockResolvedValue(BuildUserDetail());
+        NavigateToUser(view, TEST_USER_ID);
+        await waitFor(() => {
+            expect(ShownValues()).toEqual(FetchedValues(TEST_USER_ID));
+        });
+        await ExpectIdle();
+        expect(mockFetchUser).toHaveBeenCalledTimes(3);
+        expect(mockFetchUser).toHaveBeenLastCalledWith(TEST_USER_ID, UserFetchScreen.DELETE);
+    });
+});
+
 describe("COUSR03C first entry from COADM01C (no user selected)", () => {
     it("COUSR03C opened from COADM01C fetches nothing and puts the cursor on USRIDIN", () => {
         RenderScreen();
@@ -496,6 +612,42 @@ describe("COUSR03C PF5 delete (DELETE-USER-INFO)", () => {
         await ExpectAlert(TYPED_DELETED_MESSAGE, "success");
         expect(mockDeleteUser).toHaveBeenCalledWith(TYPED_USER_ID);
         expect(mockFetchUser).not.toHaveBeenCalled();
+    });
+});
+
+// The 3270 keyboard locks from send to response, so nothing keyed meanwhile reaches USRIDIN.
+describe("COUSR03C USRIDIN keyboard lock while a call runs", () => {
+    it.each(SCREEN_CALLS)("COUSR03C locks USRIDIN until the %s call answers", async (call) => {
+        const settleCall = DeferCall(call);
+        const user = await RenderWithTypedId(TEST_USER_ID);
+        await PressFunction(user, CALL_KEYS[call], "key");
+        const userIdInput = screen.getByLabelText(USER_ID_LABEL);
+        expect(userIdInput).toHaveAttribute("readonly");
+        await TypeOverUserId(user, OTHER_USER_ID);
+        expect(userIdInput).toHaveValue(TEST_USER_ID);
+        await act(async () => {
+            settleCall();
+        });
+        await ExpectIdle();
+        expect(userIdInput).not.toHaveAttribute("readonly");
+    });
+});
+
+describe("COUSR03C PF5 after keys typed while FetchUser ran", () => {
+    it("COUSR03C shows the fetched user beside its own ID and PF5 deletes that user", async () => {
+        const settleFetch = DeferCall("fetch");
+        const user = await RenderWithTypedId(TEST_USER_ID);
+        await PressFunction(user, "ENTER", "key");
+        await TypeOverUserId(user, OTHER_USER_ID);
+        await act(async () => {
+            settleFetch();
+        });
+        await ExpectAlert(PRESS_PF5_MESSAGE, "info");
+        expect(ShownValues()).toEqual(FetchedValues(TEST_USER_ID));
+        await PressFunction(user, "F5", "key");
+        await ExpectAlert(DELETED_MESSAGE, "success");
+        expect(mockDeleteUser).toHaveBeenCalledTimes(1);
+        expect(mockDeleteUser).toHaveBeenCalledWith(TEST_USER_ID);
     });
 });
 

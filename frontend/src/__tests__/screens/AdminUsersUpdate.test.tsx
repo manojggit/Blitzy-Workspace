@@ -5,7 +5,7 @@
 // backend/app/services/users/cousr02c.py; the user API module is mocked, so every server outcome
 // is a resolved or a rejected call.
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
@@ -78,6 +78,9 @@ const mockUpdateUser = jest.mocked(UpdateUser);
 
 interface ScreenView {
     user: UserEvent;
+    // Renders the page again under the current mockSearchParams, as the App Router does on a
+    // same-route push or a history step that changes the query.
+    Rerender: () => void;
 }
 
 // A PF key of the COUSR02 legend: its KeyboardEvent.key and its button's accessible name.
@@ -111,11 +114,16 @@ const EDITED_LAST_NAME = "van Dyke";
 // Built at run time, so no password value is typed into the code (MK_Modernization Rule).
 const NEW_PASSWORD = "pw" + "new1";
 const BLANK_USER_ID = " ";
+// A second user COUSR00C can select, with details unlike the first user's.
+const OTHER_USER_ID = "TESTUSR2";
+const OTHER_FIRST_NAME = "Other";
+const OTHER_LAST_NAME = "Person";
 
 // COUSR02C literals, verbatim.
 const PRESS_PF5_MESSAGE = "Press PF5 key to save your updates ...";
 const NO_CHANGE_MESSAGE = "Please modify to update ...";
 const UPDATED_MESSAGE = "User TESTUSR1 has been updated ...";
+const OTHER_UPDATED_MESSAGE = "User TESTUSR2 has been updated ...";
 const USER_ID_EMPTY_MESSAGE = "User ID can NOT be empty...";
 const FIRST_NAME_EMPTY_MESSAGE = "First Name can NOT be empty...";
 const USER_NOT_FOUND_MESSAGE = "User ID NOT found...";
@@ -207,6 +215,18 @@ const BLANK_REQUEST: UserUpdateRequest = {
     user_type: "",
 };
 
+// The second user's record as fetched, and saved untouched.
+const OTHER_USER_DETAIL: Partial<UserDetailResponse> = {
+    user_id: OTHER_USER_ID,
+    first_name: OTHER_FIRST_NAME,
+    last_name: OTHER_LAST_NAME,
+};
+const OTHER_UNEDITED_REQUEST: UserUpdateRequest = {
+    ...UNEDITED_REQUEST,
+    first_name: OTHER_FIRST_NAME,
+    last_name: OTHER_LAST_NAME,
+};
+
 // UserDetailResponse carries no password or hash, so neither does the fixture.
 function BuildUserDetail(overrides: Partial<UserDetailResponse> = {}): UserDetailResponse {
     return {
@@ -267,14 +287,35 @@ function ArrangeSaveOutcome(literal: string, status: number): void {
     mockUpdateUser.mockRejectedValue(LegacyRejection(literal, status));
 }
 
-function RenderScreen(): ScreenView {
-    const user = userEvent.setup();
-    render(
+function ScreenTree() {
+    return (
         <ThemeProvider theme={CARD_DEMO_THEME}>
             <AdminUsersUpdatePage />
-        </ThemeProvider>,
+        </ThemeProvider>
     );
-    return { user };
+}
+
+function RenderScreen(): ScreenView {
+    const user = userEvent.setup();
+    const { rerender } = render(<ScreenTree />);
+    return { user, Rerender: () => rerender(<ScreenTree />) };
+}
+
+// A FetchUser call that stays in flight until the returned function settles it.
+function DeferFetchUser(): (response: UserDetailResponse) => void {
+    let settle: (response: UserDetailResponse) => void = () => undefined;
+    mockFetchUser.mockReturnValueOnce(
+        new Promise<UserDetailResponse>((resolve) => {
+            settle = resolve;
+        }),
+    );
+    return (response) => settle(response);
+}
+
+// A same-route push or history step to the given userId query.
+function NavigateToUser(view: ScreenView, userId: string): void {
+    mockSearchParams = new URLSearchParams({ userId });
+    view.Rerender();
 }
 
 // The screen is idle once the LinearProgress shown while a call runs is gone.
@@ -292,6 +333,14 @@ async function RenderFromList(): Promise<ScreenView> {
     await screen.findByDisplayValue(FETCHED_LAST_NAME);
     await WaitForIdle();
     return view;
+}
+
+// COUSR00C selects the second user while this screen is shown, on the same route.
+async function SwitchToOtherUser(view: ScreenView): Promise<void> {
+    mockFetchUser.mockResolvedValue(BuildUserDetail(OTHER_USER_DETAIL));
+    NavigateToUser(view, OTHER_USER_ID);
+    await screen.findByDisplayValue(OTHER_LAST_NAME);
+    await WaitForIdle();
 }
 
 // The identity normalizer: the default one trims and collapses blanks a literal keeps.
@@ -376,6 +425,14 @@ describe("COUSR02C BMS COUSR02 content", () => {
         expect(FieldInput(label)).toHaveAttribute("maxlength", String(length));
         expect(FieldInput(label)).toHaveValue("");
     });
+
+    // The design-system mapping gives every password field (COSGN00, COUSR01, COUSR02) one token.
+    it("COUSR02 PASSWD is a password input with the current-password autocomplete token", () => {
+        RenderScreen();
+        expect(FieldInput(PASSWORD_LABEL)).toHaveAttribute("type", "password");
+        expect(FieldInput(PASSWORD_LABEL)).toHaveAttribute("autocomplete", "current-password");
+        expect(FieldInput(PASSWORD_LABEL)).toHaveValue("");
+    });
 });
 
 describe("COUSR02C BMS COUSR02 hints and PF legend", () => {
@@ -408,6 +465,51 @@ describe("COUSR02C first entry from COUSR00C", () => {
         expect(FieldInput(USER_TYPE_LABEL)).toHaveValue(FETCHED_USER_TYPE);
         expect(FieldInput(PASSWORD_LABEL)).toHaveValue("");
         expect(FieldInput(USER_ID_LABEL)).toHaveFocus();
+    });
+});
+
+// Every arrival with another CDEMO-CU02-USR-SELECTED is a fresh first entry, as every XCTL is.
+describe("COUSR02C same-route push that selects another user", () => {
+    it("COUSR02C fetches the newly selected user and PF5 saves that user", async () => {
+        const view = await RenderFromList();
+        await SwitchToOtherUser(view);
+        expect(mockFetchUser).toHaveBeenLastCalledWith(OTHER_USER_ID, UserFetchScreen.UPDATE);
+        expect(FieldInput(USER_ID_LABEL)).toHaveValue(OTHER_USER_ID);
+        expect(FieldInput(FIRST_NAME_LABEL)).toHaveValue(OTHER_FIRST_NAME);
+        mockUpdateUser.mockResolvedValue(BuildSaveResponse(OTHER_UPDATED_MESSAGE));
+        await Trigger(view, SAVE_ACTION, "key");
+        await ExpectAlert(OTHER_UPDATED_MESSAGE, "success");
+        expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+        expect(mockUpdateUser).toHaveBeenCalledWith(OTHER_USER_ID, OTHER_UNEDITED_REQUEST);
+    });
+});
+
+describe("COUSR02C late answer for the user selected before a same-route push", () => {
+    it("COUSR02C discards the previous user's answer that arrives after the switch", async () => {
+        mockSearchParams = new URLSearchParams({ userId: TEST_USER_ID });
+        const settleFirstFetch = DeferFetchUser();
+        const view = RenderScreen();
+        await SwitchToOtherUser(view);
+        await act(async () => {
+            settleFirstFetch(BuildUserDetail());
+        });
+        expect(FieldInput(USER_ID_LABEL)).toHaveValue(OTHER_USER_ID);
+        expect(FieldInput(LAST_NAME_LABEL)).toHaveValue(OTHER_LAST_NAME);
+        expect(screen.queryByRole("progressbar")).toBeNull();
+    });
+});
+
+describe("COUSR02C history step back to the previously selected user", () => {
+    it("COUSR02C re-enters and fetches the first user again on a history step back", async () => {
+        const view = await RenderFromList();
+        await SwitchToOtherUser(view);
+        mockFetchUser.mockResolvedValue(BuildUserDetail());
+        NavigateToUser(view, TEST_USER_ID);
+        await screen.findByDisplayValue(FETCHED_LAST_NAME);
+        await WaitForIdle();
+        expect(mockFetchUser).toHaveBeenCalledTimes(3);
+        expect(mockFetchUser).toHaveBeenLastCalledWith(TEST_USER_ID, UserFetchScreen.UPDATE);
+        expect(FieldInput(USER_ID_LABEL)).toHaveValue(TEST_USER_ID);
     });
 });
 

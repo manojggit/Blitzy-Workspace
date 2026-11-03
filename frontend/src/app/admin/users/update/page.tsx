@@ -127,21 +127,28 @@ interface FeedbackLineProps {
     feedback: ScreenFeedbackState;
 }
 
+interface UserUpdateScreenProps {
+    selectedUserId: string | null;
+}
+
 // USRIDIN sits above the map's row of asterisks; the user details sit below it.
 const KEY_FIELD_DEFINITIONS: readonly FieldDefinition[] = [
     { name: "user_id", label: "Enter User ID:", maxLength: 8, autoComplete: "off" },
 ];
-// The fields hold another user's record, so the browser never autofills them. The stored
-// password is a bcrypt hash, so PASSWD is never prefilled; left blank it keeps the stored one.
+// The name and type fields hold another user's record, so the browser never autofills them.
+// The stored password is a bcrypt hash, so PASSWD is never prefilled; left blank it keeps the
+// stored one.
 const DETAIL_FIELD_DEFINITIONS: readonly FieldDefinition[] = [
     { name: "first_name", label: "First Name:", maxLength: 20, autoComplete: "off" },
     { name: "last_name", label: "Last Name:", maxLength: 20, autoComplete: "off" },
+    // The autocomplete token is the one the design-system mapping gives every password field
+    // (COSGN00, COUSR01, COUSR02).
     {
         name: "password",
         label: "Password:",
         maxLength: 8,
         type: "password",
-        autoComplete: "new-password",
+        autoComplete: "current-password",
         helperText: "(8 Char)",
     },
     {
@@ -399,9 +406,8 @@ function useCursorFocus(feedback: ScreenFeedbackState, fieldRefs: FieldRefs): vo
     }, [feedback, fieldRefs]);
 }
 
-function useUserUpdate(): UserUpdateModel {
+function useUserUpdate(userId: string | null): UserUpdateModel {
     const router = useRouter();
-    const userId = useSearchParams().get(USER_ID_QUERY_KEY);
     const [values, setValues] = useState<UserFieldValues>(() => InitialValues(userId));
     const [feedback, setFeedback] = useState<ScreenFeedbackState>(EMPTY_FEEDBACK);
     const [isBusy, setIsBusy] = useState(false);
@@ -476,8 +482,8 @@ function FeedbackLine({ feedback }: FeedbackLineProps) {
     );
 }
 
-function UserUpdateScreen() {
-    const model = useUserUpdate();
+function UserUpdateScreen({ selectedUserId }: UserUpdateScreenProps) {
+    const model = useUserUpdate(selectedUserId);
     const keys = BuildFunctionKeys(model.context, model.isBusy);
     useFunctionKeys(keys);
     return (
@@ -494,11 +500,19 @@ function UserUpdateScreen() {
     );
 }
 
+// Each arrival with another selected user is a fresh COUSR02C first entry, as every XCTL is, so
+// the screen state starts over whenever the userId query parameter changes. An answer still in
+// flight for the previous user lands on the discarded screen and never reaches the new one.
+function UserUpdateEntry() {
+    const selectedUserId = useSearchParams().get(USER_ID_QUERY_KEY);
+    return <UserUpdateScreen key={selectedUserId ?? ""} selectedUserId={selectedUserId} />;
+}
+
 // useSearchParams needs a Suspense boundary, or the static build cannot prerender the route.
 export default function AdminUsersUpdatePage() {
     return (
         <Suspense fallback={null}>
-            <UserUpdateScreen />
+            <UserUpdateEntry />
         </Suspense>
     );
 }

@@ -36,11 +36,14 @@ CARD_LIST_PAGE_SIZE = 7
 
 
 class CardListQuery(QueryModel):
-    """Query of ``GET /cards``: the COCRDLI filters and paging keys read by COCRDLIC (CCLI).
+    """Query of ``GET /cards``: the COCRDLI filters, paging keys and row selection codes read by
+    COCRDLIC (CCLI).
 
-    The filters are raw screen text, so the COCRDLIC edits
-    ``ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER`` and
-    ``CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER`` stay reachable.
+    The filters and codes are raw screen text, so the COCRDLIC edits
+    ``ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER``,
+    ``CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER``,
+    ``PLEASE SELECT ONLY ONE RECORD TO VIEW OR UPDATE`` and ``INVALID ACTION CODE`` stay
+    reachable on ENTER, F7 and F8 alike.
     """
 
     acct_id: ScreenText(11) = Field(
@@ -76,6 +79,18 @@ class CardListQuery(QueryModel):
         ge=0,
         alias="page",
         description="The page number shown, replacing the COMMAREA WS-CA-SCREEN-NUM counter.",
+    )
+    selections: list[ScreenText(1)] = Field(
+        default_factory=list,
+        max_length=CARD_LIST_PAGE_SIZE,
+        alias="selections",
+        description=(
+            "The CRDSEL1-7 code of each row shown, in row order and as keyed (blank for an "
+            "untouched row), sent as one repeated selections parameter per row; at most 7. "
+            "More than one S or U, or any other non-blank code, is a 400 carrying the "
+            "redisplayed rows, page keys and page. A single S or U never transfers here: only "
+            "POST /cards/selection opens the card view or update."
+        ),
     )
 
 

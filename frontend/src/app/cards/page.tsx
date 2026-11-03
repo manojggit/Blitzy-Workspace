@@ -154,11 +154,13 @@ const NO_MESSAGES: ScreenMessages = {
     cursorField: "",
 };
 
-// A refused selection redisplays rows and page keys; a refused filter carries neither.
+// A refused selection redisplays rows and page keys, and on GET /cards the page number after the
+// redisplay; a refused filter carries none of them.
 interface CardListErrorBody extends LegacyErrorResponse {
     rows?: CardListRow[];
     first_key?: string;
     last_key?: string;
+    page?: number;
 }
 
 interface ScreenSetters {
@@ -167,10 +169,25 @@ interface ScreenSetters {
     setIsBusy: Dispatch<SetStateAction<boolean>>;
 }
 
-interface ScreenContext {
+// Each screen call takes a ticket. Only the latest ticket, while the page is mounted, may change
+// the screen, navigate or end the busy state, so a slower earlier response never replaces a
+// newer page or its keys.
+interface RequestGate {
+    Begin: () => number;
+    IsCurrent: (ticket: number) => boolean;
+}
+
+interface ScreenCalls {
+    setters: ScreenSetters;
+    gate: RequestGate;
+}
+
+// What a settled call does to the screen, applied only when its ticket is still current.
+type ScreenUpdate = () => void;
+
+interface ScreenContext extends ScreenCalls {
     filters: CardFilterTexts;
     list: ListState;
-    setters: ScreenSetters;
     router: AppRouter;
 }
 
@@ -195,8 +212,9 @@ function MessagesFrom(feedback: ScreenFeedback): ScreenMessages {
     };
 }
 
-// A new page clears every selection code, as 1200-SCREEN-ARRAY-INIT shows a fresh page.
-function ListStateFrom(response: CardListResponse): ListState {
+// A new page keeps each selection code on its row position, as 1200-SCREEN-ARRAY-INIT moves
+// WS-EDIT-SELECT(n) to CRDSELnO of every row it sends; rows the new page lacks drop their codes.
+function ListStateFrom(response: CardListResponse, selectionCodes: readonly string[]): ListState {
     return {
         rows: response.rows,
         pageState: {
@@ -204,18 +222,23 @@ function ListStateFrom(response: CardListResponse): ListState {
             first_key: response.first_key,
             last_key: response.last_key,
         },
-        selectionCodes: [],
+        selectionCodes: selectionCodes.slice(0, response.rows.length),
     };
 }
 
-// The page number is unchanged by a refused selection, so the body carries none.
+// A GET /cards refusal carries the page shown after its redisplay; a POST /cards/selection
+// refusal carries none, so the page shown is kept.
 function RedisplayedListState(current: ListState, body: CardListErrorBody): ListState {
     if (body.rows === undefined) {
         return current;
     }
     return {
         rows: body.rows,
-        pageState: { ...current.pageState, first_key: body.first_key, last_key: body.last_key },
+        pageState: {
+            page: body.page ?? current.pageState?.page,
+            first_key: body.first_key,
+            last_key: body.last_key,
+        },
         selectionCodes: current.selectionCodes.slice(0, body.rows.length),
     };
 }
@@ -268,17 +291,26 @@ function SelectionRowsFor(list: ListState, fieldErrors: readonly string[]): Sele
     }));
 }
 
+// The CRDSELn code of every row shown, in row order, blank where none was keyed.
+function RowSelectionCodes(list: ListState): string[] {
+    return list.rows.map((_row, index) => list.selectionCodes[index] ?? BLANK_CODE);
+}
+
 // ENTER and F7 re-read from the first card shown, F8 from the last; each echoes the page number.
-// The keys are opaque server tokens, absent before the first page arrives.
+// The keys are opaque server tokens, absent before the first page arrives. Once any row holds a
+// code, every row's code goes too, so the server refuses more than one selection or an invalid
+// code before paging; all-blank codes are left out, as the server reads them as blank fields.
 function ListQuery(context: ScreenContext, direction?: Direction): CardListQuery {
-    const pageState = context.list.pageState;
+    const { list, filters } = context;
+    const pageState = list.pageState;
     const startKey = direction === Direction.FORWARD ? pageState?.last_key : pageState?.first_key;
     return {
-        acctId: context.filters.acct_id,
-        cardNum: context.filters.card_num,
+        acctId: filters.acct_id,
+        cardNum: filters.card_num,
         startKey,
         direction,
         page: pageState?.page,
+        selections: HasSelection(list) ? RowSelectionCodes(list) : undefined,
     };
 }
 
@@ -290,8 +322,12 @@ function CardRoute(action: CardSelectionAction, cardRef: string, acctId: string)
 }
 
 function ApplyListResponse(setters: ScreenSetters, response: CardListResponse): void {
-    setters.setList(ListStateFrom(response));
+    setters.setList((current) => ListStateFrom(response, current.selectionCodes));
     setters.setMessages(MessagesFrom(response));
+}
+
+function ListUpdate(setters: ScreenSetters, response: CardListResponse): ScreenUpdate {
+    return () => ApplyListResponse(setters, response);
 }
 
 // A legacy outcome keeps the rows shown unless its body redisplays them; a 500, a network
@@ -308,35 +344,53 @@ function ApplyCallFailure(setters: ScreenSetters, error: AxiosError): void {
 
 // The 401 and 403 redirects belong to the API client interceptor. Anything other than an axios
 // error is a defect and propagates.
-async function RunScreenCall(setters: ScreenSetters, call: () => Promise<void>): Promise<void> {
-    setters.setIsBusy(true);
+async function SettleScreenRequest(
+    setters: ScreenSetters,
+    request: () => Promise<ScreenUpdate>,
+): Promise<ScreenUpdate> {
     try {
-        await call();
+        return await request();
     } catch (error) {
         if (axios.isAxiosError(error)) {
-            ApplyCallFailure(setters, error);
-        } else {
-            throw error;
+            return () => ApplyCallFailure(setters, error);
+        }
+        throw error;
+    }
+}
+
+// The keys stay disabled until the latest call settles; a superseded or unmounted call's
+// outcome is dropped.
+async function RunScreenCall(
+    calls: ScreenCalls,
+    request: () => Promise<ScreenUpdate>,
+): Promise<void> {
+    const ticket = calls.gate.Begin();
+    calls.setters.setIsBusy(true);
+    try {
+        const update = await SettleScreenRequest(calls.setters, request);
+        if (calls.gate.IsCurrent(ticket)) {
+            update();
         }
     } finally {
-        setters.setIsBusy(false);
+        if (calls.gate.IsCurrent(ticket)) {
+            calls.setters.setIsBusy(false);
+        }
     }
 }
 
 function ReadPage(context: ScreenContext, query: CardListQuery): Promise<void> {
-    return RunScreenCall(context.setters, async () => {
-        ApplyListResponse(context.setters, await ListCards(query));
-    });
+    return RunScreenCall(context, async () => ListUpdate(context.setters, await ListCards(query)));
 }
 
 // A pending message is shown at once and kept when the first page brings no message of its own.
-async function LoadFirstPage(setters: ScreenSetters, pendingMessage: string): Promise<void> {
+async function LoadFirstPage(calls: ScreenCalls, pendingMessage: string): Promise<void> {
     if (pendingMessage !== "") {
-        setters.setMessages(MessagesFrom({ message: pendingMessage }));
+        calls.setters.setMessages(MessagesFrom({ message: pendingMessage }));
     }
-    await RunScreenCall(setters, async () => {
+    await RunScreenCall(calls, async () => {
         const response = await ListCards(FIRST_ENTRY_QUERY);
-        ApplyListResponse(setters, { ...response, message: response.message || pendingMessage });
+        const message = response.message || pendingMessage;
+        return ListUpdate(calls.setters, { ...response, message });
     });
 }
 
@@ -345,21 +399,21 @@ async function LoadFirstPage(setters: ScreenSetters, pendingMessage: string): Pr
 async function FollowSelection(
     context: ScreenContext,
     response: CardSelectionResponse,
-): Promise<void> {
+): Promise<ScreenUpdate> {
     if (response.action === null) {
-        ApplyListResponse(context.setters, await ListCards(ListQuery(context)));
-        return;
+        return ListUpdate(context.setters, await ListCards(ListQuery(context)));
     }
     const acctId = SelectedRow(context.list)?.acct_id ?? "";
-    context.router.push(CardRoute(response.action, response.card_ref, acctId));
+    const route = CardRoute(response.action, response.card_ref, acctId);
+    return () => context.router.push(route);
 }
 
 function SubmitSelection(context: ScreenContext): Promise<void> {
     const rows = BuildSelectionRows(context.list);
     const { acct_id, card_num } = context.filters;
-    return RunScreenCall(context.setters, async () => {
-        await FollowSelection(context, await SelectCards({ acct_id, card_num, rows }));
-    });
+    return RunScreenCall(context, async () =>
+        FollowSelection(context, await SelectCards({ acct_id, card_num, rows })),
+    );
 }
 
 // The filters travel as keyed: the server runs every filter edit and returns its literal.
@@ -431,6 +485,7 @@ interface ScreenState {
     messages: ScreenMessages;
     isBusy: boolean;
     setters: ScreenSetters;
+    gate: RequestGate;
 }
 
 interface CursorRefs {
@@ -456,13 +511,38 @@ interface CardListScreenModel {
 
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
+
+// Both values are refs, which survive React Strict Mode's simulated unmount and remount; its
+// cleanup and re-run leave the page marked mounted, and a real unmount clears the mark.
+function useRequestGate(): RequestGate {
+    const latestTicketRef = useRef(0);
+    const isMountedRef = useRef(false);
+    useEffect(() => {
+        isMountedRef.current = true;
+        return () => {
+            isMountedRef.current = false;
+        };
+    }, []);
+    return useMemo<RequestGate>(
+        () => ({
+            Begin: () => {
+                latestTicketRef.current += 1;
+                return latestTicketRef.current;
+            },
+            IsCurrent: (ticket) => isMountedRef.current && ticket === latestTicketRef.current,
+        }),
+        [],
+    );
+}
+
 function useScreenState(): ScreenState {
     const [filters, setFilters] = useState<CardFilterTexts>(EMPTY_FILTERS);
     const [list, setList] = useState<ListState>(EMPTY_LIST);
     const [messages, setMessages] = useState<ScreenMessages>(NO_MESSAGES);
     const [isBusy, setIsBusy] = useState(false);
     const setters = useMemo<ScreenSetters>(() => ({ setList, setMessages, setIsBusy }), []);
-    return { filters, setFilters, list, messages, isBusy, setters };
+    const gate = useRequestGate();
+    return { filters, setFilters, list, messages, isBusy, setters, gate };
 }
 
 // Every response moves the cursor, even to the field it already names, so the effect follows
@@ -493,26 +573,31 @@ function useFilterHandlers(
     );
 }
 
-// The pending message is taken once, so React's development remount of the effect still shows it.
-function useFirstPageLoad(setters: ScreenSetters): void {
-    const pendingMessageRef = useRef<string | null>(null);
+// The first page is read once per page instance: the ref survives React's development remount,
+// whose re-run of the effect neither takes the pending message again nor starts a second read.
+function useFirstPageLoad(setters: ScreenSetters, gate: RequestGate): void {
+    const hasStartedRef = useRef(false);
     useEffect(() => {
-        if (pendingMessageRef.current === null) {
-            pendingMessageRef.current = TakePendingMessage();
+        if (hasStartedRef.current) {
+            return;
         }
-        void LoadFirstPage(setters, pendingMessageRef.current);
-    }, [setters]);
+        hasStartedRef.current = true;
+        void LoadFirstPage({ setters, gate }, TakePendingMessage());
+    }, [setters, gate]);
 }
 
 function useScreenContext(state: ScreenState): ScreenContext {
     const router = useRouter();
-    const { filters, list, setters } = state;
-    return useMemo(() => ({ filters, list, setters, router }), [filters, list, setters, router]);
+    const { filters, list, setters, gate } = state;
+    return useMemo(
+        () => ({ filters, list, setters, gate, router }),
+        [filters, list, setters, gate, router],
+    );
 }
 
 function useCardListScreen(): CardListScreenModel {
     const state = useScreenState();
-    const { setters, isBusy } = state;
+    const { setters, gate, isBusy } = state;
     const { fieldInputsRef, tableRef } = useCursorFocus(state.messages);
     const filterHandlers = useFilterHandlers(state.setFilters, fieldInputsRef);
     const context = useScreenContext(state);
@@ -523,7 +608,7 @@ function useCardListScreen(): CardListScreenModel {
         [setters],
     );
     useFunctionKeys(keys);
-    useFirstPageLoad(setters);
+    useFirstPageLoad(setters, gate);
     const { filters, list, messages } = state;
     return { filters, list, messages, isBusy, keys, filterHandlers, tableRef, onSelectionChange };
 }
@@ -600,7 +685,8 @@ function CardFilterFields({ filters, fieldErrors, handlers }: CardFilterFieldsPr
     );
 }
 
-// Only the masked card number is ever shown; the full number never reaches this page.
+// List rows carry only the masked card number and an opaque card_ref token; the full number on
+// this page is the card filter as the user keyed it.
 function CardListTable({ list, fieldErrors, tableRef, onSelectionChange }: CardListTableProps) {
     return (
         <Box ref={tableRef}>

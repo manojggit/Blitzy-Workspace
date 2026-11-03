@@ -2,10 +2,10 @@
 // The literals are copied verbatim from backend/app/services/cards/cocrdlic.py, which ports
 // cbl/COCRDLIC.cbl lines 903, 908, 1022, 1058, 1086, 1112, 1219, 1239 and 1244.
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AxiosError, AxiosHeaders, type AxiosResponse } from "axios";
-import type { ReactNode } from "react";
+import { StrictMode, type ReactNode } from "react";
 
 import CardListPage from "@/app/cards/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
@@ -113,6 +113,11 @@ const CARD_NUM_FIELD = "card_num";
 const FIRST_KEY = "first-key-token";
 const LAST_KEY = "last-key-token";
 const SHOWN_PAGE = 2;
+// The page F8 reads after SHOWN_PAGE, holding cards 8 to 14.
+const NEXT_PAGE = 3;
+const NEXT_PAGE_FIRST_ROW = 8;
+// The page a GET /cards refusal reports after its redisplay, distinct from SHOWN_PAGE.
+const REDISPLAYED_PAGE = 1;
 const SELECTED_ROW = 3;
 const SELECTED_CARD_REF = "card-ref-3";
 const SELECTED_ACCT_ID = "00000000003";
@@ -139,11 +144,13 @@ const SEVERITY_CLASSES: Readonly<Record<MessageSeverity, string>> = {
 
 const KEY_TRIGGERS: readonly KeyTrigger[] = ["click", "key"];
 
-// A refused selection redisplays rows and page keys beside the legacy feedback.
+// A refused selection redisplays rows and page keys beside the legacy feedback, and on GET /cards
+// the page number after the redisplay.
 interface CardListErrorBody extends LegacyErrorResponse {
     rows?: CardListRow[];
     first_key?: string;
     last_key?: string;
+    page?: number;
 }
 
 // Row n of the shown page: its card_ref token, an 11-digit account and a masked card number.
@@ -157,8 +164,10 @@ function BuildListRow(rowNumber: number): CardListRow {
     };
 }
 
-function BuildListRows(rowCount: number): CardListRow[] {
-    return Array.from({ length: rowCount }, (_unused, index) => BuildListRow(index + 1));
+function BuildListRows(rowCount: number, firstRowNumber = 1): CardListRow[] {
+    return Array.from({ length: rowCount }, (_unused, index) =>
+        BuildListRow(firstRowNumber + index),
+    );
 }
 
 function BuildListResponse(overrides: Partial<CardListResponse> = {}): CardListResponse {
@@ -210,13 +219,31 @@ async function WaitForIdle(): Promise<void> {
     });
 }
 
-async function RenderScreen(): Promise<UserSession> {
+interface RenderedPage {
+    user: UserSession;
+    Unmount: () => void;
+}
+
+// next.config.ts sets reactStrictMode, so the development page renders inside StrictMode.
+function RenderPage(isStrictMode: boolean): RenderedPage {
     const user = userEvent.setup();
-    render(
+    const page = (
         <ThemeProvider theme={CARD_DEMO_THEME}>
             <CardListPage />
-        </ThemeProvider>,
+        </ThemeProvider>
     );
+    const { unmount } = render(isStrictMode ? <StrictMode>{page}</StrictMode> : page);
+    return { user, Unmount: unmount };
+}
+
+// Settles a call the test held pending, then waits for the screen to unlock its keys.
+async function AnswerPendingCall<T>(pending: PromiseWithResolvers<T>, answer: T): Promise<void> {
+    await act(async () => pending.resolve(answer));
+    await WaitForIdle();
+}
+
+async function RenderScreen(): Promise<UserSession> {
+    const { user } = RenderPage(false);
     await WaitForIdle();
     return user;
 }
@@ -234,6 +261,16 @@ function FilterInput(label: string): HTMLInputElement {
 
 function SelectionField(rowNumber: number): HTMLElement {
     return screen.getByRole("combobox", { name: SelectionLabelFor(rowNumber) });
+}
+
+// The code each shown row holds: the value of the Select's native input, blank when none.
+function SelectionCodesShown(): string[] {
+    return BodyRows().map(
+        (_row, index) =>
+            SelectionField(index + 1)
+                .closest(".MuiInputBase-root")
+                ?.querySelector<HTMLInputElement>("input")?.value ?? "",
+    );
 }
 
 function BodyRows(): HTMLElement[] {
@@ -626,4 +663,156 @@ describe("COCRDLIC filter field errors on /cards", () => {
         expect(FilterInput(CARD_FILTER_LABEL)).toHaveAttribute("aria-invalid", "true");
         expect(FilterInput(ACCOUNT_FILTER_LABEL)).toHaveFocus();
     });
+});
+
+function NextPageResponse(rowCount: number): CardListResponse {
+    return BuildListResponse({
+        page: NEXT_PAGE,
+        rows: BuildListRows(rowCount, NEXT_PAGE_FIRST_ROW),
+    });
+}
+
+describe("COCRDLIC first page under React Strict Mode on /cards", () => {
+    it("COCRDLIC reads the first page once, and the F8 page that follows stays shown", async () => {
+        const firstPage = Promise.withResolvers<CardListResponse>();
+        const nextPage = Promise.withResolvers<CardListResponse>();
+        mockListCards.mockReturnValueOnce(firstPage.promise).mockReturnValueOnce(nextPage.promise);
+        const { user } = RenderPage(true);
+        expect(mockListCards).toHaveBeenCalledTimes(1);
+        await AnswerPendingCall(firstPage, BuildListResponse());
+        await user.click(screen.getByRole("button", { name: KEY_BUTTON_NAMES.F8 }));
+        await AnswerPendingCall(nextPage, NextPageResponse(PAGE_SIZE));
+        expect(mockListCards).toHaveBeenCalledTimes(2);
+        expect(screen.getByText(`Page ${NEXT_PAGE}`)).toBeVisible();
+        const nextRows = NextPageResponse(PAGE_SIZE).rows;
+        expect(CardNumbersShown()).toEqual(nextRows.map((row) => row.card_num_masked));
+    });
+});
+
+describe("COCRDLIC first page arriving after unmount on /cards", () => {
+    it("COCRDLIC a first page arriving after unmount applies nothing and raises nothing", async () => {
+        const consoleError = jest.spyOn(console, "error");
+        const firstPage = Promise.withResolvers<CardListResponse>();
+        mockListCards.mockReturnValueOnce(firstPage.promise);
+        const { Unmount } = RenderPage(false);
+        Unmount();
+        await AnswerPendingCall(firstPage, BuildListResponse());
+        expect(mockListCards).toHaveBeenCalledTimes(1);
+        expect(consoleError).not.toHaveBeenCalled();
+        expect(screen.queryAllByRole("row")).toEqual([]);
+        consoleError.mockRestore();
+    });
+});
+
+describe("COCRDLIC selection answer arriving after unmount on /cards", () => {
+    it("COCRDLIC a selection answer arriving after unmount does not navigate", async () => {
+        const selection = Promise.withResolvers<CardSelectionResponse>();
+        mockSelectCards.mockReturnValueOnce(selection.promise);
+        const { user, Unmount } = RenderPage(false);
+        await WaitForIdle();
+        await ChooseSelection(user, SELECTED_ROW, "S");
+        await user.click(screen.getByRole("button", { name: KEY_BUTTON_NAMES.Enter }));
+        Unmount();
+        await AnswerPendingCall(selection, BuildSelectionResponse("view"));
+        expect(mockSelectCards).toHaveBeenCalledTimes(1);
+        expect(mockRouterPush).not.toHaveBeenCalled();
+    });
+});
+
+interface PagingRefusalCase {
+    key: Extract<ScreenKey, "F7" | "F8">;
+    startKey: string;
+    direction: Direction;
+    literal: string;
+}
+
+// The server overrides the selection literal with NO PREVIOUS PAGES TO DISPLAY for F7 on page 1.
+const PAGING_REFUSAL_CASES: readonly PagingRefusalCase[] = [
+    { key: "F8", startKey: LAST_KEY, direction: Direction.FORWARD, literal: MULTI_SELECT_MESSAGE },
+    { key: "F7", startKey: FIRST_KEY, direction: Direction.BACKWARD, literal: NO_PREVIOUS_MESSAGE },
+];
+
+// S on row 2 and U on row 4, as SELECTION_LITERAL_CASES refuses them on ENTER.
+const TWO_SELECTIONS: readonly (readonly [number, string])[] = [
+    [2, "S"],
+    [4, "U"],
+];
+const TWO_SELECTION_CODES = ["", "S", "", "U", "", "", ""];
+
+function PagingRefusalBody(literal: string): CardListErrorBody {
+    const literalCase = { literal, selections: TWO_SELECTIONS, flaggedRows: [2, 4], cursorRow: 2 };
+    return { ...SelectionRefusalBody(literalCase), page: REDISPLAYED_PAGE };
+}
+
+// The shown page's key and number, the filters as keyed and the seven positional codes.
+function PagingRefusalQuery({ startKey, direction }: PagingRefusalCase): CardListQuery {
+    return {
+        acctId: "",
+        cardNum: "",
+        startKey,
+        direction,
+        page: SHOWN_PAGE,
+        selections: TWO_SELECTION_CODES,
+    };
+}
+
+async function ChooseSelections(
+    user: UserSession,
+    selections: readonly (readonly [number, string])[],
+): Promise<void> {
+    for (const [rowNumber, code] of selections) {
+        await ChooseSelection(user, rowNumber, code);
+    }
+}
+
+describe("COCRDLIC selection codes on the paging keys on /cards", () => {
+    it.each(PAGING_REFUSAL_CASES)(
+        "COCRDLIC $key sends every row code and shows the refused $literal",
+        async (refusalCase) => {
+            const user = await RenderScreen();
+            await ChooseSelections(user, TWO_SELECTIONS);
+            const body = PagingRefusalBody(refusalCase.literal);
+            mockListCards.mockRejectedValueOnce(BuildAxiosError(HTTP_BAD_REQUEST, body));
+            await PressScreenKey(user, refusalCase.key, "click");
+            expect(mockListCards).toHaveBeenLastCalledWith(PagingRefusalQuery(refusalCase));
+            expect(mockSelectCards).not.toHaveBeenCalled();
+            await ExpectAlert(refusalCase.literal, ERRMSG_SEVERITY);
+            expect(FlaggedRowNumbers()).toEqual([2, 4]);
+            expect(SelectionField(2)).toHaveFocus();
+            expect(screen.getByText(`Page ${REDISPLAYED_PAGE}`)).toBeVisible();
+            expect(mockRouterPush).not.toHaveBeenCalled();
+        },
+    );
+});
+
+interface CodeCarryCase {
+    rowCount: number;
+    expectedCodes: readonly string[];
+}
+
+// S on SELECTED_ROW (row 3) of the seven rows shown, blank elsewhere.
+const SELECTED_ROW_CODES = ["", "", "S", "", "", "", ""];
+
+// 1200-SCREEN-ARRAY-INIT moves WS-EDIT-SELECT(n) to every row sent, so a code stays on its row
+// position; a shorter page has no row 3 to carry it.
+const CODE_CARRY_CASES: readonly CodeCarryCase[] = [
+    { rowCount: PAGE_SIZE, expectedCodes: SELECTED_ROW_CODES },
+    { rowCount: 2, expectedCodes: ["", ""] },
+];
+
+describe("COCRDLIC single selection code on F8 on /cards", () => {
+    it.each(CODE_CARRY_CASES)(
+        "COCRDLIC S then F8 to a $rowCount-row page shows codes $expectedCodes",
+        async ({ rowCount, expectedCodes }) => {
+            const user = await RenderScreen();
+            await ChooseSelection(user, SELECTED_ROW, "S");
+            mockListCards.mockResolvedValueOnce(NextPageResponse(rowCount));
+            await PressScreenKey(user, "F8", "click");
+            expect(mockListCards.mock.lastCall?.[0].selections).toEqual(SELECTED_ROW_CODES);
+            expect(mockSelectCards).not.toHaveBeenCalled();
+            expect(screen.getByText(`Page ${NEXT_PAGE}`)).toBeVisible();
+            expect(SelectionCodesShown()).toEqual(expectedCodes);
+            expect(mockRouterPush).not.toHaveBeenCalled();
+        },
+    );
 });

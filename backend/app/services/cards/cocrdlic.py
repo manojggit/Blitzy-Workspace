@@ -7,7 +7,11 @@ Paging contract, replacing WS-THIS-PROGCOMMAREA: every list response carries ``p
 opaque ``first_key`` and ``last_key``, which both hold the COMMAREA paging state (first and last
 card keys, CA-NEXT-PAGE-IND, CA-LAST-PAGE-DISPLAYED). ENTER sends ``startKey=first_key`` with no
 ``direction``, F7 ``first_key`` with ``backward``, F8 ``last_key`` with ``forward``; each echoes
-``page``. A missing, expired or foreign key is a fresh entry on page 1.
+``page`` and the rows' CRDSEL1-7 codes as ``selections``. A missing, expired or foreign key is a
+fresh entry on page 1. 2250-EDIT-ARRAY edits the codes after the filters and before any paging:
+more than one S or U, or an invalid code, redisplays the list from the lowest key as a 400
+carrying the rows, both page keys and ``page``. A single S or U on ``GET /cards`` never
+transfers; only ``POST /cards/selection`` returns the view or update action.
 
 Pinned: the program header promises admins all cards, but the code only filters, so every user
 lists alike (ported unchanged). The Style B reset of the COMMAREA user type to U (line 320) is
@@ -196,6 +200,14 @@ class ListRequest:
 
     keyPressed: str
     state: ListState
+
+
+# POST /cards/selection carries no COMMAREA paging state and no page number (WS-CA-SCREEN-NUM),
+# so its selection-error redisplay reads as a first entry: ENTER on page 1, where the page-1 test
+# of NO RECORDS FOUND (line 1241) holds.
+SELECTION_ENTRY_REQUEST = ListRequest(
+    KEY_ENTER, ListState(cursor=FRESH_CURSOR, pageNumber=FIRST_PAGE)
+)
 
 
 @dataclass(frozen=True)
@@ -520,12 +532,22 @@ def BuildListResponse(state: ListState, settings: "Settings") -> CardListRespons
 async def ListCards(context: OnlineContext, query: CardListQuery) -> CardListResponse:
     """Port of the CCLI ENTER, F7 and F8 paths: 2200-EDIT-INPUTS, 0000-MAIN, 1000-SEND-MAP.
 
-    Raises 400 for a filter edit failure and 503 for a CARDDAT file condition. Admin and
-    regular users list alike: the header's admin all-cards mode does not exist in the code.
+    The filters are edited first, then the rows' selection codes (2250-EDIT-ARRAY), because
+    WHEN INPUT-ERROR precedes every paging arm (lines 419-438). A selection error raises the
+    400 of the redisplay, with ``page``. A single S or U pages like a blank code: the XCTL arms
+    test CCARD-AID-ENTER, and this route never transfers. Raises 400 for a filter edit failure
+    and 503 for a CARDDAT file condition. Admin and regular users list alike: the header's admin
+    all-cards mode does not exist in the code.
     """
     edit = EditFilters(query.acct_id, query.card_num)
     RaiseFilterError(edit)
     request = ResolveListRequest(query, context.settings)
+    selection = EditSelections(query.selections)
+    if selection.message:
+        state = await RedisplayAfterSelectionError(
+            context, edit.Filters(), request, selection.message
+        )
+        raise SelectionError(state, selection, context.settings, withPage=True)
     state = await ReadListPage(context, edit.Filters(), request)
     return BuildListResponse(ApplyListMessages(state, request.keyPressed), context.settings)
 
@@ -568,27 +590,29 @@ def SelectionCursorField(flaggedRows: Sequence[int]) -> str:
 
 
 async def RedisplayAfterSelectionError(
-    context: OnlineContext, filters: CardFilters, message: str
+    context: OnlineContext, filters: CardFilters, request: ListRequest, message: str
 ) -> ListState:
     """Port of the WHEN INPUT-ERROR redisplay (lines 419-438) after a selection error.
 
     9000-READ-FORWARD starts from the lowest key, because this path never moves a card key to
-    the INITIALIZEd WS-CARD-RID-CARDNUM (ported unchanged). The selection literal is already set,
-    so ``NO MORE RECORDS TO SHOW`` does not replace it.
+    the INITIALIZEd WS-CARD-RID-CARDNUM (ported unchanged), with the page number and paging
+    flags of ``request``; a row read on page 0 makes it page 1. The selection literal is already
+    set, so ``NO MORE RECORDS TO SHOW`` does not replace it. 1400-SETUP-MESSAGE then runs with
+    the key pressed: F7 on page 1 overrides the literal with ``NO PREVIOUS PAGES TO DISPLAY``.
     """
-    # The selection request carries no page number (WS-CA-SCREEN-NUM), so the page-1 test of
-    # NO RECORDS FOUND (line 1241) is evaluated as page 1, the page of every first entry.
-    state = ListState(cursor=FRESH_CURSOR, pageNumber=FIRST_PAGE, message=message)
+    state = replace(request.state, message=message)
     readState = await ReadForward(context, filters, state, FRESH_CURSOR.firstCardKey)
-    return ApplyListMessages(readState, KEY_ENTER)
+    return ApplyListMessages(readState, request.keyPressed)
 
 
 def SelectionError(
-    state: ListState, selection: SelectionEdit, settings: "Settings"
+    state: ListState, selection: SelectionEdit, settings: "Settings", *, withPage: bool = False
 ) -> LegacyMessageError:
     """Return the 400 of a selection error, carrying the redisplayed rows and page keys.
 
-    The page number is unchanged by this path, so it is not returned.
+    ``withPage`` adds the page number after the redisplay's read, as 1100-SCREEN-INIT shows it
+    in PAGENO: ``GET /cards`` echoes a page, while ``POST /cards/selection`` carries none and
+    its client keeps the page it shows.
     """
     pageKey = EncodePageKey(state.cursor, settings)
     extraBody = {
@@ -596,6 +620,8 @@ def SelectionError(
         "first_key": pageKey,
         "last_key": pageKey,
     }
+    if withPage:
+        extraBody["page"] = state.pageNumber
     return LegacyMessageError(
         state.message,
         field=SelectionCursorField(selection.flaggedRows),
@@ -633,15 +659,19 @@ async def ProcessCardSelection(
     """Port of the CCLI ENTER path with selection codes: 2200-EDIT-INPUTS, then 0000-MAIN.
 
     The filters are edited first and a filter error skips 2250-EDIT-ARRAY (lines 1075-1077).
-    A selection error raises 400 with the redisplayed rows. One S or U returns ``view`` or
-    ``update`` with a fresh ``card_ref``. No selection returns no action: the WHEN OTHER
-    re-read, which the client makes with ``GET /cards`` and ``startKey=first_key``.
+    A selection error raises 400 with the rows redisplayed as a first entry on page 1, and no
+    ``page`` in the body. One S or U returns ``view`` or ``update`` with a fresh ``card_ref``:
+    this is the only transfer, as ``GET /cards`` never transfers. No selection returns no
+    action: the WHEN OTHER re-read, which the client makes with ``GET /cards`` and
+    ``startKey=first_key``.
     """
     edit = EditFilters(request.acct_id, request.card_num)
     RaiseFilterError(edit)
     selection = EditSelections(tuple(row.selection for row in request.rows))
     if selection.message:
-        state = await RedisplayAfterSelectionError(context, edit.Filters(), selection.message)
+        state = await RedisplayAfterSelectionError(
+            context, edit.Filters(), SELECTION_ENTRY_REQUEST, selection.message
+        )
         raise SelectionError(state, selection, context.settings)
     if selection.selectedIndex is None:
         return CardSelectionResponse(action=None, card_ref="", cursor_field=ACCT_ID_FIELD)

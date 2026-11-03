@@ -111,6 +111,7 @@ interface UserDetailFieldsProps {
     onUserIdChange: (userIdText: string) => void;
     fieldErrors: readonly string[];
     fieldRefs: FieldRefs;
+    isBusy: boolean;
 }
 
 interface FieldGridProps extends UserDetailFieldsProps {
@@ -123,6 +124,12 @@ interface UserDetailFieldProps {
     isError: boolean;
     inputRef: RefObject<HTMLInputElement | null>;
     onUserIdChange: (userIdText: string) => void;
+    isBusy: boolean;
+}
+
+interface UserDeleteScreenProps {
+    selectedUserId: string;
+    cameFromList: boolean;
 }
 
 const USER_ID_FIELD: UserDeleteFieldName = "user_id";
@@ -377,10 +384,7 @@ function useCursorFocus(feedback: FeedbackState, fieldRefs: FieldRefs): void {
     }, [feedback, fieldRefs]);
 }
 
-function useUserDelete(): UserDeleteScreenModel {
-    const searchParams = useSearchParams();
-    const selectedUserId = searchParams.get(USER_ID_QUERY_KEY) ?? "";
-    const cameFromList = searchParams.has(USER_ID_QUERY_KEY);
+function useUserDelete(selectedUserId: string, cameFromList: boolean): UserDeleteScreenModel {
     const state = useDeleteScreenState(selectedUserId);
     const context = useDeleteScreenContext(state);
     const actions = useUserDeleteActions(context, state.values.user_id, cameFromList);
@@ -390,10 +394,12 @@ function useUserDelete(): UserDeleteScreenModel {
 }
 
 // The BMS LENGTH, and the attribute byte: ASKIP fields are read-only but stay focusable, so the
-// cursor can rest on FNAME after a file error.
-function FieldSlotProps(definition: FieldDefinition) {
+// cursor can rest on FNAME after a file error. USRIDIN also refuses keystrokes while a fetch or
+// delete runs, as the 3270 keyboard locks from send to response, so the details shown always
+// belong to the user ID that was sent.
+function FieldSlotProps(definition: FieldDefinition, isBusy: boolean) {
     return {
-        input: { readOnly: !definition.isEditable },
+        input: { readOnly: !definition.isEditable || isBusy },
         htmlInput: { maxLength: definition.maxLength },
     };
 }
@@ -421,7 +427,7 @@ function UserDetailField(props: UserDetailFieldProps) {
             autoComplete="off"
             inputRef={props.inputRef}
             fullWidth
-            slotProps={FieldSlotProps(definition)}
+            slotProps={FieldSlotProps(definition, props.isBusy)}
         />
     );
 }
@@ -437,6 +443,7 @@ function FieldGrid(props: FieldGridProps) {
                         isError={props.fieldErrors.includes(definition.name)}
                         inputRef={props.fieldRefs[definition.name]}
                         onUserIdChange={props.onUserIdChange}
+                        isBusy={props.isBusy}
                     />
                 </Grid>
             ))}
@@ -455,8 +462,8 @@ function UserDetailFields(props: UserDetailFieldsProps) {
     );
 }
 
-function UserDeleteScreen() {
-    const screen = useUserDelete();
+function UserDeleteScreen(props: UserDeleteScreenProps) {
+    const screen = useUserDelete(props.selectedUserId, props.cameFromList);
     const keys = BuildFunctionKeys(screen.actions, screen.isBusy);
     useFunctionKeys(keys);
     return (
@@ -466,6 +473,7 @@ function UserDeleteScreen() {
                 onUserIdChange={screen.onUserIdChange}
                 fieldErrors={screen.feedback.fieldErrors}
                 fieldRefs={screen.fieldRefs}
+                isBusy={screen.isBusy}
             />
             <MessageLine {...MessageLinePropsOf(screen.feedback)} />
             <FunctionKeyBar keys={keys} />
@@ -473,11 +481,26 @@ function UserDeleteScreen() {
     );
 }
 
+// Each arrival with another selected user is a fresh COUSR03C first entry, as every XCTL is, so
+// the screen state starts over whenever the userId query parameter changes. An answer still in
+// flight for the previous user lands on the discarded screen and never reaches the new one.
+function UserDeleteEntry() {
+    const searchParams = useSearchParams();
+    const selectedUserId = searchParams.get(USER_ID_QUERY_KEY) ?? "";
+    return (
+        <UserDeleteScreen
+            key={selectedUserId}
+            selectedUserId={selectedUserId}
+            cameFromList={searchParams.has(USER_ID_QUERY_KEY)}
+        />
+    );
+}
+
 // useSearchParams needs a Suspense boundary, or the static prerender of the route fails.
 export default function AdminUsersDeletePage() {
     return (
         <Suspense fallback={null}>
-            <UserDeleteScreen />
+            <UserDeleteEntry />
         </Suspense>
     );
 }
