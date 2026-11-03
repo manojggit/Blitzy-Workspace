@@ -489,12 +489,37 @@ describe("COACTVWC COACTVW map content on /accounts/view", () => {
     it("COACTVWC shows the Address: caption over ACSADL1 and ACSADL2", ShowsAddressCaption);
 });
 
+const GROUP_LABEL = "Account Group:";
+
+// MUI InputLabel marks a label raised above its value with data-shrink="true".
+function ExpectLabelRaised(label: string): void {
+    expect(FieldByLabel(label).labels?.[0]).toHaveAttribute("data-shrink", "true");
+}
+
+// ACCT-GROUP-ID is blank in every seed account: its label stays above the empty value, as every
+// other label stays above its value, instead of standing where the value goes.
+async function RaisesBlankGroupLabel(): Promise<void> {
+    await RenderPrefilledScreen(BuildAccountView({ group_id: "" }));
+    expect(FieldByLabel(GROUP_LABEL)).toHaveValue("");
+    for (const [label] of DISPLAY_FIELD_CASES) {
+        ExpectLabelRaised(label);
+    }
+}
+
 describe("COACTVWC COACTVW display fields on /accounts/view", () => {
     it.each(DISPLAY_FIELD_CASES)("COACTVWC first entry shows %p empty and read-only", (label) => {
         RenderScreen();
         expect(FieldByLabel(label)).toHaveValue("");
         expect(FieldByLabel(label)).toHaveAttribute("readonly");
     });
+    it.each(DISPLAY_FIELD_CASES)("COACTVWC first entry raises %p over its empty value", (label) => {
+        RenderScreen();
+        ExpectLabelRaised(label);
+    });
+    it(
+        "COACTVWC a blank ACCT-GROUP-ID keeps its label raised like the others",
+        RaisesBlankGroupLabel,
+    );
 });
 
 describe("COACTVWC acctId prefill on /accounts/view?acctId=", () => {
@@ -507,6 +532,87 @@ describe("COACTVWC acctId prefill on /accounts/view?acctId=", () => {
         await ExpectAlert(INFO_PROMPT, "info");
         expect(screen.queryByTestId("message-line-error")).toBeNull();
     });
+});
+
+// One arrival on the page: its description and the query it carries.
+interface EntryCase {
+    entry: string;
+    query: string;
+}
+
+interface PendingEntryCase extends EntryCase {
+    infoLine: string;
+    expectedAlerts: readonly string[];
+}
+
+// The arrivals that send no lookup: the page treats an empty acctId as none.
+const FIRST_ENTRY_CASES: readonly EntryCase[] = [
+    { entry: "from the menu", query: "" },
+    { entry: "with an empty ?acctId=", query: "acctId=" },
+];
+
+// Only an arrival that sends no lookup shows the first-entry prompt beside the refusal; a lookup
+// in flight leaves INFOMSG blank until it answers.
+const PENDING_ENTRY_CASES: readonly PendingEntryCase[] = [
+    {
+        entry: "from the menu",
+        query: "",
+        infoLine: "WS-PROMPT-FOR-INPUT",
+        expectedAlerts: [PENDING_REFUSAL, INFO_PROMPT],
+    },
+    {
+        entry: "with ?acctId= in flight",
+        query: `acctId=${TEST_ACCOUNT_ID}`,
+        infoLine: "no information line",
+        expectedAlerts: [PENDING_REFUSAL],
+    },
+];
+
+// 1200-SETUP-SCREEN-VARS sets WS-PROMPT-FOR-INPUT on the first entry, before any key.
+function ShowsFirstEntryPrompt({ query }: EntryCase): void {
+    mockSearchParams = new URLSearchParams(query);
+    RenderScreen();
+    expect(AlertTexts()).toEqual([INFO_PROMPT]);
+    expect(screen.getByRole("status").textContent).toBe(INFO_PROMPT);
+    expect(screen.getByRole("status")).toHaveClass(SEVERITY_CLASSES.info);
+    expect(AccountIdInput()).toHaveFocus();
+    expect(mockViewAccount).not.toHaveBeenCalled();
+}
+
+async function ShowsPendingRefusalOnEntry(entryCase: PendingEntryCase): Promise<void> {
+    mockViewAccount.mockImplementation(PendingUntilAborted);
+    StorePendingMessage(PENDING_REFUSAL);
+    mockSearchParams = new URLSearchParams(entryCase.query);
+    RenderScreen();
+    await ExpectAlert(PENDING_REFUSAL, "error");
+    expect(AlertTexts()).toEqual(entryCase.expectedAlerts);
+}
+
+// The server's information line is the first one an arrival with an account number shows.
+async function ShowsNoPromptUntilLookupAnswers(): Promise<void> {
+    const answerLookup = HoldNextLookup();
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    RenderPage();
+    await waitFor(() => expect(mockViewAccount).toHaveBeenCalledTimes(1));
+    expect(AlertTexts()).toEqual([]);
+    await answerLookup(BuildAccountView());
+    await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance);
+    expect(AlertTexts()).toEqual([INFO_PROMPT]);
+}
+
+describe("COACTVWC first-entry information line on /accounts/view", () => {
+    it.each(FIRST_ENTRY_CASES)(
+        "COACTVWC first entry $entry shows WS-PROMPT-FOR-INPUT before any key",
+        ShowsFirstEntryPrompt,
+    );
+    it.each(PENDING_ENTRY_CASES)(
+        "COACTVWC entry $entry shows the pending refusal in red with $infoLine",
+        ShowsPendingRefusalOnEntry,
+    );
+    it(
+        "COACTVWC entry with ?acctId= shows no information line until the lookup answers",
+        ShowsNoPromptUntilLookupAnswers,
+    );
 });
 
 describe("COACTVWC customer display rules on /accounts/view", () => {
@@ -610,6 +716,33 @@ describe("COACTVWC 401 on /accounts/view", () => {
     });
 });
 
+// The MessageLine ERRMSG element id, which an input the server names in error references.
+const ERRMSG_ID = "message-line-errmsg";
+
+// A rejected ENTER whose body names ACCTSID: the keys typed into ACCTSID, ending with ENTER, and
+// the literal the 400 answers them with.
+const ACCOUNT_ID_ERROR_CASES: readonly (readonly [string, string])[] = [
+    ["{Enter}", NO_INPUT_MESSAGE],
+    ["ABC{Enter}", ACCOUNT_FILTER_MESSAGE],
+];
+
+// ACCTSID has no description until an answer names it, then references the ERRMSG line holding
+// the literal; the next answer, which names no field, drops the reference again.
+async function TiesAccountIdErrorToMessageLine(keys: string, literal: string): Promise<void> {
+    const body = BuildErrorBody({ message: literal });
+    mockViewAccount.mockRejectedValueOnce(BuildAxiosError(HTTP_BAD_REQUEST, body));
+    const user = RenderScreen();
+    expect(AccountIdInput()).not.toHaveAttribute("aria-describedby");
+    await user.type(AccountIdInput(), keys);
+    await ExpectAlert(literal, "error");
+    expect(AccountIdInput()).toHaveAttribute("aria-describedby", ERRMSG_ID);
+    expect(document.getElementById(ERRMSG_ID)?.textContent).toBe(literal);
+    mockViewAccount.mockResolvedValueOnce(BuildAccountView());
+    await ClickButton(user, SEARCH_BUTTON_NAME);
+    await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance);
+    expect(AccountIdInput()).not.toHaveAttribute("aria-describedby");
+}
+
 describe("COACTVWC ACCTSID field error and cursor on /accounts/view", () => {
     it("COACTVWC non-numeric filter marks ACCTSID invalid and returns the cursor", async () => {
         const body = BuildErrorBody({ message: ACCOUNT_FILTER_MESSAGE });
@@ -623,6 +756,10 @@ describe("COACTVWC ACCTSID field error and cursor on /accounts/view", () => {
         expect(AccountIdInput()).toHaveFocus();
         expect(AccountIdInput()).toHaveValue("ABC");
     });
+    it.each(ACCOUNT_ID_ERROR_CASES)(
+        "COACTVWC ACCTSID keyed %p references the ERRMSG line holding %p",
+        TiesAccountIdErrorToMessageLine,
+    );
 });
 
 // Leaving the page aborts the lookup in flight; its rejection then reaches no screen and no log.
@@ -715,6 +852,7 @@ async function StrictModeShowsPendingMessage(): Promise<void> {
     StorePendingMessage(PENDING_REFUSAL);
     RenderPage(true);
     await ExpectAlert(PENDING_REFUSAL, "error");
+    expect(AlertTexts()).toEqual([PENDING_REFUSAL, INFO_PROMPT]);
     expect(window.sessionStorage.getItem(PENDING_MESSAGE_KEY)).toBeNull();
     expect(mockViewAccount).not.toHaveBeenCalled();
 }
@@ -826,14 +964,15 @@ async function ReplacesScreenOnNewAcctId(): Promise<void> {
     ]);
 }
 
-// Dropping ?acctId= is a fresh entry from the menu: the empty map, no message and no lookup.
+// Dropping ?acctId= is a fresh entry from the menu: the empty map, only the first-entry prompt
+// and no lookup.
 async function StartsFreshEntryWithoutAcctId(): Promise<void> {
     const navigate = await RenderShownAccountRoute(BuildAccountView());
     navigate(new URLSearchParams());
     expect(AccountIdInput()).toHaveValue("");
     expect(AccountIdInput()).toHaveFocus();
     ExpectEveryDisplayFieldBlank();
-    expect(AlertTexts()).toEqual([]);
+    expect(AlertTexts()).toEqual([INFO_PROMPT]);
     await SettleRejections();
     expect(mockViewAccount).toHaveBeenCalledTimes(1);
     expect(SearchButton()).toBeEnabled();

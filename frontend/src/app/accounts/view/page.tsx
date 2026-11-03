@@ -16,7 +16,7 @@ import {
 } from "react";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { ViewAccount, type AccountViewResponse } from "@/lib/api/accounts";
 import {
@@ -46,6 +46,9 @@ const ACCOUNT_ID_FIELD = "acct_id";
 const ACCOUNT_ID_QUERY_KEY = "acctId";
 // A blank ACCTSID still reaches COACTVWC, whose key edit answers it with "No input received".
 const BLANK_ACCOUNT_ID = " ";
+// WS-PROMPT-FOR-INPUT, which 1200-SETUP-SCREEN-VARS shows on COACTVWC's first entry. An entry
+// without an account number sends no request, so the page shows the literal itself.
+const FIRST_ENTRY_INFO_MESSAGE = "Enter or update id of account to display";
 const MENU_ROUTE = "/menu";
 const SEARCH_KEY_LABEL = "Search";
 const EXIT_KEY_LABEL = "Exit";
@@ -180,6 +183,16 @@ const EMPTY_FEEDBACK: ScreenMessages = {
 
 const INITIAL_VIEW: ViewState = { account: null, feedback: EMPTY_FEEDBACK, isBusy: false };
 
+// An entry with an account number shows no information line until its lookup answers.
+function EntryInfoMessage(initialAcctId: string): string {
+    return initialAcctId === "" ? FIRST_ENTRY_INFO_MESSAGE : "";
+}
+
+function InitialViewFor(initialAcctId: string): ViewState {
+    const feedback = { ...EMPTY_FEEDBACK, infoMessage: EntryInfoMessage(initialAcctId) };
+    return { ...INITIAL_VIEW, feedback };
+}
+
 // The server's lines verbatim. CAVW only reads, so no outcome is a completed write.
 function FeedbackFrom(source: ScreenFeedback, isError: boolean): ScreenMessages {
     return {
@@ -249,11 +262,16 @@ async function RunSearch(
     }
 }
 
-// A refusal message carried across the navigation shows until the first response replaces it.
-function ShowPendingMessage(updateView: ViewUpdater): void {
+// A refusal message carried across the navigation shows, beside the entry's information line,
+// until the first response replaces both.
+function ShowPendingMessage(initialAcctId: string, updateView: ViewUpdater): void {
     const pendingMessage = TakePendingMessage();
     if (pendingMessage !== "") {
-        updateView({ feedback: FeedbackFrom({ message: pendingMessage }, true) });
+        const pendingFeedback = {
+            message: pendingMessage,
+            info_message: EntryInfoMessage(initialAcctId),
+        };
+        updateView({ feedback: FeedbackFrom(pendingFeedback, true) });
     }
 }
 
@@ -295,7 +313,7 @@ function useInitialScreen(
     useEffect(() => {
         if (!hasShownMessageRef.current) {
             hasShownMessageRef.current = true;
-            ShowPendingMessage(updateView);
+            ShowPendingMessage(initialAcctId, updateView);
         }
         if (initialAcctId !== "") {
             startLookup(initialAcctId);
@@ -322,7 +340,7 @@ function useCursorFocus(
 function useAccountViewScreen(): AccountViewScreenState {
     const initialAcctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY) ?? "";
     const [acctText, setAcctText] = useState(initialAcctId);
-    const [view, setView] = useState<ViewState>(INITIAL_VIEW);
+    const [view, setView] = useState<ViewState>(() => InitialViewFor(initialAcctId));
     const inputRef = useRef<HTMLInputElement>(null);
     const updateView = useCallback<ViewUpdater>(
         (update) => setView((current) => ({ ...current, ...update })),
@@ -348,7 +366,8 @@ function BuildFunctionKeys(
     ];
 }
 
-// Filled and read-only, as the map's protected fields are, yet focusable and labelled.
+// Filled and read-only, as the map's protected fields are, yet focusable and labelled. The label
+// stays raised, so a blank value shows as an empty field under it.
 function ReadOnlyField({ definition, value }: ReadOnlyFieldProps) {
     return (
         <TextField
@@ -357,7 +376,7 @@ function ReadOnlyField({ definition, value }: ReadOnlyFieldProps) {
             value={value}
             variant="filled"
             fullWidth
-            slotProps={{ input: { readOnly: true } }}
+            slotProps={{ input: { readOnly: true }, inputLabel: { shrink: true } }}
         />
     );
 }
@@ -378,9 +397,16 @@ function FieldCells({ definitions, account }: FieldCellsProps) {
     );
 }
 
+// The BMS LENGTH and, while the server names ACCTSID in error, its tie to the ERRMSG line that
+// holds the literal.
+function AccountIdHtmlInputProps(hasError: boolean) {
+    return { maxLength: ACCOUNT_ID_MAX_LENGTH, ...ErrorMessageReference(hasError) };
+}
+
 // ACCTSID, the map's only unprotected field. Its text is never trimmed, padded or checked here:
 // COACTVWC's key edit runs on the server.
 function AccountIdInput({ screen }: ScreenProps) {
+    const hasError = screen.feedback.fieldErrors.includes(ACCOUNT_ID_FIELD);
     return (
         <Grid size={HALF_ROW}>
             <TextField
@@ -389,9 +415,9 @@ function AccountIdInput({ screen }: ScreenProps) {
                 value={screen.acctText}
                 onChange={(event) => screen.SetAcctText(event.target.value)}
                 inputRef={screen.inputRef}
-                error={screen.feedback.fieldErrors.includes(ACCOUNT_ID_FIELD)}
+                error={hasError}
                 fullWidth
-                slotProps={{ htmlInput: { maxLength: ACCOUNT_ID_MAX_LENGTH } }}
+                slotProps={{ htmlInput: AccountIdHtmlInputProps(hasError) }}
             />
         </Grid>
     );

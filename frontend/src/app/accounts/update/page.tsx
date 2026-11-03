@@ -3,7 +3,15 @@
 // CSDAT01Y, CSMSG01Y
 "use client";
 
-import { Grid, Stack, TextField, Typography, type TextFieldProps } from "@mui/material";
+import {
+    Grid,
+    Stack,
+    TextField,
+    Typography,
+    type SxProps,
+    type TextFieldProps,
+    type Theme,
+} from "@mui/material";
 import axios from "axios";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -20,7 +28,7 @@ import {
 } from "react";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     FetchAccountForEdit,
@@ -71,11 +79,13 @@ interface SectionDefinitions {
 type ThreePartNames = readonly [AccountFieldName, AccountFieldName, AccountFieldName];
 
 // What the COMMAREA kept between two CAUP tasks: the ACUP-CHANGE-ACTION state, the encrypted
-// screen_token the server sends back unchanged, and the map fields as last shown or keyed.
+// screen_token the server sends back unchanged, the map fields as keyed, and the map fields as
+// the server last sent them.
 interface ScreenModel {
     state: UpdateScreenState;
     screenToken: string | null;
     fields: AccountScreenFields;
+    shownFields: AccountScreenFields;
 }
 
 // The ERRMSG and INFOMSG lines and the CSSETATY field attributes of the last response.
@@ -183,8 +193,13 @@ const MENU_ROUTE = "/menu";
 const ACCOUNT_ID_QUERY_KEY = "acctId";
 // A blank ACCTSID still reaches the server's key edit, which answers it.
 const BLANK_ACCOUNT_PATH = " ";
+// PROMPT-FOR-SEARCH-KEYS, which 3250-SETUP-INFOMSG shows WHEN CDEMO-PGM-ENTER. An entry without
+// ?acctId= sends no request, so the page shows the literal itself.
+const FIRST_ENTRY_INFO_MESSAGE = "Enter or update id of account to update";
 const CUSTOMER_DETAILS_HEADING = "Customer Details";
 const YES_NO_HELPER_TEXT = "Y/N";
+// Each input's id, so its helper text has an id that a field in error can reference.
+const FIELD_ID_PREFIX = "account-update-";
 
 const ACCOUNT_ID_FIELD: AccountFieldName = "acct_id";
 
@@ -196,6 +211,10 @@ const EDITABLE_FIELD_KEY = "editable";
 const PROTECTED_FIELD_KEY = "protected";
 // The parts of one map field sit side by side, as on the 3270, and stack on narrow viewports.
 const GROUP_DIRECTION = { xs: "column", sm: "row" } as const;
+// A group's inputs sit below its caption, so a section holding a group aligns each row by its
+// bottom edge, which keeps a single field level with the group's inputs. A section without a
+// group keeps the top edge, where a Y/N field's helper text hangs below its input.
+const GROUP_ROW_STYLE: SxProps<Theme> = { alignItems: "flex-end" };
 
 // The DFHMDF ACCTSID ... ACSPFLG inputs before any detail is fetched: all blank.
 const EMPTY_FIELDS: Readonly<AccountScreenFields> = Object.freeze({
@@ -376,6 +395,7 @@ const INITIAL_MODEL: ScreenModel = {
     state: UpdateScreenState.DETAILS_NOT_FETCHED,
     screenToken: null,
     fields: EMPTY_FIELDS,
+    shownFields: EMPTY_FIELDS,
 };
 
 // The BMS IC attribute: the cursor starts on ACCTSID.
@@ -386,6 +406,12 @@ const INITIAL_FEEDBACK: ScreenFeedbackView = {
     fieldErrors: [],
     cursorField: ACCOUNT_ID_FIELD,
 };
+
+// An entry with ?acctId= shows no information line until its fetch answers.
+function EntryFeedback(acctId: string | null): ScreenFeedbackView {
+    const infoMessage = acctId === null ? FIRST_ENTRY_INFO_MESSAGE : "";
+    return { ...INITIAL_FEEDBACK, infoMessage };
+}
 
 function IsAccountFieldName(name: string): name is AccountFieldName {
     return Object.hasOwn(EMPTY_FIELDS, name);
@@ -401,7 +427,7 @@ function EditableFieldsFor(
 }
 
 // A protected 3270 field returns nothing on RECEIVE MAP; the server takes its value from the
-// screen_token, so only the inputs the state leaves editable are sent, exactly as keyed.
+// screen_token, so only the inputs the state leaves editable are sent, their text unaltered.
 function PickEditableFields(
     fields: AccountScreenFields,
     state: UpdateScreenState,
@@ -434,19 +460,25 @@ function BuildFeedback(
 }
 
 function ApplyScreen(screen: AccountScreen, setters: ScreenSetters): void {
+    const shownFields = { ...EMPTY_FIELDS, ...screen.fields };
     setters.setModel({
         state: screen.state,
         screenToken: screen.screen_token,
-        fields: { ...EMPTY_FIELDS, ...screen.fields },
+        fields: shownFields,
+        shownFields,
     });
     setters.setFeedback(BuildFeedback(screen, false, screen.state));
 }
 
+// A body without fields sent no map, so the keyed and the shown fields both stay.
 function AdoptErrorScreen(model: ScreenModel, body: AccountErrorBody): ScreenModel {
+    const shownFields =
+        body.fields === undefined ? model.shownFields : { ...EMPTY_FIELDS, ...body.fields };
     return {
         state: body.state ?? model.state,
         screenToken: body.screen_token ?? model.screenToken,
-        fields: body.fields === undefined ? model.fields : { ...EMPTY_FIELDS, ...body.fields },
+        fields: body.fields === undefined ? model.fields : shownFields,
+        shownFields,
     };
 }
 
@@ -474,26 +506,39 @@ async function RunAccountRequest(request: AccountRequest, setters: ScreenSetters
     }
 }
 
-function ShowPendingMessage(setters: ScreenSetters): void {
+// A refusal message carried across the navigation shows, beside the entry's information line,
+// until the first response replaces both.
+function ShowPendingMessage(setters: ScreenSetters, acctId: string | null): void {
     const pendingMessage = TakePendingMessage();
     if (pendingMessage === "") {
         return;
     }
     setters.setFeedback({
-        ...INITIAL_FEEDBACK,
+        ...EntryFeedback(acctId),
         message: pendingMessage,
         severity: SeverityForOutcome({ isError: true, isCompletedWrite: false }),
     });
 }
 
+// Once details are fetched, F12 is the COACTUPC 2000-DECIDE-ACTION PFK12 re-read, which discards
+// the keyed edits, so its key and fields are those the server last showed, and an edit the
+// request model rejects never blocks it. Before the fetch, NormaliseAction processes F12 as ENTER
+// on the typed key, so it sends the fields as keyed, as ENTER and F5 always do.
+function FieldsSentBy(action: UpdateAction, model: ScreenModel): AccountScreenFields {
+    const isDiscardingCancel =
+        action === UpdateAction.CANCEL && model.state !== UpdateScreenState.DETAILS_NOT_FETCHED;
+    return isDiscardingCancel ? model.shownFields : model.fields;
+}
+
 // ENTER, F5 and F12 on COACTUP: the server's state machine decides what each key does.
 function HandleAction(action: UpdateAction, context: ActionContext): void {
     const { model, runRequest } = context;
-    const accountKey = model.fields.acct_id || BLANK_ACCOUNT_PATH;
+    const sentFields = FieldsSentBy(action, model);
+    const accountKey = sentFields.acct_id || BLANK_ACCOUNT_PATH;
     const request: AccountUpdateRequest = {
         action,
         screen_token: model.screenToken ?? "",
-        fields: PickEditableFields(model.fields, model.state),
+        fields: PickEditableFields(sentFields, model.state),
     };
     runRequest(() => UpdateAccount(accountKey, request));
 }
@@ -546,9 +591,9 @@ function EndBusyState(inFlight: InFlightRequest, setters: ScreenSetters): void {
 
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
-function useScreenStore(): ScreenStore {
+function useScreenStore(acctId: string | null): ScreenStore {
     const [model, setModel] = useState<ScreenModel>(INITIAL_MODEL);
-    const [feedback, setFeedback] = useState<ScreenFeedbackView>(INITIAL_FEEDBACK);
+    const [feedback, setFeedback] = useState<ScreenFeedbackView>(() => EntryFeedback(acctId));
     const [isBusy, setIsBusy] = useState(false);
     const setters = useMemo(() => ({ setModel, setFeedback, setIsBusy }), []);
     return { model, feedback, isBusy, setters };
@@ -578,14 +623,14 @@ function useRequestRunner(setters: ScreenSetters): RequestRunner {
     );
 }
 
-// Entry from the menu shows the empty key screen; entry with ?acctId= fetches that account. The
-// fetch is a read: leaving the page or a new ?acctId= aborts it, so Strict Mode's repeated mount
-// effect fetches again. The returned function aborts it for F3, as the page stays mounted until
-// the next route has loaded.
+// Entry from the menu shows the empty key screen and its prompt; entry with ?acctId= fetches that
+// account. The fetch is a read: leaving the page or a new ?acctId= aborts it, so Strict Mode's
+// repeated mount effect fetches again. The returned function aborts it for F3, as the page stays
+// mounted until the next route has loaded.
 function useEntryRequest(acctId: string | null, runRequest: RequestRunner, setters: ScreenSetters) {
     const controllerRef = useRef<AbortController | null>(null);
     useEffect(() => {
-        ShowPendingMessage(setters);
+        ShowPendingMessage(setters, acctId);
         const controller = new AbortController();
         controllerRef.current = controller;
         if (acctId !== null) {
@@ -664,10 +709,10 @@ function useFieldView(store: ScreenStore, registry: InputRegistry): FieldView {
 }
 
 function useAccountUpdateScreen(): AccountUpdateScreenModel {
-    const store = useScreenStore();
+    const acctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY);
+    const store = useScreenStore(acctId);
     const runRequest = useRequestRunner(store.setters);
     const registry = useInputRegistry();
-    const acctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY);
     const abortEntryFetch = useEntryRequest(acctId, runRequest, store.setters);
     useCursorFocus(store, registry.inputRefs);
     const keys = useFunctionKeyDefinitions(store, runRequest, abortEntryFetch);
@@ -675,14 +720,39 @@ function useAccountUpdateScreen(): AccountUpdateScreenModel {
     return { view, keys, isBusy: store.isBusy, feedback: store.feedback };
 }
 
-// The BMS UNPROT/ASKIP attribute: a protected field stays focusable, but cannot be changed.
+function FieldIdOf(name: AccountFieldName): string {
+    return FIELD_ID_PREFIX + name;
+}
+
+// The attributes a field takes from its BMS definition alone.
+function StaticFieldProps(
+    definition: ScreenFieldDefinition,
+): Pick<TextFieldProps, "id" | "label" | "helperText"> {
+    return {
+        id: FieldIdOf(definition.name),
+        label: definition.label,
+        helperText: definition.helperText,
+    };
+}
+
+// The BMS UNPROT/ASKIP attribute: a protected field stays focusable, but cannot be changed, and
+// its label stays raised, so a blank protected value shows as an empty field under it.
+// While the server names the field in error, its input is tied to the ERRMSG line ahead of the
+// field's hint.
 function FieldSlotProps(
     definition: ScreenFieldDefinition,
     isEditable: boolean,
+    hasError: boolean,
 ): TextFieldProps["slotProps"] {
+    const helperTextId = HelperTextIdOf(FieldIdOf(definition.name), definition.helperText);
     return {
-        htmlInput: { maxLength: definition.maxLength, inputMode: definition.inputMode },
+        htmlInput: {
+            maxLength: definition.maxLength,
+            inputMode: definition.inputMode,
+            ...ErrorMessageReference(hasError, helperTextId),
+        },
         input: { readOnly: !isEditable },
+        inputLabel: isEditable ? {} : { shrink: true },
     };
 }
 
@@ -691,20 +761,20 @@ function FieldSlotProps(
 // has focus never blurs, and MUI would keep showing the old field as focused.
 function ScreenField({ definition, view }: ScreenFieldProps) {
     const isEditable = view.editableFields.has(definition.name);
+    const hasError = view.fieldErrors.has(definition.name);
     return (
         <TextField
             key={isEditable ? EDITABLE_FIELD_KEY : PROTECTED_FIELD_KEY}
+            {...StaticFieldProps(definition)}
             fullWidth
-            label={definition.label}
             value={view.fields[definition.name]}
             variant={isEditable ? "outlined" : "filled"}
-            error={view.fieldErrors.has(definition.name)}
-            helperText={definition.helperText}
+            error={hasError}
             inputRef={(element: HTMLInputElement | null) =>
                 view.RegisterInput(definition.name, element)
             }
             onChange={(event) => view.onFieldChange(definition.name, event.target.value)}
-            slotProps={FieldSlotProps(definition, isEditable)}
+            slotProps={FieldSlotProps(definition, isEditable, hasError)}
         />
     );
 }
@@ -742,8 +812,9 @@ function EntryKey(entry: SectionEntry): string {
 }
 
 function FieldSection({ entries, view }: FieldSectionProps) {
+    const rowStyle = entries.some(IsFieldGroup) ? GROUP_ROW_STYLE : undefined;
     return (
-        <Grid container spacing={FIELD_SPACING}>
+        <Grid container spacing={FIELD_SPACING} sx={rowStyle}>
             {entries.map((entry) => (
                 <Grid key={EntryKey(entry)} size={ENTRY_GRID_SIZE}>
                     <SectionEntryField entry={entry} view={view} />

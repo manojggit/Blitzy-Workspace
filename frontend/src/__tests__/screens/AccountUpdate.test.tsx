@@ -33,7 +33,9 @@ import {
     type AccountUpdateRequest,
 } from "@/lib/api/accounts";
 import {
+    PENDING_MESSAGE_KEY,
     SIGN_ON_ROUTE,
+    StorePendingMessage,
     UpdateAction,
     UpdateScreenState,
     type LegacyErrorResponse,
@@ -1404,17 +1406,140 @@ function LabelsInputWithLength(fieldCase: FieldCase): void {
     expect(FieldInput(fieldCase)).toHaveAttribute("maxlength", String(fieldCase.maxLength));
 }
 
+// One COACTUP input and whether its grid row aligns its entries by their bottom edge.
+interface RowAlignmentCase {
+    name: AccountFieldName;
+    isEndAligned: boolean;
+}
+
+const GRID_ROW_SELECTOR = ".MuiGrid-container";
+const END_ALIGNMENT = "flex-end";
+
+// A single field beside a captioned group (Customer id | SSN, Date of birth | FICO Score,
+// Address | City, Phone 1 | Government Issued Id, Phone 2 | EFT Account Id) sits level with the
+// group's inputs only in a bottom-aligned row. The Account Number row keeps the top edge, where
+// the Active Y/N helper text hangs below its input.
+const ROW_ALIGNMENT_CASES: readonly RowAlignmentCase[] = [
+    { name: "cust_id", isEndAligned: true },
+    { name: "fico_credit_score", isEndAligned: true },
+    { name: "addr_line_3", isEndAligned: true },
+    { name: "govt_issued_id", isEndAligned: true },
+    { name: "eft_account_id", isEndAligned: true },
+    { name: "acct_id", isEndAligned: false },
+];
+
+function GridRowOf(name: AccountFieldName): Element {
+    const row = InputOf(name).closest(GRID_ROW_SELECTOR);
+    if (row === null) {
+        throw new Error(`No grid row holds COACTUP field ${name}`);
+    }
+    return row;
+}
+
+function AlignsRowOfField({ name, isEndAligned }: RowAlignmentCase): void {
+    RenderScreen();
+    expect(getComputedStyle(GridRowOf(name)).alignItems === END_ALIGNMENT).toBe(isEndAligned);
+}
+
 async function OpensFieldsOfState(editableCase: EditableByStateCase): Promise<void> {
     await RenderInState(editableCase.state);
     expect(EditableFieldNames()).toEqual(editableCase.editableNames);
 }
 
+// A state, and whether it leaves ACCT-GROUP-ID (blank in TEST_FIELDS, as in every seed account)
+// protected, so that its label is raised over the empty value. An open field's label rises only
+// on focus or input, as MUI's outlined fields do.
+interface BlankLabelCase {
+    state: UpdateScreenState;
+    isRaised: boolean;
+}
+
+const BLANK_LABEL_CASES: readonly BlankLabelCase[] = [
+    { state: UpdateScreenState.DETAILS_NOT_FETCHED, isRaised: true },
+    { state: UpdateScreenState.SHOW_DETAILS, isRaised: false },
+    { state: UpdateScreenState.CHANGES_NOT_OK, isRaised: false },
+    { state: UpdateScreenState.CHANGES_OK_NOT_CONFIRMED, isRaised: true },
+    { state: UpdateScreenState.CHANGES_DONE, isRaised: true },
+    { state: UpdateScreenState.CHANGES_FAILED, isRaised: true },
+];
+
+// MUI InputLabel marks a label raised above its value with data-shrink="true".
+async function RaisesLabelOfBlankProtectedField(labelCase: BlankLabelCase): Promise<void> {
+    await RenderInState(labelCase.state);
+    const input = InputOf("group_id");
+    expect(input).toHaveValue("");
+    expect(input).not.toHaveFocus();
+    expect(input.readOnly).toBe(labelCase.isRaised);
+    expect(input.labels?.[0]).toHaveAttribute("data-shrink", String(labelCase.isRaised));
+}
+
+// A refusal the apiClient interceptor carries across a navigation (backend ADMIN_ONLY_MESSAGE).
+const PENDING_REFUSAL = "No access - Admin Only option... ";
+// The ?acctId= values the page fetches: only a missing acctId is the empty key screen.
+const FETCHED_ENTRY_ACCOUNT_IDS: readonly string[] = [TEST_ACCOUNT_ID, ""];
+
+// One arrival with a carried refusal: its description, its query, the information line it shows
+// and the Alerts it shows.
+interface PendingEntryCase {
+    entry: string;
+    query: string;
+    infoLine: string;
+    expectedAlerts: readonly ShownAlert[];
+}
+
+// A fetch in flight leaves INFOMSG blank until it answers.
+const PENDING_ENTRY_CASES: readonly PendingEntryCase[] = [
+    {
+        entry: "from the menu",
+        query: "",
+        infoLine: "PROMPT-FOR-SEARCH-KEYS",
+        expectedAlerts: [
+            [PENDING_REFUSAL, "error"],
+            [INFO_PROMPT_FOR_SEARCH_KEYS, "info"],
+        ],
+    },
+    {
+        entry: "with ?acctId= in flight",
+        query: `acctId=${TEST_ACCOUNT_ID}`,
+        infoLine: "no information line",
+        expectedAlerts: [[PENDING_REFUSAL, "error"]],
+    },
+];
+
+// 3250-SETUP-INFOMSG WHEN CDEMO-PGM-ENTER: the first entry shows PROMPT-FOR-SEARCH-KEYS as
+// INFOMSG before any key.
 async function StartsOnEmptyKeyScreen(): Promise<void> {
     await RenderInState(UpdateScreenState.DETAILS_NOT_FETCHED);
     expect(mockFetchAccountForEdit).not.toHaveBeenCalled();
     expect(InputOf("acct_id")).toHaveValue("");
     expect(InputOf("acct_id")).toHaveFocus();
+    expect(ShownAlerts()).toEqual([[INFO_PROMPT_FOR_SEARCH_KEYS, "info"]]);
+    expect(screen.getByRole("status").textContent).toBe(INFO_PROMPT_FOR_SEARCH_KEYS);
+}
+
+// An arrival with ?acctId=, an empty one included, sends its edit fetch at once: INFOMSG stays
+// blank until the server's own line answers it.
+async function ShowsNoPromptUntilFetchAnswers(acctId: string): Promise<void> {
+    const answerFetch = HoldNextFetch();
+    mockSearchParams = new URLSearchParams({ acctId });
+    RenderScreen();
+    await waitFor(() => expect(mockFetchAccountForEdit).toHaveBeenCalledTimes(1));
+    expect(mockFetchAccountForEdit).toHaveBeenCalledWith(acctId, READ_OPTIONS);
     expect(ShownAlerts()).toEqual([]);
+    await answerFetch(BuildAccountScreen(UpdateScreenState.SHOW_DETAILS));
+    await WaitForIdle();
+    expect(ShownAlerts()).toEqual([[INFO_PROMPT_FOR_CHANGES, "info"]]);
+}
+
+// Only an arrival that sends no fetch shows the first-entry prompt beside the refusal.
+async function ShowsPendingRefusalOnEntry(entryCase: PendingEntryCase): Promise<void> {
+    mockFetchAccountForEdit.mockImplementation(PendingUntilAborted);
+    StorePendingMessage(PENDING_REFUSAL);
+    mockSearchParams = new URLSearchParams(entryCase.query);
+    RenderScreen();
+    await waitFor(() => expect(ShownAlerts()).toEqual(entryCase.expectedAlerts));
+    expect(window.sessionStorage.getItem(PENDING_MESSAGE_KEY)).toBeNull();
+    expect(InputOf("acct_id")).toHaveFocus();
 }
 
 async function FetchesAccountOfEntryKey(): Promise<void> {
@@ -1567,6 +1692,66 @@ async function MarksEveryFailingField(): Promise<void> {
     expect(InputOf("first_name")).toHaveAttribute("aria-invalid", "false");
     expect(InputOf("credit_limit")).toHaveFocus();
     ExpectAlert(MSG_CREDIT_LIMIT_NOT_VALID, "error");
+}
+
+// The MessageLine ERRMSG element id, which an input the server names in error references.
+const ERRMSG_ID = "message-line-errmsg";
+const MSG_ACCOUNT_STATUS_NOT_Y_OR_N = "Account Status must be Y or N.";
+const ERRMSG_REFERENCE_SELECTOR = `input[aria-describedby~="${ERRMSG_ID}"]`;
+
+// An input and the aria-describedby it carries after the answer below; null for none.
+interface ErrorReferenceCase {
+    name: AccountFieldName;
+    describedBy: string | null;
+}
+
+// A CHANGES_NOT_OK answer naming Active Y/N and State, the first failing edit's literal shown.
+const ERROR_REFERENCE_SCREEN = BuildAccountScreen(UpdateScreenState.CHANGES_NOT_OK, {
+    message: MSG_ACCOUNT_STATUS_NOT_Y_OR_N,
+    field_errors: ["active_status", "addr_state_cd"],
+    cursor_field: "active_status",
+});
+
+// A named input references ERRMSG ahead of its Y/N hint, if it has one; an input not named keeps
+// only MUI's own reference to its hint, or none.
+const ERROR_REFERENCE_CASES: readonly ErrorReferenceCase[] = [
+    { name: "addr_state_cd", describedBy: ERRMSG_ID },
+    { name: "active_status", describedBy: `${ERRMSG_ID} account-update-active_status-helper-text` },
+    { name: "primary_holder_ind", describedBy: "account-update-primary_holder_ind-helper-text" },
+    { name: "addr_zip", describedBy: null },
+];
+
+function DescribedByIds(input: HTMLInputElement): string[] {
+    return input.getAttribute("aria-describedby")?.split(" ") ?? [];
+}
+
+async function AnswerWithErrorReferenceScreen(): Promise<void> {
+    const user = await RenderInState(UpdateScreenState.SHOW_DETAILS);
+    expect(document.querySelectorAll(ERRMSG_REFERENCE_SELECTOR)).toHaveLength(0);
+    QueueUpdateOutcome(HTTP_EDIT_FAILURE, ERROR_REFERENCE_SCREEN);
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectAlert(MSG_ACCOUNT_STATUS_NOT_Y_OR_N, "error");
+}
+
+// Every id the input names is an element of the page: ERRMSG holds the literal.
+async function DescribesFieldInError(referenceCase: ErrorReferenceCase): Promise<void> {
+    await AnswerWithErrorReferenceScreen();
+    const input = InputOf(referenceCase.name);
+    expect(input.getAttribute("aria-describedby")).toBe(referenceCase.describedBy);
+    for (const id of DescribedByIds(input)) {
+        expect(document.getElementById(id)).not.toBeNull();
+    }
+    expect(document.getElementById(ERRMSG_ID)?.textContent).toBe(MSG_ACCOUNT_STATUS_NOT_Y_OR_N);
+}
+
+// Only the named inputs reference ERRMSG, and an answer naming no field drops every reference.
+async function ReferencesOnlyNamedFields(): Promise<void> {
+    await AnswerWithErrorReferenceScreen();
+    const referencing = [...document.querySelectorAll(ERRMSG_REFERENCE_SELECTOR)];
+    expect(referencing).toEqual([InputOf("active_status"), InputOf("addr_state_cd")]);
+    QueueUpdateOutcome(HTTP_OK, BuildAccountScreen(UpdateScreenState.SHOW_DETAILS));
+    await PressFunctionKey(userEvent.setup(), CANCEL_KEY);
+    expect(document.querySelectorAll(ERRMSG_REFERENCE_SELECTOR)).toHaveLength(0);
 }
 
 async function ExitsToMainMenu(method: InputMethod): Promise<void> {
@@ -1749,6 +1934,10 @@ describe("COACTUPC /accounts/update COACTUP content", () => {
         "COACTUP $name is labelled '$label' and holds $maxLength characters",
         LabelsInputWithLength,
     );
+    it.each(ROW_ALIGNMENT_CASES)(
+        "COACTUP $name row aligns its entries by the bottom edge: $isEndAligned",
+        AlignsRowOfField,
+    );
 });
 
 describe("COACTUPC /accounts/update field protection", () => {
@@ -1756,8 +1945,20 @@ describe("COACTUPC /accounts/update field protection", () => {
         "COACTUPC 3300-SETUP-SCREEN-ATTRS in $state opens $description",
         OpensFieldsOfState,
     );
+    it.each(BLANK_LABEL_CASES)(
+        "COACTUPC in $state a blank ACCT-GROUP-ID label is raised: $isRaised",
+        RaisesLabelOfBlankProtectedField,
+    );
     it("COACTUPC entry from the menu shows the empty key screen", StartsOnEmptyKeyScreen);
     it("COACTUPC entry with ?acctId fetches the account, SSN unmasked", FetchesAccountOfEntryKey);
+    it.each(FETCHED_ENTRY_ACCOUNT_IDS)(
+        "COACTUPC entry with ?acctId=%p shows no information line until the fetch answers",
+        ShowsNoPromptUntilFetchAnswers,
+    );
+    it.each(PENDING_ENTRY_CASES)(
+        "COACTUPC entry $entry shows the pending refusal in red with $infoLine",
+        ShowsPendingRefusalOnEntry,
+    );
 });
 
 describe("COACTUPC /accounts/update actions", () => {
@@ -1910,8 +2111,9 @@ function ExpectScreenShown(
     expect(ShownAlerts()).toEqual(alerts);
 }
 
-// F12 sends the edits with the held screen_token; the page shows the re-read record, and the
-// next ENTER carries the cancel response's screen_token and the values it showed.
+// F12 discards the edits: it sends the values the screen was shown with and the held
+// screen_token; the page shows the re-read record, and the next ENTER carries the cancel
+// response's screen_token and the values it showed.
 async function CancelShowsRereadRecord(startState: UpdateScreenState): Promise<void> {
     const user = await RenderInState(startState);
     await KeyEdits(user, DISCARDED_EDITS);
@@ -1920,7 +2122,7 @@ async function CancelShowsRereadRecord(startState: UpdateScreenState): Promise<v
     ExpectUpdateRequest(TEST_ACCOUNT_ID, {
         action: UpdateAction.CANCEL,
         screen_token: FIRST_SCREEN_TOKEN,
-        fields: PickFields(WithEdits(TEST_FIELDS, DISCARDED_EDITS), DETAIL_FIELD_NAMES),
+        fields: PickFields(TEST_FIELDS, DETAIL_FIELD_NAMES),
     });
     ExpectScreenShown(REREAD_FIELDS, DETAIL_FIELD_NAMES, [[INFO_PROMPT_FOR_CHANGES, "info"]]);
     QueueUpdateOutcome(HTTP_EDIT_FAILURE, NO_CHANGE_SCREEN);
@@ -1989,10 +2191,161 @@ async function ShowsEmptyKeyScreenAfterFinish(keyCase: TerminalKeyCase): Promise
     });
 }
 
+const HTTP_UNPROCESSABLE_CONTENT = 422;
+// Text no 3270 can key: the ScreenText request check rejects it with 422 before COACTUPC runs.
+const NON_CP037_ADDRESS = "Café 😀 Road";
+const NON_CP037_ACCOUNT_KEY = "0000000001’";
+const NON_CP037_EDITS: readonly FieldEdit[] = [["addr_line_1", NON_CP037_ADDRESS]];
+const MSG_NOT_CP037 =
+    "Value error, text contains characters a 3270 terminal cannot send (code page 037)";
+
+// The 422 body FastAPI sends for such text: the request-model detail beside the legacy keys that
+// name the field, and no screen.
+type StructuralErrorBody = AccountErrorBody & { detail: readonly object[] };
+
+function StructuralRejection(name: AccountFieldName): AxiosError<AccountErrorBody> {
+    const body: StructuralErrorBody = {
+        ...BuildErrorBody({ field_errors: [name], cursor_field: name }),
+        detail: [{ loc: ["body", "fields", name], msg: MSG_NOT_CP037, type: "value_error" }],
+    };
+    return BuildAxiosError(HTTP_UNPROCESSABLE_CONTENT, body);
+}
+
+// EditFailureOutcome for a credit limit TEST-NUMVAL-C rejects: shown as received, the other
+// amounts edited, with a new screen_token.
+const CREDIT_LIMIT_FAILURE_SCREEN = BuildAccountScreen(UpdateScreenState.CHANGES_NOT_OK, {
+    fields: { ...TEST_FIELDS, ...EDITED_TEST_AMOUNTS, credit_limit: "abc" },
+    screen_token: NEXT_SCREEN_TOKEN,
+    message: MSG_CREDIT_LIMIT_NOT_VALID,
+    field_errors: ["credit_limit"],
+    cursor_field: "credit_limit",
+});
+
+// A rejected ENTER or F5, text keyed after it, then F12: the cancel carries the key and fields
+// the server last showed, never the keyed text.
+interface ShownCancelCase {
+    description: string;
+    startState: UpdateScreenState;
+    rejectedKey: UpdateKey;
+    rejectedEdits: readonly FieldEdit[];
+    rejection: AxiosError<AccountErrorBody>;
+    laterEdits: readonly FieldEdit[];
+    cancelRequest: AccountUpdateRequest;
+    cancelAnswer: AccountScreen;
+}
+
+const SHOWN_CANCEL_CASES: readonly ShownCancelCase[] = [
+    {
+        description: "the fetched values after a 422 for a non-cp037 edit",
+        startState: UpdateScreenState.SHOW_DETAILS,
+        rejectedKey: ENTER_KEY,
+        rejectedEdits: NON_CP037_EDITS,
+        rejection: StructuralRejection("addr_line_1"),
+        laterEdits: [],
+        cancelRequest: {
+            action: UpdateAction.CANCEL,
+            screen_token: FIRST_SCREEN_TOKEN,
+            fields: PickFields(TEST_FIELDS, DETAIL_FIELD_NAMES),
+        },
+        cancelAnswer: REREAD_SCREEN,
+    },
+    {
+        description: "the CHANGES_NOT_OK body's values, not a non-cp037 edit keyed after it",
+        startState: UpdateScreenState.SHOW_DETAILS,
+        rejectedKey: ENTER_KEY,
+        rejectedEdits: [["credit_limit", "abc"]],
+        rejection: BuildAxiosError(HTTP_EDIT_FAILURE, BuildErrorBody(CREDIT_LIMIT_FAILURE_SCREEN)),
+        laterEdits: NON_CP037_EDITS,
+        cancelRequest: {
+            action: UpdateAction.CANCEL,
+            screen_token: NEXT_SCREEN_TOKEN,
+            fields: PickFields(CREDIT_LIMIT_FAILURE_SCREEN.fields, DETAIL_FIELD_NAMES),
+        },
+        cancelAnswer: REREAD_SCREEN,
+    },
+    {
+        description: "the failed save's key, not a non-cp037 key typed after it",
+        startState: UpdateScreenState.CHANGES_OK_NOT_CONFIRMED,
+        rejectedKey: SAVE_KEY,
+        rejectedEdits: [],
+        rejection: BuildAxiosError(
+            HTTP_RECORD_LOCKED,
+            BuildErrorBody(FailedSaveScreen(MSG_LOCK_ACCOUNT)),
+        ),
+        laterEdits: [["acct_id", NON_CP037_ACCOUNT_KEY]],
+        cancelRequest: {
+            action: UpdateAction.CANCEL,
+            screen_token: NEXT_SCREEN_TOKEN,
+            fields: { acct_id: TEST_ACCOUNT_ID },
+        },
+        cancelAnswer: EMPTY_KEY_SCREEN,
+    },
+];
+
+async function CancelSendsShownFields(cancelCase: ShownCancelCase): Promise<void> {
+    const user = await RenderInState(cancelCase.startState);
+    await KeyEdits(user, cancelCase.rejectedEdits);
+    mockUpdateAccount.mockRejectedValueOnce(cancelCase.rejection);
+    await PressFunctionKey(user, cancelCase.rejectedKey);
+    await KeyEdits(user, cancelCase.laterEdits);
+    QueueUpdateOutcome(HTTP_OK, cancelCase.cancelAnswer);
+    await PressFunctionKey(user, CANCEL_KEY);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, cancelCase.cancelRequest);
+    expect(FieldValuesShown()).toEqual(cancelCase.cancelAnswer.fields);
+}
+
+// A key whose request carries the text as keyed: ENTER and F5 once details are shown, and F12 on
+// the key screen, which NormaliseAction processes as ENTER on the typed key.
+interface KeyedRequestCase {
+    startState: UpdateScreenState;
+    updateKey: UpdateKey;
+    edits: readonly FieldEdit[];
+    request: AccountUpdateRequest;
+    answer: AccountScreen;
+}
+
+const KEYED_REQUEST_CASES: readonly KeyedRequestCase[] = [
+    ...[ENTER_KEY, SAVE_KEY].map((updateKey) => ({
+        startState: UpdateScreenState.SHOW_DETAILS,
+        updateKey,
+        edits: DISCARDED_EDITS,
+        request: {
+            action: updateKey.action,
+            screen_token: FIRST_SCREEN_TOKEN,
+            fields: PickFields(WithEdits(TEST_FIELDS, DISCARDED_EDITS), DETAIL_FIELD_NAMES),
+        },
+        answer: BuildAccountScreen(UpdateScreenState.CHANGES_OK_NOT_CONFIRMED),
+    })),
+    {
+        startState: UpdateScreenState.DETAILS_NOT_FETCHED,
+        updateKey: CANCEL_KEY,
+        edits: [["acct_id", TEST_ACCOUNT_ID]],
+        request: {
+            action: UpdateAction.CANCEL,
+            screen_token: "",
+            fields: { acct_id: TEST_ACCOUNT_ID },
+        },
+        answer: BuildAccountScreen(UpdateScreenState.SHOW_DETAILS),
+    },
+];
+
+async function SendsTextAsKeyed(keyedCase: KeyedRequestCase): Promise<void> {
+    const user = await RenderInState(keyedCase.startState);
+    await KeyEdits(user, keyedCase.edits);
+    QueueUpdateOutcome(HTTP_OK, keyedCase.answer);
+    await PressFunctionKey(user, keyedCase.updateKey);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, keyedCase.request);
+}
+
 describe("COACTUPC /accounts/update state transitions", () => {
     it.each(CANCEL_START_STATES)(
-        "COACTUPC F12 in %s sends the edits and shows the re-read record",
+        "COACTUPC F12 in %s discards the edits and shows the re-read record",
         CancelShowsRereadRecord,
+    );
+    it.each(SHOWN_CANCEL_CASES)("COACTUPC F12 sends $description", CancelSendsShownFields);
+    it.each(KEYED_REQUEST_CASES)(
+        "COACTUPC $updateKey.key in $startState sends the text as keyed",
+        SendsTextAsKeyed,
     );
     it(
         "COACTUPC ENTER in CHANGES_OK_NOT_CONFIRMED sends no field and keeps the screen",
@@ -2011,6 +2364,14 @@ describe("COACTUPC /accounts/update outcomes", () => {
         AdoptsScreenOfErrorBody,
     );
     it("COACTUPC flags every failing field and focuses the first", MarksEveryFailingField);
+    it.each(ERROR_REFERENCE_CASES)(
+        "COACTUPC after a CHANGES_NOT_OK answer $name has aria-describedby $describedBy",
+        DescribesFieldInError,
+    );
+    it(
+        "COACTUPC ties only the fields named in error to ERRMSG, until an answer names none",
+        ReferencesOnlyNamedFields,
+    );
     it("COACTUPC leaves an edit-fetch 401 to the sign-on redirect", LeavesFetch401ToInterceptor);
     it("COACTUPC leaves an update 401 to the sign-on redirect", LeavesUpdate401ToInterceptor);
 });
@@ -2187,14 +2548,15 @@ async function ExpectEnterSendsNavigatedAccount(): Promise<void> {
 }
 
 // Dropping ?acctId= after a fetched account is a fresh entry from the menu: the empty key screen
-// without a screen_token, so the next ENTER starts COACTUPC over at its key edit.
+// with its first-entry prompt and without a screen_token, so the next ENTER starts COACTUPC over
+// at its key edit.
 async function ShowsEmptyKeyScreenWithoutAcctId(): Promise<void> {
     const navigate = await RenderFetchedAccountRoute();
     navigate(new URLSearchParams());
     expect(ShownScreenFields()).toEqual(BlankFields());
     expect(EditableFieldNames()).toEqual(KEY_FIELD_NAMES);
     expect(InputOf("acct_id")).toHaveFocus();
-    expect(ShownAlerts()).toEqual([]);
+    expect(ShownAlerts()).toEqual([[INFO_PROMPT_FOR_SEARCH_KEYS, "info"]]);
     expect(mockFetchAccountForEdit).toHaveBeenCalledTimes(1);
     QueueUpdateOutcome(HTTP_EDIT_FAILURE, KeyErrorScreen(MSG_NO_INPUT_RECEIVED));
     await PressFunctionKey(userEvent.setup(), ENTER_KEY);
