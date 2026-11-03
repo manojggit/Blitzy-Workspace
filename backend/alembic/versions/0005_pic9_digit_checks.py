@@ -3,7 +3,9 @@
 Replaces: the PIC 9(n) DISPLAY identifier domains of copybooks CVACT01Y (ACCT-ID 9(11)),
     CVCUS01Y (CUST-ID 9(09), CUST-SSN 9(09)), CVACT02Y (CARD-ACCT-ID 9(11), CARD-CVV-CD 9(03)),
     CVACT03Y (XREF-CUST-ID 9(09), XREF-ACCT-ID 9(11)), CVTRA05Y and CVTRA06Y (TRAN-MERCHANT-ID,
-    DALYTRAN-MERCHANT-ID 9(09)), and CVTRA01Y (TRANCAT-ACCT-ID 9(11)).
+    DALYTRAN-MERCHANT-ID 9(09)), and CVTRA01Y (TRANCAT-ACCT-ID 9(11)); VSAM clusters
+    AWS.M2.CARDDEMO.{ACCTDATA,CUSTDATA,CARDDATA,CARDXREF,TRANSACT,TCATBALF}.VSAM.KSDS and the
+    sequential DALYTRAN input AWS.M2.CARDDEMO.DALYTRAN.PS.
 
 A COBOL PIC 9(n) DISPLAY field holds exactly n digits. These identifiers are stored as
 VARCHAR(n), or CHAR(3) for the CVV, to keep their leading zeros, so each one gets a CHECK

@@ -1,8 +1,7 @@
 """Replaces: COBIL00C (CB00), BMS COBIL00; copybooks CVACT01Y, CVACT03Y, CVTRA05Y.
 
 The bill payment router, mounted at ``/api/v1/billpay``. It replaces the CB00 transaction
-definition of ``csd/CARDDEMO.CSD`` and ENTER on map COBIL00. The path is ``/billpay``, never
-``/bill-pay``: the request's contract list names it so and outranks its pattern example.
+definition of ``csd/CARDDEMO.CSD`` and ENTER on map COBIL00.
 
 CB00 serves regular users (any type other than exactly ``A``) through ``GetRegularContext``,
 which refuses an admin with 403 and an empty message. A POST without an allow-listed Origin is

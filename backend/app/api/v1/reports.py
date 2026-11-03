@@ -8,11 +8,14 @@ Here ``GET /transactions`` returns the CBTRN03C report lines as JSON for the scr
 the backend writes no file.
 
 CR00 serves regular users (any type other than exactly ``A``) through ``GetRegularContext``,
-which refuses an admin with 403 and an empty message. The report reads no CLOSEFIL file, so it
-is not gated by the batch window. ``corpt00c`` owns every edit and literal and raises each
-legacy outcome as ``LegacyMessageError``, serialised by ``app.core.errors``; query text breaking
-its BMS LENGTH or the code-page-037 repertoire is a 422. PF3 (back to the main menu) is frontend
-navigation and has no route.
+which refuses an admin with 403 and an empty message. CR00 is deliberately not gated by the batch
+window, although the report reads TRANSACT: CORPT00C only submitted a TDQ job and never opened
+TRANSACT, so the report reads the committed transaction rows without entering the window.
+TRANBKP archives and empties TRANSACT in one transaction, so a report never sees a half-archived
+table. ``corpt00c`` owns every edit and literal and raises each legacy outcome as
+``LegacyMessageError``, serialised by ``app.core.errors``; query text breaking its BMS LENGTH or
+the code-page-037 repertoire is a 422. PF3 (back to the main menu) is frontend navigation and has
+no route.
 """
 
 from typing import Annotated, Any
