@@ -172,7 +172,8 @@ interface CardUpdateModel {
 }
 
 // The query a card list selection opens the page with (COCOM01Y CDEMO-ACCT-ID and the card,
-// as an opaque card_ref token); read once, so it describes the caller for the page's lifetime.
+// as an opaque card_ref token); the screen is keyed by it, so it describes the caller for the
+// lifetime of each screen.
 interface EntryKeys {
     cardRef: string | null;
     acctId: string;
@@ -494,11 +495,9 @@ function FocusCursorField(inputs: InputRefMap, cursorField: string): void {
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 function useEntryKeys(): EntryKeys {
     const searchParams = useSearchParams();
-    const [entry] = useState<EntryKeys>(() => ({
-        cardRef: searchParams.get(CARD_REF_QUERY_KEY) || null,
-        acctId: searchParams.get(ACCT_ID_QUERY_KEY) ?? "",
-    }));
-    return entry;
+    const cardRef = searchParams.get(CARD_REF_QUERY_KEY) || null;
+    const acctId = searchParams.get(ACCT_ID_QUERY_KEY) ?? "";
+    return useMemo(() => ({ cardRef, acctId }), [cardRef, acctId]);
 }
 
 function useScreenStore(entry: EntryKeys): ScreenStore {
@@ -750,12 +749,20 @@ function CardUpdateScreen() {
     );
 }
 
+// Each arrival with another selection is a fresh COCRDUPC first entry, as every XCTL is, so the
+// model and screen_token start over and the pending entry fetch is abandoned when the query
+// changes; a write already sent still ends, and its answer reaches no later screen.
+function CardUpdateEntry() {
+    const { cardRef, acctId } = useEntryKeys();
+    return <CardUpdateScreen key={JSON.stringify([cardRef, acctId])} />;
+}
+
 // CCUP: reached from main-menu option 5 and from a U selection on the card list (CCLI).
 // useSearchParams needs a Suspense boundary for the static prerender of npm run build.
 export default function CardUpdatePage() {
     return (
         <Suspense fallback={null}>
-            <CardUpdateScreen />
+            <CardUpdateEntry />
         </Suspense>
     );
 }

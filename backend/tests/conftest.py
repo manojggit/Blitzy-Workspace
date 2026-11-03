@@ -24,14 +24,22 @@ everything here as fixtures and must not import from this module.
 Fixtures (pytest name, scope):
 
 - databaseUrls (session): the resolved test database URLs.
-- syncEngine (session): the psycopg2 engine; refuses a database whose name lacks ``_test``.
-- migratedDatabase (session): drops the CardDemo schemas, runs ``alembic upgrade head`` and
-  returns the snapshot of every table taken right after it.
+- syncEngine (session): the psycopg2 engine. Before creating it, refuses URLs whose query sets
+  a key that redirects the driver (dbname, database, host, hostaddr, port, service, dsn), URLs
+  that omit the host or the port (the drivers would read PGHOST, PGPORT or a libpq service
+  file), URLs reaching two hosts, ports or databases, and a database whose name lacks ``_test``.
+- verifiedDatabaseIdentity (session): the database, server address, port and start time that
+  both psycopg2 (read first) and asyncpg reach; fails when they differ, and fails with the
+  actionable unreachable message when either cannot connect.
+- databaseGuard (session): the guard functions and value types, for the guard's own tests.
+- migratedDatabase (session): depends on verifiedDatabaseIdentity, so the comparison runs
+  first; then drops the CardDemo schemas, runs ``alembic upgrade head`` and returns the
+  snapshot of every table taken right after it.
 - seedUsers (session): the ten USRSEC image records, decoded independently of app.seed.
 - testSettings: a fresh app Settings; a test module may override it.
 - asyncEngine: an unpooled asyncpg engine of the test database.
 - dbSession: an AsyncSession inside an outer transaction rolled back at teardown.
-- restoreSeedState: restores the snapshot of migratedDatabase at teardown.
+- restoreSeedState: depends on migratedDatabase; restores its snapshot at teardown.
 - testApp: CreateApp(testSettings) inside its lifespan.
 - apiClient: an anonymous httpx client of testApp.
 - createUser: ``createUser(userType)`` inserts a generated sign-on user and returns it.
@@ -50,6 +58,12 @@ goes through the app:
   and makeOnlineContext depend on it, so every write a test commits is undone, and every
   client, context, session and engine is closed before the restore starts.
 
+Setup order: syncEngine (URL checks), then verifiedDatabaseIdentity (driver comparison), then
+migratedDatabase (reset and migration), then restoreSeedState and the fixtures built on it. So
+nothing is dropped, migrated or written before both drivers are known to reach one test
+database. The reset's DROP and the restore's TRUNCATE each also run only after their own
+transaction has read the validated test database as current_database().
+
 The batch suite (batch/tests/conftest.py) uses the same carddemo_test database. The two suites
 run one after the other, never at the same time.
 """
@@ -62,6 +76,7 @@ import os
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import httpx
@@ -82,7 +97,7 @@ from sqlalchemy import (
     select,
     text,
 )
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -99,6 +114,12 @@ if TYPE_CHECKING:
 # --- Database and HTTP ---------------------------------------------------------------------------
 TEST_DATABASE_NAME = "carddemo_test"
 TEST_DATABASE_SUFFIX = "_test"
+# Connection keywords of libpq (psycopg2) and asyncpg that name a server or a database. SQLAlchemy
+# passes a URL's query to the driver after the URL's own host, port and database, so any of these
+# in the query would win over them; compared lower-cased.
+CONNECTION_TARGET_QUERY_KEYS = frozenset(
+    {"dbname", "database", "host", "hostaddr", "port", "service", "dsn"}
+)
 ALLOWED_ORIGIN = "http://127.0.0.1:3000"
 API_BASE_URL = "http://127.0.0.1:8000"
 LOGIN_PATH = "/api/v1/auth/login"
@@ -157,14 +178,43 @@ INVALID_URL_MESSAGE = "A test database URL does not parse or names no database; 
 MISMATCHED_DATABASES_MESSAGE = (
     "The async and sync test database URLs name different databases; they must name one."
 )
+TARGET_OVERRIDE_MESSAGE = (
+    "Refusing a test database URL whose query sets {keyNames}: the driver would connect to the"
+    " server or database they name instead of the URL's own. Remove them from the URL."
+)
+MISSING_ENDPOINT_MESSAGE = (
+    "Refusing the {driverName} test database URL: it names no {missingParts}, which the driver"
+    " would then take from PGHOST, PGPORT or a libpq service file. Name both the host and the"
+    " port in the URL, as DB_HOST:DB_PORT in backend/.env.example."
+)
+MISMATCHED_TARGETS_MESSAGE = (
+    "The async and sync test database URLs reach different servers, {asyncTarget} and"
+    " {syncTarget}; they must name one host, port and database."
+)
 NOT_TEST_DATABASE_MESSAGE = (
     "Refusing to reset database {databaseName!r}: a test database name must end with {suffix!r}."
+)
+WRONG_CONNECTED_DATABASE_MESSAGE = (
+    "Refusing to use database {connectedName!r}: the connection must reach the validated test"
+    " database {expectedName!r}, whose name ends with {suffix!r}."
+)
+MISMATCHED_SERVERS_MESSAGE = (
+    "The asyncpg and psycopg2 test connections reached different databases or servers:"
+    " {asyncIdentity} and {syncIdentity}."
 )
 UNREACHABLE_DATABASE_MESSAGE = (
     "Cannot prepare the test database {databaseName!r}: {reason}. Start PostgreSQL with"
     " 'docker compose up -d db'; docker/postgres/init-test-db.sql creates carddemo_test."
 )
 USRSEC_SIZE_MESSAGE = "{path} holds {size} bytes, not a multiple of the 80-byte USRSEC record."
+
+# --- Server identity: what one connection reached, read the same way by both drivers -------------
+DATABASE_IDENTITY_QUERY = select(
+    func.current_database(),
+    func.host(func.inet_server_addr()),
+    func.inet_server_port(),
+    func.pg_postmaster_start_time(),
+)
 
 
 # --- Value objects -------------------------------------------------------------------------------
@@ -178,6 +228,50 @@ class DatabaseUrls:
     def IsConfigured(self) -> bool:
         """Return True when both URLs are set."""
         return bool(self.asyncUrl and self.syncUrl)
+
+
+@dataclass(frozen=True)
+class DatabaseTarget:
+    """The host, port and database a test database URL connects to; no credential is kept.
+
+    ``host`` is lower-cased. Both come from the URL itself, which must name them.
+    """
+
+    host: str
+    port: int
+    databaseName: str
+
+    def __str__(self) -> str:
+        """Return ``host:port/databaseName``, the credential-free form failure texts quote."""
+        return f"{self.host}:{self.port}/{self.databaseName}"
+
+
+@dataclass(frozen=True)
+class ServerIdentity:
+    """What one connection reached: its database, the server address and port, the start time.
+
+    The postmaster start time tells two servers listening on one address and port apart.
+    """
+
+    databaseName: str
+    serverAddress: str | None
+    serverPort: int | None
+    startedAt: datetime
+
+
+@dataclass(frozen=True)
+class DatabaseGuard:
+    """The test-database guard of this module, handed to its own tests as a fixture.
+
+    Tests never import this module, so they reach the guard functions and the value types they
+    take through this object.
+    """
+
+    requireTestDatabase: Callable[[DatabaseUrls], DatabaseTarget]
+    requireConnectedTestDatabase: Callable[[Connection, str], None]
+    requireOneServer: Callable[[ServerIdentity, ServerIdentity], None]
+    urlsType: type[DatabaseUrls]
+    identityType: type[ServerIdentity]
 
 
 @dataclass(frozen=True)
@@ -278,35 +372,105 @@ TEST_DATABASE_URLS = BootstrapTestEnvironment()
 
 
 # --- Database preparation (sync, psycopg2) -------------------------------------------------------
-def UrlDatabaseName(url: str) -> str:
-    """Return the database name of ``url``; fail the test run when the URL does not parse.
+def ParseDatabaseUrl(url: str) -> URL:
+    """Return ``url`` parsed; fail the test run when it does not parse or names no database.
 
     The failure is raised outside the except block: the parse error quotes the URL, password
     included, and must not be chained into the report.
     """
     try:
-        databaseName = make_url(url).database
+        parsedUrl = make_url(url)
     except (ArgumentError, ValueError):
-        databaseName = None
-    if databaseName is None:
+        parsedUrl = None
+    if parsedUrl is None or not parsedUrl.database:
         pytest.fail(INVALID_URL_MESSAGE, pytrace=False)
-    return databaseName
+    return parsedUrl
 
 
-def RequireTestDatabase(urls: DatabaseUrls) -> None:
-    """Fail unless both URLs are set and name one database ending in TEST_DATABASE_SUFFIX.
+def RefuseTargetOverrides(parsedUrl: URL) -> None:
+    """Fail when the query of ``parsedUrl`` sets a CONNECTION_TARGET_QUERY_KEYS key.
 
-    The fixtures drop and truncate that database, so the local carddemo database is refused.
+    Only the key names are reported, never their values or the URL.
     """
-    if not urls.IsConfigured():
-        pytest.fail(MISSING_URLS_MESSAGE, pytrace=False)
-    databaseNames = {UrlDatabaseName(urls.asyncUrl), UrlDatabaseName(urls.syncUrl)}
-    if len(databaseNames) != 1:
-        pytest.fail(MISMATCHED_DATABASES_MESSAGE, pytrace=False)
-    databaseName = databaseNames.pop()
+    queryKeys = {queryKey.lower() for queryKey in parsedUrl.query}
+    overrideKeys = sorted(queryKeys & CONNECTION_TARGET_QUERY_KEYS)
+    if overrideKeys:
+        keyNames = ", ".join(repr(overrideKey) for overrideKey in overrideKeys)
+        pytest.fail(TARGET_OVERRIDE_MESSAGE.format(keyNames=keyNames), pytrace=False)
+
+
+def RequireExplicitEndpoint(parsedUrl: URL) -> None:
+    """Fail unless ``parsedUrl`` names both its host and its port.
+
+    psycopg2 (libpq) and asyncpg fill an omitted host or port from PGHOST and PGPORT, and libpq
+    also from a service file, so such a URL could reach a server no comparison of the two URLs
+    sees. Only the driver name and the missing parts are reported, never the URL.
+    """
+    endpointParts = (("host", parsedUrl.host), ("port", parsedUrl.port))
+    missingParts = [partName for partName, partValue in endpointParts if partValue in (None, "")]
+    if missingParts:
+        failureText = MISSING_ENDPOINT_MESSAGE.format(
+            driverName=parsedUrl.drivername, missingParts=" and ".join(missingParts)
+        )
+        pytest.fail(failureText, pytrace=False)
+
+
+def UrlTarget(url: str) -> DatabaseTarget:
+    """Return the host, port and database ``url`` connects to; fail on a redirecting query.
+
+    A URL that leaves its host or port to the driver's environment is refused as well.
+    """
+    parsedUrl = ParseDatabaseUrl(url)
+    RefuseTargetOverrides(parsedUrl)
+    RequireExplicitEndpoint(parsedUrl)
+    return DatabaseTarget(
+        host=parsedUrl.host.lower(), port=parsedUrl.port, databaseName=parsedUrl.database
+    )
+
+
+def RequireTestDatabaseName(databaseName: str) -> None:
+    """Fail unless ``databaseName`` ends in TEST_DATABASE_SUFFIX."""
     if not databaseName.endswith(TEST_DATABASE_SUFFIX):
         failureText = NOT_TEST_DATABASE_MESSAGE.format(
             databaseName=databaseName, suffix=TEST_DATABASE_SUFFIX
+        )
+        pytest.fail(failureText, pytrace=False)
+
+
+def RequireTestDatabase(urls: DatabaseUrls) -> DatabaseTarget:
+    """Return the one target both URLs reach; fail unless it is a database ending in _test.
+
+    The fixtures drop and truncate that database, so the local carddemo database, a query key
+    that redirects either driver, a URL that omits its host or port, and URLs reaching two hosts
+    or ports are all refused before any engine exists. No failure text quotes a username or
+    password.
+    """
+    if not urls.IsConfigured():
+        pytest.fail(MISSING_URLS_MESSAGE, pytrace=False)
+    asyncTarget = UrlTarget(urls.asyncUrl)
+    syncTarget = UrlTarget(urls.syncUrl)
+    if asyncTarget.databaseName != syncTarget.databaseName:
+        pytest.fail(MISMATCHED_DATABASES_MESSAGE, pytrace=False)
+    if asyncTarget != syncTarget:
+        failureText = MISMATCHED_TARGETS_MESSAGE.format(
+            asyncTarget=asyncTarget, syncTarget=syncTarget
+        )
+        pytest.fail(failureText, pytrace=False)
+    RequireTestDatabaseName(syncTarget.databaseName)
+    return syncTarget
+
+
+def RequireConnectedTestDatabase(connection: Connection, expectedName: str) -> None:
+    """Fail unless ``connection`` is open on ``expectedName`` and that name ends in _test.
+
+    The reset and the restore run it inside the transaction that drops or truncates, before
+    that statement, so the statement can only reach the database read here, whatever the
+    driver did with the URL.
+    """
+    connectedName = connection.execute(select(func.current_database())).scalar_one()
+    if connectedName != expectedName or not connectedName.endswith(TEST_DATABASE_SUFFIX):
+        failureText = WRONG_CONNECTED_DATABASE_MESSAGE.format(
+            connectedName=connectedName, expectedName=expectedName, suffix=TEST_DATABASE_SUFFIX
         )
         pytest.fail(failureText, pytrace=False)
 
@@ -326,19 +490,22 @@ def DropManagedObjects(connection: Connection, schemaNames: Sequence[str]) -> No
     connection.execute(text(DROP_SORT_KEY_FUNCTION_SQL))
 
 
-def UnreachableMessage(syncEngine: Engine, error: OperationalError) -> str:
-    """Return the failure text of an OperationalError, without the URL or its password."""
-    reasonLines = str(error.orig).strip().splitlines() or [type(error.orig).__name__]
-    return UNREACHABLE_DATABASE_MESSAGE.format(
-        databaseName=syncEngine.url.database, reason=reasonLines[0]
-    )
+def UnreachableMessage(databaseName: str, driverError: BaseException) -> str:
+    """Return the failure text of a driver's connection error, without the URL or its password.
+
+    ``driverError`` is psycopg2's error (an OperationalError's ``orig``) or the OSError asyncpg
+    raises; the reason is its first line, or its type name when it has no text.
+    """
+    reasonLines = str(driverError).strip().splitlines() or [type(driverError).__name__]
+    return UNREACHABLE_DATABASE_MESSAGE.format(databaseName=databaseName, reason=reasonLines[0])
 
 
 def ResetTestDatabase(syncEngine: Engine) -> None:
     """Remove every object the migrations create, so ``upgrade head`` starts from nothing.
 
-    The failure is reported after the except block, so it shows only the actionable message
-    rather than the chained driver traceback.
+    The drop runs only after the same transaction has read the validated test database as its
+    current database. The failure is reported after the except block, so it shows only the
+    actionable message rather than the chained driver traceback.
     """
     from app.models import ALL_SCHEMAS
 
@@ -346,9 +513,10 @@ def ResetTestDatabase(syncEngine: Engine) -> None:
     try:
         with syncEngine.begin() as connection:
             SetLocalLockTimeout(connection, RESET_LOCK_TIMEOUT)
+            RequireConnectedTestDatabase(connection, syncEngine.url.database)
             DropManagedObjects(connection, ALL_SCHEMAS)
     except OperationalError as error:
-        failureText = UnreachableMessage(syncEngine, error)
+        failureText = UnreachableMessage(syncEngine.url.database, error.orig)
     if failureText:
         pytest.fail(failureText, pytrace=False)
 
@@ -429,17 +597,68 @@ def ResetSerialSequences(connection: Connection) -> None:
 def RestoreSeedSnapshot(syncEngine: Engine, snapshot: SeedSnapshot) -> None:
     """Replace the contents of every table with ``snapshot`` in one transaction.
 
-    The lock timeout makes a lock a test leaked fail the teardown instead of hanging it.
+    The truncate runs only after that transaction has read the validated test database as its
+    current database. The lock timeout makes a lock a test leaked fail the teardown instead of
+    hanging it.
     """
     from app.models import Base
 
     tables = Base.metadata.sorted_tables
     with syncEngine.begin() as connection:
         SetLocalLockTimeout(connection, RESTORE_LOCK_TIMEOUT)
+        RequireConnectedTestDatabase(connection, syncEngine.url.database)
         connection.execute(TruncateStatement(connection, tables))
         connection.execute(text(DEFER_CONSTRAINTS_SQL))
         InsertSnapshotRows(connection, tables, snapshot)
         ResetSerialSequences(connection)
+
+
+# --- Server identity: asyncpg and psycopg2 must reach one database of one server -----------------
+def ReadServerIdentity(syncEngine: Engine) -> ServerIdentity:
+    """Return the ServerIdentity of ``syncEngine``, after checking its connected database.
+
+    A database psycopg2 cannot reach fails the run with UNREACHABLE_DATABASE_MESSAGE, raised
+    after the except block so the chained driver traceback is not reported.
+    """
+    try:
+        with syncEngine.connect() as connection:
+            RequireConnectedTestDatabase(connection, syncEngine.url.database)
+            identityRow = connection.execute(DATABASE_IDENTITY_QUERY).one()
+    except OperationalError as error:
+        failureText = UnreachableMessage(syncEngine.url.database, error.orig)
+    else:
+        return ServerIdentity(*identityRow)
+    pytest.fail(failureText, pytrace=False)
+
+
+async def ReadAsyncServerIdentity(asyncUrl: str) -> ServerIdentity:
+    """Return the ServerIdentity an unpooled asyncpg engine of ``asyncUrl`` reaches.
+
+    The engine is disposed of before returning, so the check leaves no connection open. Through
+    SQLAlchemy, asyncpg reports a refused, unresolvable or timed-out connection as an OSError
+    (ConnectionRefusedError, socket.gaierror, TimeoutError); that fails the run with
+    UNREACHABLE_DATABASE_MESSAGE, raised after the except block.
+    """
+    engine = create_async_engine(asyncUrl, poolclass=NullPool, hide_parameters=True)
+    try:
+        async with engine.connect() as connection:
+            identityRow = (await connection.execute(DATABASE_IDENTITY_QUERY)).one()
+    except OSError as error:
+        failureText = UnreachableMessage(engine.url.database, error)
+    else:
+        return ServerIdentity(*identityRow)
+    finally:
+        await engine.dispose()
+    pytest.fail(failureText, pytrace=False)
+
+
+def RequireOneServer(asyncIdentity: ServerIdentity, syncIdentity: ServerIdentity) -> None:
+    """Fail unless asyncpg and psycopg2 reached one database of one running server."""
+    if asyncIdentity != syncIdentity:
+        failureText = MISMATCHED_SERVERS_MESSAGE.format(
+            asyncIdentity=asyncIdentity, syncIdentity=syncIdentity
+        )
+        pytest.fail(failureText, pytrace=False)
 
 
 # --- Seed users: the USRSEC image, decoded independently of app.seed.image_reader ----------------
@@ -591,16 +810,56 @@ def DatabaseUrlsFixture() -> DatabaseUrls:
 
 @pytest.fixture(name="syncEngine", scope="session")
 def SyncEngineFixture(databaseUrls: DatabaseUrls) -> Iterator[Engine]:
-    """Yield the psycopg2 engine of the test database, refusing any non-test database."""
+    """Yield the psycopg2 engine of the test database, refusing any non-test database.
+
+    RequireTestDatabase validates both URLs before the engine is created.
+    """
     RequireTestDatabase(databaseUrls)
     engine = create_engine(databaseUrls.syncUrl, pool_pre_ping=True, hide_parameters=True)
     yield engine
     engine.dispose()
 
 
+@pytest_asyncio.fixture(name="verifiedDatabaseIdentity", scope="session")
+async def VerifiedDatabaseIdentityFixture(
+    databaseUrls: DatabaseUrls, syncEngine: Engine
+) -> ServerIdentity:
+    """Return the ServerIdentity both drivers reach; fail when asyncpg reaches another.
+
+    migratedDatabase depends on it, so the comparison precedes the reset's DROP and the
+    migration. psycopg2 is read first, so a database that is down is reported by psycopg2's
+    actionable message; an asyncpg connection error gets the same message. A psycopg2-only
+    redirect (PGHOSTADDR, a libpq service file) shows as a different identity, or as asyncpg
+    failing to connect. The asyncpg engine is disposed of before the comparison, so no
+    connection of this check stays open into the reset's DROP or a restore's TRUNCATE.
+    """
+    syncIdentity = ReadServerIdentity(syncEngine)
+    asyncIdentity = await ReadAsyncServerIdentity(databaseUrls.asyncUrl)
+    RequireOneServer(asyncIdentity, syncIdentity)
+    return syncIdentity
+
+
+@pytest.fixture(name="databaseGuard", scope="session")
+def DatabaseGuardFixture() -> DatabaseGuard:
+    """Return the test-database guard functions and value types, for the guard's own tests."""
+    return DatabaseGuard(
+        requireTestDatabase=RequireTestDatabase,
+        requireConnectedTestDatabase=RequireConnectedTestDatabase,
+        requireOneServer=RequireOneServer,
+        urlsType=DatabaseUrls,
+        identityType=ServerIdentity,
+    )
+
+
 @pytest.fixture(name="migratedDatabase", scope="session")
-def MigratedDatabaseFixture(databaseUrls: DatabaseUrls, syncEngine: Engine) -> SeedSnapshot:
-    """Rebuild the test database at head (0009), seeded, and return its snapshot."""
+def MigratedDatabaseFixture(
+    databaseUrls: DatabaseUrls, syncEngine: Engine, verifiedDatabaseIdentity: ServerIdentity
+) -> SeedSnapshot:
+    """Rebuild the test database at head (0009), seeded, and return its snapshot.
+
+    verifiedDatabaseIdentity is set up first, so nothing is dropped or migrated until asyncpg
+    and psycopg2 are known to reach one test database of one server.
+    """
     ResetTestDatabase(syncEngine)
     UpgradeToHead(databaseUrls.syncUrl)
     return TakeSeedSnapshot(syncEngine)
@@ -622,7 +881,11 @@ def SettingsFixture() -> "Settings":
 
 @pytest.fixture(name="restoreSeedState")
 def RestoreSeedStateFixture(migratedDatabase: SeedSnapshot, syncEngine: Engine) -> Iterator[None]:
-    """Yield nothing; at teardown, restore every table to the post-migration snapshot."""
+    """Yield nothing; at teardown, restore every table to the post-migration snapshot.
+
+    Through migratedDatabase, verifiedDatabaseIdentity has made asyncpg known to reach the
+    database psycopg2 resets before any fixture built on this one writes through it.
+    """
     yield
     RestoreSeedSnapshot(syncEngine, migratedDatabase)
 

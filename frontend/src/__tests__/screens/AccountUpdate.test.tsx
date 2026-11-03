@@ -684,6 +684,704 @@ const ADOPTION_CASES: readonly AdoptionCase[] = [
     },
 ];
 
+// The remaining COACTUPC message builders, each mocked as coactupc.py sends it: the status, the
+// state, info_message, field_errors in 3300-SETUP-SCREEN-ATTRS cursor order (FIELD_ORDER) and
+// cursor_field, the first of them. Not covered, because no reachable path sends them: "Account
+// number not provided" (1200 replaces it with "No input received"), "Details of selected account
+// shown above" (3250-SETUP-INFOMSG replaces it), the " can have numbers or alphabets only." suffix
+// (no PERFORM reaches 1230 or 1240) and the CSUTLDTC " validation error Sev code: " text (a date
+// that passes the CSUTLDPY edits always passes CEEDAYS).
+
+// One failing 1200-EDIT-MAP-INPUTS run on ENTER in SHOW_DETAILS: the values keyed over the
+// fetched screen, the first failing edit's TRIM(label(1:25)) + suffix cut to 75 characters, and
+// every failing field. storedFields replaces a protected value of the fetched screen.
+interface FieldEditCase {
+    message: string;
+    keyedFields: Partial<AccountScreenFields>;
+    fieldErrors: readonly AccountFieldName[];
+    storedFields?: Partial<AccountScreenFields>;
+}
+
+// The message line and field attributes a failed request leaves; the cursor is the first field.
+interface ExpectedFailure {
+    message: string;
+    infoMessage: string;
+    fieldErrors: readonly AccountFieldName[];
+}
+
+// ACCT-GROUP-ID: no 1200 edit checks it, so it is never a failing field.
+const UNEDITED_FIELD_NAME: AccountFieldName = "group_id";
+// MUI marks an input whose TextField is in error with aria-invalid="true".
+const MARKED_INPUT_SELECTOR = 'input[aria-invalid="true"]';
+
+// 3203-SHOW-UPDATED-VALUES: a CHANGES_NOT_OK screen shows the values as received, except that an
+// amount which passed TEST-NUMVAL-C is shown edited (WS-EDIT-CURRENCY-9-2-F).
+const EDITED_TEST_AMOUNTS: Readonly<Partial<AccountScreenFields>> = {
+    credit_limit: "+      5,600.00",
+    cash_credit_limit: "+      1,200.00",
+    curr_balance: "+      2,450.00",
+    curr_cycle_credit: "+           .00",
+    curr_cycle_debit: "+           .00",
+};
+
+// Every reachable field-edit suffix and every edited label, the AAP 0.6.9 pinned cases included.
+const FIELD_EDIT_CASES: readonly FieldEditCase[] = [
+    // 1220-EDIT-YESNO: supplied (not a space or zero), then upper-case Y or N.
+    {
+        message: "Account Status must be supplied.",
+        keyedFields: { active_status: "" },
+        fieldErrors: ["active_status"],
+    },
+    {
+        message: "Account Status must be Y or N.",
+        keyedFields: { active_status: "X" },
+        fieldErrors: ["active_status"],
+    },
+    {
+        message: "Primary Card Holder must be supplied.",
+        keyedFields: { primary_holder_ind: "" },
+        fieldErrors: ["primary_holder_ind"],
+    },
+    {
+        message: "Primary Card Holder must be Y or N.",
+        keyedFields: { primary_holder_ind: "y" },
+        fieldErrors: ["primary_holder_ind"],
+    },
+    // EDIT-DATE-CCYYMMDD (cpy/CSUTLDPY.cpy) under each date's label: a 30- or 31-day failure flags
+    // the month and day, a leap-year failure every part. EDIT-DATE-OF-BIRTH, run only on a valid
+    // date, also flags every part.
+    {
+        message: "Open Date : Year must be supplied.",
+        keyedFields: { open_year: "" },
+        fieldErrors: ["open_year"],
+    },
+    {
+        message: "Open Date : Century is not valid.",
+        keyedFields: { open_year: "1814" },
+        fieldErrors: ["open_year"],
+    },
+    {
+        message: "Open Date:Cannot have 31 days in this month.",
+        keyedFields: { open_month: "04", open_day: "31" },
+        fieldErrors: ["open_month", "open_day"],
+    },
+    {
+        message: "Expiry Date must be 4 digit number.",
+        keyedFields: { expiration_year: "20A5" },
+        fieldErrors: ["expiration_year"],
+    },
+    {
+        message: "Expiry Date : Day must be supplied.",
+        keyedFields: { expiration_day: "" },
+        fieldErrors: ["expiration_day"],
+    },
+    {
+        message: "Expiry Date:Cannot have 30 days in this month.",
+        keyedFields: { expiration_month: "02", expiration_day: "30" },
+        fieldErrors: ["expiration_month", "expiration_day"],
+    },
+    {
+        message: "Reissue Date : Month must be supplied.",
+        keyedFields: { reissue_month: "" },
+        fieldErrors: ["reissue_month"],
+    },
+    {
+        message: "Reissue Date:day must be a number between 1 and 31.",
+        keyedFields: { reissue_day: "32" },
+        fieldErrors: ["reissue_day"],
+    },
+    {
+        message: "Reissue Date:Not a leap year.Cannot have 29 days in this month.",
+        keyedFields: { reissue_year: "2023", reissue_month: "02", reissue_day: "29" },
+        fieldErrors: ["reissue_year", "reissue_month", "reissue_day"],
+    },
+    {
+        message: "Date of Birth: Month must be a number between 1 and 12.",
+        keyedFields: { dob_month: "13" },
+        fieldErrors: ["dob_month"],
+    },
+    {
+        message: "Date of Birth:cannot be in the future ",
+        keyedFields: { dob_year: "2099" },
+        fieldErrors: ["dob_year", "dob_month", "dob_day"],
+    },
+    // 1250-EDIT-SIGNED-9V2: supplied, then TEST-NUMVAL-C. WS-EDIT-VARIABLE-NAME X(25) cuts the
+    // label; "Credit Limit is not valid" is the first OUTCOME_CASES case.
+    {
+        message: "Credit Limit must be supplied.",
+        keyedFields: { credit_limit: "" },
+        fieldErrors: ["credit_limit"],
+    },
+    {
+        message: "Cash Credit Limit must be supplied.",
+        keyedFields: { cash_credit_limit: "" },
+        fieldErrors: ["cash_credit_limit"],
+    },
+    {
+        message: "Cash Credit Limit is not valid",
+        keyedFields: { cash_credit_limit: "12A" },
+        fieldErrors: ["cash_credit_limit"],
+    },
+    {
+        message: "Current Balance must be supplied.",
+        keyedFields: { curr_balance: "" },
+        fieldErrors: ["curr_balance"],
+    },
+    {
+        message: "Current Balance is not valid",
+        keyedFields: { curr_balance: "1.2.3" },
+        fieldErrors: ["curr_balance"],
+    },
+    {
+        message: "Current Cycle Credit Limi must be supplied.",
+        keyedFields: { curr_cycle_credit: "" },
+        fieldErrors: ["curr_cycle_credit"],
+    },
+    {
+        message: "Current Cycle Credit Limi is not valid",
+        keyedFields: { curr_cycle_credit: "ABC" },
+        fieldErrors: ["curr_cycle_credit"],
+    },
+    {
+        message: "Current Cycle Debit Limit must be supplied.",
+        keyedFields: { curr_cycle_debit: "" },
+        fieldErrors: ["curr_cycle_debit"],
+    },
+    {
+        message: "Current Cycle Debit Limit is not valid",
+        keyedFields: { curr_cycle_debit: "--5" },
+        fieldErrors: ["curr_cycle_debit"],
+    },
+    // 1265-EDIT-US-SSN: each part under its own label. Parts 2 and 3 are edited once part 1 passes
+    // 1245-EDIT-NUM-REQD, so a part 1 of 9xx still has its part 3 flagged.
+    {
+        message: "SSN: First 3 chars must be supplied.",
+        keyedFields: { ssn_part_1: "" },
+        fieldErrors: ["ssn_part_1"],
+    },
+    {
+        message: "SSN: First 3 chars must be all numeric.",
+        keyedFields: { ssn_part_1: "2A4" },
+        fieldErrors: ["ssn_part_1"],
+    },
+    {
+        message: "SSN: First 3 chars must not be zero.",
+        keyedFields: { ssn_part_1: "000" },
+        fieldErrors: ["ssn_part_1"],
+    },
+    {
+        message: "SSN: First 3 chars: should not be 000, 666, or between 900 and 999",
+        keyedFields: { ssn_part_1: "666" },
+        fieldErrors: ["ssn_part_1"],
+    },
+    {
+        message: "SSN: First 3 chars: should not be 000, 666, or between 900 and 999",
+        keyedFields: { ssn_part_1: "950", ssn_part_3: "0000" },
+        fieldErrors: ["ssn_part_1", "ssn_part_3"],
+    },
+    {
+        message: "SSN 4th & 5th chars must be supplied.",
+        keyedFields: { ssn_part_2: "" },
+        fieldErrors: ["ssn_part_2"],
+    },
+    {
+        message: "SSN 4th & 5th chars must be all numeric.",
+        keyedFields: { ssn_part_2: "5A" },
+        fieldErrors: ["ssn_part_2"],
+    },
+    {
+        message: "SSN 4th & 5th chars must not be zero.",
+        keyedFields: { ssn_part_2: "00" },
+        fieldErrors: ["ssn_part_2"],
+    },
+    {
+        message: "SSN Last 4 chars must be supplied.",
+        keyedFields: { ssn_part_3: "" },
+        fieldErrors: ["ssn_part_3"],
+    },
+    {
+        message: "SSN Last 4 chars must be all numeric.",
+        keyedFields: { ssn_part_3: "78A0" },
+        fieldErrors: ["ssn_part_3"],
+    },
+    {
+        message: "SSN Last 4 chars must not be zero.",
+        keyedFields: { ssn_part_3: "0000" },
+        fieldErrors: ["ssn_part_3"],
+    },
+    // 1245-EDIT-NUM-REQD, then 1275-EDIT-FICO-SCORE.
+    {
+        message: "FICO Score must be supplied.",
+        keyedFields: { fico_credit_score: "" },
+        fieldErrors: ["fico_credit_score"],
+    },
+    {
+        message: "FICO Score must be all numeric.",
+        keyedFields: { fico_credit_score: "7A2" },
+        fieldErrors: ["fico_credit_score"],
+    },
+    {
+        message: "FICO Score must not be zero.",
+        keyedFields: { fico_credit_score: "000" },
+        fieldErrors: ["fico_credit_score"],
+    },
+    {
+        message: "FICO Score: should be between 300 and 850",
+        keyedFields: { fico_credit_score: "299" },
+        fieldErrors: ["fico_credit_score"],
+    },
+    // 1225-EDIT-ALPHA-REQD, 1235-EDIT-ALPHA-OPT (Middle Name) and 1215-EDIT-MANDATORY.
+    {
+        message: "First Name must be supplied.",
+        keyedFields: { first_name: "" },
+        fieldErrors: ["first_name"],
+    },
+    {
+        message: "First Name can have alphabets only.",
+        keyedFields: { first_name: "TEST1" },
+        fieldErrors: ["first_name"],
+    },
+    {
+        message: "Middle Name can have alphabets only.",
+        keyedFields: { middle_name: "TEST-M" },
+        fieldErrors: ["middle_name"],
+    },
+    {
+        message: "Last Name must be supplied.",
+        keyedFields: { last_name: "" },
+        fieldErrors: ["last_name"],
+    },
+    {
+        message: "Last Name can have alphabets only.",
+        keyedFields: { last_name: "O'TEST" },
+        fieldErrors: ["last_name"],
+    },
+    {
+        message: "Address Line 1 must be supplied.",
+        keyedFields: { addr_line_1: "" },
+        fieldErrors: ["addr_line_1"],
+    },
+    {
+        message: "City must be supplied.",
+        keyedFields: { addr_line_3: "" },
+        fieldErrors: ["addr_line_3"],
+    },
+    {
+        message: "City can have alphabets only.",
+        keyedFields: { addr_line_3: "TESTCITY9" },
+        fieldErrors: ["addr_line_3"],
+    },
+    // 1225 then 1270-EDIT-US-STATE-CD, 1245-EDIT-NUM-REQD for the ZIP, and
+    // 1280-EDIT-US-STATE-ZIP-CD, whose fixed literal flags the state and the ZIP.
+    {
+        message: "State must be supplied.",
+        keyedFields: { addr_state_cd: "" },
+        fieldErrors: ["addr_state_cd"],
+    },
+    {
+        message: "State can have alphabets only.",
+        keyedFields: { addr_state_cd: "N1" },
+        fieldErrors: ["addr_state_cd"],
+    },
+    {
+        message: "State: is not a valid state code",
+        keyedFields: { addr_state_cd: "XX" },
+        fieldErrors: ["addr_state_cd"],
+    },
+    {
+        message: "Zip must be supplied.",
+        keyedFields: { addr_zip: "" },
+        fieldErrors: ["addr_zip"],
+    },
+    {
+        message: "Zip must be all numeric.",
+        keyedFields: { addr_zip: "1000A" },
+        fieldErrors: ["addr_zip"],
+    },
+    {
+        message: "Zip must not be zero.",
+        keyedFields: { addr_zip: "00000" },
+        fieldErrors: ["addr_zip"],
+    },
+    {
+        message: "Invalid zip code for state",
+        keyedFields: { addr_zip: "90001" },
+        fieldErrors: ["addr_state_cd", "addr_zip"],
+    },
+    // ACSCTRY is protected, so 1225 edits the country the fetch stored. A keyed change lets the
+    // edits run, and the cursor still goes to the read-only input.
+    {
+        message: "Country must be supplied.",
+        keyedFields: { middle_name: "TESTMIDDLEB" },
+        fieldErrors: ["addr_country_cd"],
+        storedFields: { addr_country_cd: "" },
+    },
+    {
+        message: "Country can have alphabets only.",
+        keyedFields: { middle_name: "TESTMIDDLEB" },
+        fieldErrors: ["addr_country_cd"],
+        storedFields: { addr_country_cd: "U5A" },
+    },
+    // 1260-EDIT-US-PHONE-NUM: each failing part is flagged alone.
+    {
+        message: "Phone Number 1: Area code must be supplied.",
+        keyedFields: { phone_num_1_area: "" },
+        fieldErrors: ["phone_num_1_area"],
+    },
+    {
+        message: "Phone Number 1: Area code must be A 3 digit number.",
+        keyedFields: { phone_num_1_area: "2A2" },
+        fieldErrors: ["phone_num_1_area"],
+    },
+    {
+        message: "Phone Number 1: Area code cannot be zero",
+        keyedFields: { phone_num_1_area: "000" },
+        fieldErrors: ["phone_num_1_area"],
+    },
+    {
+        message: "Phone Number 1: Prefix code must be supplied.",
+        keyedFields: { phone_num_1_prefix: "" },
+        fieldErrors: ["phone_num_1_prefix"],
+    },
+    {
+        message: "Phone Number 1: Line number code must be A 4 digit number.",
+        keyedFields: { phone_num_1_line: "01A0" },
+        fieldErrors: ["phone_num_1_line"],
+    },
+    {
+        message: "Phone Number 2: Not valid North America general purpose area code",
+        keyedFields: { phone_num_2_area: "123" },
+        fieldErrors: ["phone_num_2_area"],
+    },
+    {
+        message: "Phone Number 2: Prefix code must be A 3 digit number.",
+        keyedFields: { phone_num_2_prefix: "5A5" },
+        fieldErrors: ["phone_num_2_prefix"],
+    },
+    {
+        message: "Phone Number 2: Prefix code cannot be zero",
+        keyedFields: { phone_num_2_prefix: "000" },
+        fieldErrors: ["phone_num_2_prefix"],
+    },
+    {
+        message: "Phone Number 2: Line number code must be supplied.",
+        keyedFields: { phone_num_2_line: "" },
+        fieldErrors: ["phone_num_2_line"],
+    },
+    {
+        message: "Phone Number 2: Line number code cannot be zero",
+        keyedFields: { phone_num_2_line: "0000" },
+        fieldErrors: ["phone_num_2_line"],
+    },
+    // 1245-EDIT-NUM-REQD.
+    {
+        message: "EFT Account Id must be supplied.",
+        keyedFields: { eft_account_id: "" },
+        fieldErrors: ["eft_account_id"],
+    },
+    {
+        message: "EFT Account Id must be all numeric.",
+        keyedFields: { eft_account_id: "000000000A" },
+        fieldErrors: ["eft_account_id"],
+    },
+    {
+        message: "EFT Account Id must not be zero.",
+        keyedFields: { eft_account_id: "0000000000" },
+        fieldErrors: ["eft_account_id"],
+    },
+];
+
+// 9600-WRITE-PROCESSING's WRITE_OUTCOMES text when READ UPDATE of CUSTDAT fails.
+const MSG_LOCK_CUSTOMER = "Could not lock customer record for update";
+
+// The status of the three NOTFND builders (app.core.errors); a READ file error is a 503.
+const HTTP_NOT_FOUND = 404;
+// The ACCTSID of the read failures. The seed data has no cross-reference for it, so a live read
+// gives the CXACAIX NOTFND; the other failures need a failing file.
+const READ_FAILURE_ACCOUNT_ID = "00000000099";
+
+// One failed 9000-READ-ACCT (coactvwc.ReadAccountChain), with the text its builder composes for
+// READ_FAILURE_ACCOUNT_ID and the customer its cross-reference names.
+interface ReadFailureCase {
+    source: string;
+    status: number;
+    message: string;
+}
+
+const READ_FAILURE_CASES: readonly ReadFailureCase[] = [
+    {
+        source: "9200-GETCARDXREF-BYACCT NOTFND",
+        status: HTTP_NOT_FOUND,
+        message: "Account:00000000099 not found in Cross ref file.  Resp:000000013  Reas:0000",
+    },
+    {
+        source: "9300-GETACCTDATA-BYACCT NOTFND",
+        status: HTTP_NOT_FOUND,
+        message: "Account:00000000099 not found in Acct Master file.Resp:000000013  Reas:0000",
+    },
+    {
+        source: "9400-GETCUSTDATA-BYCUST NOTFND",
+        status: HTTP_NOT_FOUND,
+        message: "CustId:000000099 not found in customer master.Resp: 000000013  REAS:0000000",
+    },
+    {
+        source: "batch-window CXACAIX NOTOPEN",
+        status: HTTP_FILE_ERROR,
+        message: "File Error: READ     on CXACAIX   returned RESP 000000019 ,RESP2 000000060",
+    },
+    {
+        source: "ACCTDAT IOERR",
+        status: HTTP_FILE_ERROR,
+        message: "File Error: READ     on ACCTDAT   returned RESP 000000017 ,RESP2 000000000",
+    },
+    {
+        source: "CUSTDAT IOERR",
+        status: HTTP_FILE_ERROR,
+        message: "File Error: READ     on CUSTDAT   returned RESP 000000017 ,RESP2 000000000",
+    },
+];
+// The file errors name no key, so they also stand for a failed F12 re-read of the fetched account.
+const READ_FILE_ERROR_CASES: readonly ReadFailureCase[] = READ_FAILURE_CASES.filter(
+    (readCase) => readCase.status === HTTP_FILE_ERROR,
+);
+
+// No catch-all handler is registered (AAP 0.6.5): an unexpected error is Starlette's plain-text
+// 500, which the page shows as the ABEND-ROUTINE text (CSMSG02Y ABEND-MSG).
+const HTTP_INTERNAL_SERVER_ERROR = 500;
+const INTERNAL_SERVER_ERROR_TEXT = "Internal Server Error";
+const MSG_ABEND = "UNEXPECTED ABEND OCCURRED.";
+
+// Entry with ?acctId= fetches the SHOW_DETAILS screen, with the stored values a case replaces.
+async function RenderFetchedDetails(
+    storedFields: Partial<AccountScreenFields> = {},
+): Promise<UserEvent> {
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    const fetchedFields: AccountScreenFields = { ...TEST_FIELDS, ...storedFields };
+    mockFetchAccountForEdit.mockResolvedValueOnce(
+        BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, { fields: fetchedFields }),
+    );
+    const user = RenderScreen();
+    await WaitForIdle();
+    return user;
+}
+
+// Keys each value over the fetched text: the field is cleared, then the value typed.
+async function KeyFields(
+    user: UserEvent,
+    keyedFields: Partial<AccountScreenFields>,
+): Promise<void> {
+    for (const name of ALL_FIELD_NAMES) {
+        const value = keyedFields[name];
+        if (value === undefined) {
+            continue;
+        }
+        await user.clear(InputOf(name));
+        if (value !== "") {
+            await user.type(InputOf(name), value);
+        }
+    }
+}
+
+// The screen values the ENTER carries: the fetched ones with the case's keyed values.
+function KeyedScreenFields(editCase: FieldEditCase): AccountScreenFields {
+    return { ...TEST_FIELDS, ...editCase.storedFields, ...editCase.keyedFields };
+}
+
+function CursorFieldOf(fieldErrors: readonly AccountFieldName[]): AccountFieldName {
+    const cursorField = fieldErrors[0];
+    if (cursorField === undefined) {
+        throw new Error("A failed COACTUPC screen names at least one field");
+    }
+    return cursorField;
+}
+
+// EditFailureOutcome: the 400 CHANGES_NOT_OK screen, which keeps the before-image in its token.
+function FieldEditScreen(editCase: FieldEditCase): AccountScreen {
+    return BuildAccountScreen(UpdateScreenState.CHANGES_NOT_OK, {
+        fields: {
+            ...TEST_FIELDS,
+            ...EDITED_TEST_AMOUNTS,
+            ...editCase.storedFields,
+            ...editCase.keyedFields,
+        },
+        message: editCase.message,
+        field_errors: [...editCase.fieldErrors],
+        cursor_field: CursorFieldOf(editCase.fieldErrors),
+    });
+}
+
+// AAP 0.6.3: ERRMSG in red with INFOMSG after it, as sent; every field the server names is marked
+// and no other; the cursor is on the first of them.
+function ExpectFailureShown(expected: ExpectedFailure): void {
+    expect(ShownAlerts()).toEqual([
+        [expected.message, "error"],
+        [expected.infoMessage, "info"],
+    ]);
+    const markedInputs = [...document.querySelectorAll(MARKED_INPUT_SELECTOR)];
+    expect(markedInputs).toHaveLength(expected.fieldErrors.length);
+    for (const name of expected.fieldErrors) {
+        expect(markedInputs).toContain(InputOf(name));
+    }
+    expect(InputOf(UNEDITED_FIELD_NAME)).toHaveAttribute("aria-invalid", "false");
+    expect(InputOf(CursorFieldOf(expected.fieldErrors))).toHaveFocus();
+}
+
+async function ShowsFieldEditFailure(editCase: FieldEditCase): Promise<void> {
+    const user = await RenderFetchedDetails(editCase.storedFields);
+    await KeyFields(user, editCase.keyedFields);
+    QueueUpdateOutcome(HTTP_EDIT_FAILURE, FieldEditScreen(editCase));
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: FIRST_SCREEN_TOKEN,
+        fields: PickFields(KeyedScreenFields(editCase), DETAIL_FIELD_NAMES),
+    });
+    ExpectFailureShown({
+        message: editCase.message,
+        infoMessage: INFO_PROMPT_FOR_CHANGES,
+        fieldErrors: editCase.fieldErrors,
+    });
+}
+
+// The 423 body of a CUSTDAT lock failure: nothing is written and the update ends in
+// CHANGES_FAILED. No field failed, so app.core.errors.ErrorBody names the cursor field ACCTSID
+// in field_errors.
+function CustomerLockScreen(): AccountScreen {
+    return BuildAccountScreen(UpdateScreenState.CHANGES_FAILED, {
+        screen_token: ADOPTED_SCREEN_TOKEN,
+        message: MSG_LOCK_CUSTOMER,
+        field_errors: [...KEY_FIELD_NAMES],
+        cursor_field: "acct_id",
+    });
+}
+
+// CHANGES_FAILED opens only the key: the next ENTER sends ACCTSID alone, with the failed save's
+// screen_token, and the server answers with the empty key screen.
+async function SendsKeyAfterFailedSave(user: UserEvent): Promise<void> {
+    const keyScreen = BuildAccountScreen(UpdateScreenState.DETAILS_NOT_FETCHED, {
+        fields: BlankFields(),
+    });
+    QueueUpdateOutcome(HTTP_OK, keyScreen);
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: ADOPTED_SCREEN_TOKEN,
+        fields: { acct_id: TEST_ACCOUNT_ID },
+    });
+}
+
+async function ShowsCustomerLockFailure(): Promise<void> {
+    const user = await RenderInState(UpdateScreenState.CHANGES_OK_NOT_CONFIRMED);
+    QueueUpdateOutcome(HTTP_RECORD_LOCKED, CustomerLockScreen());
+    await PressFunctionKey(user, SAVE_KEY);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: UpdateAction.SAVE,
+        screen_token: FIRST_SCREEN_TOKEN,
+        fields: {},
+    });
+    ExpectFailureShown({
+        message: MSG_LOCK_CUSTOMER,
+        infoMessage: INFO_INFORM_FAILURE,
+        fieldErrors: KEY_FIELD_NAMES,
+    });
+    await SendsKeyAfterFailedSave(user);
+}
+
+// ReadFailureOutcome: the DETAILS_NOT_FETCHED screen shows only the key as received. Whichever
+// file failed, the error body names ACCTSID as the failing field and the cursor.
+function ReadFailureScreen(readCase: ReadFailureCase): AccountScreen {
+    return BuildAccountScreen(UpdateScreenState.DETAILS_NOT_FETCHED, {
+        fields: { ...BlankFields(), acct_id: READ_FAILURE_ACCOUNT_ID },
+        message: readCase.message,
+        field_errors: [...KEY_FIELD_NAMES],
+        cursor_field: "acct_id",
+    });
+}
+
+// The key stays on the screen, open for the next ENTER.
+function ExpectReadFailureShown(readCase: ReadFailureCase): void {
+    ExpectFailureShown({
+        message: readCase.message,
+        infoMessage: INFO_PROMPT_FOR_SEARCH_KEYS,
+        fieldErrors: KEY_FIELD_NAMES,
+    });
+    expect(InputOf("acct_id")).toHaveValue(READ_FAILURE_ACCOUNT_ID);
+    ExpectEditable("acct_id", true);
+}
+
+// 1210-EDIT-ACCOUNT passes the ?acctId= key, then its read fails.
+async function ShowsEntryFetchFailure(readCase: ReadFailureCase): Promise<void> {
+    mockSearchParams = new URLSearchParams({ acctId: READ_FAILURE_ACCOUNT_ID });
+    const errorBody = BuildErrorBody(ReadFailureScreen(readCase));
+    mockFetchAccountForEdit.mockRejectedValueOnce(BuildAxiosError(readCase.status, errorBody));
+    RenderScreen();
+    await WaitForIdle();
+    expect(mockFetchAccountForEdit).toHaveBeenCalledWith(READ_FAILURE_ACCOUNT_ID, READ_OPTIONS);
+    ExpectReadFailureShown(readCase);
+}
+
+// ENTER on the empty key screen with the key typed reads the same chain.
+async function ShowsKeyEnterFailure(readCase: ReadFailureCase): Promise<void> {
+    const user = await RenderInState(UpdateScreenState.DETAILS_NOT_FETCHED);
+    await user.type(InputOf("acct_id"), READ_FAILURE_ACCOUNT_ID);
+    QueueUpdateOutcome(readCase.status, ReadFailureScreen(readCase));
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectUpdateRequest(READ_FAILURE_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: "",
+        fields: { acct_id: READ_FAILURE_ACCOUNT_ID },
+    });
+    ExpectReadFailureShown(readCase);
+}
+
+// F12 re-reads the token's account; CancelReadFailureOutcome keeps the provisional SHOW_DETAILS
+// screen, its values and its open fields, and flags the key.
+async function ShowsCancelReadFailure(readCase: ReadFailureCase): Promise<void> {
+    const user = await RenderInState(UpdateScreenState.SHOW_DETAILS);
+    const provisionalScreen = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
+        message: readCase.message,
+        field_errors: [...KEY_FIELD_NAMES],
+        cursor_field: "acct_id",
+    });
+    QueueUpdateOutcome(readCase.status, provisionalScreen);
+    await PressFunctionKey(user, CANCEL_KEY);
+    ExpectFailureShown({
+        message: readCase.message,
+        infoMessage: INFO_PROMPT_FOR_CHANGES,
+        fieldErrors: KEY_FIELD_NAMES,
+    });
+    ExpectEditable("credit_limit", true);
+}
+
+function BuildServerError(): AxiosError<string> {
+    const config: InternalAxiosRequestConfig = { headers: new AxiosHeaders() };
+    const response: AxiosResponse<string> = {
+        status: HTTP_INTERNAL_SERVER_ERROR,
+        statusText: "",
+        headers: {},
+        config,
+        data: INTERNAL_SERVER_ERROR_TEXT,
+    };
+    return new AxiosError(
+        "Request failed",
+        AxiosError.ERR_BAD_RESPONSE,
+        config,
+        undefined,
+        response,
+    );
+}
+
+// The 500 carries no screen, so the page keeps the fetched one and marks no field.
+async function ShowsAbendOnServerError(): Promise<void> {
+    const user = await RenderInState(UpdateScreenState.SHOW_DETAILS);
+    mockUpdateAccount.mockRejectedValueOnce(BuildServerError());
+    await PressFunctionKey(user, ENTER_KEY);
+    expect(ShownAlerts()).toEqual([[MSG_ABEND, "error"]]);
+    expect(document.querySelectorAll(MARKED_INPUT_SELECTOR)).toHaveLength(0);
+    expect(InputOf("credit_limit")).toHaveValue(TEST_FIELDS.credit_limit);
+    ExpectEditable("credit_limit", true);
+}
+
 function ShowsTitleAndCaptions(): void {
     RenderScreen();
     expect(screen.getByRole("heading", { level: 1, name: "Update Account" })).toBeInTheDocument();
@@ -1087,6 +1785,33 @@ describe("COACTUPC /accounts/update outcomes", () => {
     it("COACTUPC flags every failing field and focuses the first", MarksEveryFailingField);
     it("COACTUPC leaves an edit-fetch 401 to the sign-on redirect", LeavesFetch401ToInterceptor);
     it("COACTUPC leaves an update 401 to the sign-on redirect", LeavesUpdate401ToInterceptor);
+});
+
+describe("COACTUPC /accounts/update message builders", () => {
+    it.each(FIELD_EDIT_CASES)(
+        "COACTUPC ENTER shows '$message' and flags $fieldErrors",
+        ShowsFieldEditFailure,
+    );
+    it(
+        "COACTUPC F5 shows the CUSTDAT lock failure, then sends only ACCTSID",
+        ShowsCustomerLockFailure,
+    );
+    it("COACTUPC shows a plain 500 as the red ABEND-ROUTINE text", ShowsAbendOnServerError);
+});
+
+describe("COACTUPC /accounts/update read failures", () => {
+    it.each(READ_FAILURE_CASES)(
+        "COACTUPC ?acctId= fetch shows the $source text on the key screen",
+        ShowsEntryFetchFailure,
+    );
+    it.each(READ_FAILURE_CASES)(
+        "COACTUPC ENTER on the key screen shows the $source text",
+        ShowsKeyEnterFailure,
+    );
+    it.each(READ_FILE_ERROR_CASES)(
+        "COACTUPC F12 re-read shows the $source text and keeps SHOW_DETAILS",
+        ShowsCancelReadFailure,
+    );
 });
 
 describe("COACTUPC /accounts/update edit fetch cancellation", () => {
