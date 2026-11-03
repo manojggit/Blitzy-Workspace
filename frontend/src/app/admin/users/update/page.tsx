@@ -18,7 +18,7 @@ import { Divider, Grid, Stack, TextField } from "@mui/material";
 import { isAxiosError } from "axios";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     SeverityForOutcome,
@@ -429,6 +429,12 @@ function PreventFormSubmit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
 }
 
+// While the server names the field in error, it is described by the ERRMSG line, then its hint.
+function ErrorReferenceOf(definition: FieldDefinition, model: UserUpdateModel) {
+    const hasError = model.feedback.fieldErrors.includes(definition.name);
+    return ErrorMessageReference(hasError, HelperTextIdOf(definition.name, definition.helperText));
+}
+
 // The value is stored exactly as typed; only the BMS LENGTH limits it.
 function UserDetailField({ definition, model }: UserDetailFieldProps) {
     const { name, maxLength, ...display } = definition;
@@ -445,7 +451,7 @@ function UserDetailField({ definition, model }: UserDetailFieldProps) {
                 error={model.feedback.fieldErrors.includes(name)}
                 onChange={(event) => ChangeFieldValue(model.context, name, event.target.value)}
                 inputRef={model.fieldRefs[name]}
-                slotProps={{ htmlInput: { maxLength } }}
+                slotProps={{ htmlInput: { maxLength, ...ErrorReferenceOf(definition, model) } }}
             />
         </Grid>
     );

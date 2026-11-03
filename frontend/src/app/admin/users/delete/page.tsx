@@ -19,7 +19,12 @@ import { Divider, Grid, Stack, TextField } from "@mui/material";
 import { isAxiosError } from "axios";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine, type MessageLineProps } from "@/components/MessageLine";
+import {
+    ErrorMessageReference,
+    HelperTextIdOf,
+    MessageLine,
+    type MessageLineProps,
+} from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     ADMIN_HOME_ROUTE,
@@ -393,14 +398,23 @@ function useUserDelete(selectedUserId: string, cameFromList: boolean): UserDelet
     return { ...state, actions };
 }
 
+function FieldIdOf(name: UserDeleteFieldName): string {
+    return `user-delete-${name}`;
+}
+
 // The BMS LENGTH, and the attribute byte: ASKIP fields are read-only but stay focusable, so the
 // cursor can rest on FNAME after a file error. USRIDIN also refuses keystrokes while a fetch or
 // delete runs, as the 3270 keyboard locks from send to response, so the details shown always
-// belong to the user ID that was sent.
-function FieldSlotProps(definition: FieldDefinition, isBusy: boolean) {
+// belong to the user ID that was sent. A field in error is described by the ERRMSG line, then its
+// hint.
+function FieldSlotProps({ definition, isError, isBusy }: UserDetailFieldProps) {
+    const helperTextId = HelperTextIdOf(FieldIdOf(definition.name), definition.helperText);
     return {
         input: { readOnly: !definition.isEditable || isBusy },
-        htmlInput: { maxLength: definition.maxLength },
+        htmlInput: {
+            maxLength: definition.maxLength,
+            ...ErrorMessageReference(isError, helperTextId),
+        },
     };
 }
 
@@ -417,6 +431,7 @@ function UserDetailField(props: UserDetailFieldProps) {
     const { definition } = props;
     return (
         <TextField
+            id={FieldIdOf(definition.name)}
             label={definition.label}
             value={props.value}
             variant={definition.isEditable ? "outlined" : "filled"}
@@ -427,7 +442,7 @@ function UserDetailField(props: UserDetailFieldProps) {
             autoComplete="off"
             inputRef={props.inputRef}
             fullWidth
-            slotProps={FieldSlotProps(definition, props.isBusy)}
+            slotProps={FieldSlotProps(props)}
         />
     );
 }

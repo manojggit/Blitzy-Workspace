@@ -281,9 +281,16 @@ function ClickButton(user: UserEvent, name: string): Promise<void> {
     return user.click(screen.getByRole("button", { name }));
 }
 
-// The Alerts whose raw text is exactly the literal, blanks included.
+function InDocumentOrder(first: Node, second: Node): number {
+    return first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+}
+
+// The Alerts whose raw text is exactly the literal, blanks included, in screen order: ERRMSG has
+// role alert and INFOMSG role status.
 function AlertsHolding(text: string): HTMLElement[] {
-    return screen.queryAllByRole("alert").filter((alert) => alert.textContent === text);
+    return [...screen.queryAllByRole("alert"), ...screen.queryAllByRole("status")]
+        .sort(InDocumentOrder)
+        .filter((alert) => alert.textContent === text);
 }
 
 async function ExpectAlert(text: string, severity: MessageSeverity): Promise<void> {
@@ -480,6 +487,7 @@ describe("COACTVWC 401 on /accounts/view", () => {
         await waitFor(() => expect(SearchButton()).toBeEnabled());
         expect(SIGN_ON_ROUTE).toBe("/signon");
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        expect(screen.queryAllByRole("status")).toHaveLength(0);
         expect(mockRouterPush).not.toHaveBeenCalled();
         expect(mockRouterReplace).not.toHaveBeenCalled();
     });

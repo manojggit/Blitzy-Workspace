@@ -518,10 +518,15 @@ function SeverityOf(alert: HTMLElement): string {
     return severity ?? "";
 }
 
-// The message line's Alerts in screen order, each with its raw text.
+function InDocumentOrder(first: Node, second: Node): number {
+    return first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+}
+
+// The message line's Alerts in screen order, each with its raw text: ERRMSG has role alert and
+// INFOMSG role status.
 function ShownAlerts(): ShownAlert[] {
-    return screen
-        .queryAllByRole("alert")
+    return [...screen.queryAllByRole("alert"), ...screen.queryAllByRole("status")]
+        .sort(InDocumentOrder)
         .map((alert) => [alert.textContent ?? "", SeverityOf(alert)]);
 }
 

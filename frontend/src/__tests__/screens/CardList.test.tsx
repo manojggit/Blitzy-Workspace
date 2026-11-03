@@ -297,8 +297,16 @@ function FlaggedRowNumbers(): number[] {
         );
 }
 
+function InDocumentOrder(first: Node, second: Node): number {
+    return first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+}
+
+// The first Alert in screen order whose raw text is the literal: ERRMSG has role alert and
+// INFOMSG role status.
 function AlertWithText(text: string): HTMLElement | undefined {
-    return screen.queryAllByRole("alert").find((alert) => alert.textContent === text);
+    return [...screen.queryAllByRole("alert"), ...screen.queryAllByRole("status")]
+        .sort(InDocumentOrder)
+        .find((alert) => alert.textContent === text);
 }
 
 // The text is compared raw, so the server literal must arrive unchanged, blanks included.
@@ -629,6 +637,7 @@ describe("COCRDLIC session refusal on /cards", () => {
         await RenderScreen();
         expect(mockListCards).toHaveBeenCalledTimes(1);
         expect(screen.queryAllByRole("alert")).toEqual([]);
+        expect(screen.queryAllByRole("status")).toEqual([]);
         expect(BodyRows()).toEqual([]);
         expect(mockRouterPush).not.toHaveBeenCalled();
         expect(mockRouterReplace).not.toHaveBeenCalled();

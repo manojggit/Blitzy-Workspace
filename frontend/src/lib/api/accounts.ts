@@ -9,6 +9,7 @@
 // outcome reaches the caller as a rejected call whose body LegacyErrorBody reads.
 import {
     API_CLIENT,
+    EncodePathKey,
     type MoneyAmount,
     type ScreenFeedback,
     type UpdateAction,
@@ -17,12 +18,6 @@ import {
 
 const ACCOUNTS_PATH = "/accounts";
 const EDIT_SUFFIX = "/edit";
-
-// Path segments a URL cannot carry as typed: an empty one reaches no account route, and "." or
-// ".." is removed by URL normalisation ("/accounts/./edit" would become the view of "edit"). Each
-// travels with one trailing space instead, so a blank ACCTSID arrives as SPACES (%20); the key
-// edits cannot tell it apart, because the server pads the key with spaces to its BMS LENGTH.
-const UNSENDABLE_PATH_SEGMENTS: readonly string[] = ["", ".", ".."];
 
 // The COACTVW screen: one account (CVACT01Y) and its customer (CVCUS01Y), display only. Amounts
 // are exact decimal text, dates YYYY-MM-DD text (empty when not stored) and the SSN is masked.
@@ -122,11 +117,6 @@ export interface AccountUpdateRequest {
     action?: UpdateAction;
     screen_token?: string;
     fields?: Partial<AccountScreenFields>;
-}
-
-function EncodePathKey(value: string): string {
-    const sendableValue = UNSENDABLE_PATH_SEGMENTS.includes(value) ? `${value} ` : value;
-    return encodeURIComponent(sendableValue);
 }
 
 // acctId is the ACCTSID text as keyed; the server's key edit answers a blank or invalid one.

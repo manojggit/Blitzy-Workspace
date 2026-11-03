@@ -8,7 +8,7 @@ import { useRouter } from "next/navigation";
 import { Suspense, useCallback, useEffect, useRef, useState, type RefObject } from "react";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { Logout } from "@/lib/api/auth";
 import { FetchAdminMenu, SelectAdminMenuOption, type MenuOption } from "@/lib/api/menu";
@@ -325,6 +325,15 @@ function AdminMenuOptions({ menuOptions, isBusy, onSelectOption }: AdminMenuOpti
     );
 }
 
+// The BMS LENGTH and, while COADM01C rejects the option, the field's tie to the ERRMSG line.
+function OptionInputProps(hasError: boolean) {
+    return {
+        maxLength: OPTION_MAX_LENGTH,
+        inputMode: "numeric" as const,
+        ...ErrorMessageReference(hasError),
+    };
+}
+
 // The OPTION field: BMS LENGTH=2 and NUM, with the initial cursor (IC). The text is sent as keyed.
 function OptionEntryField(props: OptionEntryFieldProps) {
     return (
@@ -338,9 +347,7 @@ function OptionEntryField(props: OptionEntryFieldProps) {
                     inputRef={props.inputRef}
                     autoFocus
                     fullWidth
-                    slotProps={{
-                        htmlInput: { maxLength: OPTION_MAX_LENGTH, inputMode: "numeric" },
-                    }}
+                    slotProps={{ htmlInput: OptionInputProps(props.hasError) }}
                 />
             </Grid>
         </Grid>

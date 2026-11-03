@@ -69,6 +69,13 @@ const FONT_FAMILY = "var(--font-roboto, Roboto), Roboto, Helvetica, Arial, sans-
 // The 4 dp grid: theme.spacing(4) is 16px.
 const SPACING_UNIT_PX = 4;
 
+/**
+ * White-space handling of the Alert message slot, where server literals are shown: every blank a
+ * legacy literal carries stays visible ("must  be", the two blanks after a sentence's full stop),
+ * and long lines still wrap at blanks.
+ */
+export const MESSAGE_TEXT_WHITE_SPACE = "pre-wrap";
+
 // The HTML element each type role renders as when a component gives none.
 const M3_VARIANT_MAPPING = {
     displayLarge: "h1",
@@ -204,7 +211,12 @@ export const CARD_DEMO_THEME = createTheme({
         },
         MuiToggleButton: { styleOverrides: { root: BuildSegmentStyle } },
         MuiTextField: { defaultProps: { variant: "outlined" } },
-        MuiAlert: { styleOverrides: { root: { borderRadius: M3_SHAPE_SCALE.small } } },
+        MuiAlert: {
+            styleOverrides: {
+                root: { borderRadius: M3_SHAPE_SCALE.small },
+                message: { whiteSpace: MESSAGE_TEXT_WHITE_SPACE },
+            },
+        },
     },
 });
 

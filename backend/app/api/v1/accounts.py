@@ -12,14 +12,16 @@ state leaves editable, the edits, the no-change check and the two-unit save. Leg
 are raised by the services as ``LegacyMessageError`` and serialised by ``app.core.errors``;
 screen text breaking its BMS LENGTH or the code-page-037 repertoire is a 422. The view masks
 the SSN; the update screen does not, because COACTUPC edits it. A PUT without an allow-listed
-Origin is refused with 403 by ``core.middleware.OriginGuard``.
+Origin is refused with 403 by ``core.middleware.OriginGuard``. The routes are
+``LosslessKeyRoute`` routes, so ``/{acctId}`` receives a key holding ``/`` as one value and
+``/{acctId}/edit`` is reached only by a literal ``/edit`` suffix.
 """
 
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path
 
-from app.api.v1 import LegacyErrorResponses
+from app.api.v1 import LegacyErrorResponses, LosslessKeyRoute
 from app.core.dependencies import GetRegularContext, OnlineContext
 from app.schemas.accounts import AccountScreen, AccountUpdateRequest, AccountViewResponse
 from app.schemas.common import ScreenText
@@ -27,16 +29,17 @@ from app.services.accounts import coactupc, coactvwc
 
 # BMS ACCTSID LENGTH=11 on both COACTVW and COACTUP.
 ACCOUNT_ID_LENGTH = 11
-# Raw screen text with no digit pattern and never an int: a blank key (sent as %20) and a
-# non-numeric key must reach the services' key edits, which answer ``No input received`` and
-# the 11-digit non-zero literals, rather than a 422.
+# Raw screen text with no digit pattern and never an int: a blank key (sent as %20), a key
+# holding "/" (sent as %2F, kept in one segment by LosslessKeyRoute) and any other non-numeric
+# key must reach the services' key edits, which answer ``No input received`` and the 11-digit
+# non-zero literals, rather than a 422 or a framework 404.
 ACCOUNT_ID_PATH = Annotated[
     ScreenText(ACCOUNT_ID_LENGTH),
     Path(description="Account number as typed on the screen (up to 11 characters)."),
 ]
 REGULAR_CONTEXT = Annotated[OnlineContext, Depends(GetRegularContext)]
 
-ROUTER = APIRouter(prefix="/accounts", tags=["accounts"])
+ROUTER = APIRouter(prefix="/accounts", tags=["accounts"], route_class=LosslessKeyRoute)
 
 
 @ROUTER.get(

@@ -415,6 +415,7 @@ it("COMEN01C option edit failure marks OPTION invalid and returns the cursor", a
     await user.click(KeyButton(CONTINUE_BUTTON_NAME));
     await ExpectAlert(INVALID_OPTION_MESSAGE, "error");
     expect(OptionInput()).toHaveAttribute("aria-invalid", "true");
+    expect(OptionInput()).toHaveAccessibleDescription(INVALID_OPTION_MESSAGE);
     expect(OptionInput()).toHaveFocus();
 });
 
@@ -445,6 +446,7 @@ it.each(UNAUTHORIZED_CASES)(
     async ({ ArrangeAndTrigger }) => {
         await ArrangeAndTrigger();
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        expect(screen.queryAllByRole("status")).toHaveLength(0);
         expect(mockRouterPush).not.toHaveBeenCalled();
         expect(mockRouterReplace).not.toHaveBeenCalled();
         expect(SIGN_ON_ROUTE).toBe("/signon");

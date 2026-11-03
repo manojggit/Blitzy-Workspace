@@ -49,9 +49,9 @@ interface LiteralCase {
     sentKey: string;
 }
 
-interface StatusRegionPair {
+interface ScreenStatus {
     detailStatus: HTMLElement;
-    messageLine: HTMLElement;
+    messageText: string;
 }
 
 interface EmptiedStatusCase {
@@ -354,14 +354,16 @@ async function ExpectAlert(text: string, severity: MessageSeverity): Promise<voi
     expect(alert).toHaveClass(SEVERITY_CLASSES[severity]);
 }
 
-// CT01 always renders two polite role="status" regions: its own loaded-status region, then the
-// MessageLine's below the display fields.
-function StatusRegions(): StatusRegionPair {
+// CT01 always renders exactly one role="status" region, its own polite loaded-status region:
+// it has no INFOMSG line, and MessageLine shows ERRMSG as a role="alert" Alert only while the
+// message is non-blank, so the ERRMSG text is "" when no alert is shown.
+function StatusRegions(): ScreenStatus {
     const regions = screen.getAllByRole("status");
-    expect(regions).toHaveLength(2);
-    regions.forEach((region) => expect(region).toHaveAttribute("aria-live", "polite"));
-    const [detailStatus, messageLine] = regions as [HTMLElement, HTMLElement];
-    return { detailStatus, messageLine };
+    expect(regions).toHaveLength(1);
+    const [detailStatus] = regions as [HTMLElement];
+    expect(detailStatus).toHaveAttribute("aria-live", "polite");
+    const messageText = screen.queryByRole("alert")?.textContent ?? "";
+    return { detailStatus, messageText };
 }
 
 // The next read stays pending until the test settles it with the returned function.
@@ -564,9 +566,9 @@ describe("COTRN01C displayed-record status after a read", () => {
         await TypeTranId(user, TEST_TRAN_ID);
         await PressFunctionKey(user, FETCH_KEY, "key");
         await screen.findByDisplayValue(MASKED_CARD_NUMBER);
-        const { detailStatus, messageLine } = StatusRegions();
+        const { detailStatus, messageText } = StatusRegions();
         expect(detailStatus.textContent).toBe(DETAIL_SHOWN_STATUS);
-        expect(messageLine.textContent).toBe("");
+        expect(messageText).toBe("");
         expect(screen.queryByRole("alert")).toBeNull();
         expect(TranIdInput()).toHaveFocus();
     });
@@ -591,9 +593,9 @@ describe("COTRN01C displayed-record status once the record leaves the screen", (
     it.each(EMPTIED_STATUS_CASES)("COTRN01C empties the status after $action", async (status) => {
         const user = await RenderFrom(TEST_TRAN_ID);
         await status.Reach(user);
-        const { detailStatus, messageLine } = StatusRegions();
+        const { detailStatus, messageText } = StatusRegions();
         expect(detailStatus.textContent).toBe("");
-        expect(messageLine.textContent).toBe(status.messageText);
+        expect(messageText).toBe(status.messageText);
         expect(DetailValues()).toEqual(EMPTY_DETAIL_VALUES);
     });
 });

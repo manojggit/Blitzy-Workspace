@@ -12,14 +12,16 @@ serialised by ``app.core.errors``; screen text breaking its BMS LENGTH or the co
 repertoire is a 422. Responses carry masked card numbers and never the CVV. The list's page
 keys and ``card_ref`` are opaque server-issued tokens, so a full card number never enters a
 frontend URL. CCLI, CCDL and CCUP touch no batch-window file. A POST or PUT without an
-allow-listed Origin is refused with 403 by ``core.middleware.OriginGuard``.
+allow-listed Origin is refused with 403 by ``core.middleware.OriginGuard``. The routes are
+``LosslessKeyRoute`` routes, so ``/{cardNum}`` receives CARDSID text holding ``/`` as one
+value, while ``/selection`` and the literal ``/edit`` suffix keep their precedence.
 """
 
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query
 
-from app.api.v1 import LegacyErrorResponses
+from app.api.v1 import LegacyErrorResponses, LosslessKeyRoute
 from app.core.dependencies import GetRegularContext, OnlineContext
 from app.schemas.cards import (
     CardDetailResponse,
@@ -31,15 +33,19 @@ from app.schemas.cards import (
     CardSelectionResponse,
     CardUpdateRequest,
 )
-from app.schemas.common import CARD_REF_MAX_LENGTH, ScreenText
+from app.schemas.common import CARD_REF_MAX_LENGTH, ScreenTextOrToken
 from app.services.cards import cocrdlic, cocrdslc, cocrdupc
 
-# Raw screen text with no digit pattern and no 16-character cap: the CARDSID text as keyed
-# (LENGTH=16, a blank key sent as %20) must reach the services' ``Card number not provided``
-# and ``CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER`` edits rather than a 422, and a
-# longer value is a ``card_ref`` token, which cocrdslc.ResolveCardKey decodes.
+# BMS CARDSID LENGTH=16 on both COCRDSL and COCRDUP (CARD-NUM X(16) of CVACT02Y).
+CARD_NUM_LENGTH = 16
+# Raw screen text with no digit pattern: the CARDSID text as keyed (a blank key sent as %20, a
+# key holding "/" sent as %2F and kept in one segment by LosslessKeyRoute) must reach the
+# services' ``Card number not provided`` and ``CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT
+# NUMBER`` edits rather than a 422 or a framework 404. A longer value is a ``card_ref`` token,
+# checked for length only, so on the GET routes cocrdslc.ResolveCardKey answers a garbled one
+# with ``Did not find cards for this search condition``; the PUT route never decodes it.
 CARD_KEY_PATH = Annotated[
-    ScreenText(CARD_REF_MAX_LENGTH),
+    ScreenTextOrToken(CARD_NUM_LENGTH, CARD_REF_MAX_LENGTH),
     Path(
         description=(
             "Card number as typed (16 characters) or an opaque card_ref token from the card list."
@@ -48,7 +54,7 @@ CARD_KEY_PATH = Annotated[
 ]
 REGULAR_CONTEXT = Annotated[OnlineContext, Depends(GetRegularContext)]
 
-ROUTER = APIRouter(prefix="/cards", tags=["cards"])
+ROUTER = APIRouter(prefix="/cards", tags=["cards"], route_class=LosslessKeyRoute)
 
 
 @ROUTER.get(
@@ -138,7 +144,10 @@ async def FetchCardForEdit(
     description=(
         "Runs one step of the ENTER (enter), F5 (save) and F12 (cancel) state machine on the "
         "state carried by screen_token: enter validates, save writes the validated values and "
-        "cancel re-reads the card. Error bodies carry the screen fields, state and screen_token."
+        "cancel re-reads the card. Error bodies carry the screen fields, state and screen_token. "
+        "The cardNum path is the route identity only: the keys come from fields before the "
+        "fetch and from screen_token afterwards, so the path value, a card_ref included, is "
+        "not decoded."
     ),
     responses=LegacyErrorResponses(400, 401, 403, 404, 409, 423, 503),
 )

@@ -13,6 +13,7 @@
 // the user keyed it.
 import {
     API_CLIENT,
+    EncodePathKey,
     type Direction,
     type PageState,
     type ScreenFeedback,
@@ -23,11 +24,6 @@ import {
 const CARDS_PATH = "/cards";
 const SELECTION_PATH = `${CARDS_PATH}/selection`;
 const EDIT_SUFFIX = "/edit";
-
-// Path segments a URL cannot carry as typed: an empty one reaches another route, and "." or ".."
-// is removed by URL normalisation. Each travels with one trailing space instead, which the key
-// edits cannot tell apart, because the server pads every key with spaces to its BMS LENGTH.
-const UNSENDABLE_PATH_SEGMENTS: readonly string[] = ["", ".", ".."];
 
 // The server reads a list as one repeated parameter per item (selections=&selections=S), so
 // array items are sent without axios's default "[]" suffix; blank items are kept.
@@ -124,11 +120,6 @@ export interface CardUpdateRequest {
     action?: UpdateAction;
     screen_token?: string;
     fields?: Partial<CardScreenFields>;
-}
-
-function EncodePathKey(value: string): string {
-    const sendableValue = UNSENDABLE_PATH_SEGMENTS.includes(value) ? `${value} ` : value;
-    return encodeURIComponent(sendableValue);
 }
 
 // cardNum is the CARDSID text as keyed or a card_ref token; the server tells them apart.

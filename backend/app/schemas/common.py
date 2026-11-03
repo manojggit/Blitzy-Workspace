@@ -8,6 +8,7 @@ repertoire (``ScreenText``). A request a 3270 terminal could never send is rejec
 while every accept and reject path of the legacy edits stays reachable in the services.
 """
 
+import functools
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -85,6 +86,40 @@ def ScreenText(maxLength: int) -> Any:
         str,
         StringConstraints(max_length=maxLength),
         AfterValidator(RequireCp037Printable),
+        Cp037JsonPattern(),
+    ]
+
+
+def RequireCp037PrintableScreenText(screenLength: int, value: str) -> str:
+    """Return ``value`` unchanged, applying ``RequireCp037Printable`` only when it is screen text.
+
+    A value of at most ``screenLength`` characters (the BMS LENGTH) is screen text. A longer
+    one is an opaque token, whose decoder judges its characters.
+
+    Raises:
+        ValueError: screen text holds a character outside ``CP037_PRINTABLE``; FastAPI
+            answers 422 without echoing the input.
+    """
+    if len(value) <= screenLength:
+        return RequireCp037Printable(value)
+    return value
+
+
+def ScreenTextOrToken(screenLength: int, tokenLength: int) -> Any:
+    """Raw 3270 field text of at most ``screenLength`` characters, or a longer opaque token of
+    at most ``tokenLength`` characters, told apart by length alone.
+
+    It serves a value that is either, as the CCDL and CCUP ``{cardNum}`` is the CARDSID text as
+    keyed or a ``card_ref`` (``cocrdslc.ResolveCardKey`` draws the same line). Screen text keeps
+    the ``ScreenText`` repertoire check. A token is checked for length only, as ``OpaqueToken``
+    is, so a garbled ``card_ref`` reaches its decoder and gives
+    ``Did not find cards for this search condition``, never a 422. The published pattern
+    documents the repertoire, which every server-issued token also keeps to.
+    """
+    return Annotated[
+        str,
+        StringConstraints(max_length=tokenLength),
+        AfterValidator(functools.partial(RequireCp037PrintableScreenText, screenLength)),
         Cp037JsonPattern(),
     ]
 

@@ -17,7 +17,7 @@ import {
 } from "react";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     SelectionTable,
@@ -356,7 +356,12 @@ function SearchField(props: SearchFieldProps) {
             onChange={(event) => props.onSearchChange(event.target.value)}
             autoComplete="off"
             fullWidth
-            slotProps={{ htmlInput: { maxLength: SEARCH_MAX_LENGTH } }}
+            slotProps={{
+                htmlInput: {
+                    maxLength: SEARCH_MAX_LENGTH,
+                    ...ErrorMessageReference(props.hasError),
+                },
+            }}
         />
     );
 }

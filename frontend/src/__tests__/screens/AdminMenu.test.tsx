@@ -446,6 +446,7 @@ describe("COADM01C OPTION field error", () => {
         await SubmitOption(user, "9");
         await ExpectAlert(INVALID_OPTION_MESSAGE, "error");
         expect(OptionField()).toHaveAttribute("aria-invalid", "true");
+        expect(OptionField()).toHaveAccessibleDescription(INVALID_OPTION_MESSAGE);
         expect(OptionField()).toHaveFocus();
         expect(OptionField()).toHaveValue("9");
     });

@@ -751,6 +751,7 @@ describe("COUSR03C field error and cursor (MOVE -1 TO <field>L)", () => {
             await ExpectAlert(literal, "error");
             const input = screen.getByLabelText(label);
             expect(input).toHaveAttribute("aria-invalid", "true");
+            expect(input).toHaveAccessibleDescription(literal);
             expect(input).toHaveFocus();
         },
     );

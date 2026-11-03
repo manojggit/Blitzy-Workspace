@@ -15,6 +15,7 @@ import {
     API_V1_URL,
     ClearHomeRoute,
     DEFAULT_HOME_ROUTE,
+    EncodePathKey,
     GetHomeRoute,
     HandleResponse,
     HandleResponseError,
@@ -224,6 +225,26 @@ const ORIGIN_CASES: readonly string[] = [
     BACKEND_ORIGIN,
     BACKEND_ORIGIN + "/",
     BACKEND_ORIGIN + "//",
+];
+// A raw screen key as one path segment: "/" and "%" percent-encoded, and only a blank, "." or ".."
+// key given the one trailing space the server's space padding ignores.
+const PATH_KEY_CASES: readonly { key: string; segment: string }[] = [
+    { key: "", segment: "%20" },
+    { key: ".", segment: ".%20" },
+    { key: "..", segment: "..%20" },
+    { key: "A/B", segment: "A%2FB" },
+    { key: "/", segment: "%2F" },
+    { key: "%", segment: "%25" },
+    { key: "00000000001", segment: "00000000001" },
+    { key: "A.B", segment: "A.B" },
+    { key: "A B  C", segment: "A%20B%20%20C" },
+];
+const TRANSACTIONS_URL = API_V1_PATH + "/transactions";
+// What the WHATWG URL parser makes of a bare dot segment, which is why such a key is padded.
+const DOT_SEGMENT_CASES: readonly { segment: string; pathname: string }[] = [
+    { segment: ".", pathname: TRANSACTIONS_URL + "/" },
+    { segment: "..", pathname: API_V1_PATH + "/" },
+    { segment: "%2E%2E", pathname: API_V1_PATH + "/" },
 ];
 
 let consoleErrorSpy: jest.SpyInstance;
@@ -578,3 +599,21 @@ it("any other sessionStorage error is a defect and propagates", () => {
     expect(() => StorePendingMessage(ADMIN_ONLY_MESSAGE)).toThrow(defect);
     expect(() => TakePendingMessage()).toThrow(defect);
 });
+
+it.each(PATH_KEY_CASES)(
+    'path key "$key" travels as the one segment $segment',
+    ({ key, segment }) => {
+        const pathKey = EncodePathKey(key);
+        const requestUrl = new URL(`${TRANSACTIONS_URL}/${pathKey}`, BACKEND_ORIGIN);
+        expect(pathKey).toBe(segment);
+        expect(requestUrl.pathname).toBe(`${TRANSACTIONS_URL}/${segment}`);
+        expect(decodeURIComponent(pathKey).trimEnd()).toBe(key.trimEnd());
+    },
+);
+
+it.each(DOT_SEGMENT_CASES)(
+    "an unpadded $segment segment would leave the detail route for $pathname",
+    ({ segment, pathname }) => {
+        expect(new URL(`${TRANSACTIONS_URL}/${segment}`, BACKEND_ORIGIN).pathname).toBe(pathname);
+    },
+);

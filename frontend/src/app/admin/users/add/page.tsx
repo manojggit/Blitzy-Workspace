@@ -18,7 +18,7 @@ import { isAxiosError } from "axios";
 import { Grid, TextField, type TextFieldProps } from "@mui/material";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     ADMIN_HOME_ROUTE,
@@ -282,18 +282,28 @@ function useUserAdd(): UserAddScreenModel {
     return { fieldValues, feedback, isBusy, keys, fieldElementsRef, SetFieldValue: setFieldValue };
 }
 
+function FieldIdOf(name: UserFieldName): string {
+    return `user-add-${name}`;
+}
+
 // The attributes a field takes from its BMS definition alone. No native validation attribute is
 // set: the server decides validity, and each accessible name stays the BMS label text.
 function StaticFieldProps(definition: UserFieldDefinition): TextFieldProps {
     return {
-        id: `user-add-${definition.name}`,
+        id: FieldIdOf(definition.name),
         name: definition.name,
         label: definition.label,
         type: definition.inputType,
         autoComplete: definition.autoComplete,
         helperText: definition.helperText,
-        slotProps: { htmlInput: { maxLength: definition.maxLength } },
     };
+}
+
+// The BMS LENGTH and, while the server names the field in error, its tie to the ERRMSG line
+// ahead of the field's hint.
+function HtmlInputProps(definition: UserFieldDefinition, hasError: boolean) {
+    const helperTextId = HelperTextIdOf(FieldIdOf(definition.name), definition.helperText);
+    return { maxLength: definition.maxLength, ...ErrorMessageReference(hasError, helperTextId) };
 }
 
 function UserAddField(props: UserAddFieldProps) {
@@ -308,6 +318,7 @@ function UserAddField(props: UserAddFieldProps) {
                 fieldElementsRef.current[definition.name] = element;
             }}
             fullWidth
+            slotProps={{ htmlInput: HtmlInputProps(definition, props.hasError) }}
         />
     );
 }

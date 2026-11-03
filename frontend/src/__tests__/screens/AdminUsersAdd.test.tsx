@@ -91,6 +91,8 @@ const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
 const ADDED_MESSAGE = "User TESTUSR1 has been added ...";
 const FIRST_NAME_EMPTY_MESSAGE = "First Name can NOT be empty...";
 const USER_ID_EXISTS_MESSAGE = "User ID already exist...";
+// The COUSR1A hint beside USERID and PASSWD.
+const EIGHT_CHAR_HINT = "(8 Char)";
 
 // The statuses cousr01c.py raises: an edit failure, DUPKEY/DUPREC and the WHEN OTHER file error.
 const HTTP_OK = 200;
@@ -432,6 +434,20 @@ describe("COUSR01C field errors and cursor on /admin/users/add", () => {
         await ExpectAlert(FIRST_NAME_EMPTY_MESSAGE, "error");
         ExpectInvalidFields(["first_name", "last_name"]);
         await waitFor(() => expect(FieldInput("first_name")).toHaveFocus());
+    });
+});
+
+describe("COUSR01C field error description on /admin/users/add", () => {
+    it("COUSR01C describes the flagged USERID by the ERRMSG literal, then its hint", async () => {
+        ArrangeAddUser(HTTP_USER_ID_EXISTS, USER_ID_EXISTS_MESSAGE, "user_id");
+        const user = RenderScreen();
+        await FillUser(user, KEYED_USER);
+        await PressLegend(user, "ENTER", "click");
+        await ExpectAlert(USER_ID_EXISTS_MESSAGE, "error");
+        expect(FieldInput("user_id")).toHaveAccessibleDescription(
+            `${USER_ID_EXISTS_MESSAGE} ${EIGHT_CHAR_HINT}`,
+        );
+        expect(FieldInput("password")).toHaveAccessibleDescription(EIGHT_CHAR_HINT);
     });
 });
 

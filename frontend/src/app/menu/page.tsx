@@ -8,7 +8,7 @@ import { useRouter } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { Logout } from "@/lib/api/auth";
 import { FetchMainMenu, SelectMainMenuOption, type MenuOption } from "@/lib/api/menu";
@@ -369,6 +369,15 @@ function MenuOptionList({ options, onSelect, disabled }: MenuOptionListProps) {
     );
 }
 
+// The BMS LENGTH and, while COMEN01C rejects the option, the field's tie to the ERRMSG line.
+function OptionInputProps(hasError: boolean) {
+    return {
+        maxLength: OPTION_FIELD_LENGTH,
+        inputMode: "numeric" as const,
+        ...ErrorMessageReference(hasError),
+    };
+}
+
 // The OPTION field keeps the text exactly as keyed: COMEN01C's own edit decides whether a blank,
 // non-numeric, zero or out-of-range option is valid.
 function OptionEntryField({ value, onChange, error, inputRef }: OptionEntryFieldProps) {
@@ -380,7 +389,7 @@ function OptionEntryField({ value, onChange, error, inputRef }: OptionEntryField
             error={error}
             inputRef={inputRef}
             autoFocus
-            slotProps={{ htmlInput: { maxLength: OPTION_FIELD_LENGTH, inputMode: "numeric" } }}
+            slotProps={{ htmlInput: OptionInputProps(error) }}
         />
     );
 }

@@ -431,6 +431,7 @@ describe("COSGN00C BMS COSGN00 legend and cursor", () => {
         await RenderScreen();
         expect(CredentialInput("user_id")).toHaveFocus();
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        expect(screen.queryAllByRole("status")).toHaveLength(0);
     });
 });
 
@@ -567,6 +568,7 @@ describe("COSGN00C keys outside the COSGN00 legend on /signon", () => {
         expect(loginMock).not.toHaveBeenCalled();
         expect(logoutMock).not.toHaveBeenCalled();
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        expect(screen.queryAllByRole("status")).toHaveLength(0);
     });
 });
 
@@ -586,6 +588,20 @@ describe("COSGN00C field errors and cursor on /signon", () => {
         expect(CredentialInput("user_id")).toHaveAttribute("aria-invalid", "true");
         expect(CredentialInput("password")).toHaveAttribute("aria-invalid", "true");
         expect(CredentialInput("user_id")).toHaveFocus();
+    });
+});
+
+describe("COSGN00C field error description on /signon", () => {
+    it("COSGN00C describes the flagged field by the ERRMSG literal, then its hint", async () => {
+        loginMock.mockRejectedValue(BuildSignOnFailure(WRONG_PASSWORD_CASE));
+        const { user } = await RenderScreen();
+        await TypeCredentials(user, WRONG_PASSWORD_CASE.typed);
+        await user.click(SignOnButton());
+        await ExpectAlert(WRONG_PASSWORD_MESSAGE, "error");
+        expect(CredentialInput("password")).toHaveAccessibleDescription(
+            `${WRONG_PASSWORD_MESSAGE} ${CREDENTIAL_HELPER_TEXT}`,
+        );
+        expect(CredentialInput("user_id")).toHaveAccessibleDescription(CREDENTIAL_HELPER_TEXT);
     });
 });
 

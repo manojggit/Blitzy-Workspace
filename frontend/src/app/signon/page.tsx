@@ -18,7 +18,7 @@ import {
 } from "react";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { Login, Logout } from "@/lib/api/auth";
 import {
@@ -313,11 +313,22 @@ function useSignOnKeys(form: SignOnForm): FunctionKeyDefinition[] {
     );
 }
 
+function CredentialFieldId(name: CredentialName): string {
+    return FIELD_ID_PREFIX + name;
+}
+
+// The BMS LENGTH and, while the server names the credential in error, its tie to the ERRMSG line
+// ahead of the field's hint.
+function CredentialInputProps({ definition, hasError }: CredentialFieldProps) {
+    const helperTextId = HelperTextIdOf(CredentialFieldId(definition.name), definition.helperText);
+    return { maxLength: definition.maxLength, ...ErrorMessageReference(hasError, helperTextId) };
+}
+
 function CredentialField(props: CredentialFieldProps) {
     const { definition } = props;
     return (
         <TextField
-            id={FIELD_ID_PREFIX + definition.name}
+            id={CredentialFieldId(definition.name)}
             variant="outlined"
             label={definition.label}
             helperText={definition.helperText}
@@ -327,7 +338,7 @@ function CredentialField(props: CredentialFieldProps) {
             error={props.hasError}
             inputRef={props.inputRef}
             onChange={(event) => props.onValueChange(definition.name, event.target.value)}
-            slotProps={{ htmlInput: { maxLength: definition.maxLength } }}
+            slotProps={{ htmlInput: CredentialInputProps(props) }}
         />
     );
 }

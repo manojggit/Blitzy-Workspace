@@ -334,10 +334,11 @@ function BuildAxiosError(status: number, body: object): AxiosError<object> {
     );
 }
 
-// Waits for the alert holding the exact raw text and checks its message-line colour.
+// Waits for the message-line Alert holding the exact raw text (ERRMSG has role alert, INFOMSG
+// role status) and checks its colour.
 async function ExpectAlert(text: string, severity: MessageSeverity): Promise<void> {
     const textElement = await screen.findByText(text, { normalizer: KeepRawText });
-    const alert = textElement.closest('[role="alert"]');
+    const alert = textElement.closest('[role="alert"], [role="status"]');
     expect(alert).toHaveClass(SEVERITY_CLASSES[severity]);
     expect(alert?.textContent).toBe(text);
 }
@@ -447,6 +448,7 @@ describe("COCRDSLC BMS COCRDSL attributes from the menu on /cards/view", () => {
         expect(InputFor(ACCOUNT_LABEL)).toHaveFocus();
         expect(mockViewCard).not.toHaveBeenCalled();
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        expect(screen.queryAllByRole("status")).toHaveLength(0);
     });
 });
 
@@ -667,6 +669,7 @@ describe("COCRDSLC session refusal on /cards/view", () => {
         await WaitForLookupEnd();
         expect(mockViewCard).toHaveBeenCalledTimes(1);
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        expect(screen.queryAllByRole("status")).toHaveLength(0);
         expect(mockRouterPush).not.toHaveBeenCalled();
         expect(mockRouterReplace).not.toHaveBeenCalled();
         expect(SIGN_ON_ROUTE).toBe("/signon");

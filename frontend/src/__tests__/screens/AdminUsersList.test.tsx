@@ -554,6 +554,7 @@ it("COUSR00C F8 refusal marks USRIDIN in error and puts the cursor on it", async
     await PressKey(user, "F8");
     await ExpectAlert(ALREADY_AT_BOTTOM, ERRMSG_SEVERITY);
     expect(SearchField()).toHaveAttribute("aria-invalid", "true");
+    expect(SearchField()).toHaveAccessibleDescription(ALREADY_AT_BOTTOM);
     expect(SearchField()).toHaveFocus();
     expect(BodyRowTexts()).toEqual(RowTextsOf(FIRST_PAGE_ROWS));
 });

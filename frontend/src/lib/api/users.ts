@@ -5,7 +5,7 @@
 // marks it. Every screen field travels as typed, never trimmed or case-folded: the server runs the
 // programs' presence checks, the U/D selection, the 10-row paging and the hashed-password change
 // detection on the raw text, and every legacy outcome reaches the caller as a rejected call.
-import { API_CLIENT, type Direction, type PageState } from "@/lib/apiClient";
+import { API_CLIENT, EncodePathKey, type Direction, type PageState } from "@/lib/apiClient";
 
 const USERS_PATH = "/admin/users";
 const SELECTION_PATH = `${USERS_PATH}/selection`;
@@ -92,11 +92,6 @@ export interface UserUpdateRequest {
 export interface UserMessageResponse {
     message: string;
     cursor_field?: string | null;
-}
-
-// An empty segment would reach the collection route; a blank USRIDIN travels as SPACES (%20).
-function EncodePathKey(value: string): string {
-    return encodeURIComponent(value === "" ? " " : value);
 }
 
 function UserPath(userId: string): string {

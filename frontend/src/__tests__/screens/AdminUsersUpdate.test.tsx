@@ -126,6 +126,7 @@ const UPDATED_MESSAGE = "User TESTUSR1 has been updated ...";
 const OTHER_UPDATED_MESSAGE = "User TESTUSR2 has been updated ...";
 const USER_ID_EMPTY_MESSAGE = "User ID can NOT be empty...";
 const FIRST_NAME_EMPTY_MESSAGE = "First Name can NOT be empty...";
+const USER_TYPE_EMPTY_MESSAGE = "User Type can NOT be empty...";
 const USER_NOT_FOUND_MESSAGE = "User ID NOT found...";
 const UNABLE_TO_LOOKUP_MESSAGE = "Unable to lookup User...";
 const UNABLE_TO_UPDATE_MESSAGE = "Unable to Update User...";
@@ -708,5 +709,23 @@ describe("COUSR02C field errors and cursor (MOVE -1 TO <field>L)", () => {
         await waitFor(() => {
             expect(FieldInput(FIRST_NAME_LABEL)).toHaveFocus();
         });
+    });
+});
+
+describe("COUSR02C field error description", () => {
+    it("COUSR02C describes the flagged USRTYPE by the ERRMSG literal, then its hint", async () => {
+        const view = await RenderFromList();
+        const body = BuildErrorBody({
+            message: USER_TYPE_EMPTY_MESSAGE,
+            field_errors: ["user_type"],
+            cursor_field: "user_type",
+        });
+        mockUpdateUser.mockRejectedValue(BuildAxiosError(HTTP_BAD_REQUEST, body));
+        await Trigger(view, SAVE_ACTION, "click");
+        await ExpectAlert(USER_TYPE_EMPTY_MESSAGE, "error");
+        expect(FieldInput(USER_TYPE_LABEL)).toHaveAccessibleDescription(
+            `${USER_TYPE_EMPTY_MESSAGE} (A=Admin, U=User)`,
+        );
+        expect(FieldInput(PASSWORD_LABEL)).toHaveAccessibleDescription("(8 Char)");
     });
 });

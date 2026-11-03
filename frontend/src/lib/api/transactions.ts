@@ -5,8 +5,16 @@
 // marks it. Every screen field travels as typed, never trimmed, padded or case-folded: the server
 // runs the search-key edit, the 10-row paging, the S selection, every CT02 first-failure edit, the
 // F5 copy of the last transaction and the TRAN-ID allocation on the raw text. CT00 literals arrive
-// in a 200 list page; every CT01 and CT02 failure reaches the caller as a rejected call.
-import { API_CLIENT, type Direction, type MoneyAmount, type PageState } from "@/lib/apiClient";
+// in a 200 list page; every CT01 and CT02 failure reaches the caller as a rejected call. The CT01
+// TRAN-ID path key goes through EncodePathKey, which gives only a blank, "." or ".." key the one
+// trailing space the server's space padding ignores.
+import {
+    API_CLIENT,
+    EncodePathKey,
+    type Direction,
+    type MoneyAmount,
+    type PageState,
+} from "@/lib/apiClient";
 
 const TRANSACTIONS_PATH = "/transactions";
 const SELECTION_PATH = `${TRANSACTIONS_PATH}/selection`;
@@ -113,12 +121,6 @@ export interface TransactionAddResponse {
     cursor_field?: string | null;
     fields?: TransactionAddFields;
     tran_id?: string | null;
-}
-
-// An empty segment would reach the list route; a blank TRNIDIN travels as SPACES (%20), so
-// COTRN01C answers it with its empty-key literal.
-function EncodePathKey(value: string): string {
-    return encodeURIComponent(value === "" ? " " : value);
 }
 
 // CT00 (COTRN00C): the first entry, a search, F7 and F8 on the transaction list.

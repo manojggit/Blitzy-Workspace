@@ -12,6 +12,8 @@ serialised by ``app.core.errors``; screen text breaking its BMS LENGTH or the co
 repertoire is a 422. ENTER on COUSR02 and COUSR03 share ``GET /{userId}``, told apart by the
 ``screen`` query parameter. COUSR01's F12 has no route: the program answers it with the
 CSMSG01Y invalid-key literal without reading any field, and the page shows that literal itself.
+The routes are ``LosslessKeyRoute`` routes, so ``/{userId}`` reaches every ID COUSR01C accepts,
+one holding ``/`` included.
 """
 
 from collections.abc import Awaitable, Callable
@@ -19,7 +21,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query
 
-from app.api.v1 import LegacyErrorResponses
+from app.api.v1 import LegacyErrorResponses, LosslessKeyRoute
 from app.core.dependencies import GetAdminContext, OnlineContext
 from app.schemas.common import ScreenText
 from app.schemas.users import (
@@ -39,7 +41,8 @@ from app.services.users import cousr00c, cousr01c, cousr02c, cousr03c
 # USRIDIN, LENGTH=8, on COUSR02 and COUSR03 (SEC-USR-ID X(08) of CSUSR01Y).
 USER_ID_LENGTH = 8
 # Raw screen text with no pattern: a blank ID sent as %20 must reach the services'
-# ``User ID can NOT be empty...`` edit rather than a 422.
+# ``User ID can NOT be empty...`` edit rather than a 422, and an ID holding "/" (sent as %2F,
+# kept in one segment by LosslessKeyRoute) its keyed read rather than a framework 404.
 USER_ID_PATH = Annotated[
     ScreenText(USER_ID_LENGTH),
     Path(description="User ID as typed on the screen (up to 8 characters)."),
@@ -54,7 +57,7 @@ FETCH_SERVICES: dict[
     UserFetchScreen.DELETE: cousr03c.FetchUserForDelete,
 }
 
-ROUTER = APIRouter(prefix="/admin/users", tags=["admin-users"])
+ROUTER = APIRouter(prefix="/admin/users", tags=["admin-users"], route_class=LosslessKeyRoute)
 
 
 @ROUTER.get(

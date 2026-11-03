@@ -12,14 +12,16 @@ service's model. Legacy outcomes are raised by the services as ``LegacyMessageEr
 serialised by ``app.core.errors`` as the four standard keys; screen text breaking its BMS
 LENGTH or the code-page-037 repertoire is a 422. Every CT00 screen outcome, the paging
 literals and ``Tran ID must be Numeric ...`` included, is a 200 list response, so the list and
-selection routes declare only the 503 file error besides the session and role refusals.
+selection routes declare only the 503 file error besides the session and role refusals. The
+routes are ``LosslessKeyRoute`` routes, so ``/{tranId}`` receives a TRAN-ID holding ``/`` as
+one value.
 """
 
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query
 
-from app.api.v1 import LegacyErrorResponses
+from app.api.v1 import LegacyErrorResponses, LosslessKeyRoute
 from app.core.dependencies import GetRegularContext, OnlineContext
 from app.schemas.common import ScreenText
 from app.schemas.transactions import (
@@ -36,14 +38,15 @@ from app.services.transactions import cotrn00c, cotrn01c, cotrn02c
 # TRNIDIN, LENGTH=16, on COTRN01 (TRAN-ID X(16) of CVTRA05Y).
 TRAN_ID_LENGTH = 16
 # Raw screen text with no pattern: a blank ID sent as %20 must reach COTRN01C's
-# ``Tran ID can NOT be empty...`` edit rather than a 422.
+# ``Tran ID can NOT be empty...`` edit rather than a 422, and an ID holding "/" (sent as %2F,
+# kept in one segment by LosslessKeyRoute) its keyed read rather than a framework 404.
 TRAN_ID_PATH = Annotated[
     ScreenText(TRAN_ID_LENGTH),
     Path(description="Transaction ID as typed on the screen (up to 16 characters)."),
 ]
 REGULAR_CONTEXT = Annotated[OnlineContext, Depends(GetRegularContext)]
 
-ROUTER = APIRouter(prefix="/transactions", tags=["transactions"])
+ROUTER = APIRouter(prefix="/transactions", tags=["transactions"], route_class=LosslessKeyRoute)
 
 
 @ROUTER.get(

@@ -40,6 +40,21 @@ export const API_CLIENT = axios.create({
     timeout: REQUEST_TIMEOUT_MILLISECONDS,
 });
 
+// Path segments a URL cannot carry as typed: an empty one reaches another route, and "." or ".."
+// is removed by URL normalisation ("/accounts/./edit" would become the view of "edit", and
+// "/transactions/.." the API root). Each travels with one trailing space instead, so a blank key
+// arrives as SPACES (%20); the server cannot tell the difference, because it compares every key
+// padded with spaces to its BMS LENGTH.
+const UNSENDABLE_PATH_SEGMENTS: readonly string[] = ["", ".", ".."];
+
+// One raw screen key (ACCTSID, CARDSID, TRNIDIN, USRIDIN) or card_ref as one path segment. The
+// text is never validated, trimmed or case-folded: "/" and "%" are percent-encoded, and the
+// backend's LosslessKeyRoute hands the key to the program's edits exactly as keyed.
+export function EncodePathKey(value: string): string {
+    const sendableValue = UNSENDABLE_PATH_SEGMENTS.includes(value) ? `${value} ` : value;
+    return encodeURIComponent(sendableValue);
+}
+
 export const ABEND_MESSAGE = "UNEXPECTED ABEND OCCURRED.";
 export const SIGN_ON_ROUTE = "/signon";
 export const DEFAULT_HOME_ROUTE = "/menu";
