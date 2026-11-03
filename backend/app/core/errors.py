@@ -89,11 +89,16 @@ class LegacyErrorDetails:
     ``last_key`` of a CT00 or CU00 invalid-selection refusal. Its values must already be
     JSON-ready (for example ``model_dump(mode="json")``): the body is sent without
     ``jsonable_encoder``, which would turn ``Decimal`` amounts into floats.
+    ``exactFieldErrors`` declares ``fieldErrors`` the exact failing-field list even when it is
+    empty, so a screen whose outcome fails no field, such as the CCUP no-change and write
+    outcomes, places the cursor without marking any field. Unset, an empty ``fieldErrors``
+    falls back to the cursor field, the contract of the first-failure programs.
     """
 
     infoMessage: str = ""
     fieldErrors: tuple[str, ...] = ()
     extraBody: Mapping[str, object] | None = None
+    exactFieldErrors: bool = False
 
 
 def ErrorBody(
@@ -101,15 +106,16 @@ def ErrorBody(
 ) -> dict[str, object]:
     """Build the legacy error body around a message literal, which is passed through unchanged.
 
-    ``field_errors`` is ``details.fieldErrors`` when it names any field, otherwise ``[field]``
-    for a non-blank ``field``, otherwise empty. ``cursor_field`` is ``field`` when non-blank,
-    otherwise the first failing field, replacing ``MOVE -1 TO <field>L``. Keys of
-    ``details.extraBody`` are added but never replace the four standard keys.
+    ``field_errors`` is ``details.fieldErrors`` when it names any field or when
+    ``details.exactFieldErrors`` is set, otherwise ``[field]`` for a non-blank ``field``,
+    otherwise empty. ``cursor_field`` is ``field`` when non-blank, otherwise the first failing
+    field, replacing ``MOVE -1 TO <field>L``. Keys of ``details.extraBody`` are added but never
+    replace the four standard keys.
     """
     errorDetails = details if details is not None else LegacyErrorDetails()
     hasField = bool(field.strip())
     fieldErrors = list(errorDetails.fieldErrors)
-    if not fieldErrors and hasField:
+    if not fieldErrors and hasField and not errorDetails.exactFieldErrors:
         fieldErrors = [field]
     body: dict[str, object] = {
         "message": message,
@@ -348,10 +354,10 @@ async def HandleRequestValidationError(
     Every request FastAPI's validation rejects arrives here: malformed JSON; a wrong JSON type
     or null; an invalid enum value on a non-screen field (an ``action``, a paging
     ``direction``, the user-fetch ``screen``, the CR00 report type or export format); a missing
-    export format; a negative page number; a list or opaque token over its maximum length; and
-    screen text over its BMS field length or outside the code-page-037 repertoire, which a 3270
-    terminal could never send (AAP 0.6.4). The legacy type, sign, range and format edits run in
-    the services, never here.
+    export format; a negative page number, or a CU00 page wider than its PIC 9(08); a list or
+    opaque token over its maximum length; and screen text over its BMS field length or outside
+    the code-page-037 repertoire, which a 3270 terminal could never send (AAP 0.6.4). The legacy
+    type, sign, range and format edits run in the services, never here.
 
     The body is FastAPI's ``HTTPValidationError`` ``detail`` list, each item holding only
     ``loc``, ``msg`` and ``type``, with the four standard legacy keys beside it. ``message`` and

@@ -57,19 +57,18 @@ from app.schemas.cards import CardScreen, CardScreenFields, CardUpdateRequest
 from app.schemas.common import UpdateAction, UpdateScreenState
 from app.services.cards.cocrdslc import (
     ACCT_ID_FIELD,
-    ACCT_ID_LENGTH,
     CARD_NOT_FOUND_MESSAGE,
     CARD_NUM_FIELD,
-    CARD_NUM_LENGTH,
     PROMPT_FOR_KEYS_INFO,
     READ_OPERATION,
     BuildFileErrorMessage,
+    DecodeCardKey,
     EditCardKeys,
     ExpiryParts,
     IsAsciiDigits,
     IsBlankKey,
+    IsListEntry,
     PadScreenText,
-    ResolveCardKey,
 )
 
 if TYPE_CHECKING:
@@ -347,24 +346,19 @@ async def FetchCardForEdit(context: OnlineContext, cardKey: str, acctId: str) ->
         LegacyMessageError: 404 ``Did not find cards for this search condition`` for an
             invalid or expired ``card_ref``, one carrying no card key, or a card that does not
             exist; 400 with the key edit literal, never for the card-list entry; 503 with the
-            CARDDAT READ file-error text.
+            CARDDAT READ file-error text. Each body carries the not-fetched key screen; for a
+            ``card_ref`` carrying no card key it shows the account as sent and a blank card
+            number, so the token is never echoed.
     """
-    cardText = ResolveCardKey(cardKey, context.settings)
+    cardText = DecodeCardKey(cardKey, context.settings)
+    if cardText is None:
+        reply = ReadFailureReply(
+            (acctId, ""), CARD_NOT_FOUND_MESSAGE, (ACCT_ID_FIELD, CARD_NUM_FIELD)
+        )
+        raise ScreenError(reply, STATUS_NOT_FOUND, context.settings)
     if IsListEntry(cardKey, acctId):
         return await ShowFetchedCard(context, acctId, cardText)
     return await FetchWithKeys(context, acctId, cardText)
-
-
-def IsListEntry(cardKey: str, acctId: str) -> bool:
-    """Return True for the card-list entry of lines 482-497: a ``card_ref`` and a row account.
-
-    COCRDLIC passes the selected row's WS-ROW-CARD-NUM and WS-ROW-ACCTNO (lines 552-556), and
-    COCRDUPC sets both filter flags valid without editing them. Only a ``card_ref`` path value
-    with an account of exactly 11 ASCII digits, zeros included, has that shape; with any other
-    account the keys are not list keys and run the 1210 and 1220 edits.
-    """
-    isCardRef = len(cardKey) > CARD_NUM_LENGTH
-    return isCardRef and len(acctId) == ACCT_ID_LENGTH and IsAsciiDigits(acctId)
 
 
 async def ProcessCardUpdate(
@@ -446,7 +440,11 @@ def ScreenError(reply: ScreenReply, httpStatus: int, settings: "Settings") -> Le
     """Return the error carrying a reply's message and its whole screen.
 
     The screen ``fields``, ``state`` and ``screen_token`` ride beside the four standard keys,
-    so the page keeps the state machine running on a 4xx or 5xx response.
+    so the page keeps the state machine running on a 4xx or 5xx response. ``field_errors`` is
+    exactly the reply's failing fields and ``cursor_field`` its cursor, so the outcomes that
+    fail no field list none: NO-CHANGES-DETECTED sets every FLG-* ISVALID (lines 685-692) and
+    the 9200 lock, record-changed and update-failed outcomes set no flag NOT-OK, so 3300
+    colours no field while it still positions the cursor.
     """
     screenBody = BuildScreen(reply, settings).model_dump(
         mode="json", include={"fields", "state", "screen_token"}
@@ -456,7 +454,10 @@ def ScreenError(reply: ScreenReply, httpStatus: int, settings: "Settings") -> Le
         field=reply.cursorField,
         httpStatus=httpStatus,
         details=LegacyErrorDetails(
-            infoMessage=reply.info, fieldErrors=reply.fieldErrors, extraBody=screenBody
+            infoMessage=reply.info,
+            fieldErrors=reply.fieldErrors,
+            extraBody=screenBody,
+            exactFieldErrors=True,
         ),
     )
 

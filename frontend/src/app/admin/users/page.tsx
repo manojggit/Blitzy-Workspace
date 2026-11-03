@@ -35,7 +35,6 @@ import {
     ToAllowedRoute,
     ToScreenFeedback,
     type CompleteScreenFeedback,
-    type LegacyErrorResponse,
     type MessageSeverity,
     type PageState,
     type RouteAllowance,
@@ -47,6 +46,7 @@ import {
     type UserListResponse,
     type UserListRow,
     type UserSelection,
+    type UserSelectionErrorResponse,
 } from "@/lib/api/users";
 import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
 
@@ -115,9 +115,6 @@ interface ScreenActions {
     router: PageRouter;
     startPageRead: PageReadStarter;
 }
-
-// The body of ENTER's invalid-selection 400: the four legacy keys plus the re-browsed page.
-type EnterRefusalBody = LegacyErrorResponse & Pick<UserListResponse, "rows" | keyof PageState>;
 
 const EMPTY_FEEDBACK: CompleteScreenFeedback = {
     message: BLANK_TEXT,
@@ -208,7 +205,7 @@ function FailureFeedback(error: unknown): CompleteScreenFeedback {
 // such as a file error that sets ERR-FLG, keeps the rows, keys and typed search text.
 function EnterFailureUpdate(error: unknown): SetStateAction<ListScreenState> {
     const feedback = FailureFeedback(error);
-    const refusalBody = LegacyErrorBody<EnterRefusalBody>(error);
+    const refusalBody = LegacyErrorBody<UserSelectionErrorResponse>(error);
     if (refusalBody?.rows === undefined) {
         return (current) => ({ ...current, feedback });
     }

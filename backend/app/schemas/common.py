@@ -110,7 +110,7 @@ def ScreenTextOrToken(screenLength: int, tokenLength: int) -> Any:
     at most ``tokenLength`` characters, told apart by length alone.
 
     It serves a value that is either, as the CCDL and CCUP ``{cardNum}`` is the CARDSID text as
-    keyed or a ``card_ref`` (``cocrdslc.ResolveCardKey`` draws the same line). Screen text keeps
+    keyed or a ``card_ref`` (``cocrdslc.DecodeCardKey`` draws the same line). Screen text keeps
     the ``ScreenText`` repertoire check. A token is checked for length only, as ``OpaqueToken``
     is, so a garbled ``card_ref`` reaches its decoder and gives
     ``Did not find cards for this search condition``, never a 422. The published pattern

@@ -43,7 +43,7 @@ from app.seed.image_reader import (
     StreamImage,
 )
 from app.seed.sample_seed import BuildPlainRows
-from app.utils.record_layouts import RecordLayout
+from app.utils.record_layouts import RecordFormatError, RecordLayout
 from sqlalchemy import Table, delete, insert, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
@@ -84,6 +84,28 @@ LOAD_ROLLED_BACK_TEMPLATE = "{dataset}: LOAD ROLLED BACK: {reason}"
 # psycopg2's message text carries a DETAIL line quoting the offending key, which can be a card
 # number or an SSN, so a rolled-back load reports only these diagnostic fields.
 INTEGRITY_REASON_TEMPLATE = "SQLSTATE {sqlState} ON CONSTRAINT {constraintName}"
+# The message of an ImageFormatError, and of the errors it is raised from, can quote the refused
+# record's text: a zoned-decimal or timestamp decoder names the field text it refused, and a
+# codec names the byte. A rejected image therefore reports a withheld ImageFormatError with the
+# same path and record number, whose reason names only the class of the error that caused the
+# rejection and, when that cause locates it, the field and offset or the byte position and
+# codec. FRAMING_ERROR_CODE stands for the cause of an ImageFormatError raised without one: a
+# length, terminator or size problem.
+FRAMING_ERROR_CODE = "FRAMING"
+WITHHELD_REASON_TEMPLATE = "CAUSE {errorCode}; RECORD TEXT WITHHELD"
+WITHHELD_FIELD_REASON_TEMPLATE = (
+    "FIELD {fieldName} AT OFFSET {fieldOffset}, CAUSE {errorCode}; RECORD TEXT WITHHELD"
+)
+# A byte the codec refused while image_reader decoded one record, at its 1-based position there.
+WITHHELD_BYTE_REASON_TEMPLATE = (
+    "BYTE {bytePosition} IS NOT {codec} TEXT, CAUSE {errorCode}; RECORD TEXT WITHHELD"
+)
+# A UnicodeDecodeError raised by a row builder, outside image_reader, carries no record number,
+# so it is reported against the whole image.
+UNDECODABLE_REASON_TEMPLATE = (
+    "BYTE {bytePosition} IS NOT {codec} TEXT, CAUSE {errorCode}; IMAGE TEXT WITHHELD"
+)
+WHOLE_IMAGE_RECORD_NUMBER = 0
 ENCODING_SEPARATOR = ", "
 
 LOAD_COMPLETE_TEMPLATE = "%s: %d ROWS LOADED, %d RECORDS SKIPPED"
@@ -177,11 +199,64 @@ def IntegrityReason(error: IntegrityError) -> str:
     )
 
 
-def ImageErrorMessage(spec: LoaderSpec, imagePath: Path, error: ImageFormatError) -> str:
-    """Return the exit-12 text of an image StreamImage refused.
+def ImageErrorCode(error: ImageFormatError) -> str:
+    """Return the class name of error's cause, or FRAMING_ERROR_CODE when it has no cause."""
+    if error.__cause__ is None:
+        return FRAMING_ERROR_CODE
+    return type(error.__cause__).__name__
 
-    StreamImage reports an absent file as ImageFormatError chained to the FileNotFoundError, so
-    that case is named as a missing image rather than a malformed one.
+
+def WithheldImageError(error: ImageFormatError) -> ImageFormatError:
+    """Return an ImageFormatError with error's path and record number but none of its text.
+
+    The reason names the cause's class, with the field and offset a RecordFormatError cause
+    locates, or the 1-based byte position in the record and the codec a UnicodeDecodeError
+    cause names. It never quotes error's reason, its causes' messages or any field or byte
+    value.
+    """
+    errorCode = ImageErrorCode(error)
+    cause = error.__cause__
+    if isinstance(cause, RecordFormatError) and cause.fieldName is not None:
+        reason = WITHHELD_FIELD_REASON_TEMPLATE.format(
+            fieldName=cause.fieldName, fieldOffset=cause.fieldOffset, errorCode=errorCode
+        )
+    elif isinstance(cause, UnicodeDecodeError):
+        reason = WITHHELD_BYTE_REASON_TEMPLATE.format(
+            bytePosition=cause.start + 1, codec=cause.encoding, errorCode=errorCode
+        )
+    else:
+        reason = WITHHELD_REASON_TEMPLATE.format(errorCode=errorCode)
+    return ImageFormatError(error.path, error.recordNumber, reason)
+
+
+def UndecodableImageError(imagePath: Path, error: UnicodeDecodeError) -> ImageFormatError:
+    """Return a whole-image ImageFormatError naming the codec and the 1-based byte position.
+
+    Neither the refused byte nor error's own text, which shows it, is quoted.
+    """
+    reason = UNDECODABLE_REASON_TEMPLATE.format(
+        bytePosition=error.start + 1, codec=error.encoding, errorCode=type(error).__name__
+    )
+    return ImageFormatError(imagePath, WHOLE_IMAGE_RECORD_NUMBER, reason)
+
+
+def ReportedImageError(error: ImageFormatError) -> ImageFormatError:
+    """Return the ImageFormatError that the load failure for error reports and is chained to.
+
+    StreamImage reports an absent file as ImageFormatError chained to the FileNotFoundError,
+    which names only the path, so that error is kept. Any other is replaced by its
+    WithheldImageError.
+    """
+    if isinstance(error.__cause__, FileNotFoundError):
+        return error
+    return WithheldImageError(error)
+
+
+def ImageErrorMessage(spec: LoaderSpec, imagePath: Path, error: ImageFormatError) -> str:
+    """Return the exit-12 text of error, an ImageFormatError ReportedImageError returned.
+
+    The error kept for an absent file is named as a missing image; any other, being withheld,
+    gives its path, record number and withheld reason as the rejection.
     """
     if isinstance(error.__cause__, FileNotFoundError):
         return IMAGE_NOT_FOUND_TEMPLATE.format(dataset=spec.dataset, path=imagePath)
@@ -190,14 +265,17 @@ def ImageErrorMessage(spec: LoaderSpec, imagePath: Path, error: ImageFormatError
 
 @contextmanager
 def MappedLoadErrors(spec: LoaderSpec, imagePath: Path) -> Iterator[None]:
-    """Turn the expected failures of one load into JobFailure(EXIT_FAILURE), chained to them.
+    """Turn the expected failures of one load into JobFailure(EXIT_FAILURE).
 
     Only a missing image, a malformed or undecodable image, and an integrity violation are
     mapped. A missing image surfaces when StreamImage opens it, a malformed record while a
     batch is being read, a duplicate key at a batch's insert and a deferred foreign-key
     violation at commit, so the context encloses StreamImage and the whole transaction, and
-    each error reaches it after the transaction has rolled back. JobFailure and every other
-    error propagate unchanged, for batch_chain to record.
+    each error reaches it after the transaction has rolled back. A missing image and an
+    integrity violation are chained to their error. A malformed or undecodable image is
+    chained to the withheld ImageFormatError its message reports, so neither the message nor a
+    rendered traceback quotes the refused record's text. JobFailure and every other error
+    propagate unchanged, for batch_chain to record.
     """
     try:
         yield
@@ -205,10 +283,13 @@ def MappedLoadErrors(spec: LoaderSpec, imagePath: Path) -> Iterator[None]:
         message = IMAGE_NOT_FOUND_TEMPLATE.format(dataset=spec.dataset, path=imagePath)
         raise JobFailure(EXIT_FAILURE, message) from error
     except ImageFormatError as error:
-        raise JobFailure(EXIT_FAILURE, ImageErrorMessage(spec, imagePath, error)) from error
+        reportedError = ReportedImageError(error)
+        message = ImageErrorMessage(spec, imagePath, reportedError)
+        raise JobFailure(EXIT_FAILURE, message) from reportedError
     except UnicodeDecodeError as error:
-        message = IMAGE_REJECTED_TEMPLATE.format(dataset=spec.dataset, reason=error)
-        raise JobFailure(EXIT_FAILURE, message) from error
+        reportedError = UndecodableImageError(imagePath, error)
+        message = IMAGE_REJECTED_TEMPLATE.format(dataset=spec.dataset, reason=reportedError)
+        raise JobFailure(EXIT_FAILURE, message) from reportedError
     except IntegrityError as error:
         message = LOAD_ROLLED_BACK_TEMPLATE.format(
             dataset=spec.dataset, reason=IntegrityReason(error)

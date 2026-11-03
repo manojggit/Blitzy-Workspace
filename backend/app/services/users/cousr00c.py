@@ -45,12 +45,13 @@ from app.core.messages import (
     REACHED_TOP_MESSAGE,
 )
 from app.repositories.user_repository import UserRepository
-from app.schemas.common import Direction
+from app.schemas.common import Direction, LegacyErrorResponse
 from app.schemas.users import (
     UserListQuery,
     UserListResponse,
     UserListRow,
     UserSelection,
+    UserSelectionErrorResponse,
     UserSelectionRequest,
     UserSelectionResponse,
 )
@@ -87,12 +88,18 @@ NO_MESSAGE = ""
 # ENTER moves 0 to CDEMO-CU00-PAGE-NUM before PROCESS-PAGE-FORWARD adds 1 (line 227).
 ENTER_BASE_PAGE = 0
 FIRST_PAGE = 1
+# CDEMO-CU00-PAGE-NUM PIC 9(08) (line 70): COMPUTE ... + 1 with no ON SIZE ERROR (lines 309-310,
+# 320-321) keeps the low-order eight digits.
+PAGE_NUMBER_MODULUS = 10**8
 # A blank last key is NEXT-PAGE-NO: F8 refuses it before any read (PROCESS-PF8-KEY).
 NO_NEXT_PAGE_KEY = ""
 # The first key of no shown page: a GET query carries none, so there are no rows to re-read.
 NO_SHOWN_KEY = ""
-# The UserListResponse fields an invalid-selection 400 carries beside the four standard keys.
-LIST_PAGE_BODY_FIELDS = {"rows", "page", "first_key", "last_key"}
+# The UserListResponse fields an invalid-selection 400 carries beside the four standard keys:
+# those UserSelectionErrorResponse adds to LegacyErrorResponse, so the body keeps to its schema.
+LIST_PAGE_BODY_FIELDS = set(UserSelectionErrorResponse.model_fields) - set(
+    LegacyErrorResponse.model_fields
+)
 BLANK_CHARACTER = " "
 
 
@@ -218,8 +225,9 @@ def _InvalidSelectionRefusal(listPage: UserListResponse) -> LegacyMessageError:
     """Return the 400 of an invalid selection code the re-browsed page still shows.
 
     The edit failure rides on the page the browse built: the body adds its ``rows``, ``page``,
-    ``first_key`` and ``last_key`` beside the four standard keys, JSON-ready, so the client
-    shows that page under the invalid-selection literal.
+    ``first_key`` and ``last_key`` beside the four standard keys, JSON-ready, as
+    ``UserSelectionErrorResponse`` declares, so the client shows that page under the
+    invalid-selection literal.
     """
     pageBody = listPage.model_dump(mode="json", include=LIST_PAGE_BODY_FIELDS)
     return LegacyMessageError(
@@ -323,12 +331,13 @@ def _BuildForwardPage(
 
     ``records`` holds up to 10 page rows plus the look-ahead READNEXT. Without the look-ahead
     the browse reached ENDFILE, whose ``You have reached the bottom of the page...`` replaces
-    any earlier message (lines 634-640). The page number grows by 1 once a row was read.
+    any earlier message (lines 634-640). The page number grows by 1 once a row was read,
+    modulo 10**8 as its PIC 9(08) truncates: page 99999999 is followed by page 0.
     """
     pageRows = records[:PAGE_SIZE]
     hasNextPage = len(records) > PAGE_SIZE
     message = priorMessage if hasNextPage else REACHED_BOTTOM_MESSAGE
-    page = basePage + 1 if pageRows else basePage
+    page = (basePage + 1) % PAGE_NUMBER_MODULUS if pageRows else basePage
     return _BuildPage(pageRows, page, message)
 
 

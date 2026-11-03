@@ -20,10 +20,15 @@ from pydantic import BaseModel, Field
 
 from app.schemas.common import (
     Direction,
+    LegacyErrorResponse,
     PageState,
     QueryModel,
     ScreenText,
 )
+
+# CDEMO-CU00-PAGE-NUM PIC 9(08) (cbl/COUSR00C.cbl line 70): no COMMAREA holds a larger page.
+CU00_PAGE_NUMBER_DIGITS = 8
+MAX_CU00_PAGE_NUMBER = 10**CU00_PAGE_NUMBER_DIGITS - 1
 
 
 class UserListQuery(QueryModel):
@@ -63,12 +68,13 @@ class UserListQuery(QueryModel):
     page: int = Field(
         default=0,
         ge=0,
+        le=MAX_CU00_PAGE_NUMBER,
         alias="page",
         description=(
-            "The page number shown when the key was pressed (CDEMO-CU00-PAGE-NUM); 0 before "
-            "the first page. F7 on page 1 or 0 answers "
+            "The page number shown when the key was pressed (CDEMO-CU00-PAGE-NUM PIC 9(08)), "
+            "0 to 99999999; 0 before the first page. F7 on page 1 or 0 answers "
             "'You are already at the top of the page...'. F8 reads after startKey from any "
-            "page."
+            "page and keeps the low-order eight digits, so page 99999999 is followed by 0."
         ),
     )
 
@@ -144,9 +150,8 @@ class UserSelectionRequest(BaseModel):
 class UserSelectionResponse(UserListResponse):
     """The COUSR00 ENTER outcome (COUSR00C, CU00): a route, or the re-browsed page.
 
-    An invalid selection code the re-browsed page still shows is not this model: it is a 400
-    whose body adds that page's ``rows``, ``page``, ``first_key`` and ``last_key`` to the four
-    standard keys.
+    An invalid selection code the re-browsed page still shows is not this model: it is the 400
+    ``UserSelectionErrorResponse``.
     """
 
     route: str | None = Field(
@@ -156,6 +161,22 @@ class UserSelectionResponse(UserListResponse):
             "or /admin/users/delete?userId=<id> (COUSR03C); null when the list fields carry "
             "the re-browsed page and its message."
         ),
+    )
+
+
+class UserSelectionErrorResponse(PageState, LegacyErrorResponse):
+    """The 400 of an invalid COUSR00 selection code (COUSR00C, CU00), with the re-browsed page.
+
+    ``Invalid selection. Valid values are U and D`` sets no ERR-FLG, so PROCESS-PAGE-FORWARD
+    still shows the page browsed from the search key. When no paging literal replaces it, the
+    body is the four standard keys of ``LegacyErrorResponse`` plus that page's ``rows``,
+    ``page``, ``first_key`` and ``last_key``, typed as ``UserListResponse`` types them.
+    """
+
+    rows: list[UserListRow] = Field(
+        default_factory=list,
+        max_length=10,
+        description="The users of the re-browsed page, in EBCDIC user-ID order; at most 10 rows.",
     )
 
 

@@ -1,23 +1,26 @@
 """Replaces: no legacy artefact (new control, AAP 0.7.1). Guards: COSGN00C (CC00) sign-on,
 key SEC-USR-ID X(08) of copybook CSUSR01Y.
 
-Every failed sign-on adds one to the failure count of its user ID in security.login_attempts,
-whether or not the user exists; cosgn00c passes the ID upper-cased, as COSGN00C reads USRSEC.
-The failure that reaches LOGIN_MAX_ATTEMPTS locks the ID for LOGIN_LOCKOUT_SECONDS, and while
-the lock lasts sign-on answers 429 with LOGIN_LOCKED_MESSAGE. The count saturates at
-LOGIN_MAX_ATTEMPTS, so a failure counted at the limit keeps it there and the SMALLINT
-failure_count never overflows. A successful sign-on deletes the row; the first failure after a
-lock has expired starts the count again at one. The table is not a batch-window file, so the
-throttle keeps working while the batch window is closed.
+Every sign-on attempt of an unlocked user ID is counted in security.login_attempts, whether or
+not the user exists, before its edits and its password check run; cosgn00c passes the ID
+upper-cased, as COSGN00C reads USRSEC. The check of the lock and the count are one atomic
+upsert, so concurrent attempts of one ID are counted one after another and no more than
+LOGIN_MAX_ATTEMPTS of them ever reach the password check. The attempt that reaches
+LOGIN_MAX_ATTEMPTS locks the ID for LOGIN_LOCKOUT_SECONDS. While the lock lasts, sign-on answers
+429 with LOGIN_LOCKED_MESSAGE and the attempt is not counted. The count saturates at
+LOGIN_MAX_ATTEMPTS, so the SMALLINT failure_count never overflows. A successful sign-on deletes
+the row, so only failed attempts stay counted; the first attempt after a lock has expired starts
+the count again at one. The table is not a batch-window file, so the throttle keeps working
+while the batch window is closed.
 """
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, case, delete, select, update
+from sqlalchemy import and_, case, delete, or_, update
 from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from app.core.database import UNIT_FAILURES, TranslateWriteFailure, WriteUnit
+from app.core.database import WriteUnit
 from app.core.dependencies import OnlineContext
 from app.core.errors import HTTP_LOGIN_LOCKED, LegacyMessageError
 from app.core.messages import LOGIN_LOCKED_MESSAGE
@@ -35,48 +38,28 @@ def UtcNow() -> datetime:
     return datetime.now(UTC)
 
 
-async def ReadLockedUntil(context: OnlineContext, userId: str) -> datetime | None:
-    """Return the lock expiry stored for the user ID, or None when it has no lock or no row.
+def BuildAttemptUpsert(userId: str, now: datetime, maxAttempts: int) -> Insert:
+    """Build the upsert that counts one sign-on attempt and returns the new attempt count.
 
-    The read locks nothing, so it runs on the request session. Besides a wrapped DBAPIError,
-    the session's first statement can meet an unwrapped connect failure, so the whole
-    UNIT_FAILURES set becomes the RepositoryError family, which cosgn00c reports as the
-    COSGN00C ``WHEN OTHER`` literal instead of an unexpected error.
+    One atomic statement, so concurrent first attempts of one user ID never collide on the
+    primary key. On a conflict PostgreSQL locks the existing row even when the WHERE clause
+    then refuses the update, so concurrent attempts of one user ID are counted one after
+    another, each against the count and the lock the previous one committed. The WHERE clause
+    refuses a row whose lock has not expired by ``now``: the row stays unchanged and the
+    statement returns no row. Every row it lets through has no lock or an expired one, so the
+    update leaves it unlocked: an expired lock is cleared and the count restarts at one.
+    Otherwise the count saturates at ``maxAttempts`` (LOGIN_MAX_ATTEMPTS): an unlocked row
+    already at the limit, as after the limit was lowered, keeps it instead of adding one, so
+    the SMALLINT failure_count never overflows.
     """
-    statement = select(LOGIN_ATTEMPTS.c.locked_until).where(LOGIN_ATTEMPTS.c.user_id == userId)
-    try:
-        result = await context.session.execute(statement)
-    except UNIT_FAILURES as error:
-        raise TranslateWriteFailure(error, LOGIN_ATTEMPTS_FILE_NAME) from error
-    return result.scalar_one_or_none()
-
-
-async def CheckLocked(context: OnlineContext, userId: str) -> None:
-    """Raise the 429 lockout error while the user ID holds a lock that has not yet expired."""
-    lockedUntil = await ReadLockedUntil(context, userId)
-    if lockedUntil is not None and lockedUntil > UtcNow():
-        raise LegacyMessageError(
-            LOGIN_LOCKED_MESSAGE, field=USER_ID_FIELD, httpStatus=LOCKED_STATUS
-        )
-
-
-def BuildFailureUpsert(userId: str, now: datetime, maxAttempts: int) -> Insert:
-    """Build the upsert that counts one failure and returns the new failure count.
-
-    One atomic statement, so concurrent first failures of one user ID never collide on the
-    primary key. A lock that has expired by ``now`` is cleared and the count restarts at one.
-    Otherwise the count saturates at ``maxAttempts`` (LOGIN_MAX_ATTEMPTS): a row already at
-    the limit, as after concurrent failures, keeps it instead of adding one, so the SMALLINT
-    failure_count never overflows.
-    """
-    lockExpired = and_(
-        LOGIN_ATTEMPTS.c.locked_until.is_not(None), LOGIN_ATTEMPTS.c.locked_until <= now
-    )
+    lockedUntil = LOGIN_ATTEMPTS.c.locked_until
+    lockExpired = and_(lockedUntil.is_not(None), lockedUntil <= now)
+    unlocked = or_(lockedUntil.is_(None), lockedUntil <= now)
     limitReached = LOGIN_ATTEMPTS.c.failure_count >= maxAttempts
-    firstFailure = insert(LOGIN_ATTEMPTS).values(
+    firstAttempt = insert(LOGIN_ATTEMPTS).values(
         user_id=userId, failure_count=1, locked_until=None, last_failure_at=now
     )
-    return firstFailure.on_conflict_do_update(
+    return firstAttempt.on_conflict_do_update(
         index_elements=[LOGIN_ATTEMPTS.c.user_id],
         set_={
             "failure_count": case(
@@ -84,14 +67,15 @@ def BuildFailureUpsert(userId: str, now: datetime, maxAttempts: int) -> Insert:
                 (limitReached, maxAttempts),
                 else_=LOGIN_ATTEMPTS.c.failure_count + 1,
             ),
-            "locked_until": case((lockExpired, None), else_=LOGIN_ATTEMPTS.c.locked_until),
+            "locked_until": None,
             "last_failure_at": now,
         },
+        where=unlocked,
     ).returning(LOGIN_ATTEMPTS.c.failure_count)
 
 
 async def ApplyLockout(unit: AsyncConnection, userId: str, lockedUntil: datetime) -> None:
-    """Lock the user ID until ``lockedUntil``, inside the unit that counted the failure."""
+    """Lock the user ID until ``lockedUntil``, inside the unit that counted the attempt."""
     statement = (
         update(LOGIN_ATTEMPTS)
         .where(LOGIN_ATTEMPTS.c.user_id == userId)
@@ -100,18 +84,31 @@ async def ApplyLockout(unit: AsyncConnection, userId: str, lockedUntil: datetime
     await unit.execute(statement)
 
 
-async def RecordFailure(context: OnlineContext, userId: str) -> None:
-    """Count one failed sign-on for the user ID, locking it once the attempt limit is reached."""
+async def ReserveAttempt(context: OnlineContext, userId: str) -> None:
+    """Count one sign-on attempt of the user ID before it is checked; refuse a locked ID.
+
+    The count, and the lock of the attempt that reaches LOGIN_MAX_ATTEMPTS, commit in one write
+    unit before cosgn00c edits the request or checks the password. The attempt therefore stays
+    counted whatever the request does next, and a concurrent attempt of the same ID is counted
+    after it.
+
+    Raises:
+        LegacyMessageError: 429 with LOGIN_LOCKED_MESSAGE while the user ID holds a lock that
+            has not expired; the attempt is not counted.
+        RepositoryError: the LOGINATT file condition when the write unit fails.
+    """
     now = UtcNow()
     settings = context.settings
-    failureUpsert = BuildFailureUpsert(userId, now, settings.LOGIN_MAX_ATTEMPTS)
-    # The unit commits when the block exits, before cosgn00c raises its sign-on error, so the
-    # failure stays recorded although the request itself ends in an error.
+    attemptUpsert = BuildAttemptUpsert(userId, now, settings.LOGIN_MAX_ATTEMPTS)
     async with WriteUnit(context.engine, LOGIN_ATTEMPTS_FILE_NAME) as unit:
-        failureCount = (await unit.execute(failureUpsert)).scalar_one()
-        if failureCount >= settings.LOGIN_MAX_ATTEMPTS:
+        attemptCount = (await unit.execute(attemptUpsert)).scalar_one_or_none()
+        if attemptCount is not None and attemptCount >= settings.LOGIN_MAX_ATTEMPTS:
             lockedUntil = now + timedelta(seconds=settings.LOGIN_LOCKOUT_SECONDS)
             await ApplyLockout(unit, userId, lockedUntil)
+    if attemptCount is None:
+        raise LegacyMessageError(
+            LOGIN_LOCKED_MESSAGE, field=USER_ID_FIELD, httpStatus=LOCKED_STATUS
+        )
 
 
 async def ResetAttempts(context: OnlineContext, userId: str) -> None:

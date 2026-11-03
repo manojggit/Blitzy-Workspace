@@ -394,6 +394,15 @@ def AssertNamesField(message: str, fieldContext: FieldContext) -> None:
     assert f"at offset {fieldContext.fieldOffset}:" in message
 
 
+def AssertLocatesField(refusal: RecordFormatError, fieldContext: FieldContext) -> None:
+    """Assert a decode refusal names the field in its message and carries its column and offset."""
+    AssertNamesField(str(refusal), fieldContext)
+    assert (refusal.fieldName, refusal.fieldOffset) == (
+        fieldContext.columnName,
+        fieldContext.fieldOffset,
+    )
+
+
 def AssertWithheld(message: str, text: str) -> None:
     """Assert message holds text in none of its raw, repr and right-trimmed forms."""
     trimmedText = text.rstrip(" ")
@@ -429,7 +438,7 @@ def test_decode_record_refuses_corrupt_field_text_without_echoing_it(
     with pytest.raises(RecordFormatError) as refusal:
         DecodeRecord(recordText, layout)
     message = str(refusal.value)
-    AssertNamesField(message, fieldContext)
+    AssertLocatesField(refusal.value, fieldContext)
     assert expectedReason in message
     AssertWithheld(message, fieldText)
 
@@ -440,7 +449,7 @@ def test_decode_record_raises_from_the_field_decoder_error(fieldContext, fieldTe
     recordText = SpliceField(ReadFirstRecord(imagePath), fieldContext, fieldText)
     with pytest.raises(RecordFormatError) as refusal:
         DecodeRecord(recordText, layout)
-    AssertNamesField(str(refusal.value), fieldContext)
+    AssertLocatesField(refusal.value, fieldContext)
     assert isinstance(refusal.value.__cause__, expectedCause)
 
 

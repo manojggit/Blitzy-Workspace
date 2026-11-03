@@ -17,11 +17,11 @@ one holding ``/`` included.
 """
 
 from collections.abc import Awaitable, Callable
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Path, Query
 
-from app.api.v1 import LegacyErrorResponses, LosslessKeyRoute
+from app.api.v1 import ERROR_DESCRIPTIONS, LegacyErrorResponses, LosslessKeyRoute
 from app.core.dependencies import GetAdminContext, OnlineContext
 from app.schemas.common import ScreenText
 from app.schemas.users import (
@@ -32,6 +32,7 @@ from app.schemas.users import (
     UserListQuery,
     UserListResponse,
     UserMessageResponse,
+    UserSelectionErrorResponse,
     UserSelectionRequest,
     UserSelectionResponse,
     UserUpdateRequest,
@@ -55,6 +56,13 @@ FETCH_SERVICES: dict[
 ] = {
     UserFetchScreen.UPDATE: cousr02c.FetchUser,
     UserFetchScreen.DELETE: cousr03c.FetchUserForDelete,
+}
+
+# The invalid-selection 400 adds the re-browsed page to the legacy error body, so it declares
+# its own model; the other statuses carry the legacy error body alone.
+SELECTION_RESPONSES: dict[int | str, dict[str, Any]] = {
+    400: {"model": UserSelectionErrorResponse, "description": ERROR_DESCRIPTIONS[400]},
+    **LegacyErrorResponses(401, 403, 503),
 }
 
 ROUTER = APIRouter(prefix="/admin/users", tags=["admin-users"], route_class=LosslessKeyRoute)
@@ -92,7 +100,7 @@ async def ListUsers(
         "browse replaces it with a paging literal, the page is a 200. A search finding no user "
         "ID answers page 1 with the shown rows read again from the first row's user_id."
     ),
-    responses=LegacyErrorResponses(400, 401, 403, 503),
+    responses=SELECTION_RESPONSES,
 )
 async def SelectUser(
     selectionRequest: UserSelectionRequest, context: ADMIN_CONTEXT

@@ -15,7 +15,9 @@ failure is a 400. Expected values are typed from those lines:
     with the rows read again from the first row's user ID when one is;
 - F8 with a blank last key and F7 on page 0 or 1 refuse with the four standard keys before any
     USRSEC read;
-- F8 with a last key reads the next 10 users from any page, page 0 included;
+- F8 with a last key reads the next 10 users from any page, page 0 included, and the page
+    number keeps CDEMO-CU00-PAGE-NUM's PIC 9(08) width (line 70): page 99999999 is followed by
+    page 0, and a wider page is refused as malformed;
 - an invalid code the browse leaves on the ERRMSG line is a 400 whose body adds the page's
     rows, page, first_key and last_key, while a page reaching the end of the file is a 200;
 - U, u, D and d still route without any read.
@@ -30,6 +32,7 @@ from typing import NamedTuple
 from unittest.mock import AsyncMock, call
 
 import pytest
+from pydantic import ValidationError
 
 from app.core.dependencies import OnlineContext
 from app.core.errors import LegacyMessageError
@@ -81,6 +84,11 @@ REFUSAL_STATUS = 400
 ENTER_PAGE = 0
 FIRST_PAGE = 1
 NEXT_PAGE_FROM_FIRST = 2
+# CDEMO-CU00-PAGE-NUM PIC 9(08) (line 70): COMPUTE ... + 1 with no ON SIZE ERROR (lines
+# 309-310) truncates 100000000 to 00000000, and no COMMAREA carries a wider page.
+LARGEST_PAGE = 99999999
+PAGE_AFTER_LARGEST = 0
+WIDER_THAN_EIGHT_DIGIT_PAGES = ["100000000", "99999999999999999999"]
 NO_MESSAGE = ""
 # The user number after SHOWN_LAST_KEY, where the next page's browse rows begin.
 NUMBER_AFTER_SHOWN_LAST = 11
@@ -283,8 +291,12 @@ async def test_paging_key_refused_before_any_read(userRepository, refusedKey):
 
 @pytest.mark.parametrize(
     ("shownPage", "expectedPage"),
-    [(ENTER_PAGE, FIRST_PAGE), (FIRST_PAGE, NEXT_PAGE_FROM_FIRST)],
-    ids=["page0", "page1"],
+    [
+        (ENTER_PAGE, FIRST_PAGE),
+        (FIRST_PAGE, NEXT_PAGE_FROM_FIRST),
+        (LARGEST_PAGE, PAGE_AFTER_LARGEST),
+    ],
+    ids=["page0", "page1", "page99999999-wraps"],
 )
 async def test_next_page_reads_the_next_ten_users_from_any_page(
     userRepository, shownPage, expectedPage
@@ -302,6 +314,15 @@ async def test_next_page_reads_the_next_ten_users_from_any_page(
     userRepository.BrowseForward.assert_awaited_once_with(
         SHOWN_LAST_KEY, inclusive=False, limit=PAGE_ROWS
     )
+
+
+@pytest.mark.parametrize("pageText", WIDER_THAN_EIGHT_DIGIT_PAGES, ids=["9-digits", "20-digits"])
+def test_page_wider_than_eight_digits_is_malformed(pageText):
+    """The query model refuses the page, which the route answers with 422 before the service."""
+    wireQuery = {"startKey": SHOWN_LAST_KEY, "direction": "forward", "page": pageText}
+    with pytest.raises(ValidationError) as raised:
+        UserListQuery.model_validate(wireQuery)
+    assert [error["loc"] for error in raised.value.errors()] == [("page",)]
 
 
 @pytest.mark.parametrize(

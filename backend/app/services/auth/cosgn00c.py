@@ -4,20 +4,22 @@ The CC00 sign-on. ENTER (PROCESS-ENTER-KEY) edits the two map fields in first-fa
 blank user ID, then a blank password, ends validation with its literal. Both inputs are then
 upper-cased, letters a-z only as FUNCTION UPPER-CASE does, for the USRSEC read and the password
 compare of READ-USER-SEC-FILE. Type exactly A opens /admin (XCTL COADM01C); every other type
-opens /menu (XCTL COMEN01C). The login throttle is the one added control: a locked user ID
-answers 429 before any edit, and every failed sign-on, the blank-field edits included, counts
-one failure against the upper-cased ID. The blank-field edits, NOTFND and the wrong password
-answer 401; the WHEN OTHER literal ``Unable to verify the User ...`` answers 503. The router
-issues and clears the session cookie, so nothing here creates, returns or logs a token. PF3 of
-MAIN-PARA is SignOff. MAIN-PARA's invalid-key branch has no path: the sign-on request carries no
-AID key, and the COSGN00 legend offers only ENTER and F3.
+opens /menu (XCTL COMEN01C). The login throttle is the one added control: before any edit,
+every sign-on attempt is counted once against the upper-cased ID, atomically, so a locked user
+ID answers 429 and concurrent attempts never check more passwords than LOGIN_MAX_ATTEMPTS. A
+failed sign-on, the blank-field edits included, leaves its attempt counted; a successful one
+clears the count. The blank-field edits, NOTFND and the wrong password answer 401; the WHEN
+OTHER literal ``Unable to verify the User ...`` answers 503. The router issues and clears the
+session cookie, so nothing here creates, returns or logs a token. PF3 of MAIN-PARA is SignOff.
+MAIN-PARA's invalid-key branch has no path: the sign-on request carries no AID key, and the
+COSGN00 legend offers only ENTER and F3.
 """
 
 import asyncio
 import logging
 import string
 from collections.abc import Mapping
-from typing import Any, NamedTuple, NoReturn
+from typing import Any, NamedTuple
 
 from app.core.dependencies import CurrentUser, OnlineContext, SessionRefusal
 from app.core.errors import (
@@ -39,7 +41,7 @@ LOGGER = logging.getLogger(__name__)
 # WS-TRANID (line 37).
 TRANSACTION_ID = "CC00"
 # The operations logged with a file condition: the USRSEC READ of READ-USER-SEC-FILE and the
-# sign-on throttle's LOGINATT read, failure-count write and reset delete.
+# sign-on throttle's LOGINATT attempt-count write and reset delete.
 READ_OPERATION = "READ"
 WRITE_OPERATION = "WRITE"
 DELETE_OPERATION = "DELETE"
@@ -112,16 +114,17 @@ def UnableToVerifyError() -> LegacyMessageError:
     )
 
 
-def RequiredFieldFailure(request: LoginRequest) -> LegacyMessageError | None:
+def EditRequiredFields(request: LoginRequest) -> None:
     """Port the EVALUATE TRUE of PROCESS-ENTER-KEY (lines 117-130): the first blank field fails.
 
-    Return the 401 failure of a blank user ID, else of a blank password, else None.
+    Raise the 401 failure of a blank user ID, else of a blank password. The attempt is already
+    counted against the upper-cased user ID, so a blank password counts against the keyed ID
+    and a blank user ID against the blank ID, once each.
     """
     if IsBlank(request.user_id):
-        return SignOnError(USER_ID_REQUIRED_MESSAGE, USER_ID_FIELD)
+        raise SignOnError(USER_ID_REQUIRED_MESSAGE, USER_ID_FIELD)
     if IsBlank(request.password):
-        return SignOnError(CREDENTIAL_REQUIRED_MESSAGE, CREDENTIAL_FIELD)
-    return None
+        raise SignOnError(CREDENTIAL_REQUIRED_MESSAGE, CREDENTIAL_FIELD)
 
 
 def NextRouteFor(userType: str) -> str:
@@ -150,52 +153,27 @@ def BuildLoginResponse(userRow: Mapping[str, Any]) -> LoginResponse:
     )
 
 
-async def FailSignOn(
-    context: OnlineContext, upperUserId: str, failure: LegacyMessageError
-) -> NoReturn:
-    """Count one failed sign-on for the upper-cased user ID, then raise its ``failure``.
+async def ReserveSignOnAttempt(context: OnlineContext, upperUserId: str) -> None:
+    """Count this sign-on attempt against the upper-cased user ID before any edit runs.
 
-    The failure commits in the throttle's own write unit before the error reaches the client.
-    A throttle that cannot record it answers the 503 WHEN OTHER literal instead, so the control
-    never fails open.
+    The count commits in the throttle's own write unit before the edits and the password
+    check, so concurrent attempts of one ID never check more passwords than
+    LOGIN_MAX_ATTEMPTS, and every failure that follows stays counted. A locked user ID answers
+    the throttle's 429 and is not counted. A throttle that cannot count the attempt answers the
+    503 WHEN OTHER literal instead, so the control never fails open.
     """
     try:
-        await login_throttle.RecordFailure(context, upperUserId)
+        await login_throttle.ReserveAttempt(context, upperUserId)
     except RepositoryError as error:
         LogFileCondition(LOGGER, TRANSACTION_ID, WRITE_OPERATION, error)
-        raise UnableToVerifyError() from error
-    raise failure
-
-
-async def EditRequiredFields(
-    context: OnlineContext, upperUserId: str, request: LoginRequest
-) -> None:
-    """Fail the first blank map field, counting it like every other failed sign-on.
-
-    The failure counts against the upper-cased user ID, so a blank password counts against the
-    keyed ID and a blank user ID against the blank ID.
-    """
-    blankFieldFailure = RequiredFieldFailure(request)
-    if blankFieldFailure is not None:
-        await FailSignOn(context, upperUserId, blankFieldFailure)
-
-
-async def GuardLockout(context: OnlineContext, upperUserId: str) -> None:
-    """Refuse a locked user ID with the throttle's 429 before any edit runs.
-
-    A throttle read failure is the 503 WHEN OTHER literal and counts no failure.
-    """
-    try:
-        await login_throttle.CheckLocked(context, upperUserId)
-    except RepositoryError as error:
-        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         raise UnableToVerifyError() from error
 
 
 async def ClearFailures(context: OnlineContext, upperUserId: str) -> None:
-    """Delete the user ID's failure count after a successful sign-on.
+    """Delete the user ID's attempt count after a successful sign-on.
 
-    A throttle that cannot reset answers the 503 WHEN OTHER literal instead of signing on.
+    A throttle that cannot reset answers the 503 WHEN OTHER literal instead of signing on, and
+    the attempt reserved for this sign-on stays counted, so the control fails closed.
     """
     try:
         await login_throttle.ResetAttempts(context, upperUserId)
@@ -208,7 +186,7 @@ async def LookUpUser(context: OnlineContext, upperUserId: str) -> dict[str, Any]
     """Port the CICS READ of USRSEC (lines 211-219): the record, or None for NOTFND (RESP 13).
 
     Any other condition, the batch window's NOTOPEN included, is the WHEN OTHER branch
-    (lines 252-256): it counts a failure and answers the 503 literal.
+    (lines 252-256): it answers the 503 literal, and the reserved attempt stays counted.
     """
     try:
         return await UserRepository(context).GetUser(upperUserId)
@@ -216,7 +194,7 @@ async def LookUpUser(context: OnlineContext, upperUserId: str) -> dict[str, Any]
         return None
     except RepositoryError as error:
         LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
-        await FailSignOn(context, upperUserId, UnableToVerifyError())
+        raise UnableToVerifyError() from error
 
 
 async def CredentialMatches(upperCredential: str, passwordHash: str) -> bool:
@@ -235,30 +213,32 @@ async def VerifyUser(
     """Port EVALUATE WS-RESP-CD of READ-USER-SEC-FILE (lines 221-257); return the user record.
 
     NOTFND gives ``User not found. Try again ...`` and a password that does not verify gives
-    ``Wrong Password. Try again ...``; each counts one failure.
+    ``Wrong Password. Try again ...``; each leaves the reserved attempt counted as its failure.
     """
     userRow = await LookUpUser(context, upperUserId)
     if userRow is None:
-        await FailSignOn(context, upperUserId, SignOnError(USER_NOT_FOUND_MESSAGE, USER_ID_FIELD))
+        raise SignOnError(USER_NOT_FOUND_MESSAGE, USER_ID_FIELD)
     if not await CredentialMatches(upperCredential, userRow["password_hash"]):
-        wrongCredential = SignOnError(WRONG_CREDENTIAL_MESSAGE, CREDENTIAL_FIELD)
-        await FailSignOn(context, upperUserId, wrongCredential)
+        raise SignOnError(WRONG_CREDENTIAL_MESSAGE, CREDENTIAL_FIELD)
     return userRow
 
 
 async def SignOn(context: OnlineContext, request: LoginRequest) -> LoginResponse:
     """Port PROCESS-ENTER-KEY (lines 108-140) and READ-USER-SEC-FILE (lines 209-257).
 
+    The attempt of an unlocked user ID is counted once, against the upper-cased ID, before the
+    edits run; a successful sign-on then clears the count.
+
     Raises:
-        LegacyMessageError: 429 with the lockout literal while the user ID is locked; 503 with
-            ``Unable to verify the User ...`` when USRSEC or the throttle fails, the batch
-            window included; 401 with the COSGN00C literal and its cursor field for every other
-            sign-on failure.
+        LegacyMessageError: 429 with the lockout literal while the user ID is locked, counting
+            nothing; 503 with ``Unable to verify the User ...`` when USRSEC or the throttle
+            fails, the batch window included; 401 with the COSGN00C literal and its cursor
+            field for every other sign-on failure.
     """
     upperUserId = NormaliseSignOnInput(request.user_id)
     upperCredential = NormaliseSignOnInput(request.password)
-    await GuardLockout(context, upperUserId)
-    await EditRequiredFields(context, upperUserId, request)
+    await ReserveSignOnAttempt(context, upperUserId)
+    EditRequiredFields(request)
     userRow = await VerifyUser(context, upperUserId, upperCredential)
     await ClearFailures(context, upperUserId)
     return BuildLoginResponse(userRow)

@@ -2,7 +2,7 @@
 
 cbl/COCRDUPC.cbl lines 482-497 (WHEN CDEMO-PGM-ENTER AND CDEMO-FROM-PROGRAM EQUAL
 LIT-CCLISTPGM) set FLG-ACCTFILTER-ISVALID and FLG-CARDFILTER-ISVALID, move the account and
-card COCRDLIC passed from the selected row (cbl/COCRDLIC.cbl lines 552-556) to CC-ACCT-ID-N and
+card COCRDLIC passed from the selected row (cbl/COCRDLIC.cbl lines 559-562) to CC-ACCT-ID-N and
 CC-CARD-NUM-N, PERFORM 9000-READ-DATA and SET CCUP-SHOW-DETAILS: no 1210-EDIT-ACCOUNT or
 1220-EDIT-CARD runs. The all-zero refusal of 1220-EDIT-CARD (lines 768-779) belongs to keys
 typed on the COCRDUP screen. Expected values are typed from those lines and the 88 levels they
@@ -13,7 +13,7 @@ set:
 - the all-zero card typed is ``Card number not provided`` (line 180);
 - a card_ref with an account no list row carries runs 1210 (lines 178, 745);
 - a forged card_ref, and one carrying a CCLI page key, give ``Did not find cards for this
-    search condition`` (line 204);
+    search condition`` (line 204) on the not-fetched key screen with the key prompt (line 163);
 - a done or failed (C, L, F) token keeps CCUP-NEW-CARDDATA, which 3200-SETUP-SCREEN-VARS shows
     for CCUP-CHANGES-MADE (lines 1113-1123).
 
@@ -68,6 +68,7 @@ NEW_YEAR = "2030"
 
 # WS-RETURN-MSG and WS-INFO-MSG 88 levels (lines 160-161, 178, 180, 204, 745).
 DETAILS_SHOWN_INFO = "Details of selected card shown above"
+PROMPT_FOR_KEYS_INFO = "Please enter Account and Card Number"
 ACCOUNT_NOT_PROVIDED_MESSAGE = "Account number not provided"
 CARD_NOT_PROVIDED_MESSAGE = "Card number not provided"
 ACCOUNT_FILTER_MESSAGE = "ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER"
@@ -78,6 +79,10 @@ CARD_NUM_FIELD = "card_num"
 NAME_FIELD = "embossed_name"
 EDIT_FAILED_STATUS = 400
 NOT_FOUND_STATUS = 404
+# Every CCUP error body: the four legacy keys and the screen beside them (ScreenError).
+CARD_SCREEN_ERROR_KEYS = frozenset(
+    {"message", "info_message", "field_errors", "cursor_field", "fields", "state", "screen_token"}
+)
 # CCUP-CHANGES-OKAYED-AND-DONE, COULD-NOT-LOCK-FOR-UPDATE and LOCKED-BUT-UPDATE-FAILED.
 FINISHED_STATE_CODES = ["C", "L", "F"]
 
@@ -227,9 +232,16 @@ async def test_card_ref_not_carrying_card_key_is_not_found(
     context = BuildContext(testSettings)
     with pytest.raises(LegacyMessageError) as raised:
         await cocrdupc.FetchCardForEdit(context, cardRefBuilder(testSettings), LIST_ACCT_ID)
+    body = raised.value.Body()
     assert raised.value.httpStatus == NOT_FOUND_STATUS
-    assert raised.value.Body()["message"] == CARD_NOT_FOUND_MESSAGE
-    assert raised.value.Body()["field_errors"] == [ACCT_ID_FIELD, CARD_NUM_FIELD]
+    assert set(body) == CARD_SCREEN_ERROR_KEYS
+    assert (body["message"], body["info_message"]) == (CARD_NOT_FOUND_MESSAGE, PROMPT_FOR_KEYS_INFO)
+    assert body["field_errors"] == [ACCT_ID_FIELD, CARD_NUM_FIELD]
+    assert body["cursor_field"] == ACCT_ID_FIELD
+    assert body["state"] == UpdateScreenState.DETAILS_NOT_FETCHED
+    assert body["fields"] == CardScreenFields(acct_id=LIST_ACCT_ID, card_num="").model_dump()
+    tokenState = cocrdupc.DecodeUpdateToken(body["screen_token"], testSettings)
+    assert tokenState == cocrdupc.NOT_FETCHED_STATE
     cardRepository.GetCard.assert_not_awaited()
 
 

@@ -94,7 +94,19 @@ REPORT_LINE_WIDTH = 133
 
 
 class RecordFormatError(ValueError):
-    """A record of the wrong length, bad field content, a missing value or a bad layout table."""
+    """A record of the wrong length, bad field content, a missing value or a bad layout table.
+
+    fieldName and fieldOffset locate the field a decoded record was refused for: its column name
+    and zero-based offset, taken from the layout table and never from the record. Both are None
+    for every other refusal.
+    """
+
+    def __init__(
+        self, message: str, fieldName: str | None = None, fieldOffset: int | None = None
+    ) -> None:
+        super().__init__(message)
+        self.fieldName = fieldName
+        self.fieldOffset = fieldOffset
 
 
 class TimestampFormatError(ValueError):
@@ -478,11 +490,16 @@ def EncodeRecord(values: dict[str, object], layout: RecordLayout) -> str:
 
 
 def _DecodeField(fieldText: str, field: FieldSpec, layout: RecordLayout) -> dict[str, object]:
-    """Decode one field's text with its kind's decoder, adding the layout context to errors."""
+    """Decode one field's text with its kind's decoder, adding the layout context to errors.
+
+    The RecordFormatError also carries the field's column name and offset as fieldName and
+    fieldOffset.
+    """
     try:
         return _DECODERS[field.kind](fieldText, field)
     except (_FieldValueError, ZonedDecimalError, TimestampFormatError) as error:
-        raise RecordFormatError(_DescribeField(layout.name, field, str(error))) from error
+        message = _DescribeField(layout.name, field, str(error))
+        raise RecordFormatError(message, field.name, field.offset) from error
 
 
 def _EncodeField(values: dict[str, object], field: FieldSpec, layout: RecordLayout) -> str:

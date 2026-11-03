@@ -42,8 +42,9 @@ CARD_NUM_LENGTH = 16
 # key holding "/" sent as %2F and kept in one segment by LosslessKeyRoute) must reach the
 # services' ``Card number not provided`` and ``CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT
 # NUMBER`` edits rather than a 422 or a framework 404. A longer value is a ``card_ref`` token,
-# checked for length only, so on the GET routes cocrdslc.ResolveCardKey answers a garbled one
-# with ``Did not find cards for this search condition``; the PUT route never decodes it.
+# checked for length only, so on the GET routes cocrdslc.DecodeCardKey refuses a garbled one and
+# the service answers ``Did not find cards for this search condition``; the PUT route never
+# decodes it.
 CARD_KEY_PATH = Annotated[
     ScreenTextOrToken(CARD_NUM_LENGTH, CARD_REF_MAX_LENGTH),
     Path(
@@ -105,9 +106,10 @@ async def SelectCard(
     response_model=CardDetailResponse,
     summary="CCDL / COCRDSLC: view card",
     description=(
-        "Edits both the account number and the card number, then reads the card by card number "
-        "only. The card number is returned masked with an opaque card_ref, and the CVV is never "
-        "returned."
+        "Edits both the account number and the typed card number, then reads the card by card "
+        "number only. A card_ref from the card list, sent with its row's 11-digit acctId, is "
+        "read with those list keys and no key edits. The card number is returned masked with "
+        "an opaque card_ref, and the CVV is never returned."
     ),
     responses=LegacyErrorResponses(400, 401, 403, 404, 503),
 )

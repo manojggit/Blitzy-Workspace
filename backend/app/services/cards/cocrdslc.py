@@ -1,14 +1,15 @@
 """Replaces: COCRDSLC (CCDL), BMS COCRDSL, copybooks CVCRD01Y, CVACT02Y, CVCUS01Y, CSMSG02Y
 
-The CCDL card detail view, served as ``GET /api/v1/cards/{cardNum}?acctId``. Both keys are
-edited in all-field mode, then CARDDAT is read by card number only: the CARDAIX paragraph
-9150-GETCARD-BYACCT is never performed in the source, so no account lookup exists and the
-account entered is never compared with the card's account.
+The CCDL card detail view, served as ``GET /api/v1/cards/{cardNum}?acctId``. Typed keys are
+edited in all-field mode; a ``card_ref`` sent with its card-list row's account is the entry
+from COCRDLIC and is read without the edits. Either way CARDDAT is read by card number only:
+the CARDAIX paragraph 9150-GETCARD-BYACCT is never performed in the source, so no account
+lookup exists and the account entered is never compared with the card's account.
 
 Shared with cocrdupc.py and cocrdlic.py: the key edits (``EditCardKeys``, ``EditAccountKey``,
-``EditCardKey``, ``PadScreenText``, ``IsBlankKey``), ``ResolveCardKey``, ``NotFoundError``,
-``FileErrorFromRepository``, ``BuildFileErrorMessage``, ``ExpiryParts``, and the message,
-field-name and length constants.
+``EditCardKey``, ``PadScreenText``, ``IsBlankKey``), ``IsListEntry``, ``DecodeCardKey``,
+``ResolveCardKey``, ``NotFoundError``, ``FileErrorFromRepository``, ``BuildFileErrorMessage``,
+``ExpiryParts``, and the message, field-name and length constants.
 """
 
 import logging
@@ -238,21 +239,64 @@ def EditCardKeys(acctText: str, cardText: str) -> CardKeyEdit:
     )
 
 
-def ResolveCardKey(cardKey: str, settings: "Settings") -> str:
+def IsListEntry(cardKey: str, acctId: str) -> bool:
+    """Return True for the entry from the card list: a ``card_ref`` and a list row's account.
+
+    COCRDLIC passes the selected row's WS-ROW-ACCTNO and WS-ROW-CARD-NUM in CDEMO-ACCT-ID and
+    CDEMO-CARD-NUM (cbl/COCRDLIC.cbl lines 531-534 for S, 559-562 for U), and both COCRDSLC
+    (lines 337-348) and COCRDUPC (cbl/COCRDUPC.cbl lines 482-497) read the card with those
+    keys without editing them. Only a ``card_ref`` path value with an account of exactly 11
+    ASCII digits, zeros included, has that shape; with any other account the keys are not list
+    keys and run the key edits.
+    """
+    isCardRef = len(cardKey) > CARD_NUM_LENGTH
+    return isCardRef and len(acctId) == ACCT_ID_LENGTH and IsAsciiDigits(acctId)
+
+
+def ListEntryKeys(acctId: str, cardText: str) -> CardKeyEdit:
+    """Return the card-list keys as lines 339-342 take them: INPUT-OK, with no key edit.
+
+    CDEMO-ACCT-ID and CDEMO-CARD-NUM move to CC-ACCT-ID-N and CC-CARD-NUM-N as COCRDLIC sent
+    them, so both filter flags are valid, no message is set and the cursor is the account.
+    """
+    return CardKeyEdit(
+        acctId=acctId,
+        cardNum=cardText,
+        acctFlag=FLAG_VALID,
+        cardFlag=FLAG_VALID,
+        message="",
+        fieldErrors=(),
+        cursorField=ACCT_ID_FIELD,
+    )
+
+
+def DecodeCardKey(cardKey: str, settings: "Settings") -> str | None:
     """Return the card text of the ``{cardNum}`` path value, replacing COMMAREA CDEMO-CARD-NUM.
 
     A value of up to 16 characters is the CARDSID text as keyed and is returned unchanged for
-    the key edits. A longer value is a ``card_ref`` token. A token that is invalid or expired,
-    or that does not carry a card key of at most 16 characters (such as a CCLI page key),
-    raises the 404 ``Did not find cards for this search condition``.
+    the key edits. A longer value is a ``card_ref`` token. None answers a token that is invalid
+    or expired, or that does not carry a card key of at most 16 characters (such as a CCLI page
+    key).
     """
     if len(cardKey) <= CARD_NUM_LENGTH:
         return cardKey
     try:
         cardText = DecodeCardRef(cardKey, settings)
     except InvalidToken:
-        raise NotFoundError() from None
+        return None
     if len(cardText) > CARD_NUM_LENGTH:
+        return None
+    return cardText
+
+
+def ResolveCardKey(cardKey: str, settings: "Settings") -> str:
+    """Return the card text ``DecodeCardKey`` finds in the ``{cardNum}`` path value.
+
+    A path value carrying no card key raises the 404 ``Did not find cards for this search
+    condition``.
+    """
+    cardText = DecodeCardKey(cardKey, settings)
+    if cardText is None:
         raise NotFoundError()
     return cardText
 
@@ -304,16 +348,26 @@ def ExpiryParts(expirationDate: date | None) -> tuple[str, str, str]:
 
 
 async def ViewCard(context: OnlineContext, cardKey: str, acctId: str) -> CardDetailResponse:
-    """Port of the CCDL ENTER path: 2000-PROCESS-INPUTS, 9000-READ-DATA, 1000-SEND-MAP.
+    """Port of the CCDL entry from the card list and of its ENTER: 9000-READ-DATA, 1000-SEND-MAP.
 
-    Raises 400 for a key edit failure, 404 when no card has the number (or for an invalid
-    ``card_ref``) and 503 for any other file condition. Both keys are edited also for a
-    ``card_ref`` from the card list: the source skips the edits on list entry (lines 339-348),
-    but list keys always pass them, so the outcome is the same.
+    ``cardKey`` is the ``{cardNum}`` path value, a keyed card number or a ``card_ref`` token,
+    and ``acctId`` the account. A ``card_ref`` sent with its list row's account is the
+    card-list entry (lines 337-348): both keys are taken as the list sent them and the card is
+    read without 2200-EDIT-MAP-INPUTS, so a card keyed all zeros opens. Any other keys, typed
+    ones included, run 2000-PROCESS-INPUTS: both key edits in all-field mode before the read.
+
+    Raises:
+        LegacyMessageError: 404 ``Did not find cards for this search condition`` for an
+            invalid or expired ``card_ref``, one carrying no card key, or a card that does not
+            exist; 400 with the key edit literal, never for the card-list entry; 503 with the
+            CARDDAT READ file-error text.
     """
     cardText = ResolveCardKey(cardKey, context.settings)
-    keys = EditCardKeys(acctId, cardText)
-    RaiseKeyEditError(keys)
+    if IsListEntry(cardKey, acctId):
+        keys = ListEntryKeys(acctId, cardText)
+    else:
+        keys = EditCardKeys(acctId, cardText)
+        RaiseKeyEditError(keys)
     card = await ReadCardOrRaise(context, keys.cardNum)
     return BuildCardDetail(card, keys, context.settings)
 

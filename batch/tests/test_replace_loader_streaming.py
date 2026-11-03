@@ -8,15 +8,19 @@ PostgreSQL, so no database is needed: it records each statement, each insert bat
 record_seq values and how many records the row builder had pulled when it ran, and whether the
 transaction committed or rolled back. run_ledger.FinishAtomicRun is replaced by a recorder.
 The daily images are synthetic copies of the first record of
-data/EBCDIC/AWS.M2.CARDDEMO.DALYTRAN.PS; the priming-only TRANFILE image is the shipped
-AWS.M2.CARDDEMO.DALYTRAN.PS.INIT.
+data/EBCDIC/AWS.M2.CARDDEMO.DALYTRAN.PS, in that EBCDIC form or re-encoded as the CRLF-separated
+lines of an ASCII image; the priming-only TRANFILE image is the shipped
+AWS.M2.CARDDEMO.DALYTRAN.PS.INIT. A rejected image's exit-12 text, and the traceback rendered
+from it, must quote none of the refused text: the field text of a malformed record, the bytes
+the image's codec or a row builder could not decode, or the original error's message.
 """
 
 import itertools
 import tempfile
-from collections.abc import Iterable, Iterator
+import traceback
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +29,7 @@ import pytest
 from app.core.paths import REPO_ROOT
 from app.models import DailyTransaction, Transaction
 from app.seed.image_reader import (
+    ENCODING_ASCII,
     ENCODING_EBCDIC,
     SAMPLE_IMAGE_NAMES,
     ImageFormatError,
@@ -46,7 +51,7 @@ from batch.loaders.replace_loader import (
 )
 from batch.orchestration import run_ledger
 from batch.orchestration.clock import Clock
-from batch.orchestration.job_context import EXIT_FAILURE, JobContext, JobFailure
+from batch.orchestration.job_context import EXIT_FAILURE, JobContext, JobFailure, JobParameters
 
 SHIPPED_EBCDIC_DIR = REPO_ROOT / "data" / "EBCDIC"
 DAILY_SAMPLE_PATH = SHIPPED_EBCDIC_DIR / SAMPLE_IMAGE_NAMES["daily_transactions"].ebcdicName
@@ -62,7 +67,34 @@ STREAMED_RECORD_COUNT = 2 * INSERT_BATCH_SIZE + 1
 MALFORMED_RECORD_NUMBER = INSERT_BATCH_SIZE + INSERT_BATCH_SIZE // 2
 # CVTRA06Y DALYTRAN-AMT S9(09)V99 at offset 132; letters are not zoned digits.
 TRAN_AMT_OFFSET = 132
-MALFORMED_AMOUNT = "XYZ!".encode("cp037")
+TRAN_AMT_LENGTH = 11
+DAILY_IMAGE_CODEC = "cp037"
+MALFORMED_AMOUNT_TEXT = "XYZ!"
+MALFORMED_AMOUNT = MALFORMED_AMOUNT_TEXT.encode(DAILY_IMAGE_CODEC)
+# The withheld reason of the malformed record: the column, its offset and the cause's class.
+MALFORMED_AMOUNT_REASON = (
+    "FIELD tran_amt AT OFFSET 132, CAUSE RecordFormatError; RECORD TEXT WITHHELD"
+)
+# The reason of an image cut short of a whole record, a problem found before any field is read.
+FRAMING_REASON = "CAUSE FRAMING; RECORD TEXT WITHHELD"
+WHOLE_IMAGE_RECORD_NUMBER = 0
+
+# Bytes a row builder decodes as ASCII for the tran_desc column of one record, and that one
+# ASCII image record holds at the start of tran_desc: the sentinel letters, then X'C1', byte 9,
+# which the strict ascii codec refuses.
+UNDECODABLE_COLUMN = "tran_desc"
+UNDECODABLE_CODEC = "ascii"
+UNDECODABLE_TEXT = b"SENTINEL\xc1"
+UNDECODABLE_REASON = "BYTE 9 IS NOT ascii TEXT, CAUSE UnicodeDecodeError; IMAGE TEXT WITHHELD"
+# The sentinel, the refused byte as the codec's message and repr show it, and that message's
+# own reason.
+UNDECODABLE_SENTINELS = ("SENTINEL", "0xc1", "\\xc1", "ordinal not in range")
+# CVTRA06Y DALYTRAN-DESC X(100) at offset 32, so the image record's refused X'C1' is its byte 41.
+TRAN_DESC_OFFSET = 32
+REFUSED_BYTE_REASON = "BYTE 41 IS NOT ascii TEXT, CAUSE UnicodeDecodeError; RECORD TEXT WITHHELD"
+# Decodes each byte to the character of the same ordinal, as a raw byte would show in text.
+RAW_BYTE_CODEC = "latin-1"
+ASCII_RECORD_TERMINATOR = b"\r\n"
 
 EVENT_DEFER = "DEFER CONSTRAINTS"
 EVENT_DELETE = "DELETE {table}"
@@ -107,6 +139,21 @@ class SettingsStub:
     """The BatchSettings member the row builders read, without backend/.env."""
 
     BCRYPT_ROUNDS: int = TEST_BCRYPT_ROUNDS
+
+
+@dataclass(frozen=True)
+class MalformedImageCase:
+    """A daily image with one malformed record, the run's --encoding, and how it is withheld.
+
+    writeImage writes the image as WriteDailyImage does. withheldReason is the exact reason the
+    rejection reports, and refusedTexts returns the texts neither its message nor its rendered
+    traceback may hold.
+    """
+
+    encoding: str
+    writeImage: Callable[[Path, int, int | None], Path]
+    withheldReason: str
+    refusedTexts: Callable[[], Iterable[str]]
 
 
 def StatementEvent(statement: object) -> str:
@@ -162,10 +209,13 @@ def LoadRecorder(monkeypatch) -> LoadRecord:
     return loadRecord
 
 
-def LoadContext(loadRecord: LoadRecord) -> JobContext:
-    """Return a context, bound to no run, whose engine records into loadRecord."""
+def LoadContext(loadRecord: LoadRecord, encoding: str = ENCODING_EBCDIC) -> JobContext:
+    """Return a context, bound to no run, whose engine records into loadRecord.
+
+    Its parameters give encoding as the run's --encoding.
+    """
     engine = SimpleNamespace(begin=partial(RecordedTransaction, loadRecord))
-    return JobContext(engine, SettingsStub(), Clock())
+    return JobContext(engine, SettingsStub(), Clock(), JobParameters(encoding=encoding))
 
 
 def CountPulls(records: Iterable[dict[str, object]], loadRecord: LoadRecord) -> Iterator[dict]:
@@ -193,13 +243,49 @@ def DailySpec(loadRecord: LoadRecord, recordLimit: int | None = None) -> LoaderS
     )
 
 
+def UndecodableDailySpec(loadRecord: LoadRecord) -> LoaderSpec:
+    """Return the DALYTRAN staging spec, its builder decoding UNDECODABLE_TEXT as ASCII.
+
+    The bytes are decoded for MALFORMED_RECORD_NUMBER's row, after the first batch's insert.
+    """
+    dailySpec = DailySpec(loadRecord)
+
+    def BuildUndecodableRows(records: Iterable[dict[str, object]], context: JobContext):
+        rows = dailySpec.rowBuilder(records, context)
+        for recordNumber, row in enumerate(rows, start=1):
+            if recordNumber == MALFORMED_RECORD_NUMBER:
+                row[UNDECODABLE_COLUMN] = UNDECODABLE_TEXT.decode(UNDECODABLE_CODEC)
+            yield row
+
+    return replace(dailySpec, rowBuilder=BuildUndecodableRows)
+
+
+def SampleDailyRecord() -> bytes:
+    """Return the first record of the shipped daily image."""
+    return DAILY_SAMPLE_PATH.read_bytes()[: DAILY_TRANSACTION_LAYOUT.lrecl]
+
+
+def MalformedDailyRecord() -> bytes:
+    """Return the sample daily record with MALFORMED_AMOUNT over the start of its amount."""
+    sampleRecord = SampleDailyRecord()
+    amountEnd = TRAN_AMT_OFFSET + len(MALFORMED_AMOUNT)
+    return sampleRecord[:TRAN_AMT_OFFSET] + MALFORMED_AMOUNT + sampleRecord[amountEnd:]
+
+
+def MalformedAmountTexts() -> tuple[str, str]:
+    """Return the malformed record's sentinel and its whole decoded 11-character amount field."""
+    amountEnd = TRAN_AMT_OFFSET + TRAN_AMT_LENGTH
+    amountText = MalformedDailyRecord()[TRAN_AMT_OFFSET:amountEnd].decode(DAILY_IMAGE_CODEC)
+    assert amountText.startswith(MALFORMED_AMOUNT_TEXT) and len(amountText) == TRAN_AMT_LENGTH
+    return MALFORMED_AMOUNT_TEXT, amountText
+
+
 def WriteDailyImage(
     directory: Path, recordCount: int, malformedRecordNumber: int | None = None
 ) -> Path:
     """Write recordCount copies of the sample daily record, one with a non-numeric amount."""
-    sampleRecord = DAILY_SAMPLE_PATH.read_bytes()[: DAILY_TRANSACTION_LAYOUT.lrecl]
-    amountEnd = TRAN_AMT_OFFSET + len(MALFORMED_AMOUNT)
-    malformedRecord = sampleRecord[:TRAN_AMT_OFFSET] + MALFORMED_AMOUNT + sampleRecord[amountEnd:]
+    sampleRecord = SampleDailyRecord()
+    malformedRecord = MalformedDailyRecord()
     imagePath = directory / DAILY_IMAGE_NAME
     with imagePath.open("wb") as image:
         for recordNumber in range(1, recordCount + 1):
@@ -208,10 +294,76 @@ def WriteDailyImage(
     return imagePath
 
 
+def AsciiDailyRecord() -> bytes:
+    """Return the sample daily record as an ASCII image holds it: its text in the ascii codec."""
+    return SampleDailyRecord().decode(DAILY_IMAGE_CODEC).encode(UNDECODABLE_CODEC)
+
+
+def RefusedByteDailyRecord() -> bytes:
+    """Return the ASCII sample daily record with UNDECODABLE_TEXT over the start of tran_desc."""
+    asciiRecord = AsciiDailyRecord()
+    descEnd = TRAN_DESC_OFFSET + len(UNDECODABLE_TEXT)
+    return asciiRecord[:TRAN_DESC_OFFSET] + UNDECODABLE_TEXT + asciiRecord[descEnd:]
+
+
+def RefusedByteTexts() -> tuple[str, ...]:
+    """Return UNDECODABLE_SENTINELS, the bytes' repr, and the refused byte as a raw character."""
+    refusedByte = UNDECODABLE_TEXT[-1:].decode(RAW_BYTE_CODEC)
+    return (*UNDECODABLE_SENTINELS, repr(UNDECODABLE_TEXT), refusedByte)
+
+
+def WriteAsciiDailyImage(
+    directory: Path, recordCount: int, malformedRecordNumber: int | None = None
+) -> Path:
+    """Write recordCount CRLF-terminated ASCII sample daily records, one with a refused byte."""
+    records = [AsciiDailyRecord()] * recordCount
+    if malformedRecordNumber is not None:
+        records[malformedRecordNumber - 1] = RefusedByteDailyRecord()
+    imagePath = directory / DAILY_IMAGE_NAME
+    imagePath.write_bytes(b"".join(record + ASCII_RECORD_TERMINATOR for record in records))
+    return imagePath
+
+
+def AppendPartialRecord(imagePath: Path) -> None:
+    """Append the malformed record's bytes up to the end of its amount, short of a whole record."""
+    with imagePath.open("ab") as image:
+        image.write(MalformedDailyRecord()[: TRAN_AMT_OFFSET + TRAN_AMT_LENGTH])
+
+
 def RejectedPrefix(imagePath: Path, recordNumber: int) -> str:
     """Return the start of the exit-12 text for a malformed daily record."""
     reason = f"{imagePath}: record {recordNumber}: "
     return IMAGE_REJECTED_TEMPLATE.format(dataset=DAILY_DATASET, reason=reason)
+
+
+def AssertWithheldRejection(
+    failure: JobFailure, imagePath: Path, recordNumber: int, withheldReason: str
+) -> None:
+    """Assert failure is the exit-12 rejection of imagePath's record by withheldReason alone.
+
+    It is chained to an ImageFormatError with the same path and record number and that reason.
+    """
+    assert failure.exitCode == EXIT_FAILURE
+    assert failure.message == RejectedPrefix(imagePath, recordNumber) + withheldReason
+    reportedError = failure.__cause__
+    assert isinstance(reportedError, ImageFormatError)
+    reportedLocation = (reportedError.path, reportedError.recordNumber, reportedError.reason)
+    assert reportedLocation == (imagePath, recordNumber, withheldReason)
+
+
+def AssertQuotesNone(failure: JobFailure, refusedTexts: Iterable[str]) -> None:
+    """Assert neither failure's message nor its rendered traceback holds a text, raw or repr."""
+    renderedTraceback = "".join(traceback.format_exception(failure))
+    for refusedText in refusedTexts:
+        for form in (refusedText, repr(refusedText)):
+            assert form not in failure.message
+            assert form not in renderedTraceback
+
+
+def AssertAmountWithheld(failure: JobFailure, imagePath: Path, recordNumber: int) -> None:
+    """Assert failure rejects the malformed amount by record, column, offset and cause only."""
+    AssertWithheldRejection(failure, imagePath, recordNumber, MALFORMED_AMOUNT_REASON)
+    AssertQuotesNone(failure, MalformedAmountTexts())
 
 
 def test_daily_image_replaces_the_table_in_batches_inside_one_transaction(imageDir, loadRecord):
@@ -245,13 +397,33 @@ def test_each_batch_is_inserted_before_later_records_are_read(imageDir, loadReco
     assert loadRecord.batches[0].pulledCount < STREAMED_RECORD_COUNT
 
 
-def test_malformed_record_after_a_batch_rolls_back_the_whole_load(imageDir, loadRecord):
-    imagePath = WriteDailyImage(imageDir, STREAMED_RECORD_COUNT, MALFORMED_RECORD_NUMBER)
+@pytest.mark.parametrize(
+    "malformedCase",
+    [
+        pytest.param(
+            MalformedImageCase(
+                ENCODING_EBCDIC, WriteDailyImage, MALFORMED_AMOUNT_REASON, MalformedAmountTexts
+            ),
+            id="ebcdic-malformed-amount",
+        ),
+        pytest.param(
+            MalformedImageCase(
+                ENCODING_ASCII, WriteAsciiDailyImage, REFUSED_BYTE_REASON, RefusedByteTexts
+            ),
+            id="ascii-refused-byte",
+        ),
+    ],
+)
+def test_malformed_record_after_a_batch_rolls_back_the_whole_load(
+    imageDir, loadRecord, malformedCase
+):
+    imagePath = malformedCase.writeImage(imageDir, STREAMED_RECORD_COUNT, MALFORMED_RECORD_NUMBER)
+    context = LoadContext(loadRecord, malformedCase.encoding)
     with pytest.raises(JobFailure) as raised:
-        ReplaceTable(LoadContext(loadRecord), DailySpec(loadRecord), imagePath)
-    assert raised.value.exitCode == EXIT_FAILURE
-    assert raised.value.message.startswith(RejectedPrefix(imagePath, MALFORMED_RECORD_NUMBER))
-    assert isinstance(raised.value.__cause__, ImageFormatError)
+        ReplaceTable(context, DailySpec(loadRecord), imagePath)
+    withheldReason = malformedCase.withheldReason
+    AssertWithheldRejection(raised.value, imagePath, MALFORMED_RECORD_NUMBER, withheldReason)
+    AssertQuotesNone(raised.value, malformedCase.refusedTexts())
     assert loadRecord.events == [
         EVENT_DEFER,
         EVENT_DELETE.format(table=DAILY_TABLE),
@@ -266,9 +438,40 @@ def test_records_a_builder_leaves_unread_are_validated_before_commit(imageDir, l
     spec = DailySpec(loadRecord, INSERT_BATCH_SIZE)
     with pytest.raises(JobFailure) as raised:
         ReplaceTable(LoadContext(loadRecord), spec, imagePath)
-    assert raised.value.message.startswith(RejectedPrefix(imagePath, STREAMED_RECORD_COUNT))
+    AssertAmountWithheld(raised.value, imagePath, STREAMED_RECORD_COUNT)
     assert loadRecord.pulledCount == INSERT_BATCH_SIZE
     assert loadRecord.events[-2:] == [EVENT_INSERT.format(table=DAILY_TABLE), EVENT_ROLLBACK]
+    assert loadRecord.finishedCounts == []
+
+
+def test_image_cut_short_of_a_record_is_rejected_as_framing(imageDir, loadRecord):
+    imagePath = WriteDailyImage(imageDir, STREAMED_RECORD_COUNT)
+    AppendPartialRecord(imagePath)
+    with pytest.raises(JobFailure) as raised:
+        ReplaceTable(LoadContext(loadRecord), DailySpec(loadRecord), imagePath)
+    AssertWithheldRejection(raised.value, imagePath, WHOLE_IMAGE_RECORD_NUMBER, FRAMING_REASON)
+    AssertQuotesNone(raised.value, MalformedAmountTexts())
+    assert loadRecord.events == [
+        EVENT_DEFER,
+        EVENT_DELETE.format(table=DAILY_TABLE),
+        EVENT_ROLLBACK,
+    ]
+    assert loadRecord.finishedCounts == []
+
+
+def test_bytes_a_row_builder_cannot_decode_roll_back_without_being_quoted(imageDir, loadRecord):
+    imagePath = WriteDailyImage(imageDir, STREAMED_RECORD_COUNT)
+    with pytest.raises(JobFailure) as raised:
+        ReplaceTable(LoadContext(loadRecord), UndecodableDailySpec(loadRecord), imagePath)
+    failure = raised.value
+    AssertWithheldRejection(failure, imagePath, WHOLE_IMAGE_RECORD_NUMBER, UNDECODABLE_REASON)
+    AssertQuotesNone(failure, UNDECODABLE_SENTINELS + (repr(UNDECODABLE_TEXT),))
+    assert loadRecord.events == [
+        EVENT_DEFER,
+        EVENT_DELETE.format(table=DAILY_TABLE),
+        EVENT_INSERT.format(table=DAILY_TABLE),
+        EVENT_ROLLBACK,
+    ]
     assert loadRecord.finishedCounts == []
 
 

@@ -97,10 +97,10 @@ class CardListQuery(QueryModel):
 class CardKeyQuery(QueryModel):
     """Query of ``GET /cards/{cardNum}`` (COCRDSLC, CCDL) and its ``/edit`` form (COCRDUPC, CCUP).
 
-    CCDL edits the account and the card key, so ``Account number not provided`` stays
-    reachable. CCUP edits both for a typed card number, and skips the edits for a ``card_ref``
-    from the card list sent with its row's 11-digit account. The ``{cardNum}`` path value is a
-    16-digit card number or a ``card_ref`` token.
+    CCDL and CCUP edit the account and the card key for a typed card number, so ``Account
+    number not provided`` stays reachable, and skip the edits for a ``card_ref`` from the card
+    list sent with its row's 11-digit account. The ``{cardNum}`` path value is a 16-digit card
+    number or a ``card_ref`` token.
     """
 
     acct_id: ScreenText(11) = Field(

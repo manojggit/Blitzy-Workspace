@@ -12,6 +12,7 @@ import {
     API_CLIENT,
     EncodePathKey,
     type Direction,
+    type LegacyErrorResponse,
     type PageState,
     type ReadOptions,
 } from "@/lib/apiClient";
@@ -25,12 +26,13 @@ export enum UserFetchScreen {
     DELETE = "delete",
 }
 
-// The GET /admin/users query (COUSR00). Without a direction it is ENTER or the first entry,
-// browsing from searchUserId; F7 and F8 send the shown page's first_key or last_key as startKey.
+// The GET /admin/users query (COUSR00). Without a direction (omitted or null, which axios does not
+// send) it is ENTER or the first entry, browsing from searchUserId; F7 and F8 send the shown
+// page's first_key or last_key as startKey.
 export interface UserListQuery {
     searchUserId?: string;
     startKey?: string;
-    direction?: Direction;
+    direction?: Direction | null;
     page?: number;
 }
 
@@ -67,11 +69,17 @@ export interface UserSelectionRequest {
 }
 
 // A route for a valid U or D selection; null when the list keys carry the re-browsed page. An
-// invalid selection code is never this response: it is a rejected call whose 400 body carries
-// the re-browsed page. A search finding no user ID is this response on page 1, with the shown
-// rows read again and a blank last_key.
+// invalid selection code is never this response: it is a rejected call whose 400 body is a
+// UserSelectionErrorResponse. A search finding no user ID is this response on page 1, with the
+// shown rows read again and a blank last_key.
 export interface UserSelectionResponse extends UserListResponse {
     route?: string | null;
+}
+
+// The 400 body of an invalid selection code the re-browsed page still shows: the legacy error
+// keys plus that page's rows and paging position.
+export interface UserSelectionErrorResponse extends LegacyErrorResponse, PageState {
+    rows?: UserListRow[];
 }
 
 // The COUSR01 add body. user_type is free text, because COUSR01C accepts any character.
