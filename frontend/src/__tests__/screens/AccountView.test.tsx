@@ -102,6 +102,12 @@ const MENU_ROUTE = "/menu";
 const SSN_LABEL = "SSN:";
 const FICO_SCORE_LABEL = "FICO Score:";
 const BALANCE_LABEL = "Current Balance     :";
+// The section captions of bms/COACTVW.bms: line 199 INITIAL='Customer Details' and line 264
+// INITIAL='Address:', which stands before ACSADL1 and ACSADL2.
+const CUSTOMER_DETAILS_CAPTION = "Customer Details";
+const ADDRESS_CAPTION = "Address:";
+// ACSADL1 and ACSADL2 carry no INITIAL of their own; these are their labels on the page.
+const ADDRESS_LINE_LABELS: readonly string[] = ["Line 1", "Line 2"];
 const MASKED_SSN = "***-**-6789";
 // An unmasked SSN in COACTVWC's 999-99-9999 display form. A bare nine-digit pattern would also
 // match CUST-ID 9(09), which the screen shows legitimately.
@@ -441,6 +447,25 @@ afterEach(() => {
     window.sessionStorage.clear();
 });
 
+function ShowsCustomerDetailsCaption(): void {
+    RenderScreen();
+    const caption = screen.getByRole("heading", { level: 2, name: CUSTOMER_DETAILS_CAPTION });
+    expect(caption).toBeVisible();
+    expect(caption.textContent).toBe(CUSTOMER_DETAILS_CAPTION);
+}
+
+// The caption is shown inside the group it names, and that group holds the two address lines.
+function ShowsAddressCaption(): void {
+    RenderScreen();
+    const addressGroup = screen.getByRole("group", { name: ADDRESS_CAPTION });
+    const caption = within(addressGroup).getByText(ADDRESS_CAPTION, { normalizer: KeepRawText });
+    expect(caption).toBeVisible();
+    const fieldLabels = within(addressGroup)
+        .getAllByRole<HTMLInputElement>("textbox")
+        .map((field) => field.labels?.[0]?.textContent);
+    expect(fieldLabels).toEqual(ADDRESS_LINE_LABELS);
+}
+
 describe("COACTVWC COACTVW map content on /accounts/view", () => {
     it("COACTVWC first entry shows the View Account title and ACCTSID with LENGTH 11", () => {
         RenderScreen();
@@ -458,6 +483,10 @@ describe("COACTVWC COACTVW map content on /accounts/view", () => {
             .map((key) => key.textContent);
         expect(keyNames).toEqual([SEARCH_BUTTON_NAME, EXIT_BUTTON_NAME]);
     });
+
+    it("COACTVWC shows the Customer Details caption as a heading", ShowsCustomerDetailsCaption);
+
+    it("COACTVWC shows the Address: caption over ACSADL1 and ACSADL2", ShowsAddressCaption);
 });
 
 describe("COACTVWC COACTVW display fields on /accounts/view", () => {
@@ -717,5 +746,106 @@ describe("COACTVWC under React Strict Mode on /accounts/view", () => {
     it(
         "COACTVWC Strict Mode takes the pending refusal once and shows it",
         StrictModeShowsPendingMessage,
+    );
+});
+
+// Account 00000000005 with a value unlike TEST_ACCOUNT_VIEW's in every displayed field, so a
+// field still showing account 00000000004 after a navigation is caught.
+const NEXT_ACCOUNT_ID = "00000000005";
+const NEXT_ACCOUNT_VIEW = BuildAccountView({
+    acct_id: NEXT_ACCOUNT_ID,
+    active_status: "N",
+    open_date: "2015-04-22",
+    credit_limit: "6120.00",
+    expiration_date: "2026-08-31",
+    cash_credit_limit: "1450.00",
+    reissue_date: "2024-08-31",
+    curr_balance: "158.00",
+    curr_cycle_credit: "42.10",
+    group_id: "GOLDCARD",
+    curr_cycle_debit: "18.75",
+    cust_id: "000000005",
+    ssn_masked: "***-**-4321",
+    date_of_birth: "1979-09-02",
+    fico_credit_score: 641,
+    first_name: "Marla",
+    middle_name: "Jo",
+    last_name: "Okafor",
+    addr_line_1: "12 Harbor View Road",
+    addr_state_cd: "OR",
+    addr_line_2: "Suite 300",
+    addr_zip: "97201",
+    addr_line_3: "Portland",
+    addr_country_cd: "CAN",
+    phone_num_1: "(503)555-0142",
+    govt_issued_id: "00000000000012345678",
+    phone_num_2: "(503)555-0199",
+    eft_account_id: "0051234567",
+    primary_holder_ind: "Y",
+});
+
+// Moves the mounted page to another query, as a same-path client navigation does: the App Router
+// keeps the route mounted and only useSearchParams changes.
+type QueryNavigator = (query: URLSearchParams) => void;
+
+// Opens /accounts/view?acctId=<view.acct_id> and waits until its entry lookup shows the view.
+async function RenderShownAccountRoute(view: AccountViewResponse): Promise<QueryNavigator> {
+    mockSearchParams = new URLSearchParams({ acctId: view.acct_id });
+    mockViewAccount.mockResolvedValueOnce(view);
+    const { rerender } = RenderPage();
+    await WaitForBalance(view.curr_balance);
+    return (query) => {
+        mockSearchParams = query;
+        rerender(PageTree());
+    };
+}
+
+function ExpectEveryDisplayFieldBlank(): void {
+    expect(Object.values(DisplayedValues()).every((value) => value === "")).toBe(true);
+}
+
+// A to B replaces ACCTSID and the record together: B's entry screen starts blank under B, shows
+// B's answer, and its next ENTER looks B up.
+async function ReplacesScreenOnNewAcctId(): Promise<void> {
+    const navigate = await RenderShownAccountRoute(BuildAccountView());
+    const answerNext = HoldNextLookup();
+    navigate(new URLSearchParams({ acctId: NEXT_ACCOUNT_ID }));
+    expect(AccountIdInput()).toHaveValue(NEXT_ACCOUNT_ID);
+    ExpectEveryDisplayFieldBlank();
+    await answerNext(NEXT_ACCOUNT_VIEW);
+    await WaitForBalance(NEXT_ACCOUNT_VIEW.curr_balance);
+    expect(DisplayedValues()).toEqual(ExpectedValues(NEXT_ACCOUNT_VIEW));
+    mockViewAccount.mockResolvedValueOnce(NEXT_ACCOUNT_VIEW);
+    await ClickButton(userEvent.setup(), SEARCH_BUTTON_NAME);
+    await waitFor(() => expect(mockViewAccount).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(SearchButton()).toBeEnabled());
+    expect(mockViewAccount.mock.calls).toEqual([
+        [TEST_ACCOUNT_ID, READ_OPTIONS],
+        [NEXT_ACCOUNT_ID, READ_OPTIONS],
+        [NEXT_ACCOUNT_ID, READ_OPTIONS],
+    ]);
+}
+
+// Dropping ?acctId= is a fresh entry from the menu: the empty map, no message and no lookup.
+async function StartsFreshEntryWithoutAcctId(): Promise<void> {
+    const navigate = await RenderShownAccountRoute(BuildAccountView());
+    navigate(new URLSearchParams());
+    expect(AccountIdInput()).toHaveValue("");
+    expect(AccountIdInput()).toHaveFocus();
+    ExpectEveryDisplayFieldBlank();
+    expect(AlertTexts()).toEqual([]);
+    await SettleRejections();
+    expect(mockViewAccount).toHaveBeenCalledTimes(1);
+    expect(SearchButton()).toBeEnabled();
+}
+
+describe("COACTVWC same-route ?acctId= change on /accounts/view", () => {
+    it(
+        "COACTVWC a new ?acctId= shows the new account under its own number and ENTER sends it",
+        ReplacesScreenOnNewAcctId,
+    );
+    it(
+        "COACTVWC dropping ?acctId= shows the empty first-entry map with no lookup",
+        StartsFreshEntryWithoutAcctId,
     );
 });

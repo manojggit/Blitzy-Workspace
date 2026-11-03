@@ -814,11 +814,21 @@ function AccountUpdateScreen() {
     );
 }
 
+// Each arrival with another ?acctId=, or with none, is a fresh COACTUPC first entry, as every
+// XCTL is, so the fields, state and screen_token start over together with their own request
+// runner. The replaced screen's unmount aborts its entry fetch; a PUT it already sent runs to its
+// answer, which reaches only that screen. A missing acctId stays distinct from an empty one,
+// because only the latter is fetched.
+function AccountUpdateEntry() {
+    const acctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY);
+    return <AccountUpdateScreen key={JSON.stringify([acctId])} />;
+}
+
 // useSearchParams needs a Suspense boundary for the static prerender of npm run build.
 export default function AccountUpdatePage() {
     return (
         <Suspense fallback={null}>
-            <AccountUpdateScreen />
+            <AccountUpdateEntry />
         </Suspense>
     );
 }

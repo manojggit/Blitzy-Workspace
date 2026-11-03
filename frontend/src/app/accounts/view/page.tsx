@@ -468,11 +468,19 @@ function AccountViewScreen() {
     );
 }
 
+// Each arrival with another ?acctId= is a fresh COACTVWC first entry, as every XCTL is, so the
+// account number, the record shown and the lookup in flight start over together: the replaced
+// screen's unmount aborts its lookup. The screen treats an empty acctId as no acctId.
+function AccountViewEntry() {
+    const acctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY) ?? "";
+    return <AccountViewScreen key={JSON.stringify([acctId])} />;
+}
+
 // useSearchParams needs a Suspense boundary, or the static prerender of the route fails.
 export default function AccountViewPage() {
     return (
         <Suspense fallback={null}>
-            <AccountViewScreen />
+            <AccountViewEntry />
         </Suspense>
     );
 }

@@ -1776,6 +1776,234 @@ describe("COACTUPC /accounts/update actions", () => {
     it.each(INPUT_METHODS)("COACTUPC F3 by %s returns to /menu without a PUT", ExitsToMainMenu);
 });
 
+// One input keyed over its shown value.
+type FieldEdit = readonly [name: AccountFieldName, value: string];
+
+// A finished F5: the status 9600-WRITE-PROCESSING ended with, the screen it sent and the inputs
+// that screen's state opens.
+interface TerminalCase {
+    status: number;
+    terminalScreen: AccountScreen;
+    editableNames: readonly AccountFieldName[];
+}
+
+interface TerminalKeyCase extends TerminalCase {
+    updateKey: UpdateKey;
+}
+
+const CANCEL_START_STATES: readonly UpdateScreenState[] = [
+    UpdateScreenState.SHOW_DETAILS,
+    UpdateScreenState.CHANGES_NOT_OK,
+];
+// The edits F12 discards: each differs from the fetched value and from the re-read one.
+const DISCARDED_EDITS: readonly FieldEdit[] = [
+    ["credit_limit", "9,999.00"],
+    ["first_name", "EDITEDFIRST"],
+    ["addr_line_1", "200 EDITED ROAD"],
+];
+// ProcessCancel: 9000-READ-ACCT re-reads the stored record, which another task has rewritten
+// since the fetch, and shows it in SHOW_DETAILS with no field flagged and a new screen_token.
+const REREAD_FIELDS: Readonly<AccountScreenFields> = { ...TEST_FIELDS, curr_balance: "2,575.00" };
+const REREAD_SCREEN = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
+    fields: { ...REREAD_FIELDS },
+    screen_token: NEXT_SCREEN_TOKEN,
+    cursor_field: "acct_id",
+});
+// ENTER on the re-read values: the compare with the new before-image finds no change.
+const NO_CHANGE_SCREEN = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
+    fields: { ...REREAD_FIELDS },
+    screen_token: ADOPTED_SCREEN_TOKEN,
+    message: MSG_NO_CHANGES,
+    field_errors: ["active_status"],
+    cursor_field: "active_status",
+});
+// KeepConfirmationOutcome: ENTER runs no edit and shows the token's validated values again.
+const KEPT_CONFIRMATION_SCREEN = BuildAccountScreen(UpdateScreenState.CHANGES_OK_NOT_CONFIRMED, {
+    screen_token: NEXT_SCREEN_TOKEN,
+    cursor_field: "acct_id",
+});
+// SaveOutcome: a committed 9600 shows the confirmed values, every one protected.
+const COMMITTED_SCREEN = BuildAccountScreen(UpdateScreenState.CHANGES_DONE, {
+    screen_token: NEXT_SCREEN_TOKEN,
+    cursor_field: "acct_id",
+});
+// ProcessAccountUpdate in CHANGES_DONE or CHANGES_FAILED reads nothing and sends
+// BuildScreen(ScreenOutcome(NOT_FETCHED_STATE)): every field blank, the key's prompt.
+const EMPTY_KEY_SCREEN = BuildAccountScreen(UpdateScreenState.DETAILS_NOT_FETCHED, {
+    fields: BlankFields(),
+    screen_token: ADOPTED_SCREEN_TOKEN,
+    cursor_field: "acct_id",
+});
+const SECOND_ACCOUNT_ID = "00000000011";
+// FetchDetails of the key typed on the empty key screen.
+const SECOND_ACCOUNT_SCREEN = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
+    fields: { ...TEST_FIELDS, acct_id: SECOND_ACCOUNT_ID, cust_id: "000000011" },
+    screen_token: FINAL_SCREEN_TOKEN,
+    cursor_field: "acct_id",
+});
+
+// The 423 or 503 body of a failed 9600 (CHANGES_FAILED) showing the confirmed values. ErrorBody
+// lists the cursor field as the failing one when no edit failed.
+function FailedSaveScreen(message: string): AccountScreen {
+    return BuildAccountScreen(UpdateScreenState.CHANGES_FAILED, {
+        screen_token: NEXT_SCREEN_TOKEN,
+        message,
+        field_errors: ["acct_id"],
+        cursor_field: "acct_id",
+    });
+}
+
+// The ways F5 ends the update: committed, the account lock refused, the rewrite failed.
+const TERMINAL_CASES: readonly TerminalCase[] = [
+    { status: HTTP_OK, terminalScreen: COMMITTED_SCREEN, editableNames: NO_FIELD_NAMES },
+    {
+        status: HTTP_RECORD_LOCKED,
+        terminalScreen: FailedSaveScreen(MSG_LOCK_ACCOUNT),
+        editableNames: KEY_FIELD_NAMES,
+    },
+    {
+        status: HTTP_FILE_ERROR,
+        terminalScreen: FailedSaveScreen(MSG_UPDATE_FAILED),
+        editableNames: KEY_FIELD_NAMES,
+    },
+];
+// Each finished screen, then ENTER, F5 or F12.
+const TERMINAL_KEY_CASES: readonly TerminalKeyCase[] = TERMINAL_CASES.flatMap((terminalCase) =>
+    REQUEST_KEYS.map((updateKey) => ({ ...terminalCase, updateKey })),
+);
+
+function WithEdits(
+    fields: Readonly<AccountScreenFields>,
+    edits: readonly FieldEdit[],
+): AccountScreenFields {
+    const edited: AccountScreenFields = { ...fields };
+    for (const [name, value] of edits) {
+        edited[name] = value;
+    }
+    return edited;
+}
+
+async function KeyEdits(user: UserEvent, edits: readonly FieldEdit[]): Promise<void> {
+    for (const [name, value] of edits) {
+        await user.clear(InputOf(name));
+        await user.type(InputOf(name), value);
+    }
+}
+
+// Every COACTUP input's value as the page shows it, by field name.
+function FieldValuesShown(): AccountScreenFields {
+    const shown = BlankFields();
+    for (const name of ALL_FIELD_NAMES) {
+        shown[name] = InputOf(name).value;
+    }
+    return shown;
+}
+
+// The screen the page shows: every value, the inputs it leaves editable and the message line.
+function ExpectScreenShown(
+    fields: Readonly<AccountScreenFields>,
+    editableNames: readonly AccountFieldName[],
+    alerts: readonly ShownAlert[],
+): void {
+    expect(FieldValuesShown()).toEqual(fields);
+    expect(EditableFieldNames()).toEqual(editableNames);
+    expect(ShownAlerts()).toEqual(alerts);
+}
+
+// F12 sends the edits with the held screen_token; the page shows the re-read record, and the
+// next ENTER carries the cancel response's screen_token and the values it showed.
+async function CancelShowsRereadRecord(startState: UpdateScreenState): Promise<void> {
+    const user = await RenderInState(startState);
+    await KeyEdits(user, DISCARDED_EDITS);
+    QueueUpdateOutcome(HTTP_OK, REREAD_SCREEN);
+    await PressFunctionKey(user, CANCEL_KEY);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: UpdateAction.CANCEL,
+        screen_token: FIRST_SCREEN_TOKEN,
+        fields: PickFields(WithEdits(TEST_FIELDS, DISCARDED_EDITS), DETAIL_FIELD_NAMES),
+    });
+    ExpectScreenShown(REREAD_FIELDS, DETAIL_FIELD_NAMES, [[INFO_PROMPT_FOR_CHANGES, "info"]]);
+    QueueUpdateOutcome(HTTP_EDIT_FAILURE, NO_CHANGE_SCREEN);
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: NEXT_SCREEN_TOKEN,
+        fields: PickFields(REREAD_FIELDS, DETAIL_FIELD_NAMES),
+    });
+}
+
+// Every field is protected, so ENTER sends none; the kept screen stays protected, and F5 carries
+// the screen_token of that ENTER's response.
+async function EnterKeepsConfirmation(): Promise<void> {
+    const user = await RenderInState(UpdateScreenState.CHANGES_OK_NOT_CONFIRMED);
+    QueueUpdateOutcome(HTTP_OK, KEPT_CONFIRMATION_SCREEN);
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: FIRST_SCREEN_TOKEN,
+        fields: {},
+    });
+    ExpectScreenShown(TEST_FIELDS, NO_FIELD_NAMES, [[INFO_PROMPT_FOR_CONFIRMATION, "info"]]);
+    QueueUpdateOutcome(HTTP_OK, { ...COMMITTED_SCREEN, screen_token: FINAL_SCREEN_TOKEN });
+    await PressFunctionKey(user, SAVE_KEY);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: UpdateAction.SAVE,
+        screen_token: NEXT_SCREEN_TOKEN,
+        fields: {},
+    });
+}
+
+// F5 from the confirmation screen, answered with the finished screen of the case.
+async function FinishUpdate(terminalCase: TerminalCase): Promise<UserEvent> {
+    const user = await RenderInState(UpdateScreenState.CHANGES_OK_NOT_CONFIRMED);
+    QueueUpdateOutcome(terminalCase.status, terminalCase.terminalScreen);
+    await PressFunctionKey(user, SAVE_KEY);
+    expect(EditableFieldNames()).toEqual(terminalCase.editableNames);
+    return user;
+}
+
+function ExpectEmptyKeyScreen(): void {
+    ExpectScreenShown(BlankFields(), KEY_FIELD_NAMES, [[INFO_PROMPT_FOR_SEARCH_KEYS, "info"]]);
+    expect(InputOf("acct_id")).toHaveAttribute("aria-invalid", "false");
+}
+
+// The key's own action goes out with the finished screen's token and open inputs; the page shows
+// the server's empty key screen, whose token and typed key the next ENTER carries.
+async function ShowsEmptyKeyScreenAfterFinish(keyCase: TerminalKeyCase): Promise<void> {
+    const user = await FinishUpdate(keyCase);
+    QueueUpdateOutcome(HTTP_OK, EMPTY_KEY_SCREEN);
+    await PressFunctionKey(user, keyCase.updateKey);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: keyCase.updateKey.action,
+        screen_token: NEXT_SCREEN_TOKEN,
+        fields: PickFields(keyCase.terminalScreen.fields, keyCase.editableNames),
+    });
+    ExpectEmptyKeyScreen();
+    await user.type(InputOf("acct_id"), SECOND_ACCOUNT_ID);
+    QueueUpdateOutcome(HTTP_OK, SECOND_ACCOUNT_SCREEN);
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectUpdateRequest(SECOND_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: ADOPTED_SCREEN_TOKEN,
+        fields: { acct_id: SECOND_ACCOUNT_ID },
+    });
+}
+
+describe("COACTUPC /accounts/update state transitions", () => {
+    it.each(CANCEL_START_STATES)(
+        "COACTUPC F12 in %s sends the edits and shows the re-read record",
+        CancelShowsRereadRecord,
+    );
+    it(
+        "COACTUPC ENTER in CHANGES_OK_NOT_CONFIRMED sends no field and keeps the screen",
+        EnterKeepsConfirmation,
+    );
+    it.each(TERMINAL_KEY_CASES)(
+        "COACTUPC $updateKey.key after the $status save shows the empty key screen",
+        ShowsEmptyKeyScreenAfterFinish,
+    );
+});
+
 describe("COACTUPC /accounts/update outcomes", () => {
     it.each(OUTCOME_CASES)("COACTUPC shows $description", ShowsOutcomeLiterals);
     it.each(ADOPTION_CASES)(
@@ -1828,5 +2056,204 @@ describe("COACTUPC /accounts/update edit fetch cancellation", () => {
     it(
         "COACTUPC Strict Mode's fetched screen sends ENTER with its token",
         StrictModeScreenTakesKeys,
+    );
+});
+
+// Account 00000000005 as the edit fetch shows it, with a value unlike TEST_FIELDS' in every
+// field, so an input still showing account 00000000004 after a navigation is caught.
+const NAVIGATED_ACCOUNT_ID = "00000000005";
+const NAVIGATED_SCREEN_TOKEN = "screen-token-5";
+const NAVIGATED_FIELDS: Readonly<AccountScreenFields> = {
+    acct_id: NAVIGATED_ACCOUNT_ID,
+    active_status: "N",
+    open_year: "2016",
+    open_month: "06",
+    open_day: "21",
+    credit_limit: "7,250.00",
+    expiration_year: "2027",
+    expiration_month: "04",
+    expiration_day: "30",
+    cash_credit_limit: "2,000.00",
+    reissue_year: "2025",
+    reissue_month: "05",
+    reissue_day: "15",
+    curr_balance: "158.00",
+    curr_cycle_credit: "15.00",
+    group_id: "GOLDCARD",
+    curr_cycle_debit: "22.50",
+    cust_id: "000000005",
+    ssn_part_1: "345",
+    ssn_part_2: "67",
+    ssn_part_3: "8901",
+    dob_year: "1979",
+    dob_month: "09",
+    dob_day: "02",
+    fico_credit_score: "641",
+    first_name: "NEXTFIRST",
+    middle_name: "NEXTMIDDLE",
+    last_name: "NEXTLAST",
+    addr_line_1: "200 NEXT AVENUE",
+    addr_state_cd: "OR",
+    addr_line_2: "SUITE 2",
+    addr_zip: "97201",
+    addr_line_3: "NEXTCITY",
+    addr_country_cd: "CAN",
+    phone_num_1_area: "503",
+    phone_num_1_prefix: "556",
+    phone_num_1_line: "0142",
+    govt_issued_id: "NEXTGOVT0002",
+    phone_num_2_area: "504",
+    phone_num_2_prefix: "557",
+    phone_num_2_line: "0199",
+    eft_account_id: "0000000005",
+    primary_holder_ind: "N",
+};
+const NAVIGATED_ACCOUNT_SCREEN = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
+    fields: { ...NAVIGATED_FIELDS },
+    screen_token: NAVIGATED_SCREEN_TOKEN,
+});
+// NoChangeOutcome for account 00000000005's unedited fields: the state kept, no field failing an
+// edit and the cursor on the account status, which the error contract lists in field_errors.
+const NAVIGATED_NO_CHANGE_SCREEN = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
+    fields: { ...NAVIGATED_FIELDS },
+    screen_token: NAVIGATED_SCREEN_TOKEN,
+    message: MSG_NO_CHANGES,
+    field_errors: ["active_status"],
+    cursor_field: "active_status",
+});
+// What account 00000000004's ENTER with a valid change answers after the page has moved on to
+// account 00000000005: the validated screen awaiting F5.
+const LATE_PUT_ANSWER = BuildAccountScreen(UpdateScreenState.CHANGES_OK_NOT_CONFIRMED, {
+    screen_token: ADOPTED_SCREEN_TOKEN,
+});
+
+// Moves the mounted page to another query, as a same-path client navigation does: the App Router
+// keeps the route mounted and only useSearchParams changes.
+type QueryNavigator = (query: URLSearchParams) => void;
+
+// Opens /accounts/update?acctId=00000000004 and waits until its edit fetch shows SHOW_DETAILS
+// with FIRST_SCREEN_TOKEN.
+async function RenderFetchedAccountRoute(): Promise<QueryNavigator> {
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    mockFetchAccountForEdit.mockResolvedValueOnce(
+        BuildAccountScreen(UpdateScreenState.SHOW_DETAILS),
+    );
+    const { rerender } = RenderPage();
+    await WaitForIdle();
+    expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID);
+    return (query) => {
+        mockSearchParams = query;
+        rerender(PageTree());
+    };
+}
+
+// Holds the next PUT in flight; the returned function answers it with a screen.
+function HoldNextAccountPut(): (accountScreen: AccountScreen) => Promise<void> {
+    let answer: (accountScreen: AccountScreen) => void = () => undefined;
+    mockUpdateAccount.mockImplementationOnce(
+        () =>
+            new Promise<AccountScreen>((resolve) => {
+                answer = resolve;
+            }),
+    );
+    return async (accountScreen) => {
+        await act(async () => answer(accountScreen));
+    };
+}
+
+// The value every COACTUP input shows, keyed by its AccountScreenFields name.
+function ShownScreenFields(): Record<string, string> {
+    return Object.fromEntries(
+        FIELD_CASES.map((fieldCase) => [fieldCase.name, FieldInput(fieldCase).value]),
+    );
+}
+
+// Account 00000000005's SHOW_DETAILS screen: its values, its open details and its INFOMSG.
+function ExpectNavigatedAccountScreen(): void {
+    expect(ShownScreenFields()).toEqual(NAVIGATED_FIELDS);
+    expect(EditableFieldNames()).toEqual(DETAIL_FIELD_NAMES);
+    expect(ShownAlerts()).toEqual([[INFO_PROMPT_FOR_CHANGES, "info"]]);
+}
+
+// The next ENTER sends account 00000000005's key, screen_token and editable inputs.
+async function ExpectEnterSendsNavigatedAccount(): Promise<void> {
+    QueueUpdateOutcome(HTTP_EDIT_FAILURE, NAVIGATED_NO_CHANGE_SCREEN);
+    await PressFunctionKey(userEvent.setup(), ENTER_KEY);
+    ExpectUpdateRequest(NAVIGATED_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: NAVIGATED_SCREEN_TOKEN,
+        fields: PickFields(NAVIGATED_FIELDS, DETAIL_FIELD_NAMES),
+    });
+}
+
+// Dropping ?acctId= after a fetched account is a fresh entry from the menu: the empty key screen
+// without a screen_token, so the next ENTER starts COACTUPC over at its key edit.
+async function ShowsEmptyKeyScreenWithoutAcctId(): Promise<void> {
+    const navigate = await RenderFetchedAccountRoute();
+    navigate(new URLSearchParams());
+    expect(ShownScreenFields()).toEqual(BlankFields());
+    expect(EditableFieldNames()).toEqual(KEY_FIELD_NAMES);
+    expect(InputOf("acct_id")).toHaveFocus();
+    expect(ShownAlerts()).toEqual([]);
+    expect(mockFetchAccountForEdit).toHaveBeenCalledTimes(1);
+    QueueUpdateOutcome(HTTP_EDIT_FAILURE, KeyErrorScreen(MSG_NO_INPUT_RECEIVED));
+    await PressFunctionKey(userEvent.setup(), ENTER_KEY);
+    ExpectUpdateRequest(BLANK_ACCOUNT_PATH, {
+        action: UpdateAction.ENTER,
+        screen_token: "",
+        fields: { acct_id: "" },
+    });
+}
+
+// A to B replaces the fields and screen_token together: B's entry starts blank, shows B's fetched
+// screen, and the next request carries B's key and token.
+async function FetchesNewAcctIdOnSameRoute(): Promise<void> {
+    const navigate = await RenderFetchedAccountRoute();
+    const answerFetch = HoldNextFetch();
+    navigate(new URLSearchParams({ acctId: NAVIGATED_ACCOUNT_ID }));
+    expect(ShownScreenFields()).toEqual(BlankFields());
+    await answerFetch(NAVIGATED_ACCOUNT_SCREEN);
+    await WaitForIdle();
+    expect(mockFetchAccountForEdit.mock.calls).toEqual([
+        [TEST_ACCOUNT_ID, READ_OPTIONS],
+        [NAVIGATED_ACCOUNT_ID, READ_OPTIONS],
+    ]);
+    ExpectNavigatedAccountScreen();
+    await ExpectEnterSendsNavigatedAccount();
+}
+
+// A's ENTER PUT with a keyed change is still in flight when the page moves to B: the request is
+// not cancelled, B's entry fetch still runs, and A's late answer changes nothing on B's screen.
+async function KeepsNewEntryWhilePutPending(): Promise<void> {
+    const navigate = await RenderFetchedAccountRoute();
+    const user = userEvent.setup();
+    await user.clear(InputOf("credit_limit"));
+    await user.type(InputOf("credit_limit"), KEYED_CREDIT_LIMIT);
+    const answerPut = HoldNextAccountPut();
+    await user.click(screen.getByRole("button", { name: ENTER_KEY.buttonName }));
+    expect(LastUpdateCall()[0]).toBe(TEST_ACCOUNT_ID);
+    mockFetchAccountForEdit.mockResolvedValueOnce(NAVIGATED_ACCOUNT_SCREEN);
+    navigate(new URLSearchParams({ acctId: NAVIGATED_ACCOUNT_ID }));
+    await WaitForIdle();
+    expect(mockFetchAccountForEdit).toHaveBeenLastCalledWith(NAVIGATED_ACCOUNT_ID, READ_OPTIONS);
+    await answerPut(LATE_PUT_ANSWER);
+    expect(mockUpdateAccount).toHaveBeenCalledTimes(1);
+    ExpectNavigatedAccountScreen();
+    ExpectRequestKeysEnabled(true);
+    await ExpectEnterSendsNavigatedAccount();
+}
+
+describe("COACTUPC /accounts/update same-route ?acctId= change", () => {
+    it(
+        "COACTUPC dropping ?acctId= shows the empty key screen and ENTER sends no token",
+        ShowsEmptyKeyScreenWithoutAcctId,
+    );
+    it(
+        "COACTUPC a new ?acctId= fetches that account and its screen_token drives the next PUT",
+        FetchesNewAcctIdOnSameRoute,
+    );
+    it(
+        "COACTUPC a new ?acctId= during a pending PUT is fetched and the late answer ignored",
+        KeepsNewEntryWhilePutPending,
     );
 });
