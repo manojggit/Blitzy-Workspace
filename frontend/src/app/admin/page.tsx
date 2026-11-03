@@ -346,8 +346,7 @@ function useAdminMenu(): AdminMenuState {
 }
 
 // BUILD-MENU-OPTIONS (OPTN001-OPTN012): every server option, label verbatim, number beside it.
-// BLITZY [A11Y]: the theme's default ListItemButton focus tint measures 1.31:1 against the Paper,
-// below the 3:1 non-text guideline; kept as the library default and flagged for designer review.
+// Keyboard focus on an option shows the theme's M3 focus ring, drawn inside the row.
 function AdminMenuOptions({ menuOptions, isBusy, onSelectOption }: AdminMenuOptionsProps) {
     return (
         <Box component="nav" aria-label={OPTION_LIST_LABEL}>

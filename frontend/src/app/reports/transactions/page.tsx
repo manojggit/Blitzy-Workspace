@@ -1382,7 +1382,7 @@ interface ReportDownloadButtonsProps {
 // the server names the file.
 function ReportDownloadButtons({ query, downloads }: ReportDownloadButtonsProps) {
     return (
-        <Stack direction="row" spacing={2} useFlexGap>
+        <Stack direction="row" spacing={2} useFlexGap sx={{ flexWrap: "wrap" }}>
             {DOWNLOAD_OPTIONS.map((option) => (
                 <ReportDownloadButton
                     key={option.format}

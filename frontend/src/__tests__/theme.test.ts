@@ -1,6 +1,6 @@
 // Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE, PRINT_LINE_STYLE),
 // the Material Design 3 token theme of AAP 0.5.3–0.5.4.
-import type { Theme } from "@mui/material/styles";
+import type { Theme, TypeAction } from "@mui/material/styles";
 import { CARD_DEMO_THEME, PRINT_LINE_STYLE, VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 
 type ColourReader = (theme: Theme) => string | undefined;
@@ -33,6 +33,63 @@ interface TypeRoleExpectation {
     fontSize: number;
     lineHeight: number;
     fontWeight: number;
+    letterSpacing: string;
+}
+
+type MuiTypographyVariantName =
+    | "h1"
+    | "h2"
+    | "h3"
+    | "h4"
+    | "h5"
+    | "h6"
+    | "subtitle1"
+    | "subtitle2"
+    | "body1"
+    | "body2"
+    | "caption"
+    | "overline"
+    | "button";
+
+interface BuiltInVariantExpectation {
+    variant: MuiTypographyVariantName;
+    role: M3TypeRoleName;
+}
+
+interface ComponentThemeEntry {
+    defaultProps?: Record<string, unknown>;
+    styleOverrides?: Record<string, unknown>;
+}
+
+interface ThemeRuleExpectation {
+    rule: string;
+    component: string;
+    slot: string;
+    selectorPath: readonly string[];
+    expectedStyle: StyleRecord;
+}
+
+interface StyleVariantEntry {
+    props: StyleRecord;
+    style: StyleRecord;
+}
+
+interface SlotVariantExpectation {
+    rule: string;
+    component: string;
+    slot: string;
+    variantProps: StyleRecord;
+    expectedStyle: StyleRecord;
+}
+
+interface ShadowExpectation {
+    muiIndex: number;
+    expectedShadow: string;
+}
+
+interface ActionRoleExpectation {
+    key: keyof TypeAction;
+    expected: string | number;
 }
 
 interface StyleCallbackProps {
@@ -88,6 +145,16 @@ const M3_COLOR_EXPECTATIONS: readonly ColourExpectation[] = [
         read: (theme) => theme.palette.m3.errorContainer,
         expected: "#F9DEDC",
     },
+    {
+        token: "onErrorContainer",
+        read: (theme) => theme.palette.m3.onErrorContainer,
+        expected: "#8C1D18",
+    },
+    {
+        token: "surfaceContainerHighest",
+        read: (theme) => theme.palette.m3.surfaceContainerHighest,
+        expected: "#E6E0E9",
+    },
     { token: "surface", read: (theme) => theme.palette.background.default, expected: "#FEF7FF" },
     {
         token: "surfaceContainer",
@@ -117,21 +184,110 @@ const PIXEL_PRECISION_DIGITS = 5;
 const ROBOTO_FONT_STACK = "var(--font-roboto, Roboto), Roboto, Helvetica, Arial, sans-serif";
 
 const M3_TYPE_EXPECTATIONS: readonly TypeRoleExpectation[] = [
-    { variant: "displayLarge", fontSize: 57, lineHeight: 64, fontWeight: 400 },
-    { variant: "displayMedium", fontSize: 45, lineHeight: 52, fontWeight: 400 },
-    { variant: "displaySmall", fontSize: 36, lineHeight: 44, fontWeight: 400 },
-    { variant: "headlineLarge", fontSize: 32, lineHeight: 40, fontWeight: 400 },
-    { variant: "headlineMedium", fontSize: 28, lineHeight: 36, fontWeight: 400 },
-    { variant: "headlineSmall", fontSize: 24, lineHeight: 32, fontWeight: 400 },
-    { variant: "titleLarge", fontSize: 22, lineHeight: 28, fontWeight: 400 },
-    { variant: "titleMedium", fontSize: 16, lineHeight: 24, fontWeight: 500 },
-    { variant: "titleSmall", fontSize: 14, lineHeight: 20, fontWeight: 500 },
-    { variant: "bodyLarge", fontSize: 16, lineHeight: 24, fontWeight: 400 },
-    { variant: "bodyMedium", fontSize: 14, lineHeight: 20, fontWeight: 400 },
-    { variant: "bodySmall", fontSize: 12, lineHeight: 16, fontWeight: 400 },
-    { variant: "labelLarge", fontSize: 14, lineHeight: 20, fontWeight: 500 },
-    { variant: "labelMedium", fontSize: 12, lineHeight: 16, fontWeight: 500 },
-    { variant: "labelSmall", fontSize: 11, lineHeight: 16, fontWeight: 500 },
+    {
+        variant: "displayLarge",
+        fontSize: 57,
+        lineHeight: 64,
+        fontWeight: 400,
+        letterSpacing: "-0.25px",
+    },
+    {
+        variant: "displayMedium",
+        fontSize: 45,
+        lineHeight: 52,
+        fontWeight: 400,
+        letterSpacing: "0px",
+    },
+    {
+        variant: "displaySmall",
+        fontSize: 36,
+        lineHeight: 44,
+        fontWeight: 400,
+        letterSpacing: "0px",
+    },
+    {
+        variant: "headlineLarge",
+        fontSize: 32,
+        lineHeight: 40,
+        fontWeight: 400,
+        letterSpacing: "0px",
+    },
+    {
+        variant: "headlineMedium",
+        fontSize: 28,
+        lineHeight: 36,
+        fontWeight: 400,
+        letterSpacing: "0px",
+    },
+    {
+        variant: "headlineSmall",
+        fontSize: 24,
+        lineHeight: 32,
+        fontWeight: 400,
+        letterSpacing: "0px",
+    },
+    { variant: "titleLarge", fontSize: 22, lineHeight: 28, fontWeight: 400, letterSpacing: "0px" },
+    {
+        variant: "titleMedium",
+        fontSize: 16,
+        lineHeight: 24,
+        fontWeight: 500,
+        letterSpacing: "0.15px",
+    },
+    {
+        variant: "titleSmall",
+        fontSize: 14,
+        lineHeight: 20,
+        fontWeight: 500,
+        letterSpacing: "0.1px",
+    },
+    { variant: "bodyLarge", fontSize: 16, lineHeight: 24, fontWeight: 400, letterSpacing: "0.5px" },
+    {
+        variant: "bodyMedium",
+        fontSize: 14,
+        lineHeight: 20,
+        fontWeight: 400,
+        letterSpacing: "0.25px",
+    },
+    { variant: "bodySmall", fontSize: 12, lineHeight: 16, fontWeight: 400, letterSpacing: "0.4px" },
+    {
+        variant: "labelLarge",
+        fontSize: 14,
+        lineHeight: 20,
+        fontWeight: 500,
+        letterSpacing: "0.1px",
+    },
+    {
+        variant: "labelMedium",
+        fontSize: 12,
+        lineHeight: 16,
+        fontWeight: 500,
+        letterSpacing: "0.5px",
+    },
+    {
+        variant: "labelSmall",
+        fontSize: 11,
+        lineHeight: 16,
+        fontWeight: 500,
+        letterSpacing: "0.5px",
+    },
+];
+
+// The M3 role each built-in MUI typography variant must render.
+const BUILT_IN_VARIANT_EXPECTATIONS: readonly BuiltInVariantExpectation[] = [
+    { variant: "h1", role: "displayLarge" },
+    { variant: "h2", role: "displayMedium" },
+    { variant: "h3", role: "displaySmall" },
+    { variant: "h4", role: "headlineMedium" },
+    { variant: "h5", role: "headlineSmall" },
+    { variant: "h6", role: "titleLarge" },
+    { variant: "subtitle1", role: "titleMedium" },
+    { variant: "subtitle2", role: "titleSmall" },
+    { variant: "body1", role: "bodyLarge" },
+    { variant: "body2", role: "bodyMedium" },
+    { variant: "caption", role: "bodySmall" },
+    { variant: "overline", role: "labelSmall" },
+    { variant: "button", role: "labelLarge" },
 ];
 
 const TONAL_VARIANT_NAME = "tonal";
@@ -170,6 +326,649 @@ const SEGMENT_STATE_EXPECTATIONS: readonly SegmentStateExpectation[] = [
     },
 ];
 
+const OUTLINE_HEX = "#79747E";
+const ON_SURFACE_HOVER_LAYER = "rgba(29, 27, 32, 0.08)";
+const ON_SURFACE_HOVER_GRADIENT =
+    "linear-gradient(" + ON_SURFACE_HOVER_LAYER + ", " + ON_SURFACE_HOVER_LAYER + ")";
+const M3_HOVER_OPACITY = 0.08;
+
+// MUI's action colours on the M3 roles: on-surface-variant icons, the 10 % on-surface focus layer,
+// 38 % disabled content and 12 % disabled containers. Selected and activated stay MUI's.
+const ACTION_ROLE_EXPECTATIONS: readonly ActionRoleExpectation[] = [
+    { key: "active", expected: "#49454F" },
+    { key: "focus", expected: "rgba(29, 27, 32, 0.1)" },
+    { key: "focusOpacity", expected: 0.1 },
+    { key: "disabled", expected: "rgba(29, 27, 32, 0.38)" },
+    { key: "disabledOpacity", expected: 0.38 },
+    { key: "disabledBackground", expected: "rgba(29, 27, 32, 0.12)" },
+    { key: "selected", expected: "rgba(0, 0, 0, 0.08)" },
+    { key: "selectedOpacity", expected: 0.08 },
+    { key: "activatedOpacity", expected: 0.12 },
+];
+
+const FOCUS_VISIBLE_SELECTOR = "&.Mui-focusVisible";
+const FORCED_COLORS_QUERY = "@media (forced-colors: active)";
+const ENABLED_SELECTED_SELECTOR = "&.Mui-selected:not(.Mui-disabled)";
+const SINGLE_LINE_INPUT_SELECTOR = "&:not(textarea)";
+const TOUCH_HOVER_RESTING_OUTLINE_SELECTOR =
+    "&:hover:not(.Mui-focused):not(.Mui-error):not(.Mui-disabled) .MuiOutlinedInput-notchedOutline";
+const SM_BREAKPOINT_QUERY = CARD_DEMO_THEME.breakpoints.up("sm");
+const FORCED_SELECTED_OPTION_STYLE = {
+    forcedColorAdjust: "none",
+    backgroundColor: "Highlight",
+    color: "HighlightText",
+};
+
+// The M3 outline, container and divider roles in place of MUI's Material Design 2 greys.
+const OUTLINE_AND_FILL_RULES: readonly ThemeRuleExpectation[] = [
+    {
+        rule: "a resting outlined field draws the outline role",
+        component: "MuiOutlinedInput",
+        slot: "notchedOutline",
+        selectorPath: [],
+        expectedStyle: { borderColor: OUTLINE_HEX },
+    },
+    {
+        rule: "a touch hover keeps the outline role on a resting outlined field",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        selectorPath: ["@media (hover: none)", TOUCH_HOVER_RESTING_OUTLINE_SELECTOR],
+        expectedStyle: { borderColor: OUTLINE_HEX },
+    },
+    {
+        rule: "a resting outlined button draws the outline role",
+        component: "MuiButton",
+        slot: "outlined",
+        selectorPath: [],
+        expectedStyle: { "--variant-outlinedBorder": OUTLINE_HEX },
+    },
+    {
+        rule: "a filled field sits on the highest surface container",
+        component: "MuiFilledInput",
+        slot: "root",
+        selectorPath: [],
+        expectedStyle: { backgroundColor: "#E6E0E9" },
+    },
+    {
+        rule: "a hovered or focused filled field keeps the highest surface container",
+        component: "MuiFilledInput",
+        slot: "root",
+        selectorPath: ["&:hover, &.Mui-focused"],
+        expectedStyle: { backgroundColor: "#E6E0E9" },
+    },
+    {
+        rule: "a pointer hover lays the 8 % on-surface state layer over a filled field",
+        component: "MuiFilledInput",
+        slot: "root",
+        selectorPath: ["@media (hover: hover)", "&:hover:not(.Mui-disabled)"],
+        expectedStyle: {
+            backgroundImage: ON_SURFACE_HOVER_GRADIENT,
+        },
+    },
+    {
+        rule: "a disabled filled field takes the 4 % on-surface container",
+        component: "MuiFilledInput",
+        slot: "root",
+        selectorPath: ["&.Mui-disabled"],
+        expectedStyle: { backgroundColor: "rgba(29, 27, 32, 0.04)" },
+    },
+    {
+        rule: "a filled field's active indicator is on-surface-variant",
+        component: "MuiFilledInput",
+        slot: "root",
+        selectorPath: ["&::before"],
+        expectedStyle: { borderBottomColor: "#49454F" },
+    },
+    {
+        rule: "table rows are separated by the outline-variant divider",
+        component: "MuiTableCell",
+        slot: "root",
+        selectorPath: [],
+        expectedStyle: { borderBottomColor: "#CAC4D0" },
+    },
+    {
+        rule: "an unselected segment label is on-surface",
+        component: "MuiToggleButton",
+        slot: "root",
+        selectorPath: [],
+        expectedStyle: { color: "#1D1B20" },
+    },
+];
+
+// The M3 focus indicator: 3 px secondary, 2 px outside, or inside where an ancestor would clip it.
+const FOCUS_RING_RULES: readonly ThemeRuleExpectation[] = [
+    {
+        rule: "every ButtonBase shows a 3 px secondary ring 2 px outside it",
+        component: "MuiButtonBase",
+        slot: "root",
+        selectorPath: [FOCUS_VISIBLE_SELECTOR],
+        expectedStyle: { outline: "3px solid #625B71", outlineOffset: 2 },
+    },
+    {
+        rule: "a list item draws its ring inside itself",
+        component: "MuiListItemButton",
+        slot: "root",
+        selectorPath: [FOCUS_VISIBLE_SELECTOR],
+        expectedStyle: { outlineOffset: -3 },
+    },
+    {
+        rule: "a menu item draws its ring inside itself",
+        component: "MuiMenuItem",
+        slot: "root",
+        selectorPath: [FOCUS_VISIBLE_SELECTOR],
+        expectedStyle: { outlineOffset: -3 },
+    },
+    {
+        rule: "an icon button draws its ring inside itself",
+        component: "MuiIconButton",
+        slot: "root",
+        selectorPath: [FOCUS_VISIBLE_SELECTOR],
+        expectedStyle: { outlineOffset: -3 },
+    },
+];
+
+// M3 sizes: 40 dp buttons inside a 48 dp target, 48 dp menu items and icon buttons.
+const TOUCH_TARGET_RULES: readonly ThemeRuleExpectation[] = [
+    {
+        rule: "a button is at least 40 px tall with 8 px and 24 px padding",
+        component: "MuiButton",
+        slot: "root",
+        selectorPath: [],
+        expectedStyle: { minHeight: 40, padding: "8px 24px" },
+    },
+    {
+        rule: "a button's pointer target reaches 4 px above and below it, never sideways",
+        component: "MuiButton",
+        slot: "root",
+        selectorPath: ["&::after"],
+        expectedStyle: {
+            content: '""',
+            position: "absolute",
+            top: -4,
+            bottom: -4,
+            left: 0,
+            right: 0,
+        },
+    },
+    {
+        rule: "an outlined button's pointer target reaches 4 px past its 1 px border",
+        component: "MuiButton",
+        slot: "outlined",
+        selectorPath: ["&::after"],
+        expectedStyle: { top: -5, bottom: -5 },
+    },
+    {
+        rule: "a text button keeps 12 px beside its label",
+        component: "MuiButton",
+        slot: "text",
+        selectorPath: [],
+        expectedStyle: { padding: "8px 12px" },
+    },
+    {
+        rule: "an outlined field input is a 24 px line box with 16 px above and below",
+        component: "MuiOutlinedInput",
+        slot: "input",
+        selectorPath: [SINGLE_LINE_INPUT_SELECTOR],
+        expectedStyle: {
+            height: "24px",
+            lineHeight: "24px",
+            paddingTop: "16px",
+            paddingBottom: "16px",
+        },
+    },
+    {
+        rule: "a menu item is 48 px tall below the sm breakpoint",
+        component: "MuiMenuItem",
+        slot: "root",
+        selectorPath: [],
+        expectedStyle: { minHeight: 48 },
+    },
+    {
+        rule: "a menu item stays 48 px tall from the sm breakpoint",
+        component: "MuiMenuItem",
+        slot: "root",
+        selectorPath: [SM_BREAKPOINT_QUERY],
+        expectedStyle: { minHeight: 48 },
+    },
+    {
+        rule: "a medium icon button pads its 24 px icon to 48 px",
+        component: "MuiIconButton",
+        slot: "sizeMedium",
+        selectorPath: [],
+        expectedStyle: { padding: "12px" },
+    },
+];
+
+// Forced-colours mode: system-colour boundaries and the Highlight pair on the selected option.
+const FORCED_COLOUR_RULES: readonly ThemeRuleExpectation[] = [
+    {
+        rule: "a button draws a ButtonText boundary",
+        component: "MuiButton",
+        slot: "root",
+        selectorPath: [FORCED_COLORS_QUERY],
+        expectedStyle: { border: "1px solid ButtonText" },
+    },
+    {
+        rule: "a button's pointer target reaches 4 px past its 1 px boundary",
+        component: "MuiButton",
+        slot: "root",
+        selectorPath: [FORCED_COLORS_QUERY, "&::after"],
+        expectedStyle: { top: -5, bottom: -5 },
+    },
+    {
+        rule: "a disabled button draws a GrayText boundary",
+        component: "MuiButton",
+        slot: "root",
+        selectorPath: [FORCED_COLORS_QUERY, "&.Mui-disabled"],
+        expectedStyle: { borderColor: "GrayText" },
+    },
+    {
+        rule: "an Alert draws a CanvasText boundary",
+        component: "MuiAlert",
+        slot: "root",
+        selectorPath: [FORCED_COLORS_QUERY],
+        expectedStyle: { border: "1px solid CanvasText" },
+    },
+    {
+        rule: "a filled field draws a CanvasText boundary",
+        component: "MuiFilledInput",
+        slot: "root",
+        selectorPath: [FORCED_COLORS_QUERY],
+        expectedStyle: { border: "1px solid CanvasText" },
+    },
+    {
+        rule: "a Select menu draws a CanvasText boundary",
+        component: "MuiMenu",
+        slot: "paper",
+        selectorPath: [FORCED_COLORS_QUERY],
+        expectedStyle: { border: "1px solid CanvasText" },
+    },
+    {
+        rule: "the selected menu option is the Highlight pair",
+        component: "MuiMenuItem",
+        slot: "root",
+        selectorPath: [FORCED_COLORS_QUERY, ENABLED_SELECTED_SELECTOR],
+        expectedStyle: FORCED_SELECTED_OPTION_STYLE,
+    },
+    {
+        rule: "the selected segment is the Highlight pair",
+        component: "MuiToggleButton",
+        slot: "root",
+        selectorPath: [FORCED_COLORS_QUERY, ENABLED_SELECTED_SELECTOR],
+        expectedStyle: FORCED_SELECTED_OPTION_STYLE,
+    },
+    {
+        rule: "the focus ring takes the Highlight system colour",
+        component: "MuiButtonBase",
+        slot: "root",
+        selectorPath: [FOCUS_VISIBLE_SELECTOR, FORCED_COLORS_QUERY],
+        expectedStyle: { outlineColor: "Highlight" },
+    },
+    {
+        rule: "the selected menu option's ring is HighlightText 2 px inside its fill",
+        component: "MuiMenuItem",
+        slot: "root",
+        selectorPath: [FORCED_COLORS_QUERY, "&.Mui-selected.Mui-focusVisible"],
+        expectedStyle: { outlineColor: "HighlightText", outlineOffset: -5 },
+    },
+];
+
+// Component typography and spacing on the M3 type scale and the 4 dp grid.
+const TYPE_AND_SPACING_RULES: readonly ThemeRuleExpectation[] = [
+    {
+        rule: "helper text is bodySmall, 4 px below its field",
+        component: "MuiFormHelperText",
+        slot: "root",
+        selectorPath: [],
+        expectedStyle: {
+            fontSize: "12px",
+            lineHeight: "16px",
+            letterSpacing: "0.4px",
+            marginTop: "4px",
+        },
+    },
+    {
+        rule: "an Alert is padded 4 px and 16 px on an 8 px corner",
+        component: "MuiAlert",
+        slot: "root",
+        selectorPath: [],
+        expectedStyle: { padding: "4px 16px", borderRadius: 8 },
+    },
+    {
+        rule: "an Alert icon fills a 20 px line box 8 px from the edge",
+        component: "MuiAlert",
+        slot: "icon",
+        selectorPath: [],
+        expectedStyle: { padding: "8px 0px", fontSize: "20px" },
+    },
+    {
+        rule: "a filled field input is a 24 px line box with 24 px above and 8 px below",
+        component: "MuiFilledInput",
+        slot: "input",
+        selectorPath: [SINGLE_LINE_INPUT_SELECTOR],
+        expectedStyle: {
+            height: "24px",
+            lineHeight: "24px",
+            paddingTop: "24px",
+            paddingBottom: "8px",
+        },
+    },
+    {
+        rule: "a menu item pads its label 8 px above and below",
+        component: "MuiMenuItem",
+        slot: "root",
+        selectorPath: [],
+        expectedStyle: { paddingTop: "8px", paddingBottom: "8px" },
+    },
+    {
+        rule: "a medium segment pads its label 12 px on every side",
+        component: "MuiToggleButton",
+        slot: "sizeMedium",
+        selectorPath: [],
+        expectedStyle: { padding: "12px" },
+    },
+];
+
+// The M3 text field's 16 dp inset, shared by the input text, the floating label and the helper.
+const TEXT_FIELD_INSET = "16px";
+const TEXT_FIELD_INSET_STYLE = { paddingLeft: TEXT_FIELD_INSET, paddingRight: TEXT_FIELD_INSET };
+const ADORNED_START_INPUT_SELECTOR = ".MuiInputBase-adornedStart > &";
+const ADORNED_END_INPUT_SELECTOR = ".MuiInputBase-adornedEnd > &";
+// The notch edge sits 12 px in from the field's edge; the fieldset pads that less its outline,
+// which is 1 px wide at rest and 2 px while the field has focus.
+const RESTING_NOTCH_PADDING = "calc(12px - 1px)";
+const FOCUSED_NOTCH_PADDING = "calc(12px - 2px)";
+const NOTCH_LABEL_SELECTOR = "& > legend > span:not(.notranslate)";
+const FOCUSED_NOTCHED_OUTLINE_SELECTOR = "&.Mui-focused .MuiOutlinedInput-notchedOutline";
+// A label spans the field between the two insets; shrunk, its unscaled width is that over 0.75.
+const RESTING_LABEL_MAX_WIDTH = "calc((100% - 2 * 16px) / 1)";
+const SHRUNK_LABEL_MAX_WIDTH = "calc((100% - 2 * 16px) / 0.75)";
+
+// Text-field horizontal geometry on the 4 dp grid, in place of MUI's 14 px, 12 px and 5 px values.
+const TEXT_FIELD_INSET_RULES: readonly ThemeRuleExpectation[] = [
+    {
+        rule: "an outlined field's input text sits 16 px in from either side",
+        component: "MuiOutlinedInput",
+        slot: "input",
+        selectorPath: [SINGLE_LINE_INPUT_SELECTOR],
+        expectedStyle: TEXT_FIELD_INSET_STYLE,
+    },
+    {
+        rule: "a filled field's input text sits 16 px in from either side",
+        component: "MuiFilledInput",
+        slot: "input",
+        selectorPath: [SINGLE_LINE_INPUT_SELECTOR],
+        expectedStyle: TEXT_FIELD_INSET_STYLE,
+    },
+    {
+        rule: "an outlined field's input keeps no padding beside a start adornment",
+        component: "MuiOutlinedInput",
+        slot: "input",
+        selectorPath: [SINGLE_LINE_INPUT_SELECTOR, ADORNED_START_INPUT_SELECTOR],
+        expectedStyle: { paddingLeft: 0 },
+    },
+    {
+        rule: "an outlined field's input keeps no padding beside an end adornment",
+        component: "MuiOutlinedInput",
+        slot: "input",
+        selectorPath: [SINGLE_LINE_INPUT_SELECTOR, ADORNED_END_INPUT_SELECTOR],
+        expectedStyle: { paddingRight: 0 },
+    },
+    {
+        rule: "a filled field's input keeps no padding beside a start adornment",
+        component: "MuiFilledInput",
+        slot: "input",
+        selectorPath: [SINGLE_LINE_INPUT_SELECTOR, ADORNED_START_INPUT_SELECTOR],
+        expectedStyle: { paddingLeft: 0 },
+    },
+    {
+        rule: "a filled field's input keeps no padding beside an end adornment",
+        component: "MuiFilledInput",
+        slot: "input",
+        selectorPath: [SINGLE_LINE_INPUT_SELECTOR, ADORNED_END_INPUT_SELECTOR],
+        expectedStyle: { paddingRight: 0 },
+    },
+    {
+        rule: "an outlined field's resting label sits on the 16 px inset",
+        component: "MuiInputLabel",
+        slot: "outlined",
+        selectorPath: [],
+        expectedStyle: {
+            transform: "translate(16px, 16px) scale(1)",
+            maxWidth: RESTING_LABEL_MAX_WIDTH,
+        },
+    },
+    {
+        rule: "a filled field's resting label sits on the 16 px inset",
+        component: "MuiInputLabel",
+        slot: "filled",
+        selectorPath: [],
+        expectedStyle: {
+            transform: "translate(16px, 16px) scale(1)",
+            maxWidth: RESTING_LABEL_MAX_WIDTH,
+        },
+    },
+    {
+        rule: "a resting outline puts its notch edge 12 px in from the field's edge",
+        component: "MuiOutlinedInput",
+        slot: "notchedOutline",
+        selectorPath: [],
+        expectedStyle: { paddingLeft: RESTING_NOTCH_PADDING, paddingRight: RESTING_NOTCH_PADDING },
+    },
+    {
+        rule: "a focused outline keeps its notch edge 12 px in from the field's edge",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        selectorPath: [FOCUSED_NOTCHED_OUTLINE_SELECTOR],
+        expectedStyle: { paddingLeft: FOCUSED_NOTCH_PADDING, paddingRight: FOCUSED_NOTCH_PADDING },
+    },
+    {
+        rule: "the notch opens 4 px before a field's label and closes 4 px after it",
+        component: "MuiOutlinedInput",
+        slot: "notchedOutline",
+        selectorPath: [NOTCH_LABEL_SELECTOR],
+        expectedStyle: {
+            paddingLeft: "4px",
+            paddingRight: "4px",
+            letterSpacing: "calc(0.5px * 0.75)",
+        },
+    },
+    {
+        rule: "an outlined or filled field's helper text sits 16 px in from either side",
+        component: "MuiFormHelperText",
+        slot: "contained",
+        selectorPath: [],
+        expectedStyle: { marginLeft: TEXT_FIELD_INSET, marginRight: TEXT_FIELD_INSET },
+    },
+];
+
+const THEME_RULE_GROUPS: readonly [string, readonly ThemeRuleExpectation[]][] = [
+    ["M3 outlines, fills and dividers", OUTLINE_AND_FILL_RULES],
+    ["M3 focus ring", FOCUS_RING_RULES],
+    ["M3 touch targets", TOUCH_TARGET_RULES],
+    ["Forced colours", FORCED_COLOUR_RULES],
+    ["M3 component typography and spacing", TYPE_AND_SPACING_RULES],
+    ["M3 text-field insets (FE2A-F12)", TEXT_FIELD_INSET_RULES],
+];
+
+// Overrides MUI applies only to components in one state: a small or hidden-label field, a dense
+// menu item, a normally padded small cell, a severity.
+const SLOT_VARIANT_EXPECTATIONS: readonly SlotVariantExpectation[] = [
+    {
+        rule: "a small filled field's input sits 20 px below the top and 4 px above the bottom",
+        component: "MuiFilledInput",
+        slot: "input",
+        variantProps: { size: "small" },
+        expectedStyle: {
+            [SINGLE_LINE_INPUT_SELECTOR]: { paddingTop: "20px", paddingBottom: "4px" },
+        },
+    },
+    {
+        rule: "a filled field with a hidden label centres its input 16 px from top and bottom",
+        component: "MuiFilledInput",
+        slot: "input",
+        variantProps: { hiddenLabel: true },
+        expectedStyle: {
+            [SINGLE_LINE_INPUT_SELECTOR]: { paddingTop: "16px", paddingBottom: "16px" },
+        },
+    },
+    {
+        rule: "a small filled field with a hidden label centres its input 8 px from top and bottom",
+        component: "MuiFilledInput",
+        slot: "input",
+        variantProps: { hiddenLabel: true, size: "small" },
+        expectedStyle: {
+            [SINGLE_LINE_INPUT_SELECTOR]: { paddingTop: "8px", paddingBottom: "8px" },
+        },
+    },
+    {
+        rule: "a dense menu item keeps MUI's 4 px above and below its label",
+        component: "MuiMenuItem",
+        slot: "root",
+        variantProps: { dense: true },
+        expectedStyle: { paddingTop: "4px", paddingBottom: "4px" },
+    },
+    {
+        rule: "a normally padded small cell is padded 8 px and 16 px",
+        component: "MuiTableCell",
+        slot: "sizeSmall",
+        variantProps: { padding: "normal" },
+        expectedStyle: { padding: "8px 16px" },
+    },
+    {
+        rule: "a small field's input spans the 48 px target and overhangs its 40 px outline",
+        component: "MuiOutlinedInput",
+        slot: "input",
+        variantProps: { size: "small" },
+        expectedStyle: {
+            [SINGLE_LINE_INPUT_SELECTOR]: {
+                paddingTop: "12px",
+                paddingBottom: "12px",
+                marginTop: -4,
+                marginBottom: -4,
+            },
+        },
+    },
+    {
+        rule: "an error Alert is the error-container pair with an error icon",
+        component: "MuiAlert",
+        slot: "root",
+        variantProps: { variant: "standard", colorSeverity: "error" },
+        expectedStyle: {
+            backgroundColor: "#F9DEDC",
+            color: "#8C1D18",
+            "& .MuiAlert-icon": { color: "#B3261E" },
+        },
+    },
+    {
+        rule: "an info Alert is the primary-container pair with a primary icon",
+        component: "MuiAlert",
+        slot: "root",
+        variantProps: { variant: "standard", colorSeverity: "info" },
+        expectedStyle: {
+            backgroundColor: PRIMARY_CONTAINER_HEX,
+            color: ON_PRIMARY_CONTAINER_HEX,
+            "& .MuiAlert-icon": { color: "#6750A4" },
+        },
+    },
+    {
+        rule: "a small outlined field's resting label sits on the 16 px inset at MUI's 9 px",
+        component: "MuiInputLabel",
+        slot: "outlined",
+        variantProps: { size: "small" },
+        expectedStyle: { transform: "translate(16px, 9px) scale(1)" },
+    },
+    {
+        rule: "an outlined field's shrunk label sits on the 16 px inset at MUI's -9 px",
+        component: "MuiInputLabel",
+        slot: "outlined",
+        variantProps: { shrink: true },
+        expectedStyle: {
+            transform: "translate(16px, -9px) scale(0.75)",
+            maxWidth: SHRUNK_LABEL_MAX_WIDTH,
+        },
+    },
+    {
+        rule: "a small filled field's resting label sits on the 16 px inset at MUI's 13 px",
+        component: "MuiInputLabel",
+        slot: "filled",
+        variantProps: { size: "small" },
+        expectedStyle: { transform: "translate(16px, 13px) scale(1)" },
+    },
+    {
+        rule: "a filled field's shrunk label sits on the 16 px inset at MUI's 7 px",
+        component: "MuiInputLabel",
+        slot: "filled",
+        variantProps: { shrink: true },
+        expectedStyle: {
+            transform: "translate(16px, 7px) scale(0.75)",
+            maxWidth: SHRUNK_LABEL_MAX_WIDTH,
+        },
+    },
+    {
+        rule: "a small filled field's shrunk label sits on the 16 px inset at MUI's 4 px",
+        component: "MuiInputLabel",
+        slot: "filled",
+        variantProps: { shrink: true, size: "small" },
+        expectedStyle: {
+            transform: "translate(16px, 4px) scale(0.75)",
+            maxWidth: SHRUNK_LABEL_MAX_WIDTH,
+        },
+    },
+    {
+        rule: "an outlined Select's arrow sits 8 px in from the field's edge",
+        component: "MuiSelect",
+        slot: "icon",
+        variantProps: { variant: "outlined" },
+        expectedStyle: { right: "8px" },
+    },
+    {
+        rule: "a filled Select's arrow sits 8 px in from the field's edge",
+        component: "MuiSelect",
+        slot: "icon",
+        variantProps: { variant: "filled" },
+        expectedStyle: { right: "8px" },
+    },
+];
+
+// The label states of each field variant in MUI's order, so a later, more specific state wins.
+const LABEL_PLACEMENT_ORDERS: readonly [string, readonly StyleRecord[]][] = [
+    ["outlined", [{ size: "small" }, { shrink: true }]],
+    ["filled", [{ size: "small" }, { shrink: true }, { shrink: true, size: "small" }]],
+];
+
+const NO_FOCUS_RIPPLE_COMPONENTS = ["MuiButton", "MuiToggleButton", "MuiIconButton"] as const;
+
+// The M3 elevation levels 1-5 and the MUI elevation indices that render each one.
+const M3_LEVEL_INDEX_RANGES = [
+    {
+        shadow: "0px 1px 2px 0px rgba(0, 0, 0, 0.3), 0px 1px 3px 1px rgba(0, 0, 0, 0.15)",
+        first: 1,
+        last: 2,
+    },
+    {
+        shadow: "0px 1px 2px 0px rgba(0, 0, 0, 0.3), 0px 2px 6px 2px rgba(0, 0, 0, 0.15)",
+        first: 3,
+        last: 4,
+    },
+    {
+        shadow: "0px 1px 3px 0px rgba(0, 0, 0, 0.3), 0px 4px 8px 3px rgba(0, 0, 0, 0.15)",
+        first: 5,
+        last: 8,
+    },
+    {
+        shadow: "0px 2px 3px 0px rgba(0, 0, 0, 0.3), 0px 6px 10px 4px rgba(0, 0, 0, 0.15)",
+        first: 9,
+        last: 16,
+    },
+    {
+        shadow: "0px 4px 4px 0px rgba(0, 0, 0, 0.3), 0px 8px 12px 6px rgba(0, 0, 0, 0.15)",
+        first: 17,
+        last: 24,
+    },
+];
+const MUI_SHADOW_COUNT = 25;
+
 // MUI's documented visuallyHidden helper (@mui/utils/visuallyHidden). The 1px and -1px values are
 // strings: in sx a bare 1 would be 100% and a bare margin would be theme spacing.
 const MUI_VISUALLY_HIDDEN_VALUES = {
@@ -185,12 +984,14 @@ const MUI_VISUALLY_HIDDEN_VALUES = {
 };
 
 // The TRANREPT print lines: Courier, as the report PDF draws them, then a generic fixed-pitch face,
-// at the M3 body-small size and line height, with every blank kept and no wrapping.
+// in the M3 body-small role (size, line height and tracking), with every blank kept and no
+// wrapping. The tracking is uniform per character, so fixed-pitch columns still line up.
 const PRINT_LINE_VALUES = {
     fontFamily: '"Courier New", Courier, monospace',
     fontSize: "12px",
     lineHeight: "16px",
     fontWeight: 400,
+    letterSpacing: "0.4px",
     whiteSpace: "pre",
 };
 
@@ -294,6 +1095,56 @@ function ReadSegmentRule(selectorPath: readonly string[]): StyleRecord | undefin
     );
 }
 
+function ReadComponentEntry(component: string): ComponentThemeEntry | undefined {
+    const components = CARD_DEMO_THEME.components as
+        Record<string, ComponentThemeEntry> | undefined;
+    return components?.[component];
+}
+
+// Resolves one style-override slot of a component and walks it down a chain of nested selectors.
+function ReadThemeRule(
+    component: string,
+    slot: string,
+    selectorPath: readonly string[],
+): StyleRecord | undefined {
+    const slotStyle = ReadComponentEntry(component)?.styleOverrides?.[slot];
+    const styleProps = { theme: CARD_DEMO_THEME, ownerState: {} };
+    return selectorPath.reduce<StyleRecord | undefined>(
+        (rule, selector) => AsStyleRecord(rule?.[selector]),
+        AsStyleRecord(ResolveStyle(slotStyle, styleProps)),
+    );
+}
+
+function ReadSlotVariants(component: string, slot: string): readonly StyleVariantEntry[] {
+    const variants = ReadThemeRule(component, slot, [])?.variants;
+    return Array.isArray(variants) ? (variants as StyleVariantEntry[]) : [];
+}
+
+function MatchesVariantProps(entry: StyleVariantEntry, variantProps: StyleRecord): boolean {
+    return Object.entries(variantProps).every(([key, value]) => entry.props[key] === value);
+}
+
+function FindSlotVariantStyle(
+    component: string,
+    slot: string,
+    variantProps: StyleRecord,
+): StyleRecord | undefined {
+    const variants = ReadSlotVariants(component, slot);
+    return variants.find((entry) => MatchesVariantProps(entry, variantProps))?.style;
+}
+
+function ExpectedShadowAt(muiIndex: number): string {
+    const levelRange = M3_LEVEL_INDEX_RANGES.find(
+        ({ first, last }) => muiIndex >= first && muiIndex <= last,
+    );
+    return levelRange?.shadow ?? "none";
+}
+
+const SHADOW_EXPECTATIONS: readonly ShadowExpectation[] = Array.from(
+    { length: MUI_SHADOW_COUNT },
+    (_unused, muiIndex) => ({ muiIndex, expectedShadow: ExpectedShadowAt(muiIndex) }),
+);
+
 describe("M3 colour roles (AAP 0.5.3)", () => {
     it.each(M3_COLOR_EXPECTATIONS)("$token is $expected", ({ read, expected }) => {
         expect(NormaliseColour(read(CARD_DEMO_THEME))).toBe(expected.toUpperCase());
@@ -320,8 +1171,9 @@ describe("M3 type scale (AAP 0.5.3, gap 0.5.4)", () => {
     });
 
     it.each(M3_TYPE_EXPECTATIONS)(
-        "$variant is Roboto $fontSize px on a $lineHeight px line at weight $fontWeight",
-        ({ variant, fontSize, lineHeight, fontWeight }) => {
+        "$variant is Roboto $fontSize px on a $lineHeight px line " +
+            "at weight $fontWeight, tracking $letterSpacing",
+        ({ variant, fontSize, lineHeight, fontWeight, letterSpacing }) => {
             const roleStyle = CARD_DEMO_THEME.typography[variant];
             expect(roleStyle).toBeDefined();
             const measuredFontSize = FontSizeToPixels(roleStyle.fontSize);
@@ -329,7 +1181,99 @@ describe("M3 type scale (AAP 0.5.3, gap 0.5.4)", () => {
             expect(measuredFontSize).toBeCloseTo(fontSize, PIXEL_PRECISION_DIGITS);
             expect(measuredLineHeight).toBeCloseTo(lineHeight, PIXEL_PRECISION_DIGITS);
             expect(roleStyle.fontWeight).toBe(fontWeight);
+            expect(roleStyle.letterSpacing).toBe(letterSpacing);
             expect(roleStyle.fontFamily).toBe(ROBOTO_FONT_STACK);
+        },
+    );
+});
+
+describe("MUI built-in variants on the M3 type scale (FE2A-F12)", () => {
+    it.each(BUILT_IN_VARIANT_EXPECTATIONS)(
+        "$variant renders the $role role",
+        ({ variant, role }) => {
+            expect(CARD_DEMO_THEME.typography[variant]).toMatchObject(
+                CARD_DEMO_THEME.typography[role],
+            );
+        },
+    );
+
+    it("the button variant keeps legacy labels in their own case", () => {
+        expect(CARD_DEMO_THEME.typography.button.textTransform).toBe("none");
+    });
+});
+
+describe("M3 hover state layer (FE2C-F01)", () => {
+    it(`action.hover is on-surface at ${M3_HOVER_OPACITY} opacity`, () => {
+        expect(CARD_DEMO_THEME.palette.action.hoverOpacity).toBe(M3_HOVER_OPACITY);
+        expect(CARD_DEMO_THEME.palette.action.hover).toBe(ON_SURFACE_HOVER_LAYER);
+    });
+});
+
+describe("M3 action roles (FE2C-F01)", () => {
+    it.each(ACTION_ROLE_EXPECTATIONS)("action.$key is $expected", ({ key, expected }) => {
+        expect(CARD_DEMO_THEME.palette.action[key]).toBe(expected);
+    });
+});
+
+describe.each(THEME_RULE_GROUPS)("%s", (_groupName, rules) => {
+    it.each(rules)("$rule", ({ component, slot, selectorPath, expectedStyle }) => {
+        expect(ReadThemeRule(component, slot, selectorPath)).toMatchObject(expectedStyle);
+    });
+});
+
+describe("State-scoped overrides (FE2A-F10, FE2A-F12)", () => {
+    it.each(SLOT_VARIANT_EXPECTATIONS)(
+        "$rule",
+        ({ component, slot, variantProps, expectedStyle }) => {
+            expect(FindSlotVariantStyle(component, slot, variantProps)).toMatchObject(
+                expectedStyle,
+            );
+        },
+    );
+
+    it("only the error and info Alerts change colour, so success keeps MUI's green", () => {
+        const severities = ReadSlotVariants("MuiAlert", "root").map(
+            (entry) => entry.props.colorSeverity,
+        );
+        expect(severities).toEqual(["error", "info"]);
+    });
+});
+
+describe("Floating-label placements (FE2A-F12)", () => {
+    it.each(LABEL_PLACEMENT_ORDERS)(
+        "a shrunk %s label outranks its small resting placement",
+        (slot, placementProps) => {
+            const placements = ReadSlotVariants("MuiInputLabel", slot).map((entry) => entry.props);
+            expect(placements).toEqual(placementProps);
+        },
+    );
+});
+
+describe("Small table cells on the 4 dp grid (FE2A-F12)", () => {
+    it("small checkbox and unpadded cells keep MUI's padding", () => {
+        const paddedStates = ReadSlotVariants("MuiTableCell", "sizeSmall").map(
+            (entry) => entry.props.padding,
+        );
+        expect(ReadThemeRule("MuiTableCell", "sizeSmall", [])).not.toHaveProperty("padding");
+        expect(paddedStates).toEqual(["normal"]);
+    });
+});
+
+describe("Focus ripple (FE1A-F02, FE2A-F05, FE2C-F05)", () => {
+    it.each(NO_FOCUS_RIPPLE_COMPONENTS)("%s turns the pulsing focus ripple off", (component) => {
+        expect(ReadComponentEntry(component)?.defaultProps?.disableFocusRipple).toBe(true);
+    });
+});
+
+describe("M3 elevation (FE2A-F12)", () => {
+    it(`shadows holds MUI's ${MUI_SHADOW_COUNT} elevation indices`, () => {
+        expect(CARD_DEMO_THEME.shadows).toHaveLength(MUI_SHADOW_COUNT);
+    });
+
+    it.each(SHADOW_EXPECTATIONS)(
+        "shadows[$muiIndex] is the M3 level the index maps to",
+        ({ muiIndex, expectedShadow }) => {
+            expect(CARD_DEMO_THEME.shadows[muiIndex]).toBe(expectedShadow);
         },
     );
 });

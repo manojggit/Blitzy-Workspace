@@ -704,8 +704,8 @@ const FLAGGED_CONTROL_CASES: readonly FlaggedControlCase[] = [
     },
 ];
 
-// Resolves once the first-display cursor sits on MONTHLY (IC): that focus starts a MUI focus
-// ripple asynchronously, which must settle inside the testing-library wrapper, not after a test.
+// Resolves once the first-display cursor sits on MONTHLY (IC), which the screen places after it
+// mounts, so every test starts from the map's initial cursor.
 async function RenderScreen(): Promise<UserEvent> {
     const user = userEvent.setup();
     render(
