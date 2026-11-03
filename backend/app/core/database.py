@@ -14,8 +14,8 @@ service that goes on to read another file first calls RecoverRequestSession. A r
 UPDATE and its WRITE, REWRITE or DELETE run inside one WriteUnit, on a pooled connection of its
 own:
 
-- CAUP (COACTUPC) opens the ACCTDAT unit and then the CUSTDAT unit, locking both records
-  before either rewrite; the account unit commits first.
+- CAUP (COACTUPC) opens the CUSTDAT unit and then the ACCTDAT unit, locking the account record
+  before the customer record and both before either rewrite; the account unit commits first.
 - CB00 (COBIL00C) holds the ACCTDAT unit from its READ UPDATE to the REWRITE, while a separate
   TRANSACT unit allocates the TRAN-ID and inserts the payment.
 - CT02 (COTRN02C) and CU01 (COUSR01C) insert in one unit each.

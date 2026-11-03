@@ -1012,10 +1012,10 @@ def EditDateField(editContext: AccountEditContext, step: EditStep) -> DateEditRe
 
 
 def EditBirthDate(editContext: AccountEditContext, step: EditStep) -> None:
-    """Port of the Date of Birth edit (lines 1546-1556).
+    """Port of the 1200 Date of Birth edit (lines 1533-1543).
 
-    EDIT-DATE-CCYYMMDD first; only when its flags are valid, EDIT-DATE-OF-BIRTH, whose failure
-    (a date not before today) flags all three parts.
+    EDIT-DATE-CCYYMMDD first; only when its flags are valid, EDIT-DATE-OF-BIRTH (cpy/CSUTLDPY.cpy
+    lines 341-370), whose failure (a date not before today) flags all three parts.
     """
     if not EditDateField(editContext, step).isValid:
         return
@@ -1028,14 +1028,17 @@ def EditUsSsn(editContext: AccountEditContext, step: EditStep) -> None:
     """Port of 1265-EDIT-US-SSN: each part numeric, non-zero, and part 1 not 666 or 900-999.
 
     Each part is edited under its own label. A part 1 of 000 fails as ``must not be zero.``
-    before the INVALID-SSN-PART1 test is reached.
+    before the INVALID-SSN-PART1 test is reached. Parts 2 and 3 are edited only when part 1
+    passes 1245-EDIT-NUM-REQD: ``IF FLG-EDIT-US-SSN-PART1-ISVALID`` stays open until the period
+    after the part 3 edit (lines 2448-2488), so a blank, non-numeric or zero part 1 is the only
+    failing SSN field, while a part 1 of 666 or 900-999 still has parts 2 and 3 edited.
     """
     parts = tuple(zip(step.fieldKeys, SSN_PART_LABELS, strict=True))
     firstKey, firstLabel = parts[0]
     firstLength = SCREEN_FIELD_LENGTHS[firstKey]
-    firstValid = EditNumericRequired(editContext, firstKey, firstLabel, firstLength)
-    firstText = FieldText(editContext, firstKey, firstLength)
-    if firstValid and int(firstText) in INVALID_SSN_PART1_VALUES:
+    if not EditNumericRequired(editContext, firstKey, firstLabel, firstLength):
+        return
+    if int(FieldText(editContext, firstKey, firstLength)) in INVALID_SSN_PART1_VALUES:
         invalidMessage = EditMessage(firstLabel, SSN_PART1_INVALID_SUFFIX)
         editContext.collector.Fail((firstKey,), invalidMessage)
     for fieldKey, label in parts[1:]:
@@ -1404,9 +1407,10 @@ class WriteAbandoned(Exception):
 class WriteAttempt:
     """The progress of one 9600-WRITE-PROCESSING, read once both write units have ended.
 
-    ``outcome`` is what ending now with a file condition would mean: an account lock failure
-    until the account is locked, a customer lock failure until the customer is locked, then an
-    update failure. It becomes OUTCOME_DONE only after the customer unit commits.
+    ``outcome`` is what ending now with a file condition would mean: a customer lock failure
+    while the CUSTDAT unit is being opened, an account lock failure until the account is
+    locked, a customer lock failure until the customer is locked, then an update failure. It
+    becomes OUTCOME_DONE only after the customer unit commits.
     ``freshImage`` is the before-image of the records 9700 found changed.
     """
 
@@ -1431,15 +1435,16 @@ class WriteOutcomeScreen:
     message: str
 
 
-# 2000-DECIDE-ACTION (lines 2603-2615). COULD-NOT-LOCK-CUST-FOR-UPDATE has no WHEN of its own,
-# so WHEN OTHER sets ACUP-CHANGES-OKAYED-AND-DONE although nothing was written.
+# 2000-DECIDE-ACTION (lines 2603-2615). A customer lock failure is CHANGES_FAILED, as the CAUP
+# save contract specifies for every lock failure, although COULD-NOT-LOCK-CUST-FOR-UPDATE has
+# no WHEN of its own there and WHEN OTHER would set ACUP-CHANGES-OKAYED-AND-DONE.
 WRITE_OUTCOMES: Mapping[str, WriteOutcomeScreen] = MappingProxyType(
     {
         OUTCOME_ACCOUNT_LOCK_FAILED: WriteOutcomeScreen(
             UpdateScreenState.CHANGES_FAILED, HTTP_RECORD_LOCKED, MSG_LOCK_ACCOUNT
         ),
         OUTCOME_CUSTOMER_LOCK_FAILED: WriteOutcomeScreen(
-            UpdateScreenState.CHANGES_DONE, HTTP_RECORD_LOCKED, MSG_LOCK_CUSTOMER
+            UpdateScreenState.CHANGES_FAILED, HTTP_RECORD_LOCKED, MSG_LOCK_CUSTOMER
         ),
         OUTCOME_CHANGED: WriteOutcomeScreen(
             UpdateScreenState.SHOW_DETAILS, HTTP_RECORD_CHANGED, MSG_RECORD_CHANGED
@@ -1579,11 +1584,15 @@ async def WriteProcessing(
     """Port of 9600-WRITE-PROCESSING (lines 3888-4104) in two write units.
 
     The CUSTDAT unit is opened first and holds no lock until the account is locked in the
-    ACCTDAT unit, so the account record is always locked first. Leaving the ACCTDAT unit commits
+    ACCTDAT unit, so the account record is always locked first. A failure opening the CUSTDAT
+    unit is a customer lock failure. Inside it, a failure is an account lock failure until the
+    account is locked, the ACCTDAT unit's opening included. Leaving the ACCTDAT unit commits
     the account rewrite before the customer rewrite starts: a failed, cancelled or interrupted
     customer rewrite rolls back only the CUSTDAT unit and the account change persists.
     """
+    attempt.outcome = OUTCOME_CUSTOMER_LOCK_FAILED
     async with WriteUnit(context.engine, CUSTOMER_FILE_NAME) as customerUnit:
+        attempt.outcome = OUTCOME_ACCOUNT_LOCK_FAILED
         async with WriteUnit(context.engine, ACCOUNT_FILE_NAME) as accountUnit:
             units = WriteUnits(accountUnit, customerUnit)
             await LockCompareAndRewriteAccount(context, updateState, units, attempt)
@@ -1596,9 +1605,11 @@ async def RunWriteProcessing(
     """Run 9600-WRITE-PROCESSING and return how it ended.
 
     A file condition at any step, the units' connect and commit included, ends the attempt with
-    the outcome of the step in progress. The batch window's FileNotOpenError is one, so a save
-    during the window answers ``Could not lock account record for update``. Task cancellation
-    is not caught.
+    the outcome of the step in progress: a customer lock failure while the CUSTDAT unit is
+    being opened, an account lock failure until the account is locked, a customer lock failure
+    until the customer is locked, then an update failure. The batch window's FileNotOpenError
+    on the account READ UPDATE is one, so a save during the window answers ``Could not lock
+    account record for update``. Task cancellation is not caught.
     """
     attempt = WriteAttempt()
     try:
@@ -1639,7 +1650,7 @@ async def ProcessSave(context: OnlineContext, updateState: AccountUpdateState) -
 
     Raises:
         LegacyMessageError: 423 ``Could not lock account record for update`` (CHANGES_FAILED)
-            or ``Could not lock customer record for update`` (CHANGES_DONE, nothing written);
+            or ``Could not lock customer record for update`` (CHANGES_FAILED, nothing written);
             409 ``Record changed by some one else. Please review`` with the fresh records
             shown; 503 ``Update of record failed`` (CHANGES_FAILED).
     """
