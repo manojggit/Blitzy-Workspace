@@ -258,6 +258,22 @@ const LITERAL_CASES: readonly LiteralCase[] = [
     { literal: ABEND, key: "F7", status: 500 },
 ];
 
+// The id of the MessageLine ERRMSG Alert, which a field named in field_errors is described by.
+const ERRMSG_ID = "message-line-errmsg";
+
+// A literal case and the aria-describedby TRNIDIN carries after its answer, null for none.
+interface SearchDescriptionCase extends LiteralCase {
+    describedBy: string | null;
+}
+
+// Both rejections name TRNIDIN in field_errors; the 200 paging literal names it only as the
+// cursor, so TRNIDIN, which has no helper text, is described by nothing.
+const SEARCH_DESCRIPTION_CASES: readonly SearchDescriptionCase[] = [
+    { literal: NUMERIC_SEARCH, key: "ENTER", status: HTTP_EDIT_FAILURE, describedBy: ERRMSG_ID },
+    { literal: LOOKUP_FAILED, key: "F8", status: 503, describedBy: ERRMSG_ID },
+    { literal: BOTTOM_ALREADY, key: "F8", status: HTTP_OK, describedBy: null },
+];
+
 // Non-numeric TRNIDIN text travels as typed, neither case-folded nor trimmed.
 const NON_NUMERIC_SEARCH_CASES: readonly [string, string][] = [
     ["letters", "abc"],
@@ -460,6 +476,17 @@ async function ExpectAlert(text: string, severity: MessageSeverity): Promise<voi
     expect(alert).toHaveClass(ALERT_COLOR_CLASSES[severity]);
 }
 
+// A flagged TRNIDIN names the ERRMSG Alert that holds the literal; an unflagged one names nothing.
+function ExpectSearchDescription({ literal, describedBy }: SearchDescriptionCase): void {
+    if (describedBy === null) {
+        expect(SearchField()).not.toHaveAttribute("aria-describedby");
+        return;
+    }
+    expect(SearchField()).toHaveAttribute("aria-describedby", describedBy);
+    expect(document.getElementById(describedBy)).toBe(screen.getByRole("alert"));
+    expect(SearchField()).toHaveAccessibleDescription(literal);
+}
+
 // A 200 answer carries the literal over the shown page; any other status rejects the call, its
 // body adding the case's list page, if any, to the four legacy keys.
 function OutcomeFor(literalCase: LiteralCase): Promise<TransactionSelectionResponse> {
@@ -621,12 +648,17 @@ describe("COTRN00C first entry on /transactions", () => {
     });
 });
 
+// The row-21 ASKIP instruction of bms/COTRN00.bms lines 444-449 (LENGTH=50): the doubled
+// quotes of INITIAL are single quotes, and the column-16 continuation supplies " list".
+const SELECTION_INSTRUCTION = "Type 'S' to View Transaction details from the list";
+
 describe("COTRN00C BMS COTRN00 fields", () => {
-    it("COTRN00C TRNIDIN, the column headings and each Sel code follow COTRN00", async () => {
+    it("COTRN00C TRNIDIN, headings, Sel codes and the instruction follow COTRN00", async () => {
         const user = await RenderFirstPage();
         expect(SearchField()).toHaveAttribute("maxlength", SEARCH_MAX_LENGTH);
         const headers = screen.getAllByRole("columnheader").map((header) => header.textContent);
         expect(headers).toEqual(COLUMN_HEADERS);
+        expect(screen.getByText(SELECTION_INSTRUCTION)).toBeVisible();
         await user.click(SelectionField(1));
         const offeredCodes = within(screen.getByRole("listbox"))
             .getAllByRole("option")
@@ -655,6 +687,82 @@ describe("COTRN00C ENTER with an S selection and a search key", () => {
             expect(mockSelectTransactions).toHaveBeenCalledTimes(1);
             expect(mockSelectTransactions).toHaveBeenCalledWith(SELECTION_REQUEST);
             expect(mockRouterPush).toHaveBeenCalledTimes(1);
+        },
+    );
+});
+
+// Routes cotrn00c._ViewRoute never builds: other sites, a script, a scheme-relative host, the
+// view page without its tranId or with another key beside it, another screen, a dot segment out
+// of the view page, and a non-string.
+const UNEXPECTED_SELECTION_ROUTES: readonly unknown[] = [
+    "https://evil.example/transactions/view?tranId=1",
+    "javascript:alert(1)",
+    "//evil.example/transactions/view?tranId=1",
+    "/transactions/view",
+    "/transactions/view?tranId=1&x=2",
+    "/admin/users?tranId=1",
+    "/transactions/view/../admin?tranId=1",
+    42,
+];
+
+// cotrn00c's urlencode writes a blank as "+"; another spelling of the same TRAN-ID is rebuilt
+// with URLSearchParams before it reaches the router, so the view page reads the same tranId.
+const RE_ENCODED_ROUTE_CASES: readonly [string, string][] = [
+    ["/transactions/view?tranId=00000000000000%303", VIEW_ROUTE],
+    ["/transactions/view?tranId=0000%2000000000003", "/transactions/view?tranId=0000+00000000003"],
+];
+
+// CT00 renders exactly one role="status" region, its own polite result status: COTRN00C sends no
+// INFOMSG, and MessageLine shows ERRMSG as a role="alert" Alert.
+function ResultStatusRegion(): HTMLElement {
+    const regions = screen.getAllByRole("status");
+    expect(regions).toHaveLength(1);
+    const [resultStatus] = regions as [HTMLElement];
+    expect(resultStatus).toHaveAttribute("aria-live", "polite");
+    return resultStatus;
+}
+
+// A 200 selection answer carrying a route its TypeScript type rules out, as unchecked JSON can.
+function SelectionAnswering(route: unknown): TransactionSelectionResponse {
+    const answer = { route };
+    return answer as TransactionSelectionResponse;
+}
+
+// ENTER over an S selection and typed search text, answered with the given route.
+async function EnterSelectionAnswered(route: unknown): Promise<void> {
+    const user = await RenderFirstPage();
+    mockSelectTransactions.mockResolvedValueOnce(SelectionAnswering(route));
+    await ChooseSelection(user, SELECTED_ROW_NUMBER, "S");
+    await user.type(SearchField(), SEARCH_KEY);
+    await PressKey(user, "ENTER", "button");
+}
+
+describe("COTRN00C ENTER answered with an unexpected route", () => {
+    it.each(UNEXPECTED_SELECTION_ROUTES)(
+        "COTRN00C ENTER answered with route %p shows the abend text and never navigates",
+        async (route) => {
+            await EnterSelectionAnswered(route);
+            await ExpectAlert(ABEND, "error");
+            expect(mockRouterPush).not.toHaveBeenCalled();
+            expect(mockRouterReplace).not.toHaveBeenCalled();
+            ExpectShownRows(1);
+            expect(screen.getByText("1")).toBeVisible();
+            expect(SearchField()).toHaveValue(SEARCH_KEY);
+            expect(SearchField()).toHaveFocus();
+            expect(ResultStatusRegion().textContent).toBe("");
+            ExpectRequestKeysDisabled(false);
+        },
+    );
+});
+
+describe("COTRN00C ENTER answered with a differently encoded view route", () => {
+    it.each(RE_ENCODED_ROUTE_CASES)(
+        "COTRN00C ENTER answered with %s opens %s",
+        async (servedRoute, canonicalRoute) => {
+            await EnterSelectionAnswered(servedRoute);
+            await waitFor(() => expect(mockRouterPush).toHaveBeenCalledWith(canonicalRoute));
+            expect(mockRouterPush).toHaveBeenCalledTimes(1);
+            expect(screen.queryByRole("alert")).toBeNull();
         },
     );
 });
@@ -947,6 +1055,19 @@ describe("COTRN00C cursor without an error mark", () => {
     });
 });
 
+describe("COTRN00C TRNIDIN described by ERRMSG", () => {
+    it.each(SEARCH_DESCRIPTION_CASES)(
+        "COTRN00C $key answered $status with $literal: TRNIDIN aria-describedby $describedBy",
+        async (descriptionCase) => {
+            const user = await RenderFirstPage();
+            MockKeyOutcome(descriptionCase);
+            await PressKey(user, descriptionCase.key, "button");
+            await ExpectAlert(descriptionCase.literal, "error");
+            ExpectSearchDescription(descriptionCase);
+        },
+    );
+});
+
 // The cleanup between the two effect runs aborts the first read and frees the lock, so the second
 // read is sent; the first read's late cancellation leaves the keys locked until the second answers.
 describe("COTRN00C first entry under React Strict Mode", () => {
@@ -1056,6 +1177,105 @@ describe("COTRN00C cancelled read", () => {
             mockListTransactions.mockResolvedValueOnce(BuildListResponse(LATEST_PAGE));
             await PressKey(user, key, "button");
             await screen.findByText(TranIdFor(LATEST_FIRST_ROW_NUMBER + PAGE_SIZE - 1));
+        },
+    );
+});
+
+// The page's result status reports the page number, the row count and the first and last TRAN-ID
+// shown. It is the page's own accessibility text, not a COTRN00C literal.
+const FIRST_PAGE_STATUS = "Page 1: 10 transactions, 0000000000000001 to 0000000000000010";
+const SECOND_PAGE_STATUS = "Page 2: 10 transactions, 0000000000000011 to 0000000000000020";
+
+// A first-entry answer and the status it gives: a full page, one row, and the page 0 without
+// rows that an empty TRANSACT gives, under its literal.
+const FIRST_ENTRY_STATUS_CASES: readonly [string, TransactionListResponse, string][] = [
+    ["a full page", BuildListResponse(), FIRST_PAGE_STATUS],
+    [
+        "one row",
+        BuildListResponse({ rows: [BuildRow(7)] }),
+        "Page 1: 1 transaction, 0000000000000007 to 0000000000000007",
+    ],
+    [
+        "an empty TRANSACT",
+        BuildListResponse({ rows: [], page: 0, message: AT_TOP }),
+        "Page 0: no transactions",
+    ],
+];
+
+// The literals a 200 page carries, and the refusals, which leave the status empty.
+const PAGE_LITERAL_CASES = LITERAL_CASES.filter((literalCase) => literalCase.status === HTTP_OK);
+const REFUSAL_LITERAL_CASES = LITERAL_CASES.filter((literalCase) => literalCase.status !== HTTP_OK);
+
+describe("COTRN00C result status after first entry", () => {
+    it.each(FIRST_ENTRY_STATUS_CASES)(
+        "COTRN00C first entry answered with %s announces the page shown",
+        async (_caseName, answer, statusText) => {
+            mockListTransactions.mockResolvedValueOnce(answer);
+            RenderScreen();
+            await waitFor(() => expect(ResultStatusRegion().textContent).toBe(statusText));
+            expect(screen.queryByRole("alert")?.textContent ?? "").toBe(answer.message);
+        },
+    );
+
+    it("COTRN00C result status is rendered empty while the first entry is pending", async () => {
+        await StartPendingFirstEntry();
+        expect(ResultStatusRegion().textContent).toBe("");
+    });
+});
+
+describe("COTRN00C result status after F7 and F8", () => {
+    it.each(PAGE_KEYS)("COTRN00C %s announces the page it shows", async (key) => {
+        const user = await RenderFirstPage();
+        expect(ResultStatusRegion().textContent).toBe(FIRST_PAGE_STATUS);
+        mockListTransactions.mockResolvedValueOnce(BuildListResponse(SECOND_PAGE));
+        await PressKey(user, key, "button");
+        await screen.findByText(TranIdFor(20));
+        expect(ResultStatusRegion().textContent).toBe(SECOND_PAGE_STATUS);
+        expect(screen.queryByRole("alert")).toBeNull();
+    });
+});
+
+// The status empties when a request starts, so an answer identical to the page shown changes it
+// from empty again and is announced again.
+describe("COTRN00C result status while a request is out", () => {
+    it.each(REQUEST_KEYS)(
+        "COTRN00C %s empties the status until its answer, which is announced again",
+        async (key) => {
+            const user = await RenderFirstPage();
+            const { promise, resolve } = Promise.withResolvers<TransactionSelectionResponse>();
+            MockKeyAnswer(key, () => promise);
+            await PressKey(user, key, "button");
+            expect(ResultStatusRegion().textContent).toBe("");
+            await act(async () => resolve(BuildListResponse()));
+            await waitFor(() => expect(ResultStatusRegion().textContent).toBe(FIRST_PAGE_STATUS));
+            ExpectRequestKeysDisabled(false);
+        },
+    );
+});
+
+describe("COTRN00C result status beside the ERRMSG line", () => {
+    it.each(PAGE_LITERAL_CASES)(
+        "COTRN00C $key answered 200 with $literal shows it in red and announces the page",
+        async (literalCase) => {
+            const user = await RenderFirstPage();
+            MockKeyOutcome(literalCase);
+            await PressKey(user, literalCase.key, "button");
+            await ExpectAlert(literalCase.literal, "error");
+            expect(ResultStatusRegion().textContent).toBe(FIRST_PAGE_STATUS);
+            expect(SearchField()).toHaveFocus();
+        },
+    );
+});
+
+describe("COTRN00C result status after a refusal", () => {
+    it.each(REFUSAL_LITERAL_CASES)(
+        "COTRN00C $key answered $status shows $literal in red and leaves the status empty",
+        async (literalCase) => {
+            const user = await RenderFirstPage();
+            MockKeyOutcome(literalCase);
+            await PressKey(user, literalCase.key, "button");
+            await ExpectAlert(literalCase.literal, "error");
+            expect(ResultStatusRegion().textContent).toBe("");
         },
     );
 });

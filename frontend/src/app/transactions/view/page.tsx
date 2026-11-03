@@ -19,7 +19,11 @@ import axios from "axios";
 
 import { VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine, type MessageLineProps } from "@/components/MessageLine";
+import {
+    ErrorMessageReference,
+    MessageLine,
+    type MessageLineProps,
+} from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { ViewTransaction, type TransactionDetailResponse } from "@/lib/api/transactions";
 import {
@@ -490,6 +494,12 @@ function useViewFunctionKeys(view: TransactionView): readonly FunctionKeyDefinit
     return functionKeys;
 }
 
+// The BMS LENGTH and, while the server names TRNIDIN in error, its tie to the ERRMSG line that
+// holds the literal.
+function KeyInputProps(isInvalid: boolean) {
+    return { maxLength: TRAN_ID_MAX_LENGTH, ...ErrorMessageReference(isInvalid) };
+}
+
 // TRNIDIN keeps the text exactly as typed: COTRN01C neither upper-cases nor edits it beyond the
 // blank test, and the BMS LENGTH is the only client-side limit.
 function KeyField(props: KeyFieldProps) {
@@ -505,7 +515,7 @@ function KeyField(props: KeyFieldProps) {
                     error={props.isInvalid}
                     inputRef={props.inputRef}
                     onChange={(event) => props.onChange(event.target.value)}
-                    slotProps={{ htmlInput: { maxLength: TRAN_ID_MAX_LENGTH } }}
+                    slotProps={{ htmlInput: KeyInputProps(props.isInvalid) }}
                 />
             </Grid>
         </Grid>

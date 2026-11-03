@@ -21,7 +21,6 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import {
-    Box,
     Button,
     Grid,
     Stack,
@@ -50,7 +49,7 @@ import axios, { type AxiosError } from "axios";
 
 import { ConfirmField } from "@/components/ConfirmField";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     IsCancelledRequest,
@@ -99,8 +98,6 @@ const REPORT_TYPE_OPTIONS: readonly ReportTypeOption[] = [
     { value: ReportType.CUSTOM, label: "Custom (Date Range)" },
 ];
 const REPORT_TYPE_GROUP_LABEL = "Report type";
-// The message line's id, by which a report-type group the server names in error is described.
-const MESSAGE_LINE_ID = "report-message-line";
 // A report-type group the server names in error: every segment border, the inner ones of either
 // orientation included, and the label of each segment not chosen take the error colour. The
 // chosen segment keeps its container colours, so its label stays legible.
@@ -679,7 +676,7 @@ function FlaggedSelectorProps(isFlagged: boolean): Partial<ToggleButtonGroupProp
     }
     return {
         "aria-invalid": true,
-        "aria-describedby": MESSAGE_LINE_ID,
+        ...ErrorMessageReference(isFlagged),
         sx: FLAGGED_SELECTOR_STYLE,
     };
 }
@@ -708,13 +705,18 @@ function ReportTypeSelector(props: ReportTypeSelectorProps) {
 }
 
 // Only the BMS LENGTH limits the part: the keyed text is never trimmed, padded or checked here,
-// so every CORPT00C date literal stays reachable.
-function DatePartSlotProps(part: DatePartDefinition): TextFieldProps["slotProps"] {
+// so every CORPT00C date literal stays reachable. A part the server names in error is described
+// by the ERRMSG line that holds its literal.
+function DatePartSlotProps(
+    part: DatePartDefinition,
+    isFlagged: boolean,
+): TextFieldProps["slotProps"] {
     return {
         htmlInput: {
             maxLength: part.maxLength,
             inputMode: "numeric",
             "aria-label": part.ariaLabel,
+            ...ErrorMessageReference(isFlagged),
         },
     };
 }
@@ -743,7 +745,7 @@ function DatePartInput(props: DatePartInputProps) {
             size="small"
             fullWidth
             inputRef={inputRef}
-            slotProps={DatePartSlotProps(part)}
+            slotProps={DatePartSlotProps(part, isFlagged)}
         />
     );
 }
@@ -861,16 +863,14 @@ function ReportCriteriaSection({ form }: ReportFormSectionProps) {
     );
 }
 
-// ERRMSG and INFOMSG, under the id a flagged report-type group names as its description.
+// ERRMSG and INFOMSG. Every flagged control names the ERRMSG Alert as its description.
 function ReportMessageLine({ form }: ReportFormSectionProps) {
     return (
-        <Box id={MESSAGE_LINE_ID}>
-            <MessageLine
-                message={form.feedback.message}
-                severity={form.feedback.severity}
-                infoMessage={form.feedback.infoMessage}
-            />
-        </Box>
+        <MessageLine
+            message={form.feedback.message}
+            severity={form.feedback.severity}
+            infoMessage={form.feedback.infoMessage}
+        />
     );
 }
 

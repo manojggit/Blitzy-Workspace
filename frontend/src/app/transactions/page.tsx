@@ -2,7 +2,7 @@
 // COCOM01Y, COTTL01Y, CSDAT01Y, CSMSG01Y
 "use client";
 
-import { Grid, Stack, TextField, Typography, type SxProps, type Theme } from "@mui/material";
+import { Box, Grid, Stack, TextField, Typography, type SxProps, type Theme } from "@mui/material";
 import axios from "axios";
 import { useRouter } from "next/navigation";
 import {
@@ -17,8 +17,9 @@ import {
     type SetStateAction,
 } from "react";
 
+import { VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     SelectionTable,
@@ -35,16 +36,19 @@ import {
     type TransactionSelectionResponse,
 } from "@/lib/api/transactions";
 import {
+    ABEND_MESSAGE,
     Direction,
     IsCancelledRequest,
     LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
+    ToAllowedRoute,
     ToScreenFeedback,
     type LegacyErrorResponse,
     type MessageSeverity,
     type PageState,
     type ReadOptions,
+    type RouteAllowance,
 } from "@/lib/apiClient";
 import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
 
@@ -53,6 +57,12 @@ const PROGRAM_NAME = "COTRN00C";
 const SCREEN_TITLE = "List Transactions";
 // PF3 transfers to COMEN01C, the main menu that owns CT00.
 const MENU_ROUTE = "/menu";
+// The only page an S selection may open, with the selected transaction's tranId: VIEW_ROUTE and
+// ROUTE_TRAN_ID_PARAMETER in backend/app/services/transactions/cotrn00c.py (XCTL COTRN01C).
+const SELECTION_ROUTE_ALLOWANCE: RouteAllowance = {
+    pathnames: ["/transactions/view"],
+    queryKey: "tranId",
+};
 // TRNIDIN: LENGTH=16, UNPROT.
 const SEARCH_FIELD_LENGTH = 16;
 const SEARCH_LABEL = "Search Tran ID:";
@@ -76,6 +86,16 @@ const ERRMSG_SEVERITY: MessageSeverity = SeverityForOutcome({
 // An empty startKey is ENTER on the server. F8 over an empty map sends CDEMO-CT00-TRNID-LAST as
 // the spaces it holds, which PROCESS-PF8-KEY reads as HIGH-VALUES.
 const BLANK_LAST_KEY = " ";
+// The polite result status is client accessibility text, never a COTRN00C literal: a shown page
+// usually carries a blank ERRMSG, so this text reports the page number, the row count and the
+// first and last TRAN-ID shown, as in "Page 2: 10 transactions, 0000000000000011 to
+// 0000000000000020", or "Page 0: no transactions" for a page without rows.
+const RESULT_STATUS_PAGE_PREFIX = "Page";
+const RESULT_STATUS_ONE_ROW = "transaction";
+const RESULT_STATUS_ROWS = "transactions";
+const RESULT_STATUS_NO_ROWS = "no transactions";
+const RESULT_STATUS_RANGE_SEPARATOR = " to ";
+const NO_RESULT_STATUS = "";
 
 // The search field and the page number share one row, centred on each other.
 const SEARCH_ROW_STYLE: SxProps<Theme> = { alignItems: "center" };
@@ -92,11 +112,13 @@ interface ListFeedback {
 }
 
 // The rows shown and the CDEMO-CT00-INFO keys the server returned with them; the keys are
-// echoed back unchanged and never parsed.
+// echoed back unchanged and never parsed. resultStatus is set only from a 200 list page and is
+// emptied whenever a request starts, so every other answer leaves it empty.
 interface ListScreen {
     rows: readonly TransactionListRow[];
     pageState: PageState | null;
     feedback: ListFeedback;
+    resultStatus: string;
 }
 
 // A 400 body: the four legacy keys, beside which an invalid selection code adds the page the
@@ -176,7 +198,12 @@ const EMPTY_FEEDBACK: ListFeedback = {
     cursorField: null,
 };
 
-const INITIAL_SCREEN: ListScreen = { rows: [], pageState: null, feedback: EMPTY_FEEDBACK };
+const INITIAL_SCREEN: ListScreen = {
+    rows: [],
+    pageState: null,
+    feedback: EMPTY_FEEDBACK,
+    resultStatus: NO_RESULT_STATUS,
+};
 
 function FeedbackFromResponse(response: TransactionListResponse): ListFeedback {
     return {
@@ -202,13 +229,38 @@ function FeedbackFromError(error: unknown): ListFeedback {
     };
 }
 
+function RowCountText(rowCount: number): string {
+    return `${rowCount} ${rowCount === 1 ? RESULT_STATUS_ONE_ROW : RESULT_STATUS_ROWS}`;
+}
+
+// The page number PAGENUM shows, the row count and the TRAN-IDs of the first and last rows shown;
+// only those two rows are read, so the status never reads out the whole list.
+function ResultStatusText(response: TransactionListResponse): string {
+    const rows = response.rows ?? [];
+    const pageText = `${RESULT_STATUS_PAGE_PREFIX} ${PageNumberText(response)}`.trimEnd();
+    const firstRow = rows[0];
+    const lastRow = rows[rows.length - 1];
+    if (firstRow === undefined || lastRow === undefined) {
+        return `${pageText}: ${RESULT_STATUS_NO_ROWS}`;
+    }
+    const keyRange = `${firstRow.tran_id}${RESULT_STATUS_RANGE_SEPARATOR}${lastRow.tran_id}`;
+    return `${pageText}: ${RowCountText(rows.length)}, ${keyRange}`;
+}
+
 function ScreenFromResponse(response: TransactionListResponse): ListScreen {
     const { page, first_key, last_key } = response;
     return {
         rows: response.rows ?? [],
         pageState: { page, first_key, last_key },
         feedback: FeedbackFromResponse(response),
+        resultStatus: ResultStatusText(response),
     };
+}
+
+// Each request empties the result status, so no status describes a page while a request is out
+// and a page answered again with the same text is announced again.
+function WithoutResultStatus(screen: ListScreen): ListScreen {
+    return { ...screen, resultStatus: NO_RESULT_STATUS };
 }
 
 // The 400 of an invalid selection code shows the page the browse built, as COTRN00C sends the
@@ -223,7 +275,12 @@ function RefusalOutcome(error: unknown): ListOutcome {
     }
     const { rows, page, first_key, last_key } = body;
     return {
-        screenUpdate: { rows, pageState: { page, first_key, last_key }, feedback },
+        screenUpdate: {
+            rows,
+            pageState: { page, first_key, last_key },
+            feedback,
+            resultStatus: NO_RESULT_STATUS,
+        },
         searchCleared: body.search_cleared === true,
     };
 }
@@ -248,6 +305,20 @@ async function SettleRequest(
     }
 }
 
+// The XCTL to COTRN01C opens the route rebuilt from its checked pathname and tranId, never the
+// server's own text. Any other route is an unexpected answer: the abend text in red with the
+// cursor on TRNIDIN, and the rows, page number and search text kept. The feedback is built anew
+// for every refusal, so each one puts the cursor back.
+function FollowSelectionRoute(route: unknown, updaters: ListUpdaters): void {
+    const allowedRoute = ToAllowedRoute(route, SELECTION_ROUTE_ALLOWANCE);
+    if (allowedRoute === null) {
+        const feedback = { ...EMPTY_FEEDBACK, message: ABEND_MESSAGE, cursorField: SEARCH_FIELD };
+        updaters.setScreen((screen) => ({ ...screen, feedback }));
+        return;
+    }
+    updaters.Navigate(allowedRoute);
+}
+
 // A 200 answer is a route or a list page; a rejected call updates the screen as its body allows.
 // The selection codes are cleared after every answer, so no code carries over onto the rows of
 // another page. The search text is blanked only when the answer reports search_cleared. A
@@ -265,7 +336,7 @@ function ApplyOutcome(outcome: ListOutcome | null, updaters: ListUpdaters): void
     }
     const { response } = outcome;
     if (response.route) {
-        updaters.Navigate(response.route);
+        FollowSelectionRoute(response.route, updaters);
         return;
     }
     updaters.setScreen(ScreenFromResponse(response));
@@ -418,6 +489,7 @@ async function RunExclusive(request: ListRequest, runner: RequestRunnerContext):
     runner.latestRequestRef.current += 1;
     const requestNumber = runner.latestRequestRef.current;
     runner.updaters.setIsBusy(true);
+    runner.updaters.setScreen(WithoutResultStatus);
     try {
         const outcome = await SettleRequest(request, { signal: readController.signal });
         if (requestNumber === runner.latestRequestRef.current) {
@@ -559,18 +631,21 @@ function useTransactionList(): TransactionListView {
 // blanked the field. An answer with search_cleared, the 400 of an invalid selection code
 // included, empties it, so the next ENTER browses from the lowest key; any other answer or
 // failed call keeps the text as keyed. The field is read-only while a request is out, as the
-// 3270 keyboard lock, so no text keyed meanwhile is lost.
+// 3270 keyboard lock, so no text keyed meanwhile is lost. While the server names TRNIDIN in
+// field_errors, the field is described by the ERRMSG line that holds its literal.
 function SearchField({ view }: ListViewProps) {
+    const isFlagged = view.screen.feedback.fieldErrors.includes(SEARCH_FIELD);
+    const htmlInput = { maxLength: SEARCH_FIELD_LENGTH, readOnly: view.isBusy };
     return (
         <TextField
             label={SEARCH_LABEL}
             variant="outlined"
             fullWidth
             value={view.searchTranId}
-            error={view.screen.feedback.fieldErrors.includes(SEARCH_FIELD)}
+            error={isFlagged}
             inputRef={view.searchInputRef}
             onChange={(event) => view.setSearchTranId(event.target.value)}
-            slotProps={{ htmlInput: { maxLength: SEARCH_FIELD_LENGTH, readOnly: view.isBusy } }}
+            slotProps={{ htmlInput: { ...htmlInput, ...ErrorMessageReference(isFlagged) } }}
         />
     );
 }
@@ -588,6 +663,17 @@ function PageNumber({ view }: ListViewProps) {
     );
 }
 
+// A visually hidden polite live region of its own, apart from MessageLine's ERRMSG alert, which
+// announces refusals and literals. It stays rendered while empty, so each shown page changes its
+// text from empty and is announced once, without reading the rows or moving the cursor.
+function ResultStatus({ view }: ListViewProps) {
+    return (
+        <Box role="status" aria-live="polite" sx={VISUALLY_HIDDEN_STYLE}>
+            {view.screen.resultStatus}
+        </Box>
+    );
+}
+
 function SearchBar({ view }: ListViewProps) {
     return (
         <Grid container spacing={4} sx={SEARCH_ROW_STYLE}>
@@ -596,6 +682,7 @@ function SearchBar({ view }: ListViewProps) {
             </Grid>
             <Grid size={{ xs: 12, md: 6 }}>
                 <PageNumber view={view} />
+                <ResultStatus view={view} />
             </Grid>
         </Grid>
     );

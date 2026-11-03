@@ -18,7 +18,7 @@ import {
 
 import { ConfirmField } from "@/components/ConfirmField";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { PayBill, type BillPayResponse } from "@/lib/api/billpay";
 import {
@@ -75,10 +75,13 @@ const FORM_FIELD_OF_INPUT = {
     confirm: "confirm",
 } as const satisfies Record<BillPayInputName, keyof BillPayFormState>;
 
+// isInFlightRef is the synchronous write lock: true from the press that sends a payment request
+// until that request settles, so a key pressed before the busy render reaches the keys is refused.
 interface BillPayScreenSetters {
     setForm: Dispatch<SetStateAction<BillPayFormState>>;
     setFeedback: Dispatch<SetStateAction<BillPayFeedback>>;
     setIsBusy: Dispatch<SetStateAction<boolean>>;
+    isInFlightRef: RefObject<boolean>;
 }
 
 interface BillPayKeyActions {
@@ -213,8 +216,15 @@ function ShowFailure(error: unknown, setters: BillPayScreenSetters): void {
 
 // ENTER: both inputs reach COBIL00C exactly as keyed, because the program runs its blank, Y/y,
 // N/n and invalid-value edits on the raw text. The keyboard stays locked until the answer is
-// applied, so the answer always lands on the form that was sent.
+// applied, so the answer always lands on the form that was sent. The disabled keys take effect
+// only a render after the press, so the in-flight lock, taken before anything else, refuses a
+// second ENTER in that gap and one press sends one payment command. The lock clears when the
+// request settles, a rethrown defect included.
 async function SubmitBillPay(form: BillPayFormState, setters: BillPayScreenSetters) {
+    if (setters.isInFlightRef.current) {
+        return;
+    }
+    setters.isInFlightRef.current = true;
     setters.setIsBusy(true);
     try {
         const response = await PayBill({ acct_id: form.acctId, confirm: form.confirm });
@@ -223,18 +233,25 @@ async function SubmitBillPay(form: BillPayFormState, setters: BillPayScreenSette
     } catch (error) {
         ShowFailure(error, setters);
     } finally {
+        setters.isInFlightRef.current = false;
         setters.setIsBusy(false);
     }
 }
 
-// F4 (CLEAR-CURRENT-SCREEN) reads no file, so it never reaches the server.
+// F4 (CLEAR-CURRENT-SCREEN) reads no file, so it never reaches the server. It is refused while a
+// payment request is in flight, so the answer still lands on the form that was sent.
 function ClearScreen(setters: BillPayScreenSetters): void {
+    if (setters.isInFlightRef.current) {
+        return;
+    }
     setters.setForm(ClearedForm());
     setters.setFeedback(ClearedFeedback());
 }
 
-// The map's legend, in its order: ENTER=Continue  F3=Back  F4=Clear. ENTER and F4 wait for the
-// running call, so a Clear can never be undone by a late answer; F3 still leaves the screen.
+// The map's legend, in its order: ENTER=Continue  F3=Back  F4=Clear. ENTER and F4 are disabled
+// while the call runs; disabling takes effect a render after the press, so SubmitBillPay and
+// ClearScreen also refuse a press made in that gap through the in-flight lock. A Clear can never
+// be undone by a late answer; F3 still leaves the screen.
 function BuildKeyDefinitions(actions: BillPayKeyActions): FunctionKeyDefinition[] {
     return [
         { key: "ENTER", label: "Continue", onPress: actions.onContinue, disabled: actions.isBusy },
@@ -305,13 +322,20 @@ function useBillPayScreen(): BillPayScreenModel {
     const [form, setForm] = useState<BillPayFormState>(ClearedForm);
     const [feedback, setFeedback] = useState<BillPayFeedback>(ClearedFeedback);
     const [isBusy, setIsBusy] = useState(false);
-    const setters = useMemo<BillPayScreenSetters>(() => ({ setForm, setFeedback, setIsBusy }), []);
+    // The in-flight lock travels with the one stable set of setters.
+    const isInFlightRef = useRef(false);
+    const setters = useMemo<BillPayScreenSetters>(
+        () => ({ setForm, setFeedback, setIsBusy, isInFlightRef }),
+        [],
+    );
     usePendingMessage(setFeedback);
     const inputRefs = useCursorFocus(feedback);
     const keys = useBillPayKeys({ form, isBusy, setters });
     return { form, feedback, isBusy, inputRefs, keys, setForm };
 }
 
+// While the server names ACTIDIN in error, the field is described by the ERRMSG line that holds
+// its literal.
 function AccountIdField(props: KeyedInputProps) {
     const { value, isInvalid, isKeyboardLocked, onValueChange, inputRef } = props;
     const { label, maxLength } = FIELD_DEFINITIONS.acct_id;
@@ -325,7 +349,7 @@ function AccountIdField(props: KeyedInputProps) {
             variant="outlined"
             size="small"
             inputRef={inputRef}
-            slotProps={{ htmlInput: { maxLength } }}
+            slotProps={{ htmlInput: { maxLength, ...ErrorMessageReference(isInvalid) } }}
         />
     );
 }

@@ -519,6 +519,8 @@ const LONG_REPORT_PAGE_CASES: readonly ReportPageCase[] = [
 const ONE_PAGE_LINE_COUNTS: readonly number[] = [REPORT_LINES.length, REPORT_LINES_PER_PAGE];
 
 const REPORT_TYPE_GROUP_LABEL = "Report type";
+// The id of the MessageLine ERRMSG Alert, which every control the server names is described by.
+const ERRMSG_ID = "message-line-errmsg";
 
 // An error outcome that names reportType, with the report type chosen before ENTER, if any.
 interface FlaggedReportTypeCase {
@@ -575,6 +577,37 @@ const UNFLAGGED_REPORT_TYPE_CASES: readonly UnflaggedReportTypeCase[] = [
             EditFailure(SELECT_REPORT_TYPE_MESSAGE, "reportType"),
             SubmittedOutcome(MONTHLY_SUBMITTED_MESSAGE, REPORT_LINES),
         ],
+    },
+];
+
+// An ENTER outcome that names one text control, that control and its own hint, if any.
+interface FlaggedControlCase {
+    control: string;
+    outcome: LiteralCase;
+    FlaggedControl: () => HTMLElement;
+    hint: string | null;
+}
+
+// The date edits and the invalid-confirm edit name their field in field_errors; the blank-confirm
+// prompt names CONFIRM as its cursor. CONFIRM keeps its Y/N hint after the ERRMSG line.
+const FLAGGED_CONTROL_CASES: readonly FlaggedControlCase[] = [
+    {
+        control: "the start month",
+        outcome: EditFailure(START_MONTH_INVALID_MESSAGE, "startMm"),
+        FlaggedControl: () => DatePartInput(START_MONTH_PART),
+        hint: null,
+    },
+    {
+        control: "CONFIRM",
+        outcome: EditFailure('"X" is not a valid value to confirm...', "confirm"),
+        FlaggedControl: () => ConfirmInput(),
+        hint: "Y/N",
+    },
+    {
+        control: "CONFIRM",
+        outcome: PromptOutcome("Please confirm to print the Monthly report..."),
+        FlaggedControl: () => ConfirmInput(),
+        hint: "Y/N",
     },
 ];
 
@@ -1060,9 +1093,30 @@ it.each(FLAGGED_REPORT_TYPE_CASES)(
         await PressScreenKey(user, ENTER_KEY, "click");
         await ExpectAlert(body.message, "error");
         expect(ReportTypeGroup()).toHaveAttribute("aria-invalid", "true");
+        expect(ReportTypeGroup()).toHaveAttribute("aria-describedby", ERRMSG_ID);
         expect(ReportTypeGroup()).toHaveAccessibleDescription(body.message);
         ExpectErrorSegments(chosenLabel);
         await waitFor(() => expect(ReportTypeButton(MONTHLY_LABEL)).toHaveFocus());
+    },
+);
+
+// The ERRMSG Alert comes first in the description, then the control's own hint; a part the
+// answer does not name is described by nothing.
+it.each(FLAGGED_CONTROL_CASES)(
+    "CORPT00C describes $control by the ERRMSG line after $outcome.literal",
+    async ({ outcome, FlaggedControl, hint }) => {
+        MockReportOutcome(outcome);
+        const user = await RenderScreen();
+        await PressScreenKey(user, ENTER_KEY, "click");
+        await ExpectAlert(outcome.literal, outcome.severity);
+        const control = FlaggedControl();
+        const hintIds = hint === null ? [] : [`${control.id}-helper-text`];
+        const hintTexts = hint === null ? [] : [hint];
+        expect(control).toHaveAttribute("aria-invalid", "true");
+        expect(control).toHaveAttribute("aria-describedby", [ERRMSG_ID, ...hintIds].join(" "));
+        expect(document.getElementById(ERRMSG_ID)).toBe(screen.getByRole("alert"));
+        expect(control).toHaveAccessibleDescription([outcome.literal, ...hintTexts].join(" "));
+        expect(DatePartInput(START_YEAR_PART)).not.toHaveAttribute("aria-describedby");
     },
 );
 

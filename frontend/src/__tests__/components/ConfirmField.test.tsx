@@ -7,9 +7,14 @@ import { createRef, type ReactElement, type Ref } from "react";
 
 import { CARD_DEMO_THEME } from "@/app/theme";
 import { ConfirmField } from "@/components/ConfirmField";
+import { MessageLine } from "@/components/MessageLine";
 
 // Each map's ASKIP INITIAL prompt before CONFIRM, verbatim: trailing blanks and " :" are kept.
 const COBIL00_PROMPT = "Do you want to pay your balance now. Please confirm: ";
+// The COBIL00C literal for an answer other than Y or N, and the id of the ERRMSG Alert showing it.
+const INVALID_CONFIRM_MESSAGE = "Invalid value. Valid values are (Y/N)...";
+const ERRMSG_ID = "message-line-errmsg";
+const CONFIRM_HINT = "Y/N";
 
 const CONFIRM_PROMPTS: readonly { mapName: string; prompt: string }[] = [
     { mapName: "COBIL00", prompt: COBIL00_PROMPT },
@@ -20,15 +25,32 @@ const CONFIRM_PROMPTS: readonly { mapName: string; prompt: string }[] = [
 // Y and N, a lower-case y, a code the programs reject and a blank: the server judges each one.
 const CONFIRM_KEYSTROKES = ["Y", "N", "y", "X", " "] as const;
 
+// The ERRMSG ids aria-describedby names ahead of the Y/N hint's id, and the description they give.
 interface ErrorStateCase {
     errorState: string;
     error?: boolean;
     ariaInvalid: string;
+    errmsgIds: readonly string[];
+    description: string;
 }
 
+// Only a field in error is tied to the ERRMSG line; otherwise MUI's hint description stands.
 const ERROR_STATE_CASES: readonly ErrorStateCase[] = [
-    { errorState: "error set", error: true, ariaInvalid: "true" },
-    { errorState: "error omitted", ariaInvalid: "false" },
+    {
+        errorState: "error set",
+        error: true,
+        ariaInvalid: "true",
+        errmsgIds: [ERRMSG_ID],
+        description: `${INVALID_CONFIRM_MESSAGE} ${CONFIRM_HINT}`,
+    },
+    {
+        errorState: "error false",
+        error: false,
+        ariaInvalid: "false",
+        errmsgIds: [],
+        description: CONFIRM_HINT,
+    },
+    { errorState: "error omitted", ariaInvalid: "false", errmsgIds: [], description: CONFIRM_HINT },
 ];
 
 interface DisabledStateCase {
@@ -127,4 +149,23 @@ describe("ConfirmField error state and focus target", () => {
         const input = RenderConfirm({ inputRef });
         expect(inputRef.current).toBe(input);
     });
+});
+
+// The page's MessageLine shows the server literal under ERRMSG_ID beside the field.
+describe("ConfirmField error description", () => {
+    it.each(ERROR_STATE_CASES)(
+        "COBIL00 CONFIRM with $errorState is described as '$description'",
+        ({ error, errmsgIds, description }) => {
+            RenderWithTheme(<MessageLine message={INVALID_CONFIRM_MESSAGE} />);
+            const input = RenderConfirm({ error });
+            const helperTextId = `${input.id}-helper-text`;
+            expect(input.id).not.toBe("");
+            expect(document.getElementById(helperTextId)?.textContent).toBe(CONFIRM_HINT);
+            expect(input).toHaveAttribute(
+                "aria-describedby",
+                [...errmsgIds, helperTextId].join(" "),
+            );
+            expect(input).toHaveAccessibleDescription(description);
+        },
+    );
 });

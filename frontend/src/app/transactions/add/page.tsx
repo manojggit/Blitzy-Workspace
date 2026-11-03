@@ -29,7 +29,7 @@ import {
 
 import { ConfirmField } from "@/components/ConfirmField";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
-import { MessageLine } from "@/components/MessageLine";
+import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     AddTransaction,
@@ -241,11 +241,14 @@ interface AddFeedback {
 
 // values is what ENTER and F5 send, its card_num only ever the card as the user keyed it;
 // servedCard is the masked card the server resolved, which is only ever displayed.
+// isInFlightRef is the synchronous write lock: true from the press that sends a request until
+// that request settles, so a key pressed before the busy render reaches the keys is refused.
 interface AddScreenSetters {
     setValues: Dispatch<SetStateAction<AddFieldValues>>;
     setServedCard: Dispatch<SetStateAction<string>>;
     setFeedback: Dispatch<SetStateAction<AddFeedback>>;
     setIsBusy: Dispatch<SetStateAction<boolean>>;
+    isInFlightRef: RefObject<boolean>;
 }
 
 interface AddKeyInputs {
@@ -419,18 +422,26 @@ function ShowFailure(error: unknown, setters: AddScreenSetters): void {
 // One helper for ENTER and F5. The request sends the keyed values, the card as keyed rather than
 // the masked card shown; at the server a non-blank account, such as the one the prompt resolved,
 // takes precedence over the card. Every input stays locked until the answer is applied, so the
-// form it updates is the form that was sent.
+// form it updates is the form that was sent. The disabled keys take effect only a render after
+// the press, so the in-flight lock, taken before anything else, refuses a second ENTER or F5 in
+// that gap: each add allocates a new TRAN-ID, so a second request would write a second record.
+// The lock clears when the request settles, a rethrown defect included.
 async function SubmitAdd(
     action: TransactionAddAction,
     values: AddFieldValues,
     setters: AddScreenSetters,
 ): Promise<void> {
+    if (setters.isInFlightRef.current) {
+        return;
+    }
+    setters.isInFlightRef.current = true;
     setters.setIsBusy(true);
     try {
         ShowResponse(await AddTransaction(BuildAddRequest(action, values)), setters);
     } catch (error) {
         ShowFailure(error, setters);
     } finally {
+        setters.isInFlightRef.current = false;
         setters.setIsBusy(false);
     }
 }
@@ -446,8 +457,12 @@ function HandleCopyLast(values: AddFieldValues, setters: AddScreenSetters): void
     void SubmitAdd(TransactionAddAction.COPY_LAST, values, setters);
 }
 
-// F4 (CLEAR-CURRENT-SCREEN) reads no file, so it never reaches the server.
+// F4 (CLEAR-CURRENT-SCREEN) reads no file, so it never reaches the server. It is refused while a
+// request is in flight, so the answer still lands on the form that was sent.
 function HandleClear(setters: AddScreenSetters): void {
+    if (setters.isInFlightRef.current) {
+        return;
+    }
     setters.setValues(EMPTY_FIELDS);
     setters.setServedCard("");
     setters.setFeedback(ClearedFeedback());
@@ -468,8 +483,10 @@ function HandleFieldChange(setters: AddScreenSetters, name: AddFieldName, value:
 }
 
 // The map's legend, in its order: ENTER=Continue  F3=Back  F4=Clear  F5=Copy Last Tran. ENTER, F4
-// and F5 wait while a call runs, as the 3270 keyboard locked, so one press is one request and a
-// late answer never refills a cleared screen.
+// and F5 are disabled while a call runs, as the 3270 keyboard locked. Disabling takes effect a
+// render after the press, so SubmitAdd and HandleClear also refuse a press made in that gap
+// through the in-flight lock: one press is one request and a late answer never refills a cleared
+// screen.
 function BuildKeyDefinitions(actions: AddKeyActions): FunctionKeyDefinition[] {
     return [
         { key: "ENTER", label: "Continue", onPress: actions.onContinue, disabled: actions.isBusy },
@@ -531,14 +548,15 @@ function useTransactionAddKeys({ values, isBusy, setters }: AddKeyInputs) {
 }
 
 // The keyed values, the resolved masked card, the message line and the busy flag, with one stable
-// set of setters.
+// set of setters that also carries the in-flight lock.
 function useAddScreenState() {
     const [values, setValues] = useState<AddFieldValues>(EMPTY_FIELDS);
     const [servedCard, setServedCard] = useState("");
     const [feedback, setFeedback] = useState<AddFeedback>(ClearedFeedback);
     const [isBusy, setIsBusy] = useState(false);
+    const isInFlightRef = useRef(false);
     const setters = useMemo<AddScreenSetters>(
-        () => ({ setValues, setServedCard, setFeedback, setIsBusy }),
+        () => ({ setValues, setServedCard, setFeedback, setIsBusy, isInFlightRef }),
         [],
     );
     return { values, servedCard, feedback, isBusy, setters };
@@ -569,7 +587,7 @@ function useTransactionAdd(): AddScreenModel {
 // Autocomplete is off because each value belongs to a new transaction record.
 function StaticFieldProps(definition: AddFieldDefinition): TextFieldProps {
     return {
-        id: `transaction-add-${definition.name}`,
+        id: FieldIdOf(definition.name),
         name: definition.name,
         label: definition.label,
         helperText: definition.helperText,
@@ -577,8 +595,18 @@ function StaticFieldProps(definition: AddFieldDefinition): TextFieldProps {
         size: "small",
         autoComplete: "off",
         fullWidth: true,
-        slotProps: { htmlInput: { maxLength: definition.maxLength } },
     };
+}
+
+function FieldIdOf(name: AddTextFieldName): string {
+    return `transaction-add-${name}`;
+}
+
+// The BMS LENGTH and, while the server names the field in error, its tie to the ERRMSG line
+// ahead of the field's format hint, so the amount and date hints stay part of the description.
+function HtmlInputProps(definition: AddFieldDefinition, hasError: boolean) {
+    const helperTextId = HelperTextIdOf(FieldIdOf(definition.name), definition.helperText);
+    return { maxLength: definition.maxLength, ...ErrorMessageReference(hasError, helperTextId) };
 }
 
 // No form element: useFunctionKeys handles ENTER from any input, and a native submit would add a
@@ -586,16 +614,18 @@ function StaticFieldProps(definition: AddFieldDefinition): TextFieldProps {
 function AddTextField({ definition, form }: AddTextFieldProps) {
     const { name } = definition;
     const { inputsRef } = form;
+    const hasError = form.fieldErrors.includes(name);
     return (
         <TextField
             {...StaticFieldProps(definition)}
             value={form.values[name]}
             onChange={(event) => form.onFieldChange(name, event.target.value)}
-            error={form.fieldErrors.includes(name)}
+            error={hasError}
             disabled={form.isBusy}
             inputRef={(element: HTMLInputElement | null) => {
                 inputsRef.current[name] = element;
             }}
+            slotProps={{ htmlInput: HtmlInputProps(definition, hasError) }}
         />
     );
 }

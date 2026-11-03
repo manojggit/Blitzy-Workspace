@@ -150,6 +150,8 @@ const TRAN_LOOKUP_FAILED_MESSAGE = "Unable to lookup Transaction...";
 const ABEND_MESSAGE = "UNEXPECTED ABEND OCCURRED.";
 // The page's own polite status while a record is shown; COTRN01C leaves ERRMSG blank then.
 const DETAIL_SHOWN_STATUS = "Transaction details displayed";
+// The id of the MessageLine ERRMSG Alert, which a field named in field_errors is described by.
+const ERRMSG_ID = "message-line-errmsg";
 
 // The row-24 legend: ENTER=Fetch  F3=Back  F4=Clear  F5=Browse Tran.
 const FETCH_KEY: FunctionKeyCase = { keyName: "Enter", buttonName: "Fetch (Enter)" };
@@ -274,6 +276,11 @@ const LITERAL_CASES: readonly LiteralCase[] = [
         sentKey: TEST_TRAN_ID,
     },
 ];
+
+// The legacy bodies, each naming TRNIDIN in field_errors; the plain-text 500 names no field.
+const FLAGGED_LITERAL_CASES: readonly LiteralCase[] = LITERAL_CASES.filter(
+    (literalCase) => typeof literalCase.body !== "string",
+);
 
 // F3 returns to the main menu (COMEN01C), whether the menu or a CT00 selection opened the screen.
 const BACK_CASES: readonly BackCase[] = PRESS_MODES.flatMap((mode) => [
@@ -593,6 +600,24 @@ describe("COTRN01C MOVE -1 TO TRNIDINL", () => {
         expect(TranIdInput()).toHaveAttribute("aria-invalid", "true");
         expect(TranIdInput()).toHaveFocus();
     });
+});
+
+// Nothing describes TRNIDIN before an answer; once one names it, the ERRMSG Alert does.
+describe("COTRN01C TRNIDIN described by ERRMSG", () => {
+    it.each(FLAGGED_LITERAL_CASES)(
+        "COTRN01C $status describes TRNIDIN by the ERRMSG line showing $shownText",
+        async (literal) => {
+            mockViewTransaction.mockRejectedValue(BuildAxiosError(literal.status, literal.body));
+            const user = RenderScreen();
+            expect(TranIdInput()).not.toHaveAttribute("aria-describedby");
+            await TypeTranId(user, literal.typedText);
+            await PressFunctionKey(user, FETCH_KEY, "button");
+            await ExpectAlert(literal.shownText, literal.severity);
+            expect(TranIdInput()).toHaveAttribute("aria-describedby", ERRMSG_ID);
+            expect(document.getElementById(ERRMSG_ID)).toBe(screen.getByRole("alert"));
+            expect(TranIdInput()).toHaveAccessibleDescription(literal.shownText);
+        },
+    );
 });
 
 describe("COTRN01C F4 (CLEAR-CURRENT-SCREEN) after a display", () => {

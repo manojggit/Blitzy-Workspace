@@ -43,6 +43,15 @@ interface PendingPayBill {
     Fail: (error: unknown) => void;
 }
 
+// How the payment request out settles, what the screen then shows, and what the next ENTER sends.
+interface LockReleaseCase {
+    outcome: string;
+    SettlePayBill: (pendingPayBill: PendingPayBill) => void;
+    message: string;
+    severity: MessageSeverity;
+    nextRequest: BillPayRequest;
+}
+
 const mockRouterPush = jest.fn();
 const mockRouterReplace = jest.fn();
 // One router object for every render, as Next.js keeps the App Router instance stable.
@@ -216,6 +225,34 @@ const DUPLICATE_TRAN_ID_CASE = ErrorCase(
 );
 const KEPT_BALANCE_CASES: readonly LiteralCase[] = [INVALID_CONFIRM_CASE, DUPLICATE_TRAN_ID_CASE];
 
+// The id of the MessageLine ERRMSG Alert, which a field named in field_errors is described by.
+const ERRMSG_ID = "message-line-errmsg";
+
+// An edit failure naming its cursor field, that field's hint, if any, and the other input with
+// the description it keeps.
+interface FlaggedFieldCase extends LiteralCase {
+    hint: string | null;
+    unflaggedName: BillPayInputName;
+    unflaggedDescription: string;
+}
+
+// ACTIDIN has no hint; CONFIRM keeps its Y/N hint after the ERRMSG line, and as the unflagged
+// field it is described by that hint alone.
+const FLAGGED_FIELD_CASES: readonly FlaggedFieldCase[] = [
+    {
+        ...ErrorCase(HTTP_EDIT_FAILURE, ACCT_ID_EMPTY_MESSAGE, "acct_id", BLANK_REQUEST),
+        hint: null,
+        unflaggedName: "confirm",
+        unflaggedDescription: CONFIRM_HINT,
+    },
+    {
+        ...INVALID_CONFIRM_CASE,
+        hint: CONFIRM_HINT,
+        unflaggedName: "acct_id",
+        unflaggedDescription: "",
+    },
+];
+
 // The confirmation prompt by default: CURBAL shown, the cursor on CONFIRM, nothing written.
 function BuildBillPayResponse(overrides: Partial<BillPayResponse> = {}): BillPayResponse {
     return {
@@ -385,6 +422,56 @@ async function TryToEditWhileLocked(user: UserEvent, confirmSent: string): Promi
     expect(InputOf("confirm")).toHaveValue(confirmSent);
 }
 
+// Physical keys reach the useFunctionKeys window listener. They all run inside one act, so no
+// render, and no effect handing the keys their disabled state, runs between two presses. The
+// pointer first leaves the inputs: an input focused when the busy render disables it would have
+// MUI's FormControl update its focus state during act's final flush, outside act.
+async function PressInOneTurn(user: UserEvent, keyNames: readonly string[]): Promise<void> {
+    await user.click(document.body);
+    await act(async () => {
+        for (const keyName of keyNames) {
+            window.dispatchEvent(new KeyboardEvent("keydown", { key: keyName, bubbles: true }));
+        }
+    });
+}
+
+// The confirmed payment screen as sent: the account, the Y answer and the CURBAL shown.
+function ExpectPaymentScreenKept(): void {
+    expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID);
+    expect(InputOf("confirm")).toHaveValue("Y");
+    expect(BalanceField()).toHaveValue(TEST_BALANCE);
+}
+
+// A second ENTER, or an F4, pressed before the busy render while the confirmed payment is out.
+const BURST_SECOND_KEYS: readonly MapKey[] = ["ENTER", "F4"];
+
+const WRITTEN_PAYMENT: Partial<BillPayResponse> = {
+    current_balance: null,
+    message: PAYMENT_SUCCESS_MESSAGE,
+    cursor_field: "acct_id",
+    tran_id: TEST_TRAN_ID,
+};
+
+// A written payment blanks the screen, so the next ENTER sends blank fields; the duplicate
+// TRAN-ID keeps the screen sent, so the next ENTER sends it again.
+const LOCK_RELEASE_CASES: readonly LockReleaseCase[] = [
+    {
+        outcome: "a written payment",
+        SettlePayBill: (pendingPayBill) =>
+            pendingPayBill.Answer(BuildBillPayResponse(WRITTEN_PAYMENT)),
+        message: PAYMENT_SUCCESS_MESSAGE,
+        severity: "success",
+        nextRequest: BLANK_REQUEST,
+    },
+    {
+        outcome: "a 409 rejection",
+        SettlePayBill: (pendingPayBill) => pendingPayBill.Fail(FailureOf(DUPLICATE_TRAN_ID_CASE)),
+        message: TRAN_ID_EXISTS_MESSAGE,
+        severity: "error",
+        nextRequest: PAY_REQUEST,
+    },
+];
+
 beforeEach(() => {
     mockPayBill.mockReset();
     window.history.pushState({}, "", PAGE_ROUTE);
@@ -402,11 +489,12 @@ it("COBIL00 shows TRNNAME CB00, PGMNAME COBIL00C and the title Bill Payment", ()
     expect(screen.getByRole("heading", { level: 1, name: SCREEN_TITLE })).toBeVisible();
 });
 
-it("COBIL00 ACTIDIN (11), CURBAL (ASKIP) and CONFIRM (1, Y/N) keep their BMS attributes", () => {
+it("COBIL00 ACTIDIN (11), CURBAL (14, ASKIP) and CONFIRM (1, Y/N) keep BMS attributes", () => {
     RenderScreen();
     expect(InputOf("acct_id")).toHaveAttribute("maxlength", "11");
     expect(InputOf("confirm")).toHaveAttribute("maxlength", "1");
     expect(screen.getByText(CONFIRM_HINT)).toBeInTheDocument();
+    expect(BalanceField()).toHaveAttribute("maxlength", "14");
     expect(BalanceField()).toHaveAttribute("readonly");
     expect(BalanceField()).toHaveValue("");
 });
@@ -512,6 +600,45 @@ it("COBIL00C PF4 is locked while PayBill runs, so its answer applies to the scre
     expect(screen.getByRole("button", { name: MAP_KEYS.F4.button })).toBeEnabled();
 });
 
+// The keys disable a render after ENTER, so a second ENTER or an F4 pressed in that gap meets the
+// in-flight lock: one payment command is sent, and its answer lands on the screen that was sent.
+it.each(BURST_SECOND_KEYS)(
+    "COBIL00C ENTER and %s in one turn send one payment and keep the screen sent",
+    async (secondKey) => {
+        const user = RenderScreen();
+        await ShowConfirmPrompt(user);
+        const pendingPayBill = DeferPayBill();
+        await KeyInto(user, "confirm", "Y");
+        await PressInOneTurn(user, [MAP_KEYS.ENTER.key, MAP_KEYS[secondKey].key]);
+        expect(mockPayBill).toHaveBeenCalledTimes(2);
+        expect(mockPayBill).toHaveBeenLastCalledWith(PAY_REQUEST);
+        ExpectKeyboardLocked();
+        ExpectPaymentScreenKept();
+        await Settle(() => pendingPayBill.Fail(FailureOf(DUPLICATE_TRAN_ID_CASE)));
+        await ExpectAlert(TRAN_ID_EXISTS_MESSAGE, "error");
+        ExpectPaymentScreenKept();
+        expect(mockPayBill).toHaveBeenCalledTimes(2);
+    },
+);
+
+// The lock clears once the request settles, answered or rejected, so the next ENTER is sent.
+it.each(LOCK_RELEASE_CASES)(
+    "COBIL00C the in-flight lock clears after $outcome, so the next ENTER is sent",
+    async ({ SettlePayBill, message, severity, nextRequest }) => {
+        const user = RenderScreen();
+        await ShowConfirmPrompt(user);
+        const pendingPayBill = DeferPayBill();
+        await KeyInto(user, "confirm", "Y");
+        await PressInOneTurn(user, [MAP_KEYS.ENTER.key]);
+        await Settle(() => SettlePayBill(pendingPayBill));
+        await ExpectAlert(message, severity);
+        DeferPayBill();
+        await PressInOneTurn(user, [MAP_KEYS.ENTER.key]);
+        expect(mockPayBill).toHaveBeenCalledTimes(3);
+        expect(mockPayBill).toHaveBeenLastCalledWith(nextRequest);
+    },
+);
+
 it("COBIL00C payment written: INITIALIZE-ALL-FIELDS blanks every field", async () => {
     const user = RenderScreen();
     await ShowConfirmPrompt(user);
@@ -528,21 +655,26 @@ it("COBIL00C payment written: INITIALIZE-ALL-FIELDS blanks every field", async (
     expect(BalanceField()).toHaveValue("");
 });
 
-it("COBIL00C N answer: CLEAR-CURRENT-SCREEN blanks every field and the message", async () => {
-    const user = RenderScreen();
-    await ShowConfirmPrompt(user);
-    const cleared = { current_balance: null, message: "", cursor_field: "acct_id" };
-    mockPayBill.mockResolvedValue(BuildBillPayResponse(cleared));
-    await KeyInto(user, "confirm", "N");
-    await UseMapKey(user, "ENTER", "button");
-    await waitFor(() => {
-        expect(screen.queryByRole("alert")).toBeNull();
-    });
-    expect(mockPayBill).toHaveBeenLastCalledWith({ acct_id: TEST_ACCOUNT_ID, confirm: "N" });
-    expect(InputOf("acct_id")).toHaveValue("");
-    expect(BalanceField()).toHaveValue("");
-    expect(InputOf("acct_id")).toHaveFocus();
-});
+// CONFIRMI WHEN 'N' WHEN 'n' runs CLEAR-CURRENT-SCREEN; INITIALIZE-ALL-FIELDS blanks CONFIRM too.
+it.each(["N", "n"])(
+    "COBIL00C %s answer: CLEAR-CURRENT-SCREEN blanks every field and the message",
+    async (answer) => {
+        const user = RenderScreen();
+        await ShowConfirmPrompt(user);
+        const cleared = { current_balance: null, message: "", cursor_field: "acct_id" };
+        mockPayBill.mockResolvedValue(BuildBillPayResponse(cleared));
+        await KeyInto(user, "confirm", answer);
+        await UseMapKey(user, "ENTER", "button");
+        await waitFor(() => {
+            expect(screen.queryByRole("alert")).toBeNull();
+        });
+        expect(mockPayBill).toHaveBeenLastCalledWith({ acct_id: TEST_ACCOUNT_ID, confirm: answer });
+        expect(InputOf("acct_id")).toHaveValue("");
+        expect(InputOf("confirm")).toHaveValue("");
+        expect(BalanceField()).toHaveValue("");
+        expect(InputOf("acct_id")).toHaveFocus();
+    },
+);
 
 // The abend names no field, so the unlocked keyboard puts the cursor on ACTIDIN (BMS IC).
 it("COBIL00C unexpected 500 shows the CSMSG02Y abend text", async () => {
@@ -572,6 +704,27 @@ it("COBIL00C field_errors mark every named field and the cursor goes to cursor_f
     expect(InputOf("confirm")).toHaveAttribute("aria-invalid", "true");
     expect(InputOf("acct_id")).toHaveFocus();
 });
+
+// The flagged field names the ERRMSG Alert holding the literal first, then its own hint.
+it.each(FLAGGED_FIELD_CASES)(
+    "COBIL00C $status $message describes $cursorField by the ERRMSG line",
+    async (fieldCase) => {
+        MockOutcome(fieldCase);
+        const user = RenderScreen();
+        await KeyRequest(user, fieldCase.request);
+        await UseMapKey(user, "ENTER", "button");
+        await ExpectAlert(fieldCase.message, "error");
+        const input = InputOf(fieldCase.cursorField);
+        const hintIds = fieldCase.hint === null ? [] : [`${input.id}-helper-text`];
+        const hintTexts = fieldCase.hint === null ? [] : [fieldCase.hint];
+        expect(input).toHaveAttribute("aria-describedby", [ERRMSG_ID, ...hintIds].join(" "));
+        expect(document.getElementById(ERRMSG_ID)).toBe(screen.getByRole("alert"));
+        expect(input).toHaveAccessibleDescription([fieldCase.message, ...hintTexts].join(" "));
+        expect(InputOf(fieldCase.unflaggedName)).toHaveAccessibleDescription(
+            fieldCase.unflaggedDescription,
+        );
+    },
+);
 
 it.each(KEY_METHODS)(
     "COBIL00C PF4 by %s runs CLEAR-CURRENT-SCREEN without a call",
