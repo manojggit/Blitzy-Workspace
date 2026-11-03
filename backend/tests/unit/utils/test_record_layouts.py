@@ -12,18 +12,29 @@ Expected values are derived from the legacy sources and sample images, never fro
 - The four 26-character timestamp forms of the Technical Specification, Section 0.6.6:
     "S" YYYY-MM-DD HH:MM:SS.ffffff, "D" YYYY-MM-DD-HH.MM.SS.cc0000, "T" YYYY-MM-DD followed by
     16 spaces (midnight), and 26 spaces (NULL, format " ").
+- Hostile records are record 1 of data/ASCII/acctdata.txt, custdata.txt, carddata.txt and
+    dailytran.txt with one whole field overwritten at the offset its copybook PIC clauses give,
+    and a CSUSR01Y record, which no ASCII image holds, built from literals around a password
+    generated at run time. Every refusal names the field and its offset; X, 9 and date refusals
+    must not echo the refused text, while S9V and TS26 ones quote it and are checked by cause.
 """
 
+import secrets
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from typing import NamedTuple
 
 import pytest
 
 from app.core.paths import REPO_ROOT
 from app.utils import record_layouts
+from app.utils.decimal_utils import ZonedDecimalError
 from app.utils.record_layouts import (
     ACCOUNT_LAYOUT,
+    CARD_LAYOUT,
+    CUSTOMER_LAYOUT,
     DAILY_TRANSACTION_LAYOUT,
+    USER_SECURITY_LAYOUT,
     DecodeRecord,
     DecodeTimestamp,
     EncodeRecord,
@@ -258,3 +269,408 @@ def test_decode_timestamp_rejects_other_text(text):
 def test_encode_timestamp_refuses_values_its_form_cannot_hold(value, timestampFormat):
     with pytest.raises(TimestampFormatError):
         EncodeTimestamp(value, timestampFormat)
+
+
+class FieldContext(NamedTuple):
+    """A field as its copybook gives it: record name, column, data name, offset and length."""
+
+    layoutName: str
+    columnName: str
+    copybookName: str
+    fieldOffset: int
+    fieldLength: int
+
+
+CUSTOMER_IMAGE = "data/ASCII/custdata.txt"
+CARD_IMAGE = "data/ASCII/carddata.txt"
+
+# The layout under test and the sample image whose record 1 is corrupted, by copybook record.
+SAMPLE_IMAGES = {
+    "CVACT01Y": (ACCOUNT_LAYOUT, ACCOUNT_IMAGE),
+    "CVCUS01Y": (CUSTOMER_LAYOUT, CUSTOMER_IMAGE),
+    "CVACT02Y": (CARD_LAYOUT, CARD_IMAGE),
+    "CVTRA06Y": (DAILY_TRANSACTION_LAYOUT, DAILY_TRANSACTION_IMAGE),
+}
+
+# Offsets and lengths summed from the PIC clauses of cpy/CVACT01Y.cpy, cpy/CVCUS01Y.cpy,
+# cpy/CVACT02Y.cpy, cpy/CVTRA06Y.cpy and cpy/CSUSR01Y.cpy.
+ACCT_ID_FIELD = FieldContext("CVACT01Y", "acct_id", "ACCT-ID", 0, 11)
+ACCT_CURR_BAL_FIELD = FieldContext("CVACT01Y", "curr_balance", "ACCT-CURR-BAL", 12, 12)
+ACCT_OPEN_DATE_FIELD = FieldContext("CVACT01Y", "open_date", "ACCT-OPEN-DATE", 48, 10)
+ACCT_ADDR_ZIP_FIELD = FieldContext("CVACT01Y", "addr_zip", "ACCT-ADDR-ZIP", 102, 10)
+CUST_SSN_FIELD = FieldContext("CVCUS01Y", "ssn", "CUST-SSN", 279, 9)
+CUST_DOB_FIELD = FieldContext("CVCUS01Y", "date_of_birth", "CUST-DOB-YYYY-MM-DD", 308, 10)
+CARD_CVV_FIELD = FieldContext("CVACT02Y", "cvv_cd", "CARD-CVV-CD", 27, 3)
+DALYTRAN_CAT_CD_FIELD = FieldContext("CVTRA06Y", "tran_cat_cd", "DALYTRAN-CAT-CD", 18, 4)
+DALYTRAN_DESC_FIELD = FieldContext("CVTRA06Y", "tran_desc", "DALYTRAN-DESC", 32, 100)
+DALYTRAN_AMT_FIELD = FieldContext("CVTRA06Y", "tran_amt", "DALYTRAN-AMT", 132, 11)
+DALYTRAN_MERCHANT_NAME_FIELD = FieldContext(
+    "CVTRA06Y", "merchant_name", "DALYTRAN-MERCHANT-NAME", 152, 50
+)
+DALYTRAN_ORIG_TS_FIELD = FieldContext("CVTRA06Y", "orig_ts", "DALYTRAN-ORIG-TS", 278, 26)
+SEC_USR_PWD_FIELD = FieldContext("CSUSR01Y", "password", "SEC-USR-PWD", 48, 8)
+
+# CSUSR01Y SEC-USR-ID X(08) at 0, FNAME and LNAME X(20) at 8 and 28, PWD X(08) at 48, TYPE X(01)
+# at 56, FILLER X(23) at 57. The user is none of the USRSEC sample users.
+USER_SECURITY_LRECL = 80
+USER_SECURITY_PASSWORD_LENGTH = 8
+NON_SAMPLE_USER_ID = "QAUSER01"
+NON_SAMPLE_FIRST_NAME = "Hostile"
+NON_SAMPLE_LAST_NAME = "Record"
+NON_SAMPLE_USER_TYPE = "U"
+
+DIGITS_REASON = "the text must consist of the digits 0-9 only"
+FORBIDDEN_CHARACTER_REASON = "the text contains a NUL, CR or LF character"
+CALENDAR_DATE_REASON = "the YYYY-MM-DD text is not a calendar date"
+DATE_PATTERN_REASON = "the text is neither blank nor a YYYY-MM-DD date"
+# NUL cannot be stored in PostgreSQL text; CR and LF would split a line-oriented record file.
+FORBIDDEN_CHARACTERS = (
+    pytest.param("\x00", id="nul"),
+    pytest.param("\r", id="cr"),
+    pytest.param("\n", id="lf"),
+)
+
+# (field, text overwriting the whole field, reason) for X, 9, 9N and date fields.
+CORRUPT_FIELD_REFUSALS = (
+    pytest.param(ACCT_ID_FIELD, "0000000000A", DIGITS_REASON, id="acct-id-letter"),
+    pytest.param(ACCT_ID_FIELD, "0000000001 ", DIGITS_REASON, id="acct-id-trailing-space"),
+    pytest.param(ACCT_ID_FIELD, "\u0660" * 11, DIGITS_REASON, id="acct-id-arabic-indic-digits"),
+    pytest.param(CUST_SSN_FIELD, "0209738X8", DIGITS_REASON, id="cust-ssn-letter"),
+    pytest.param(CARD_CVV_FIELD, "7O7", DIGITS_REASON, id="card-cvv-letter"),
+    pytest.param(DALYTRAN_CAT_CD_FIELD, "00-1", DIGITS_REASON, id="dalytran-cat-cd-hyphen"),
+    pytest.param(DALYTRAN_CAT_CD_FIELD, " 001", DIGITS_REASON, id="dalytran-cat-cd-leading-space"),
+    pytest.param(ACCT_OPEN_DATE_FIELD, "2014-02-30", CALENDAR_DATE_REASON, id="open-date-feb-30"),
+    pytest.param(ACCT_OPEN_DATE_FIELD, "2014-13-01", CALENDAR_DATE_REASON, id="open-date-month-13"),
+    pytest.param(ACCT_OPEN_DATE_FIELD, "2014/11/20", DATE_PATTERN_REASON, id="open-date-slashes"),
+    pytest.param(CUST_DOB_FIELD, "1961-02-29", CALENDAR_DATE_REASON, id="dob-feb-29-common-year"),
+    pytest.param(CUST_DOB_FIELD, "19610608  ", DATE_PATTERN_REASON, id="dob-without-hyphens"),
+    pytest.param(ACCT_ADDR_ZIP_FIELD, "A0000\x000000", FORBIDDEN_CHARACTER_REASON, id="zip-nul"),
+    pytest.param(ACCT_ADDR_ZIP_FIELD, "A0000\r0000", FORBIDDEN_CHARACTER_REASON, id="zip-cr"),
+    pytest.param(ACCT_ADDR_ZIP_FIELD, "A0000\n0000", FORBIDDEN_CHARACTER_REASON, id="zip-lf"),
+    pytest.param(
+        DALYTRAN_DESC_FIELD,
+        "Purchase at Abshire-Lowe\r\n".ljust(100),
+        FORBIDDEN_CHARACTER_REASON,
+        id="dalytran-desc-crlf",
+    ),
+)
+
+# (field, text overwriting the whole field, error class the RecordFormatError is raised from)
+# for S9V and TS26 fields, whose own messages quote the text they refuse.
+CORRUPT_FIELD_CAUSES = (
+    pytest.param(ACCT_CURR_BAL_FIELD, "00000001940X", ZonedDecimalError, id="curr-bal-overpunch"),
+    pytest.param(ACCT_CURR_BAL_FIELD, "0000000A940{", ZonedDecimalError, id="curr-bal-letter"),
+    pytest.param(ACCT_CURR_BAL_FIELD, " " * 12, ZonedDecimalError, id="curr-bal-blank"),
+    pytest.param(DALYTRAN_AMT_FIELD, "0000005047Z", ZonedDecimalError, id="tran-amt-overpunch"),
+    pytest.param(DALYTRAN_AMT_FIELD, "+0000504.77", ZonedDecimalError, id="tran-amt-edited"),
+    pytest.param(
+        DALYTRAN_ORIG_TS_FIELD,
+        "2022-06-10T19:27:53.000000",
+        TimestampFormatError,
+        id="orig-ts-iso-separator",
+    ),
+    pytest.param(
+        DALYTRAN_ORIG_TS_FIELD,
+        "2022-02-30 19:27:53.000000",
+        TimestampFormatError,
+        id="orig-ts-feb-30",
+    ),
+)
+
+
+def SpliceField(recordText: str, fieldContext: FieldContext, fieldText: str) -> str:
+    """Return recordText with the whole field overwritten by fieldText, at the same length."""
+    fieldEnd = fieldContext.fieldOffset + fieldContext.fieldLength
+    splicedText = recordText[: fieldContext.fieldOffset] + fieldText + recordText[fieldEnd:]
+    assert len(splicedText) == len(recordText), fieldContext
+    return splicedText
+
+
+def AssertNamesField(message: str, fieldContext: FieldContext) -> None:
+    """Assert message names the copybook record, column, data name and offset of the field."""
+    assert fieldContext.layoutName in message
+    assert fieldContext.columnName in message
+    assert fieldContext.copybookName in message
+    assert f"at offset {fieldContext.fieldOffset}:" in message
+
+
+def AssertWithheld(message: str, text: str) -> None:
+    """Assert message holds text in none of its raw, repr and right-trimmed forms."""
+    trimmedText = text.rstrip(" ")
+    assert trimmedText, "a blank text cannot be checked for an echo"
+    for form in (text, repr(text), trimmedText, repr(trimmedText)):
+        assert form not in message
+
+
+def GeneratePassword(length: int) -> str:
+    """Return a random URL-safe password of length characters, generated at run time."""
+    return secrets.token_urlsafe(length)[:length]
+
+
+def BuildUserSecurityRecord(passwordText: str) -> str:
+    """Return the 80-character CSUSR01Y record of a non-sample user holding passwordText."""
+    recordText = (
+        NON_SAMPLE_USER_ID.ljust(8)
+        + NON_SAMPLE_FIRST_NAME.ljust(20)
+        + NON_SAMPLE_LAST_NAME.ljust(20)
+        + passwordText.ljust(USER_SECURITY_PASSWORD_LENGTH)
+        + NON_SAMPLE_USER_TYPE
+    ).ljust(USER_SECURITY_LRECL)
+    assert len(recordText) == USER_SECURITY_LRECL
+    return recordText
+
+
+@pytest.mark.parametrize("fieldContext, fieldText, expectedReason", CORRUPT_FIELD_REFUSALS)
+def test_decode_record_refuses_corrupt_field_text_without_echoing_it(
+    fieldContext, fieldText, expectedReason
+):
+    layout, imagePath = SAMPLE_IMAGES[fieldContext.layoutName]
+    recordText = SpliceField(ReadFirstRecord(imagePath), fieldContext, fieldText)
+    with pytest.raises(RecordFormatError) as refusal:
+        DecodeRecord(recordText, layout)
+    message = str(refusal.value)
+    AssertNamesField(message, fieldContext)
+    assert expectedReason in message
+    AssertWithheld(message, fieldText)
+
+
+@pytest.mark.parametrize("fieldContext, fieldText, expectedCause", CORRUPT_FIELD_CAUSES)
+def test_decode_record_raises_from_the_field_decoder_error(fieldContext, fieldText, expectedCause):
+    layout, imagePath = SAMPLE_IMAGES[fieldContext.layoutName]
+    recordText = SpliceField(ReadFirstRecord(imagePath), fieldContext, fieldText)
+    with pytest.raises(RecordFormatError) as refusal:
+        DecodeRecord(recordText, layout)
+    AssertNamesField(str(refusal.value), fieldContext)
+    assert isinstance(refusal.value.__cause__, expectedCause)
+
+
+@pytest.mark.parametrize("forbiddenCharacter", FORBIDDEN_CHARACTERS)
+def test_decode_record_withholds_a_password_holding_a_forbidden_character(forbiddenCharacter):
+    secretText = GeneratePassword(USER_SECURITY_PASSWORD_LENGTH - 1)
+    fieldText = secretText + forbiddenCharacter
+    with pytest.raises(RecordFormatError) as refusal:
+        DecodeRecord(BuildUserSecurityRecord(fieldText), USER_SECURITY_LAYOUT)
+    message = str(refusal.value)
+    AssertNamesField(message, SEC_USR_PWD_FIELD)
+    assert FORBIDDEN_CHARACTER_REASON in message
+    AssertWithheld(message, fieldText)
+    AssertWithheld(message, secretText)
+
+
+# The layout under test and the columns of its sample record 1, by copybook record.
+SAMPLE_COLUMNS = {
+    "CVACT01Y": (ACCOUNT_LAYOUT, ACCOUNT_RECORD_ONE),
+    "CVTRA06Y": (DAILY_TRANSACTION_LAYOUT, DAILY_TRANSACTION_RECORD_ONE),
+}
+# A change to this value deletes the column instead of replacing it.
+REMOVED_COLUMN = object()
+
+# (field, column changes, reason) for missing columns and values of the wrong type.
+UNENCODABLE_COLUMN_VALUES = (
+    pytest.param(
+        ACCT_ID_FIELD,
+        {"acct_id": REMOVED_COLUMN},
+        "no value was supplied for 'acct_id'",
+        id="missing-acct-id",
+    ),
+    pytest.param(
+        ACCT_CURR_BAL_FIELD,
+        {"curr_balance": REMOVED_COLUMN},
+        "no value was supplied for 'curr_balance'",
+        id="missing-curr-balance",
+    ),
+    pytest.param(
+        ACCT_OPEN_DATE_FIELD,
+        {"open_date": REMOVED_COLUMN},
+        "no value was supplied for 'open_date'",
+        id="missing-open-date",
+    ),
+    pytest.param(
+        DALYTRAN_ORIG_TS_FIELD,
+        {"orig_ts_format": REMOVED_COLUMN},
+        "no value was supplied for 'orig_ts_format'",
+        id="missing-orig-ts-format",
+    ),
+    pytest.param(
+        ACCT_CURR_BAL_FIELD,
+        {"curr_balance": 194.0},
+        "the value must be Decimal or int, not float",
+        id="curr-balance-float",
+    ),
+    pytest.param(
+        ACCT_CURR_BAL_FIELD,
+        {"curr_balance": True},
+        "the value must be Decimal or int, not bool",
+        id="curr-balance-bool",
+    ),
+    pytest.param(
+        DALYTRAN_CAT_CD_FIELD,
+        {"tran_cat_cd": 1.0},
+        "the value must be int, not float",
+        id="tran-cat-cd-float",
+    ),
+    pytest.param(
+        DALYTRAN_CAT_CD_FIELD,
+        {"tran_cat_cd": True},
+        "the value must be int, not bool",
+        id="tran-cat-cd-bool",
+    ),
+    pytest.param(
+        ACCT_ID_FIELD, {"acct_id": 1.0}, "the value must be int, not float", id="acct-id-float"
+    ),
+    pytest.param(
+        ACCT_ID_FIELD, {"acct_id": False}, "the value must be int, not bool", id="acct-id-bool"
+    ),
+    pytest.param(
+        ACCT_ADDR_ZIP_FIELD,
+        {"addr_zip": 12345},
+        "the value must be str, not int",
+        id="addr-zip-int",
+    ),
+    pytest.param(
+        ACCT_OPEN_DATE_FIELD,
+        {"open_date": "2014-11-20"},
+        "the value must be a date or None, not str",
+        id="open-date-str",
+    ),
+    pytest.param(
+        ACCT_OPEN_DATE_FIELD,
+        {"open_date": datetime(2014, 11, 20)},
+        "the value must be a date or None, not datetime",
+        id="open-date-datetime",
+    ),
+)
+
+# (field, text replacing the field's column, reason) for X and 9 columns.
+UNENCODABLE_TEXT_VALUES = (
+    pytest.param(
+        ACCT_ADDR_ZIP_FIELD,
+        "A0000000001",
+        "11 characters exceed the length 10",
+        id="addr-zip-11-characters",
+    ),
+    pytest.param(
+        DALYTRAN_DESC_FIELD,
+        "Purchase at Abshire-Lowe".ljust(101, "."),
+        "101 characters exceed the length 100",
+        id="tran-desc-101-characters",
+    ),
+    pytest.param(
+        ACCT_ID_FIELD, "000000000001", "12 digits exceed the length 11", id="acct-id-12-digits"
+    ),
+    pytest.param(ACCT_ADDR_ZIP_FIELD, "A0000\x00", FORBIDDEN_CHARACTER_REASON, id="addr-zip-nul"),
+    pytest.param(ACCT_ADDR_ZIP_FIELD, "A0000\r", FORBIDDEN_CHARACTER_REASON, id="addr-zip-cr"),
+    pytest.param(ACCT_ADDR_ZIP_FIELD, "A0000\n", FORBIDDEN_CHARACTER_REASON, id="addr-zip-lf"),
+    pytest.param(
+        DALYTRAN_MERCHANT_NAME_FIELD,
+        "Abshire\rLowe",
+        FORBIDDEN_CHARACTER_REASON,
+        id="merchant-name-cr",
+    ),
+    pytest.param(
+        DALYTRAN_DESC_FIELD,
+        "Purchase at\nAbshire-Lowe",
+        FORBIDDEN_CHARACTER_REASON,
+        id="tran-desc-lf",
+    ),
+    pytest.param(ACCT_ID_FIELD, "0000000000A", DIGITS_REASON, id="acct-id-letter"),
+    pytest.param(ACCT_ID_FIELD, "\u0660" * 11, DIGITS_REASON, id="acct-id-arabic-indic-digits"),
+)
+
+# (field, column changes, error class the RecordFormatError is raised from) for numbers and
+# timestamps the field's picture or form cannot hold.
+UNENCODABLE_VALUE_CAUSES = (
+    pytest.param(
+        ACCT_CURR_BAL_FIELD,
+        {"curr_balance": Decimal("NaN")},
+        ZonedDecimalError,
+        id="curr-balance-nan",
+    ),
+    pytest.param(
+        DALYTRAN_AMT_FIELD,
+        {"tran_amt": Decimal("Infinity")},
+        ZonedDecimalError,
+        id="tran-amt-infinity",
+    ),
+    pytest.param(
+        ACCT_CURR_BAL_FIELD,
+        {"curr_balance": Decimal("1E+40")},
+        InvalidOperation,
+        id="curr-balance-beyond-31-digits",
+    ),
+    pytest.param(
+        DALYTRAN_ORIG_TS_FIELD,
+        {"orig_ts": datetime(2022, 6, 10, 19, 27, 53, 345678), "orig_ts_format": "D"},
+        TimestampFormatError,
+        id="orig-ts-d-below-hundredths",
+    ),
+    pytest.param(
+        DALYTRAN_ORIG_TS_FIELD,
+        {"orig_ts": "2022-06-10 19:27:53.000000"},
+        TimestampFormatError,
+        id="orig-ts-text",
+    ),
+)
+
+
+def ChangeColumns(columns: dict[str, object], changes: dict[str, object]) -> dict[str, object]:
+    """Return a copy of columns with changes applied; a REMOVED_COLUMN value deletes the column."""
+    changedColumns = dict(columns)
+    for columnName, value in changes.items():
+        if value is REMOVED_COLUMN:
+            del changedColumns[columnName]
+        else:
+            changedColumns[columnName] = value
+    return changedColumns
+
+
+def BuildUserSecurityColumns(passwordText: str) -> dict[str, object]:
+    """Return the CSUSR01Y columns of the non-sample user, holding passwordText."""
+    return {
+        "user_id": NON_SAMPLE_USER_ID,
+        "first_name": NON_SAMPLE_FIRST_NAME,
+        "last_name": NON_SAMPLE_LAST_NAME,
+        "password": passwordText,
+        "user_type": NON_SAMPLE_USER_TYPE,
+    }
+
+
+@pytest.mark.parametrize("fieldContext, changes, expectedReason", UNENCODABLE_COLUMN_VALUES)
+def test_encode_record_refuses_missing_and_mistyped_values(fieldContext, changes, expectedReason):
+    layout, columns = SAMPLE_COLUMNS[fieldContext.layoutName]
+    with pytest.raises(RecordFormatError) as refusal:
+        EncodeRecord(ChangeColumns(columns, changes), layout)
+    message = str(refusal.value)
+    AssertNamesField(message, fieldContext)
+    assert expectedReason in message
+
+
+@pytest.mark.parametrize("fieldContext, valueText, expectedReason", UNENCODABLE_TEXT_VALUES)
+def test_encode_record_refuses_text_without_echoing_it(fieldContext, valueText, expectedReason):
+    layout, columns = SAMPLE_COLUMNS[fieldContext.layoutName]
+    changes = {fieldContext.columnName: valueText}
+    with pytest.raises(RecordFormatError) as refusal:
+        EncodeRecord(ChangeColumns(columns, changes), layout)
+    message = str(refusal.value)
+    AssertNamesField(message, fieldContext)
+    assert expectedReason in message
+    AssertWithheld(message, valueText)
+
+
+@pytest.mark.parametrize("fieldContext, changes, expectedCause", UNENCODABLE_VALUE_CAUSES)
+def test_encode_record_raises_from_the_field_encoder_error(fieldContext, changes, expectedCause):
+    layout, columns = SAMPLE_COLUMNS[fieldContext.layoutName]
+    with pytest.raises(RecordFormatError) as refusal:
+        EncodeRecord(ChangeColumns(columns, changes), layout)
+    AssertNamesField(str(refusal.value), fieldContext)
+    assert isinstance(refusal.value.__cause__, expectedCause)
+
+
+def test_encode_record_withholds_an_overlong_password():
+    secretText = GeneratePassword(USER_SECURITY_PASSWORD_LENGTH + 1)
+    with pytest.raises(RecordFormatError) as refusal:
+        EncodeRecord(BuildUserSecurityColumns(secretText), USER_SECURITY_LAYOUT)
+    message = str(refusal.value)
+    AssertNamesField(message, SEC_USR_PWD_FIELD)
+    assert "9 characters exceed the length 8" in message
+    AssertWithheld(message, secretText)

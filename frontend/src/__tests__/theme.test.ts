@@ -32,6 +32,7 @@ interface TypeRoleExpectation {
     variant: M3TypeRoleName;
     fontSize: number;
     lineHeight: number;
+    fontWeight: number;
 }
 
 interface StyleCallbackProps {
@@ -110,23 +111,27 @@ const SPACING_UNITS = 4;
 const SPACING_PIXELS = "16px";
 
 const ROOT_FONT_SIZE_PIXELS = 16;
+// Absorbs only floating-point error from rem or unitless-ratio conversion, so pixel drift fails.
+const PIXEL_PRECISION_DIGITS = 5;
+
+const ROBOTO_FONT_STACK = "var(--font-roboto, Roboto), Roboto, Helvetica, Arial, sans-serif";
 
 const M3_TYPE_EXPECTATIONS: readonly TypeRoleExpectation[] = [
-    { variant: "displayLarge", fontSize: 57, lineHeight: 64 },
-    { variant: "displayMedium", fontSize: 45, lineHeight: 52 },
-    { variant: "displaySmall", fontSize: 36, lineHeight: 44 },
-    { variant: "headlineLarge", fontSize: 32, lineHeight: 40 },
-    { variant: "headlineMedium", fontSize: 28, lineHeight: 36 },
-    { variant: "headlineSmall", fontSize: 24, lineHeight: 32 },
-    { variant: "titleLarge", fontSize: 22, lineHeight: 28 },
-    { variant: "titleMedium", fontSize: 16, lineHeight: 24 },
-    { variant: "titleSmall", fontSize: 14, lineHeight: 20 },
-    { variant: "bodyLarge", fontSize: 16, lineHeight: 24 },
-    { variant: "bodyMedium", fontSize: 14, lineHeight: 20 },
-    { variant: "bodySmall", fontSize: 12, lineHeight: 16 },
-    { variant: "labelLarge", fontSize: 14, lineHeight: 20 },
-    { variant: "labelMedium", fontSize: 12, lineHeight: 16 },
-    { variant: "labelSmall", fontSize: 11, lineHeight: 16 },
+    { variant: "displayLarge", fontSize: 57, lineHeight: 64, fontWeight: 400 },
+    { variant: "displayMedium", fontSize: 45, lineHeight: 52, fontWeight: 400 },
+    { variant: "displaySmall", fontSize: 36, lineHeight: 44, fontWeight: 400 },
+    { variant: "headlineLarge", fontSize: 32, lineHeight: 40, fontWeight: 400 },
+    { variant: "headlineMedium", fontSize: 28, lineHeight: 36, fontWeight: 400 },
+    { variant: "headlineSmall", fontSize: 24, lineHeight: 32, fontWeight: 400 },
+    { variant: "titleLarge", fontSize: 22, lineHeight: 28, fontWeight: 400 },
+    { variant: "titleMedium", fontSize: 16, lineHeight: 24, fontWeight: 500 },
+    { variant: "titleSmall", fontSize: 14, lineHeight: 20, fontWeight: 500 },
+    { variant: "bodyLarge", fontSize: 16, lineHeight: 24, fontWeight: 400 },
+    { variant: "bodyMedium", fontSize: 14, lineHeight: 20, fontWeight: 400 },
+    { variant: "bodySmall", fontSize: 12, lineHeight: 16, fontWeight: 400 },
+    { variant: "labelLarge", fontSize: 14, lineHeight: 20, fontWeight: 500 },
+    { variant: "labelMedium", fontSize: 12, lineHeight: 16, fontWeight: 500 },
+    { variant: "labelSmall", fontSize: 11, lineHeight: 16, fontWeight: 500 },
 ];
 
 const TONAL_VARIANT_NAME = "tonal";
@@ -287,18 +292,20 @@ describe("M3 shape and spacing (AAP 0.5.3)", () => {
 
 describe("M3 type scale (AAP 0.5.3, gap 0.5.4)", () => {
     it("typography.fontFamily is the Roboto stack", () => {
-        expect(CARD_DEMO_THEME.typography.fontFamily).toMatch(/roboto/i);
+        expect(CARD_DEMO_THEME.typography.fontFamily).toBe(ROBOTO_FONT_STACK);
     });
 
     it.each(M3_TYPE_EXPECTATIONS)(
-        "$variant is $fontSize px on a $lineHeight px line",
-        ({ variant, fontSize, lineHeight }) => {
+        "$variant is Roboto $fontSize px on a $lineHeight px line at weight $fontWeight",
+        ({ variant, fontSize, lineHeight, fontWeight }) => {
             const roleStyle = CARD_DEMO_THEME.typography[variant];
             expect(roleStyle).toBeDefined();
             const measuredFontSize = FontSizeToPixels(roleStyle.fontSize);
             const measuredLineHeight = LineHeightToPixels(roleStyle.lineHeight, measuredFontSize);
-            expect(measuredFontSize).toBeCloseTo(fontSize, 0);
-            expect(measuredLineHeight).toBeCloseTo(lineHeight, 0);
+            expect(measuredFontSize).toBeCloseTo(fontSize, PIXEL_PRECISION_DIGITS);
+            expect(measuredLineHeight).toBeCloseTo(lineHeight, PIXEL_PRECISION_DIGITS);
+            expect(roleStyle.fontWeight).toBe(fontWeight);
+            expect(roleStyle.fontFamily).toBe(ROBOTO_FONT_STACK);
         },
     );
 });

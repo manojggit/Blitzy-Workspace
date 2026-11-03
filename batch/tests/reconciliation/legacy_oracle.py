@@ -884,6 +884,8 @@ CREDENTIAL_COLUMN = "password"
 
 EXIT_OK = 0
 EXIT_REJECTS = 4
+# The status of a refused IDCAMS utility step, such as a REPRO that meets a duplicate key.
+EXIT_UTILITY_FAILURE = 12
 EXIT_ABEND = 16
 CHAIN_STOP_EXIT = 8
 
@@ -1020,23 +1022,54 @@ def IsPrimingRecord(record: str) -> bool:
     return record[:PRIMING_PREFIX_LENGTH] == PRIMING_CHARACTER * PRIMING_PREFIX_LENGTH
 
 
-def LoadTransactionImage(ebcdicDir: Path) -> dict[str, str]:
-    """Replay TRANFILE STEP15 (jcl/TRANFILE.jcl): REPRO DALYTRAN.PS.INIT into TRANSACT.
+def IndexTransactionImage(path: Path, records: Sequence[str]) -> dict[str, str]:
+    """Index the TRANFILE records by TRAN-ID, as the REPRO into KEYS(16 0) does; priming skipped.
 
-    The only record is the priming record, which is skipped, so the result is empty.
+    Records are numbered from 1 in file order, the priming record included. The REPRO writes the
+    priming record into the KSDS too, so a record that is not a priming record and repeats the
+    TRAN-ID of any earlier record, the priming record's all-NUL key included, is refused. A
+    priming record itself is skipped, as every load of the image skips it.
+
+    Raises:
+        ImageRecordError: A record that is not a priming record repeats the TRAN-ID of an
+            earlier record; the reason names that record, as DuplicateKeyError does.
+    """
+    keyColumns = TABLE_SPECS[TRANSACTIONS_TABLE].keyColumns
+    loaded: dict[str, str] = {}
+    firstRecordNumbers: dict[str, int] = {}
+    for recordNumber, record in enumerate(records, start=1):
+        tranId = record[TRAN_ID_SLICE]
+        if IsPrimingRecord(record):
+            firstRecordNumbers.setdefault(tranId, recordNumber)
+            continue
+        if tranId in firstRecordNumbers:
+            duplicate = DuplicateKeyError(recordNumber, firstRecordNumbers[tranId], keyColumns)
+            raise ImageRecordError(path, recordNumber, duplicate.reason)
+        firstRecordNumbers[tranId] = recordNumber
+        loaded[tranId] = record
+    return loaded
+
+
+def LoadTransactionImage(ebcdicDir: Path) -> dict[str, str]:
+    """Replay TRANFILE STEP15 (jcl/TRANFILE.jcl lines 67-75): REPRO DALYTRAN.PS.INIT into TRANSACT.
+
+    Every record that is not the priming record is decoded with CVTRA05Y, then IndexTransactionImage
+    keys the records by TRAN-ID. The KSDS is defined KEYS(16 0) (line 53), so its REPRO refuses a
+    duplicate key, and the replace load then exits 12 and rolls back: nothing is returned. The
+    sample image holds only the priming record, which is skipped, so the sample result is empty.
 
     Raises:
         FileNotFoundError: The image does not exist.
         ImageRecordError: The image size is not a multiple of 350, or a record that is not the
-            priming record does not decode with CVTRA05Y.
+            priming record does not decode with CVTRA05Y or repeats the TRAN-ID of an earlier
+            record. Records are numbered from 1 in file order, the priming record included.
     """
     path = ImagePath(ebcdicDir, DALYTRAN_INIT_IMAGE)
-    loaded: dict[str, str] = {}
-    for recordNumber, record in enumerate(ReadEbcdicRecords(path, TRANSACTION_LRECL), start=1):
+    records = ReadEbcdicRecords(path, TRANSACTION_LRECL)
+    for recordNumber, record in enumerate(records, start=1):
         if not IsPrimingRecord(record):
             ParseImageRecord(path, recordNumber, record, TRANSACTION_FIELDS)
-            loaded[record[:16]] = record
-    return loaded
+    return IndexTransactionImage(path, records)
 
 
 def ReadUsers(ebcdicDir: Path) -> list[dict[str, object]]:
@@ -1245,11 +1278,18 @@ REJECT_ACCOUNT_NOT_FOUND = (101, "ACCOUNT RECORD NOT FOUND")
 REJECT_OVERLIMIT = (102, "OVERLIMIT TRANSACTION")
 REJECT_EXPIRED_ACCOUNT = (103, "TRANSACTION RECEIVED AFTER ACCT EXPIRATION")
 REJECT_DESCRIPTION_LENGTH = 76
+# WS-COUNTERS: WS-TRANSACTION-COUNT and WS-REJECT-COUNT are PIC 9(09) VALUE 0
+# (cbl/CBTRN02C.cbl lines 184-186), so each ADD 1 stores (n + 1) % 10**9: 999999999 -> 0.
+POSTTRAN_COUNTER_MODULUS = 10**9
 
 
 @dataclass
 class PostingWorkArea:
-    """The files CBTRN02C changes while it runs; mutable and private to RunPosttran."""
+    """The files and WS-COUNTERS CBTRN02C changes while it runs; mutable, private to RunPosttran.
+
+    processedCount and rejectCount are the stored WS-TRANSACTION-COUNT and WS-REJECT-COUNT
+    (cbl/CBTRN02C.cbl lines 184-186); rejectRecords is every DALYREJS record written.
+    """
 
     accounts: dict[str, dict[str, object]]
     categoryBalances: dict[tuple[str, str, int], dict[str, object]]
@@ -1257,6 +1297,16 @@ class PostingWorkArea:
     xrefs: Mapping[str, dict[str, object]]
     procTimestamp: tuple[datetime | None, str]
     rejectRecords: list[str] = field(default_factory=list)
+    processedCount: int = 0
+    rejectCount: int = 0
+
+
+def NextCounterValue(counter: int) -> int:
+    """Transcribes ADD 1 into a PIC 9(09) WS-COUNTERS receiver, cbl/CBTRN02C.cbl lines 206, 214.
+
+    The source has no ON SIZE ERROR, so the high-order digit is lost: 999999999 -> 0.
+    """
+    return (counter + 1) % POSTTRAN_COUNTER_MODULUS
 
 
 def CheckAccountLimits(account: Mapping[str, object], record: str) -> tuple[int, str]:
@@ -1352,6 +1402,7 @@ def BuildPostedRecord(
 def PostDailyRecord(work: PostingWorkArea, record: str) -> bool:
     """Transcribes one pass of the CBTRN02C mainline loop, cbl/CBTRN02C.cbl lines 202-219.
 
+    A rejected record runs ADD 1 TO WS-REJECT-COUNT, then 2500-WRITE-REJECT-REC (lines 214-215).
     A valid record runs 2000-POST-TRANSACTION (424-444): 2700, 2800, then 2900 writes TRANSACT.
 
     Returns:
@@ -1362,6 +1413,7 @@ def PostDailyRecord(work: PostingWorkArea, record: str) -> bool:
         raise ValueError(f"daily record of {len(record)} characters; DALYTRAN LRECL is 350")
     reason, description = ValidateDailyRecord(work, record)
     if reason != 0:
+        work.rejectCount = NextCounterValue(work.rejectCount)
         work.rejectRecords.append(BuildRejectRecord(record, reason, description))
         return True
     daily = ParseRecord(record, DAILY_FIELDS)
@@ -1386,43 +1438,61 @@ def NewPostingWorkArea(state: OracleState, clockText: str) -> PostingWorkArea:
     )
 
 
-def PostDailyFile(work: PostingWorkArea, dailyRecords: Iterable[str]) -> tuple[int, bool]:
+def PostDailyFile(work: PostingWorkArea, dailyRecords: Iterable[str]) -> bool:
     """Transcribes the PERFORM UNTIL END-OF-FILE loop of cbl/CBTRN02C.cbl lines 202-219.
 
+    Each record read runs ADD 1 TO WS-TRANSACTION-COUNT (line 206) into work.processedCount
+    before it is validated; rejects add to work.rejectCount in PostDailyRecord.
+
     Returns:
-        (WS-TRANSACTION-COUNT, whether the run abended on a duplicate TRAN-ID).
+        Whether the run abended on a duplicate TRAN-ID.
     """
-    processedCount = 0
     for record in dailyRecords:
-        processedCount += 1
+        work.processedCount = NextCounterValue(work.processedCount)
         if not PostDailyRecord(work, record):
-            return processedCount, True
-    return processedCount, False
+            return True
+    return False
+
+
+def PosttranExitCode(rejectCount: int, abended: bool) -> int:
+    """Transcribes the CBTRN02C return code, cbl/CBTRN02C.cbl lines 229-230, and abend 999.
+
+    Args:
+        rejectCount: The stored WS-REJECT-COUNT, already wrapped at 10**9.
+        abended: Whether 9999-ABEND-PROGRAM ended the run.
+
+    Returns:
+        EXIT_ABEND after an abend; EXIT_REJECTS when WS-REJECT-COUNT > 0; else EXIT_OK.
+    """
+    if abended:
+        return EXIT_ABEND
+    if rejectCount > 0:
+        return EXIT_REJECTS
+    return EXIT_OK
 
 
 def RunPosttran(state: OracleState, dailyRecords: Iterable[str], clockText: str) -> PosttranOutcome:
     """Transcribes CBTRN02C (jcl/POSTTRAN.jcl STEP15), cbl/CBTRN02C.cbl lines 193-234.
 
     Records are processed in file order; each completed write stays, as in the legacy VSAM files.
-    The status is 4 when any record is rejected (lines 229-231), else 0. A duplicate TRAN-ID gives
+    The status is 4 when the stored WS-REJECT-COUNT is above zero (lines 229-230), else 0. Both
+    PIC 9(09) counters wrap at 10**9 (lines 184-186), so exactly 10**9 rejects store 0 and give
+    status 0, while rejectRecords still holds every DALYREJS record. A duplicate TRAN-ID gives
     exit 16 and the partial state, which already holds that record's category-balance and account
     updates: what a --force rerun over already-posted records yields. On exit 16, rejectRecords
     holds what was written before the abend, which DALYREJS DISP=(NEW,CATLG,DELETE) discards.
     """
     work = NewPostingWorkArea(state, clockText)
-    processedCount, abended = PostDailyFile(work, dailyRecords)
+    abended = PostDailyFile(work, dailyRecords)
     rejects = list(work.rejectRecords)
-    if abended:
-        exitCode = EXIT_ABEND
-    else:
-        exitCode = EXIT_REJECTS if rejects else EXIT_OK
+    exitCode = PosttranExitCode(work.rejectCount, abended)
     newState = dataclasses.replace(
         state,
         accounts=work.accounts,
         categoryBalances=work.categoryBalances,
         transactions=work.transactions,
     )
-    return PosttranOutcome(newState, rejects, processedCount, len(rejects), exitCode)
+    return PosttranOutcome(newState, rejects, work.processedCount, work.rejectCount, exitCode)
 
 
 # CBACT04C constants: the /1200 of 1300-COMPUTE-INTEREST, the DEFAULT group of 1200-A, the
@@ -1618,10 +1688,56 @@ def RunCombtran(bkupRecords: Iterable[str], systranRecords: Iterable[str]) -> li
     """Transcribes jcl/COMBTRAN.jcl: STEP05R (line 22) and STEP10 (line 41).
 
     STEP05R sorts TRANSACT.BKUP(0) and SYSTRAN(0) with SORT FIELDS=(TRAN-ID,A) (line 30) into
-    TRANSACT.COMBINED(+1), and STEP10 REPROs that into TRANSACT. The sort is stable, so equal keys
-    keep their input order.
+    TRANSACT.COMBINED(+1); STEP10's REPRO of that into TRANSACT is ReloadCombinedTransactions.
+    The sort is stable, so equal keys keep their input order.
     """
     return sorted([*bkupRecords, *systranRecords], key=TransactionKeyOrder)
+
+
+def CombinedDuplicateMessage(recordNumber: int, firstRecordNumber: int | None) -> str:
+    """Return COMBTRAN STEP10's refusal of a duplicate TRAN-ID, naming records, never the key.
+
+    Args:
+        recordNumber: The 1-based TRANSACT.COMBINED(+1) record that repeats the key.
+        firstRecordNumber: The earlier combined record that holds the key, or None when TRANSACT
+            already held it before the REPRO.
+    """
+    keyColumns = TABLE_SPECS[TRANSACTIONS_TABLE].keyColumns
+    if firstRecordNumber is None:
+        reason = f"duplicate key ({', '.join(keyColumns)}) of a record already in TRANSACT"
+    else:
+        reason = DuplicateKeyError(recordNumber, firstRecordNumber, keyColumns).reason
+    return f"COMBTRAN STEP10 REPRO: TRANSACT.COMBINED(+1) record {recordNumber}: {reason}"
+
+
+def ReloadCombinedTransactions(state: OracleState, combinedRecords: Sequence[str]) -> OracleState:
+    """Transcribes jcl/COMBTRAN.jcl STEP10 (lines 41-48): REPRO TRANSACT.COMBINED(+1) to TRANSACT.
+
+    Each combined record is added to the TRANSACT KSDS (KEYS(16 0)) under its TRAN-ID. The REPRO
+    refuses a TRAN-ID that TRANSACT already holds or that an earlier combined record carries,
+    and COMBTRAN then ends at status 12 with full rollback, so no state is returned and the
+    state passed in is left as it was.
+
+    Args:
+        state: The state COMBTRAN starts from, after the second TRANBKP emptied TRANSACT.
+        combinedRecords: TRANSACT.COMBINED(+1) in file order, as RunCombtran returns it.
+
+    Returns:
+        A new state whose transactions hold the earlier ones plus every combined record.
+
+    Raises:
+        OracleAbend: A combined record repeats a TRAN-ID, with exitCode EXIT_UTILITY_FAILURE.
+    """
+    transactions = dict(state.transactions)
+    firstRecordNumbers: dict[str, int] = {}
+    for recordNumber, record in enumerate(combinedRecords, start=1):
+        tranId = record[TRAN_ID_SLICE]
+        if tranId in transactions:
+            message = CombinedDuplicateMessage(recordNumber, firstRecordNumbers.get(tranId))
+            raise OracleAbend(message, EXIT_UTILITY_FAILURE)
+        transactions[tranId] = record
+        firstRecordNumbers[tranId] = recordNumber
+    return dataclasses.replace(state, transactions=transactions)
 
 
 def TrailingSign(storedValue: Decimal) -> str:
@@ -2202,13 +2318,20 @@ ACCOUNT_TOTAL_LABEL = "Account Total".ljust(13) + "." * 84
 GRAND_TOTAL_LABEL = "Grand Total".ljust(11) + "." * 86
 TYPE_DESCRIPTION_WIDTH = 15
 CATEGORY_DESCRIPTION_WIDTH = 29
+# WS-CURR-CARD-NUM PIC X(16) VALUE SPACES (cbl/CBTRN03C.cbl line 137).
+REPORT_INITIAL_CARD_NUM = " " * CARD_NUM_LENGTH
 
 
 @dataclass
 class ReportWorkArea:
     """CBTRN03C WS-REPORT-VARS and the lookup records while it runs; private to BuildReportLines.
 
-    currCard None stands for the initial WS-CURR-CARD-NUM, before any card has been read.
+    currCard starts as REPORT_INITIAL_CARD_NUM, the 16 spaces of WS-CURR-CARD-NUM (line 137).
+    xrefAcctId holds XREF-ACCT-ID of CARD-XREF-RECORD, the WORKING-STORAGE COPY CVACT03Y at line
+    98, which only READ XREF-FILE INTO CARD-XREF-RECORD fills (line 485). CARD-XREF-RECORD has no
+    VALUE clause, so the language leaves its content before the first read unpredictable. A
+    leading all-space card reads no xref, so its detail line takes this oracle's defined outcome,
+    "", which TRAN-REPORT-ACCOUNT-ID X(11) prints as 11 spaces (line 364).
     """
 
     reportInput: ReportInput
@@ -2218,7 +2341,7 @@ class ReportWorkArea:
     accountTotal: Decimal = ZERO_AMOUNT
     grandTotal: Decimal = ZERO_AMOUNT
     firstTime: bool = True
-    currCard: str | None = None
+    currCard: str = REPORT_INITIAL_CARD_NUM
     xrefAcctId: str = ""
 
 
@@ -2324,8 +2447,10 @@ def WriteTransactionReport(
 def ReportOneRecord(work: ReportWorkArea, record: str) -> None:
     """Transcribes the in-file branch of the CBTRN03C mainline, cbl/CBTRN03C.cbl lines 179-196.
 
-    On a change of card, the previous account total is written (after the first record) and the
-    new card's xref is read; the type and category are read for every record.
+    Lines 181-188: only when the X(16) TRAN-CARD-NUM differs from WS-CURR-CARD-NUM is the
+    previous account total written (after the first record) and the new card's xref read, so a
+    card equal to the initial spaces reads no xref. The type and category are read for every
+    record.
     """
     card = record[TRAN_CARD_SLICE]
     if card != work.currCard:
@@ -2435,11 +2560,14 @@ def RunReportingSteps(
 ) -> tuple[OracleState, StatementOutcome, list[str]]:
     """Run CREASTMT (step 17) and the sample TRANREPT over the TRANSACT COMBTRAN reloaded.
 
+    COMBTRAN STEP10's reload (ReloadCombinedTransactions) runs first, over the state the second
+    TRANBKP left.
+
     Raises:
-        OracleAbend: CREASTMT ends at 8 or more.
+        OracleAbend: COMBTRAN's reload meets a duplicate TRAN-ID (exitCode 12), so the chain
+            stops before CREASTMT; or CREASTMT ends at 8 or more.
     """
-    combinedTransactions = {record[TRAN_ID_SLICE]: record for record in steps.combinedRecords}
-    finalState = dataclasses.replace(steps.bkupRun2.state, transactions=combinedTransactions)
+    finalState = ReloadCombinedTransactions(steps.bkupRun2.state, steps.combinedRecords)
     statements = RunCreastmt(finalState)
     RequireChainContinues(statements.exitCode, "CREASTMT")
     reportLines = BuildReportLines(SampleReportInput(finalState))
@@ -2455,7 +2583,8 @@ def RunSampleChain(ebcdicDir: Path, clockText: str) -> ChainOutcome:
     the sample because POSTTRAN rejects records.
 
     Raises:
-        OracleAbend: A step ends at 8 or more, where the chain would stop.
+        OracleAbend: A step ends at 8 or more, where the chain would stop; exitCode 12 when
+            COMBTRAN's reload meets a duplicate TRAN-ID.
     """
     loadedState = LoadSampleState(ebcdicDir)
     dailyRecords = ReadDailyRecords(ImagePath(ebcdicDir, DALYTRAN_IMAGE))

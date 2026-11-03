@@ -10,14 +10,24 @@ module:
     source, amount, then one row per report line in report order; amounts are plain decimals;
     a text cell starting with =, +, - or @ gets a ' prefix so a spreadsheet keeps it as text,
     while a negative amount is numeric data and stays unguarded;
-- PDF: every 133-column print line drawn unchanged in Courier, as TRANREPT printed it; the
-    document is deterministic and uncompressed, so each line's text is readable in the raw
-    bytes as a PDF literal string.
+- PDF: every 133-column print line drawn unchanged in Courier, as TRANREPT printed it, with a
+    new physical page only when a page is full; the document is deterministic and uncompressed,
+    so a small decoder here follows the page tree from the trailer's /Root and reads back the
+    strings each page's content stream shows. The tests compare those drawn lines, page by
+    page, with the expected print text; metadata and unreferenced objects never count;
+- both downloads are built in memory: rendering them with every file-system audit event
+    refused and recorded must succeed with no attempt recorded.
 """
 
+import contextlib
+import contextvars
 import csv
 import io
+import os
+import pathlib
 import re
+import sys
+from collections.abc import Iterator
 from decimal import Decimal
 from typing import Any
 
@@ -184,6 +194,83 @@ GUARD_CASES = (
 )
 GUARD_IDS = ("equals", "plus", "minus", "at", "plain", "inner-prefix", "empty")
 
+LINES_PER_PAGE = report_export.LinesPerPage()
+# (detail line count, the [start, stop) span of those lines each PDF page must draw)
+PAGE_SPLIT_CASES = (
+    (0, ((0, 0),)),
+    (LINES_PER_PAGE, ((0, LINES_PER_PAGE),)),
+    (LINES_PER_PAGE + 1, ((0, LINES_PER_PAGE), (LINES_PER_PAGE, LINES_PER_PAGE + 1))),
+)
+PAGE_SPLIT_IDS = ("empty-report", "full-page", "one-line-over")
+
+# The report fonts use /WinAnsiEncoding, which is Windows code page 1252.
+PDF_TEXT_ENCODING = "cp1252"
+PDF_OBJECT_PATTERN = re.compile(rb"^(\d+) 0 obj\r?\n(.*?)\r?\nendobj\r?$", re.DOTALL | re.MULTILINE)
+PDF_REFERENCE_PATTERN = re.compile(rb"(\d+)\s+0\s+R")
+PDF_STREAM_HEAD_PATTERN = re.compile(rb"<<(.*?)>>\s*stream\r?\n", re.DOTALL)
+# A direct /Length only: an indirect one, such as /Length 9 0 R, does not match.
+PDF_STREAM_LENGTH_PATTERN = re.compile(rb"/Length\s+(\d+)\b(?!\s+\d+\s+R)")
+# A content-stream token: a literal string, escapes included, or a run of other non-blank
+# bytes, which is an operator, a number or a name.
+PDF_CONTENT_TOKEN_PATTERN = re.compile(rb"\((?:[^\\()]|\\.)*\)|[^\s()]+", re.DOTALL)
+# A literal-string escape: one to three octal digits, a line end (a continuation), or one byte.
+PDF_ESCAPE_PATTERN = re.compile(rb"\\(?:([0-7]{1,3})|(\r\n|\r|\n)|(.))", re.DOTALL)
+PDF_ESCAPED_BYTES = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f"}
+
+# The audit events (sys.addaudithook) raised when a file is opened, a directory is read, or a
+# file-system entry is created, changed, copied, moved or removed. In-memory buffers such as
+# io.BytesIO and io.StringIO raise none of them.
+FILESYSTEM_AUDIT_EVENTS = frozenset(
+    {
+        # builtins.open, io.open, io.open_code, io.FileIO and os.open.
+        "open",
+        # Directory reads.
+        "os.listdir",
+        "os.scandir",
+        "os.walk",
+        "os.fwalk",
+        "glob.glob",
+        "glob.glob/2",
+        "pathlib.Path.glob",
+        "pathlib.Path.rglob",
+        "pathlib.Path.walk",
+        # Entry attributes and permissions.
+        "os.getxattr",
+        "os.listxattr",
+        "os.setxattr",
+        "os.removexattr",
+        "os.chmod",
+        "os.chown",
+        "os.chflags",
+        "os.utime",
+        "shutil.chown",
+        # Entry creation, change, copy, move and removal.
+        "os.mkdir",
+        "os.remove",
+        "os.rename",
+        "os.rmdir",
+        "os.truncate",
+        "os.link",
+        "os.symlink",
+        "shutil.copyfile",
+        "shutil.copymode",
+        "shutil.copystat",
+        "shutil.copytree",
+        "shutil.move",
+        "shutil.rmtree",
+        "shutil.make_archive",
+        "shutil.unpack_archive",
+        "tempfile.mkstemp",
+        "tempfile.mkdtemp",
+    }
+)
+# The refused-event list of the active FilesystemDenied block, or None outside every block.
+# None leaves the audit hook inert, which matters because a hook, once added, stays for the
+# rest of the process.
+FILESYSTEM_GUARD_ATTEMPTS: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "filesystemGuardAttempts", default=None
+)
+
 
 def ParseCsv(data: bytes) -> list[list[str]]:
     """Return every row of the UTF-8 CSV document data, header row included."""
@@ -200,17 +287,218 @@ def SampleCsvCell(lineIndex: int, column: str) -> str:
     return SampleCsvRows()[lineIndex][EXPECTED_COLUMNS.index(column)]
 
 
-def EscapePdfText(text: str) -> bytes:
-    """Return text as a PDF literal string body: backslash first, then both parentheses."""
-    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-    return escaped.encode("ascii")
+def NumberedDetailLines(lineCount: int) -> list[ReportLine]:
+    """Return lineCount detail lines with tran_ids 1, 2, ... so every print text is distinct."""
+    return [
+        BuildDetailLine({"tran_id": f"{lineNumber:016d}"}, Decimal("1.00"), "           1.00")
+        for lineNumber in range(1, lineCount + 1)
+    ]
 
 
-def PdfPageCount(pdfBytes: bytes) -> int:
-    """Return the /Count of the page tree of the PDF document pdfBytes."""
-    pageCount = re.search(rb"/Count (\d+)", pdfBytes)
+def PdfObjects(pdfBytes: bytes) -> dict[int, bytes]:
+    """Return the body of every indirect object of the PDF document pdfBytes, by number."""
+    return {int(number): body for number, body in PDF_OBJECT_PATTERN.findall(pdfBytes)}
+
+
+def PdfReference(dictionary: bytes, key: bytes) -> int:
+    """Return the object number dictionary refers to under key, as 5 in /Root 5 0 R."""
+    reference = re.search(rb"/" + re.escape(key) + rb"\s+(\d+)\s+0\s+R", dictionary)
+    assert reference is not None, key
+    return int(reference.group(1))
+
+
+def PdfHasType(dictionary: bytes, typeName: bytes) -> bool:
+    """Return whether dictionary declares /Type /typeName; /Page never matches /Pages."""
+    return re.search(rb"/Type\s*/" + re.escape(typeName) + rb"\b", dictionary) is not None
+
+
+def PdfStreamData(streamObject: bytes) -> bytes:
+    """Return the data of the stream object body streamObject, read by its direct /Length.
+
+    A /Filter, such as compression, fails the assertion, so encoded bytes are never read as
+    text.
+    """
+    streamHead = PDF_STREAM_HEAD_PATTERN.match(streamObject)
+    assert streamHead is not None
+    assert b"/Filter" not in streamHead.group(1)
+    streamLength = PDF_STREAM_LENGTH_PATTERN.search(streamHead.group(1))
+    assert streamLength is not None
+    dataEnd = streamHead.end() + int(streamLength.group(1))
+    assert re.fullmatch(rb"\s*endstream", streamObject[dataEnd:])
+    return streamObject[streamHead.end() : dataEnd]
+
+
+def PdfPageContent(objects: dict[int, bytes], page: bytes) -> bytes:
+    """Return the content of the page dictionary page: its /Contents streams joined in order."""
+    contents = re.search(rb"/Contents\s*(\[[^\]]*\]|\d+\s+0\s+R)", page)
+    assert contents is not None
+    streamNumbers = PDF_REFERENCE_PATTERN.findall(contents.group(1))
+    return b"\n".join(PdfStreamData(objects[int(number)]) for number in streamNumbers)
+
+
+def PdfPageContents(objects: dict[int, bytes], nodeNumber: int) -> list[bytes]:
+    """Return the content of every page under page-tree node nodeNumber, in /Kids order.
+
+    A /Pages node is walked kid by kid, into nested /Pages nodes too; a /Page leaf gives its
+    own content.
+    """
+    node = objects[nodeNumber]
+    if PdfHasType(node, b"Page"):
+        return [PdfPageContent(objects, node)]
+    assert PdfHasType(node, b"Pages")
+    kids = re.search(rb"/Kids\s*\[([^\]]*)\]", node)
+    assert kids is not None
+    pageContents: list[bytes] = []
+    for kidNumber in PDF_REFERENCE_PATTERN.findall(kids.group(1)):
+        pageContents.extend(PdfPageContents(objects, int(kidNumber)))
+    return pageContents
+
+
+def PdfEscapeValue(escape: re.Match[bytes]) -> bytes:
+    """Return the bytes one backslash escape of a PDF literal string stands for.
+
+    An octal escape gives its byte, a backslash before a line end continues the string with
+    nothing, and any other escaped byte gives itself, \\n, \\r, \\t, \\b and \\f excepted.
+    """
+    octalDigits, lineEnd, escapedByte = escape.groups()
+    if octalDigits is not None:
+        return bytes([int(octalDigits, 8) & 0xFF])
+    if lineEnd is not None:
+        return b""
+    return PDF_ESCAPED_BYTES.get(escapedByte, escapedByte)
+
+
+def UnescapePdfLiteral(literal: bytes) -> str:
+    """Return the text of literal, a PDF literal string with its enclosing parentheses.
+
+    An unescaped line end inside the string reads as one line feed.
+    """
+    body = re.sub(rb"\r\n?", b"\n", literal[1:-1])
+    return PDF_ESCAPE_PATTERN.sub(PdfEscapeValue, body).decode(PDF_TEXT_ENCODING)
+
+
+def ShownStrings(content: bytes) -> list[str]:
+    """Return, in order, the literal strings content shows with Tj inside BT ... ET."""
+    shownStrings: list[str] = []
+    inTextObject = False
+    previousToken = b""
+    for token in PDF_CONTENT_TOKEN_PATTERN.findall(content):
+        if token in (b"BT", b"ET"):
+            inTextObject = token == b"BT"
+        elif token == b"Tj" and inTextObject:
+            assert previousToken.startswith(b"(")
+            shownStrings.append(UnescapePdfLiteral(previousToken))
+        previousToken = token
+    return shownStrings
+
+
+def PdfPageLines(pdfBytes: bytes) -> list[list[str]]:
+    """Return, page by page, the text lines the PDF document pdfBytes draws.
+
+    The walk starts at the trailer's /Root catalog and follows its page tree in /Kids order, so
+    only text a page's content stream shows counts: document metadata and objects no page
+    refers to never do. Each string shown with Tj is one drawn line, as RenderPdf draws them.
+    """
+    objects = PdfObjects(pdfBytes)
+    trailer = pdfBytes[pdfBytes.rindex(b"trailer") :]
+    catalog = objects[PdfReference(trailer, b"Root")]
+    assert PdfHasType(catalog, b"Catalog")
+    rootNodeNumber = PdfReference(catalog, b"Pages")
+    pageContents = PdfPageContents(objects, rootNodeNumber)
+    pageCount = re.search(rb"/Count\s+(\d+)", objects[rootNodeNumber])
     assert pageCount is not None
-    return int(pageCount.group(1))
+    assert int(pageCount.group(1)) == len(pageContents)
+    return [ShownStrings(content) for content in pageContents]
+
+
+def RefuseGuardedFilesystemEvent(event: str, eventArgs: tuple[Any, ...]) -> None:
+    """Audit hook: inside a FilesystemDenied block, record a file-system event, then refuse it.
+
+    Recording comes before the PermissionError, so an attempt the code under test catches and
+    ignores is still seen. Outside every block, and for any other event, the hook does nothing.
+    """
+    attempts = FILESYSTEM_GUARD_ATTEMPTS.get()
+    if attempts is None or event not in FILESYSTEM_AUDIT_EVENTS:
+        return
+    attempts.append(event)
+    raise PermissionError(f"file-system access refused during an in-memory export: {event}")
+
+
+sys.addaudithook(RefuseGuardedFilesystemEvent)
+
+
+@contextlib.contextmanager
+def FilesystemDenied() -> Iterator[list[str]]:
+    """Refuse, and record, every file-system audit event raised in this context until exit.
+
+    Yields:
+        The names of the refused events in the order they were raised; empty when nothing in
+        the block reached for the file system.
+    """
+    attempts: list[str] = []
+    guardToken = FILESYSTEM_GUARD_ATTEMPTS.set(attempts)
+    try:
+        yield attempts
+    finally:
+        FILESYSTEM_GUARD_ATTEMPTS.reset(guardToken)
+
+
+def ReadDevnullWithOpen() -> None:
+    """Read os.devnull through builtins.open."""
+    with open(os.devnull, "rb") as devnull:
+        devnull.read()
+
+
+def WriteDevnullWithOpen() -> None:
+    """Write to os.devnull through builtins.open."""
+    with open(os.devnull, "wb") as devnull:
+        devnull.write(b"\n")
+
+
+def WriteDevnullWithOsOpen() -> None:
+    """Write to os.devnull through a file descriptor from os.open."""
+    descriptor = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.write(descriptor, b"\n")
+    finally:
+        os.close(descriptor)
+
+
+def WriteDevnullWithFileIo() -> None:
+    """Write to os.devnull through io.FileIO, the raw file object beneath builtins.open."""
+    with io.FileIO(os.devnull, "wb") as devnull:
+        devnull.write(b"\n")
+
+
+def ReadDevnullWithOpenCode() -> None:
+    """Read os.devnull through io.open_code, the opener the import system uses."""
+    with io.open_code(os.devnull) as devnull:
+        devnull.read()
+
+
+def WriteDevnullWithPathlib() -> None:
+    """Write to os.devnull through pathlib.Path.write_bytes."""
+    pathlib.Path(os.devnull).write_bytes(b"\n")
+
+
+# Each way to reach a file, aimed at os.devnull so a guard that failed to refuse one would
+# still touch no real file.
+DEVNULL_ACCESS_CASES = (
+    ReadDevnullWithOpen,
+    WriteDevnullWithOpen,
+    WriteDevnullWithOsOpen,
+    WriteDevnullWithFileIo,
+    ReadDevnullWithOpenCode,
+    WriteDevnullWithPathlib,
+)
+DEVNULL_ACCESS_IDS = (
+    "open-read",
+    "open-write",
+    "os-open-write",
+    "fileio-write",
+    "open-code-read",
+    "pathlib-write-bytes",
+)
 
 
 def test_csv_starts_with_the_header_row_and_no_byte_order_mark():
@@ -267,24 +555,37 @@ def test_pdf_draws_in_courier():
 
 
 def test_pdf_draws_every_whole_print_line_in_report_order():
-    pdfBytes = report_export.RenderPdf(SAMPLE_LINES)
-    literals = [b"(" + EscapePdfText(line.text) + b")" for line in SAMPLE_LINES]
-    positions = [pdfBytes.find(literal) for literal in literals]
+    pdfPages = PdfPageLines(report_export.RenderPdf(SAMPLE_LINES))
 
-    assert -1 not in positions
-    assert positions == sorted(positions)
+    assert pdfPages == [[line.text for line in SAMPLE_LINES]]
 
 
-@pytest.mark.parametrize(
-    "lineCount, pageCount",
-    (
-        (0, 1),
-        (report_export.LinesPerPage(), 1),
-        (report_export.LinesPerPage() + 1, 2),
-    ),
-    ids=("empty-report", "full-page", "one-line-over"),
-)
-def test_pdf_starts_a_new_page_only_when_a_page_is_full(lineCount, pageCount):
-    lines = [SAMPLE_LINES[PURCHASE_LINE_INDEX]] * lineCount
+@pytest.mark.parametrize("lineCount, pageSpans", PAGE_SPLIT_CASES, ids=PAGE_SPLIT_IDS)
+def test_pdf_starts_a_new_page_only_when_a_page_is_full(lineCount, pageSpans):
+    lines = NumberedDetailLines(lineCount)
+    lineTexts = [line.text for line in lines]
 
-    assert PdfPageCount(report_export.RenderPdf(lines)) == pageCount
+    pdfPages = PdfPageLines(report_export.RenderPdf(lines))
+
+    assert pdfPages == [lineTexts[start:stop] for start, stop in pageSpans]
+
+
+def test_csv_and_pdf_exports_are_built_with_every_file_access_refused():
+    with FilesystemDenied() as attempts:
+        csvData = report_export.RenderCsv(SAMPLE_LINES)
+        pdfData = report_export.RenderPdf(SAMPLE_LINES)
+
+    assert attempts == []
+    csvRows = ParseCsv(csvData)
+    assert csvRows[0] == list(EXPECTED_COLUMNS)
+    assert [row[0] for row in csvRows[1:]] == [line.line_kind.value for line in SAMPLE_LINES]
+    assert PdfPageLines(pdfData) == [[line.text for line in SAMPLE_LINES]]
+
+
+@pytest.mark.parametrize("accessDevnull", DEVNULL_ACCESS_CASES, ids=DEVNULL_ACCESS_IDS)
+def test_filesystem_guard_refuses_and_records_each_file_entry_point(accessDevnull):
+    with FilesystemDenied() as attempts, pytest.raises(PermissionError):
+        accessDevnull()
+
+    assert attempts == ["open"]
+    assert FILESYSTEM_GUARD_ATTEMPTS.get() is None
