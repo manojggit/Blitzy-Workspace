@@ -39,6 +39,7 @@ import {
     type CardUpdateRequest,
 } from "@/lib/api/cards";
 import {
+    IsCancelledRequest,
     LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
@@ -210,7 +211,12 @@ type CardErrorBody = LegacyErrorResponse &
 
 type CardRequest = () => Promise<CardScreen>;
 
-type RequestRunner = (request: CardRequest) => void;
+// signal is given only with a read, by the AbortController that owns it; a write never has one,
+// so a save, an ENTER or a cancel is never abandoned once sent.
+type RequestRunner = (request: CardRequest, signal?: AbortSignal) => void;
+
+// The request that holds the screen while it runs, or null when a key may start one.
+type BusyHolderRef = RefObject<object | null>;
 
 type InputRefMap = Partial<Record<CardFieldName, HTMLInputElement | null>>;
 
@@ -234,6 +240,7 @@ interface KeyInputs {
     model: CardUpdateModel;
     isBusy: boolean;
     runRequest: RequestRunner;
+    AbandonEntryFetch: () => void;
 }
 
 interface KeyHandlers {
@@ -407,9 +414,13 @@ function ApplyScreenResponse(screen: CardScreen, setters: ScreenSetters): void {
     setters.setFeedback(BuildFeedback(screen, { isError: false, state: screen.state }));
 }
 
-// Only an axios error is a legacy outcome; anything else is a defect and propagates. A 500, a
-// network failure or a non-legacy body keeps the screen and shows the abend text.
+// An abandoned read (axios's CanceledError) is no legacy outcome and is discarded silently. Only an
+// axios error is a legacy outcome; anything else is a defect and propagates. A 500, a network
+// failure or a non-legacy body keeps the screen and shows the abend text.
 function ApplyErrorResponse(error: unknown, setters: ScreenSetters): void {
+    if (IsCancelledRequest(error)) {
+        return;
+    }
     if (!axios.isAxiosError(error)) {
         throw error;
     }
@@ -498,42 +509,62 @@ function useScreenStore(entry: EntryKeys): ScreenStore {
     return { model, feedback, isBusy, setters };
 }
 
+// A request frees the screen only while it still holds it, so an abandoned read never frees the
+// screen for a request that started after it.
+function ReleaseBusyHolder(busyRef: BusyHolderRef, holder: object, setters: ScreenSetters): void {
+    if (busyRef.current !== holder) {
+        return;
+    }
+    busyRef.current = null;
+    setters.setIsBusy(false);
+}
+
 // One request at a time, as one CICS task per key press: a key pressed while a request is in
-// flight is ignored, so no request ever carries a screen_token the server has moved past.
+// flight is ignored, so no request ever carries a screen_token the server has moved past. A request
+// frees the screen when it ends; an abandoned read frees it at once, so the fetch React's
+// development remount starts next is not ignored.
 function useRequestRunner(setters: ScreenSetters): RequestRunner {
-    const isBusyRef = useRef(false);
+    const busyHolderRef = useRef<object | null>(null);
     return useCallback(
-        (request: CardRequest) => {
-            if (isBusyRef.current) {
+        (request: CardRequest, signal?: AbortSignal) => {
+            if (busyHolderRef.current !== null) {
                 return;
             }
-            isBusyRef.current = true;
+            const holder = {};
+            busyHolderRef.current = holder;
             setters.setIsBusy(true);
-            void RunCardRequest(request, setters).finally(() => {
-                isBusyRef.current = false;
-                setters.setIsBusy(false);
-            });
+            const release = () => ReleaseBusyHolder(busyHolderRef, holder, setters);
+            signal?.addEventListener("abort", release, { once: true });
+            void RunCardRequest(request, setters).finally(release);
         },
         [setters],
     );
 }
 
 // Lines 482-497: a card list selection fetches the card at once. Entry from the menu shows the
-// empty key screen and calls nothing. The ref keeps React's development remount from fetching
-// twice.
-function useEntryFetch(entry: EntryKeys, runRequest: RequestRunner, setters: ScreenSetters): void {
-    const hasEnteredRef = useRef(false);
+// empty key screen and calls nothing. The fetch is a read with its own AbortController: leaving
+// the page abandons it, and React's development remount abandons the first fetch and fetches
+// again. A pending message is taken once, so the remount finds none. The answer abandons the
+// fetch on F3, as the page stays mounted until the next route has loaded.
+function useEntryFetch(
+    entry: EntryKeys,
+    runRequest: RequestRunner,
+    setters: ScreenSetters,
+): () => void {
+    const entryFetchControllerRef = useRef<AbortController | null>(null);
     useEffect(() => {
-        if (hasEnteredRef.current) {
-            return;
-        }
-        hasEnteredRef.current = true;
         ShowPendingMessage(setters);
         const { cardRef, acctId } = entry;
-        if (cardRef !== null) {
-            runRequest(() => FetchCardForEdit(cardRef, acctId));
+        if (cardRef === null) {
+            return undefined;
         }
+        const entryFetchController = new AbortController();
+        entryFetchControllerRef.current = entryFetchController;
+        const { signal } = entryFetchController;
+        runRequest(() => FetchCardForEdit(cardRef, acctId, { signal }), signal);
+        return () => entryFetchController.abort();
     }, [entry, runRequest, setters]);
+    return useCallback(() => entryFetchControllerRef.current?.abort(), []);
 }
 
 // Every response moves the cursor, a repeated cursor field included, so the effect follows the
@@ -544,15 +575,19 @@ function useCursorFocus(feedback: ScreenFeedbackView, inputRefs: RefObject<Input
     }, [feedback, inputRefs]);
 }
 
-// PF3 returns to the main menu, whether the menu or the card list opened the page.
+// PF3 returns to the main menu, whether the menu or the card list opened the page. It abandons
+// an entry fetch still in flight; a write in flight is never abandoned.
 function useScreenFunctionKeys(inputs: KeyInputs): readonly FunctionKeyDefinition[] {
     const router = useRouter();
-    const { model, isBusy, runRequest } = inputs;
+    const { model, isBusy, runRequest, AbandonEntryFetch } = inputs;
     const onAction = useCallback(
         (action: UpdateAction) => HandleAction(action, { model, runRequest }),
         [model, runRequest],
     );
-    const onExit = useCallback(() => router.push(MENU_ROUTE), [router]);
+    const onExit = useCallback(() => {
+        AbandonEntryFetch();
+        router.push(MENU_ROUTE);
+    }, [AbandonEntryFetch, router]);
     return useMemo(
         () => BuildFunctionKeys({ onAction, onExit }, isBusy),
         [onAction, onExit, isBusy],
@@ -591,9 +626,14 @@ function useCardUpdateScreen(): CardUpdateScreenModel {
     const store = useScreenStore(entry);
     const runRequest = useRequestRunner(store.setters);
     const registry = useInputRegistry();
-    useEntryFetch(entry, runRequest, store.setters);
+    const abandonEntryFetch = useEntryFetch(entry, runRequest, store.setters);
     useCursorFocus(store.feedback, registry.inputRefs);
-    const keys = useScreenFunctionKeys({ model: store.model, isBusy: store.isBusy, runRequest });
+    const keys = useScreenFunctionKeys({
+        model: store.model,
+        isBusy: store.isBusy,
+        runRequest,
+        AbandonEntryFetch: abandonEntryFetch,
+    });
     useFunctionKeys(keys);
     const view = useFieldView(store, registry.registerInput);
     return { view, keys, isBusy: store.isBusy, feedback: store.feedback };

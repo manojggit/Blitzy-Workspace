@@ -30,10 +30,14 @@ export const API_V1_URL = API_BASE_URL + API_V1_PATH;
 export const REQUEST_TIMEOUT_MILLISECONDS = 60000;
 
 // The session cookie travels on every call; no token, role or credential is held client-side, and
-// the browser supplies the Origin header that the backend OriginGuard checks. A caller abandons a
-// call through axios's per-call signal (an AbortController). A timed-out or cancelled call
+// the browser supplies the Origin header that the backend OriginGuard checks. A timed-out call
 // rejects with an axios error without a response, which the interceptor rejects unchanged and
-// ToScreenFeedback shows as the abend text, as it does a network failure.
+// ToScreenFeedback shows as the abend text, as it does a network failure. A read takes an
+// optional signal through ReadOptions; aborting it rejects the call with axios's CanceledError,
+// also without a response, which the interceptor rejects unchanged with no 401 or 403 action. The
+// read's owner detects it with IsCancelledRequest and discards it silently instead of showing the
+// abend text. Aborting only stops the browser waiting, never proof that the server stopped, so a
+// write is never given a signal.
 export const API_CLIENT = axios.create({
     baseURL: API_V1_URL,
     withCredentials: true,
@@ -106,6 +110,12 @@ export interface LegacyErrorResponse extends ScreenFeedback {
 
 export interface MessageResponse {
     message: string;
+}
+
+// The per-call options of a read. signal is the AbortSignal of the AbortController that owns the
+// read, aborted when that owner is disposed or superseded.
+export interface ReadOptions {
+    signal?: AbortSignal;
 }
 
 // The paging position of the CCLI, CT00 and CU00 lists (common.PageState). Every key has a
@@ -399,6 +409,13 @@ function FeedbackFromBody(body: LegacyErrorResponse): CompleteScreenFeedback {
         field_errors: body.field_errors ?? [],
         cursor_field: body.cursor_field === undefined ? "" : body.cursor_field,
     };
+}
+
+// True only for a call abandoned through its signal (axios's CanceledError); a timeout, a network
+// failure and an error response are not cancellations. The owner of an abandoned read discards it
+// before ToScreenFeedback, which would show it as the abend text.
+export function IsCancelledRequest(error: unknown): boolean {
+    return axios.isCancel(error);
 }
 
 // The legacy feedback of a failed call. A 500, a network failure or a non-legacy body shows the

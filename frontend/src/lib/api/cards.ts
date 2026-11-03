@@ -16,6 +16,7 @@ import {
     EncodePathKey,
     type Direction,
     type PageState,
+    type ReadOptions,
     type ScreenFeedback,
     type UpdateAction,
     type UpdateScreenState,
@@ -127,11 +128,17 @@ function CardPath(cardNum: string): string {
     return `${CARDS_PATH}/${EncodePathKey(cardNum)}`;
 }
 
-// CCLI (COCRDLIC): ENTER, F7 and F8 on the card list.
-export async function ListCards(query: CardListQuery): Promise<CardListResponse> {
+// CCLI (COCRDLIC): ENTER, F7 and F8 on the card list. options carries the owning read's
+// AbortSignal, as it does on every read below; the selection and the update are writes and take
+// none.
+export async function ListCards(
+    query: CardListQuery,
+    options?: ReadOptions,
+): Promise<CardListResponse> {
     const response = await API_CLIENT.get<CardListResponse>(CARDS_PATH, {
         params: query,
         paramsSerializer: REPEATED_PARAMS_SERIALIZER,
+        signal: options?.signal,
     });
     return response.data;
 }
@@ -143,17 +150,31 @@ export async function SelectCards(request: CardSelectionRequest): Promise<CardSe
 }
 
 // CCDL (COCRDSLC): ENTER on the card view, or the entry from a list selection.
-export async function ViewCard(cardNum: string, acctId: string): Promise<CardDetailResponse> {
+export async function ViewCard(
+    cardNum: string,
+    acctId: string,
+    options?: ReadOptions,
+): Promise<CardDetailResponse> {
     const params: CardKeyQuery = { acctId };
-    const response = await API_CLIENT.get<CardDetailResponse>(CardPath(cardNum), { params });
+    const response = await API_CLIENT.get<CardDetailResponse>(CardPath(cardNum), {
+        params,
+        signal: options?.signal,
+    });
     return response.data;
 }
 
 // CCUP (COCRDUPC): the entry from a list selection, fetching the card into the update screen.
-export async function FetchCardForEdit(cardNum: string, acctId: string): Promise<CardScreen> {
+export async function FetchCardForEdit(
+    cardNum: string,
+    acctId: string,
+    options?: ReadOptions,
+): Promise<CardScreen> {
     const params: CardKeyQuery = { acctId };
     const editPath = CardPath(cardNum) + EDIT_SUFFIX;
-    const response = await API_CLIENT.get<CardScreen>(editPath, { params });
+    const response = await API_CLIENT.get<CardScreen>(editPath, {
+        params,
+        signal: options?.signal,
+    });
     return response.data;
 }
 

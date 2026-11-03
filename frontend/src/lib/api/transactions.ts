@@ -17,6 +17,7 @@ import {
     type Direction,
     type MoneyAmount,
     type PageState,
+    type ReadOptions,
 } from "@/lib/apiClient";
 
 const TRANSACTIONS_PATH = "/transactions";
@@ -126,12 +127,16 @@ export interface TransactionAddResponse {
     tran_id?: string | null;
 }
 
-// CT00 (COTRN00C): the first entry, a search, F7 and F8 on the transaction list.
+// CT00 (COTRN00C): the first entry, a search, F7 and F8 on the transaction list. options carries
+// the owning read's AbortSignal, as on ViewTransaction; the selection and the add are writes and
+// take none.
 export async function ListTransactions(
     query: TransactionListQuery,
+    options?: ReadOptions,
 ): Promise<TransactionListResponse> {
     const response = await API_CLIENT.get<TransactionListResponse>(TRANSACTIONS_PATH, {
         params: query,
+        signal: options?.signal,
     });
     return response.data;
 }
@@ -145,9 +150,14 @@ export async function SelectTransactions(
 }
 
 // CT01 (COTRN01C): ENTER on the view screen, or the arrival from a CT00 S selection.
-export async function ViewTransaction(tranId: string): Promise<TransactionDetailResponse> {
+export async function ViewTransaction(
+    tranId: string,
+    options?: ReadOptions,
+): Promise<TransactionDetailResponse> {
     const path = `${TRANSACTIONS_PATH}/${EncodePathKey(tranId)}`;
-    const response = await API_CLIENT.get<TransactionDetailResponse>(path);
+    const response = await API_CLIENT.get<TransactionDetailResponse>(path, {
+        signal: options?.signal,
+    });
     return response.data;
 }
 

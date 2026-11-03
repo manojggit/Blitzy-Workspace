@@ -11,6 +11,7 @@ import {
     API_CLIENT,
     EncodePathKey,
     type MoneyAmount,
+    type ReadOptions,
     type ScreenFeedback,
     type UpdateAction,
     type UpdateScreenState,
@@ -124,16 +125,25 @@ function AccountPath(acctId: string): string {
     return `${ACCOUNTS_PATH}/${EncodePathKey(acctId)}`;
 }
 
-// CAVW (COACTVWC): ENTER on the account view.
-export async function ViewAccount(acctId: string): Promise<AccountViewResponse> {
-    const response = await API_CLIENT.get<AccountViewResponse>(AccountPath(acctId));
+// CAVW (COACTVWC): ENTER on the account view. options carries the owning read's AbortSignal, as
+// it does on every read below; the update is a write and takes none.
+export async function ViewAccount(
+    acctId: string,
+    options?: ReadOptions,
+): Promise<AccountViewResponse> {
+    const response = await API_CLIENT.get<AccountViewResponse>(AccountPath(acctId), {
+        signal: options?.signal,
+    });
     return response.data;
 }
 
 // CAUP (COACTUPC): ENTER with an account number, fetching it into the update screen.
-export async function FetchAccountForEdit(acctId: string): Promise<AccountScreen> {
+export async function FetchAccountForEdit(
+    acctId: string,
+    options?: ReadOptions,
+): Promise<AccountScreen> {
     const editPath = AccountPath(acctId) + EDIT_SUFFIX;
-    const response = await API_CLIENT.get<AccountScreen>(editPath);
+    const response = await API_CLIENT.get<AccountScreen>(editPath, { signal: options?.signal });
     return response.data;
 }
 

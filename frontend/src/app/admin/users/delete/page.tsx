@@ -28,6 +28,7 @@ import {
 import { ScreenShell } from "@/components/ScreenShell";
 import {
     ADMIN_HOME_ROUTE,
+    IsCancelledRequest,
     SIGN_ON_ROUTE,
     SeverityForOutcome,
     TakePendingMessage,
@@ -67,6 +68,10 @@ type FieldRefs = Readonly<Record<UserDeleteFieldName, RefObject<HTMLInputElement
 
 type AppRouter = ReturnType<typeof useRouter>;
 
+// The controller of the fetch in flight, null once it settles. A newer fetch and the screen's
+// unmount abort it; the delete is a write and never takes a signal.
+type FetchControllerRef = RefObject<AbortController | null>;
+
 interface FieldDefinition {
     name: UserDeleteFieldName;
     label: string;
@@ -83,12 +88,14 @@ interface FeedbackState {
     cursorField: string | null;
 }
 
-// The setters and router the fetch, delete and clear operations update the screen through.
+// The setters and router the fetch, delete and clear operations update the screen through, and
+// the fetch that owns the screen.
 interface DeleteScreenContext {
     setValues: Dispatch<SetStateAction<UserDeleteValues>>;
     setFeedback: Dispatch<SetStateAction<FeedbackState>>;
     setIsBusy: Dispatch<SetStateAction<boolean>>;
     router: AppRouter;
+    fetchControllerRef: FetchControllerRef;
 }
 
 interface DeleteScreenState extends DeleteScreenContext {
@@ -233,12 +240,16 @@ function ShowCallError(context: DeleteScreenContext, error: unknown): void {
 }
 
 // Every key press starts with a blank message line, as MAIN-PARA moves SPACES to ERRMSGO.
+function BeginScreenCall(context: DeleteScreenContext): void {
+    context.setFeedback(EMPTY_FEEDBACK);
+    context.setIsBusy(true);
+}
+
 async function RunScreenCall(
     context: DeleteScreenContext,
     operation: () => Promise<void>,
 ): Promise<void> {
-    context.setFeedback(EMPTY_FEEDBACK);
-    context.setIsBusy(true);
+    BeginScreenCall(context);
     try {
         await operation();
     } catch (error) {
@@ -259,13 +270,53 @@ function ShowFetchedUser(context: DeleteScreenContext, response: UserDetailRespo
     context.setFeedback(OutcomeFeedback(response.message ?? "", PROMPT_OUTCOME, USER_ID_FIELD));
 }
 
+// A newer fetch aborts the one in flight, so only the newest read changes the screen.
+function TakeOverFetch(context: DeleteScreenContext): AbortController {
+    context.fetchControllerRef.current?.abort();
+    const controller = new AbortController();
+    context.fetchControllerRef.current = controller;
+    return controller;
+}
+
+// Only the fetch still owning the screen ends the busy state, never one a newer fetch replaced.
+function ReleaseFetch(context: DeleteScreenContext, controller: AbortController): void {
+    if (context.fetchControllerRef.current !== controller) {
+        return;
+    }
+    context.fetchControllerRef.current = null;
+    context.setIsBusy(false);
+}
+
+// An aborted read rejects with axios's CanceledError. It is not a server outcome, so it is
+// dropped before ShowCallError would show it as the abend text, and the fields stay as they are.
+async function ReadForDelete(
+    context: DeleteScreenContext,
+    userIdText: string,
+    signal: AbortSignal,
+): Promise<void> {
+    try {
+        const response = await FetchUser(userIdText || BLANK_USER_ID, UserFetchScreen.DELETE, {
+            signal,
+        });
+        ShowFetchedUser(context, response);
+    } catch (error) {
+        if (IsCancelledRequest(error)) {
+            return;
+        }
+        ShowCallError(context, error);
+    }
+}
+
 // PROCESS-ENTER-KEY: the protected fields are blanked before USRSEC is read.
 async function FetchForDelete(context: DeleteScreenContext, userIdText: string): Promise<void> {
+    const controller = TakeOverFetch(context);
     context.setValues((current) => ({ ...EMPTY_VALUES, user_id: current.user_id }));
-    await RunScreenCall(context, async () => {
-        const response = await FetchUser(userIdText || BLANK_USER_ID, UserFetchScreen.DELETE);
-        ShowFetchedUser(context, response);
-    });
+    BeginScreenCall(context);
+    try {
+        await ReadForDelete(context, userIdText, controller.signal);
+    } finally {
+        ReleaseFetch(context, controller);
+    }
 }
 
 // DELETE-USER-INFO: success clears every field (INITIALIZE-ALL-FIELDS); a refusal keeps them.
@@ -290,6 +341,20 @@ function ShowPendingMessage(context: DeleteScreenContext): void {
     if (pendingMessage !== "") {
         context.setFeedback(OutcomeFeedback(pendingMessage, ERROR_OUTCOME, USER_ID_FIELD));
     }
+}
+
+// Reads the controller at unmount time, so it aborts the fetch in flight then, if any, and
+// reopens the first-entry guard for a remount.
+function AbortPendingFetch(
+    fetchControllerRef: FetchControllerRef,
+    hasEnteredRef: RefObject<boolean>,
+): void {
+    const pendingFetch = fetchControllerRef.current;
+    if (pendingFetch === null) {
+        return;
+    }
+    pendingFetch.abort();
+    hasEnteredRef.current = false;
 }
 
 function BuildFunctionKeys(actions: UserDeleteActions, isBusy: boolean): FunctionKeyDefinition[] {
@@ -328,19 +393,20 @@ function useDeleteScreenState(selectedUserId: string): DeleteScreenState {
     const [feedback, setFeedback] = useState<FeedbackState>(EMPTY_FEEDBACK);
     const [isBusy, setIsBusy] = useState(false);
     const fieldRefs = useFieldRefs();
+    const fetchControllerRef = useRef<AbortController | null>(null);
     const router = useRouter();
     const onUserIdChange = useCallback((userIdText: string) => {
         setValues((current) => ({ ...current, user_id: userIdText }));
     }, []);
     const screenState = { values, setValues, feedback, setFeedback, isBusy, setIsBusy, router };
-    return { ...screenState, fieldRefs, onUserIdChange };
+    return { ...screenState, fieldRefs, fetchControllerRef, onUserIdChange };
 }
 
 function useDeleteScreenContext(state: DeleteScreenState): DeleteScreenContext {
-    const { setValues, setFeedback, setIsBusy, router } = state;
+    const { setValues, setFeedback, setIsBusy, router, fetchControllerRef } = state;
     return useMemo(
-        () => ({ setValues, setFeedback, setIsBusy, router }),
-        [setValues, setFeedback, setIsBusy, router],
+        () => ({ setValues, setFeedback, setIsBusy, router, fetchControllerRef }),
+        [setValues, setFeedback, setIsBusy, router, fetchControllerRef],
     );
 }
 
@@ -362,8 +428,19 @@ function useUserDeleteActions(
     );
 }
 
-// First entry (CDEMO-PGM-REENTER off): the user COUSR00C selected is fetched once, React Strict
-// Mode's repeated effect included.
+// Leaving the screen aborts the fetch in flight. React Strict Mode's rehearsal unmount aborts the
+// first-entry fetch that way, so the entry guard is reopened and the remount fetches again.
+function useAbortFetchOnUnmount(
+    fetchControllerRef: FetchControllerRef,
+    hasEnteredRef: RefObject<boolean>,
+): void {
+    useEffect(() => {
+        return () => AbortPendingFetch(fetchControllerRef, hasEnteredRef);
+    }, [fetchControllerRef, hasEnteredRef]);
+}
+
+// First entry (CDEMO-PGM-REENTER off): the user COUSR00C selected is fetched once, unless an
+// unmount aborts that fetch before it answers.
 function usePrefetchSelectedUser(selectedUserId: string, context: DeleteScreenContext): void {
     const hasEnteredRef = useRef(false);
     useEffect(() => {
@@ -377,6 +454,7 @@ function usePrefetchSelectedUser(selectedUserId: string, context: DeleteScreenCo
         }
         void FetchForDelete(context, selectedUserId);
     }, [selectedUserId, context]);
+    useAbortFetchOnUnmount(context.fetchControllerRef, hasEnteredRef);
 }
 
 // MOVE -1 TO <field>L: each new feedback puts the cursor on the field the server named.
@@ -497,8 +575,9 @@ function UserDeleteScreen(props: UserDeleteScreenProps) {
 }
 
 // Each arrival with another selected user is a fresh COUSR03C first entry, as every XCTL is, so
-// the screen state starts over whenever the userId query parameter changes. An answer still in
-// flight for the previous user lands on the discarded screen and never reaches the new one.
+// the screen state starts over whenever the userId query parameter changes. The discarded
+// screen's unmount aborts a fetch still in flight for the previous user, so its answer never
+// reaches the new one.
 function UserDeleteEntry() {
     const searchParams = useSearchParams();
     const selectedUserId = searchParams.get(USER_ID_QUERY_KEY) ?? "";

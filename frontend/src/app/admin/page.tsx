@@ -14,6 +14,7 @@ import { Logout } from "@/lib/api/auth";
 import { FetchAdminMenu, SelectAdminMenuOption, type MenuOption } from "@/lib/api/menu";
 import {
     ABEND_MESSAGE,
+    IsCancelledRequest,
     SIGN_ON_ROUTE,
     SeverityForOutcome,
     StorePendingMessage,
@@ -159,12 +160,19 @@ function PendingMessageOf(pendingMessage: string): ScreenMessage {
 }
 
 // SEND-MENU-SCREEN after BUILD-MENU-OPTIONS: every COADM02Y option with the carried-over message,
-// or the failure's message in its place, as the screen has one ERRMSG line.
-async function ReadAdminMenu(pendingMessage: ScreenMessage): Promise<MenuLoadResult> {
+// or the failure's message in its place, as the screen has one ERRMSG line. A read aborted through
+// its signal gives null and is discarded silently.
+async function ReadAdminMenu(
+    pendingMessage: ScreenMessage,
+    signal: AbortSignal,
+): Promise<MenuLoadResult | null> {
     try {
-        const response = await FetchAdminMenu();
+        const response = await FetchAdminMenu({ signal });
         return { menuOptions: response.options, loadMessage: pendingMessage };
     } catch (error) {
+        if (IsCancelledRequest(error)) {
+            return null;
+        }
         return { menuOptions: [], loadMessage: ErrorMessageOf(error) };
     }
 }
@@ -285,22 +293,22 @@ function useOptionEntry(screenMessage: ScreenMessage): OptionEntryFieldProps {
 
 // The options and the message line arrive together, as one SEND-MENU-SCREEN paints both. The
 // pending message is taken once and kept in a ref, so a StrictMode re-run of the effect still
-// shows it.
+// shows it. Cleaning up the effect aborts its read, so the GET stops and its answer is never shown.
 function useMenuLoad(showMessage: (screenMessage: ScreenMessage) => void): MenuLoadState {
     const [loadState, setLoadState] = useState<MenuLoadState>(LOADING_MENU);
     const pendingMessageRef = useRef<string | null>(null);
     useEffect(() => {
-        let isCurrent = true;
+        const controller = new AbortController();
         pendingMessageRef.current ??= TakePendingMessage();
         const pendingMessage = PendingMessageOf(pendingMessageRef.current);
-        void ReadAdminMenu(pendingMessage).then(({ menuOptions, loadMessage }) => {
-            if (isCurrent) {
-                setLoadState({ menuOptions, isLoading: false });
-                showMessage(loadMessage);
+        void ReadAdminMenu(pendingMessage, controller.signal).then((loadResult) => {
+            if (loadResult !== null && !controller.signal.aborted) {
+                setLoadState({ menuOptions: loadResult.menuOptions, isLoading: false });
+                showMessage(loadResult.loadMessage);
             }
         });
         return () => {
-            isCurrent = false;
+            controller.abort();
         };
     }, [showMessage]);
     return loadState;

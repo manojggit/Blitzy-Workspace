@@ -14,6 +14,7 @@ import { Logout } from "@/lib/api/auth";
 import { FetchMainMenu, SelectMainMenuOption, type MenuOption } from "@/lib/api/menu";
 import {
     ABEND_MESSAGE,
+    IsCancelledRequest,
     SeverityForOutcome,
     SIGN_ON_ROUTE,
     StorePendingMessage,
@@ -109,7 +110,7 @@ interface MenuFeedbackState {
 interface MenuLoad {
     callContext: ScreenCallContext;
     SetOptions: (options: readonly MenuOption[]) => void;
-    IsIgnored: () => boolean;
+    signal: AbortSignal;
 }
 
 interface MenuActionContext {
@@ -240,21 +241,25 @@ function useScreenCall(): ScreenCallState {
     return { isBusy, feedback, inputRef, callContext };
 }
 
-// SEND-MENU-SCREEN's option list. An answer that arrives after the effect is cleaned up is
-// dropped, so no state is set once the screen is gone.
+// SEND-MENU-SCREEN's option list. Cleaning up the effect aborts the read, so its GET stops and
+// nothing it answers is shown; the cancellation is discarded silently, and the busy state and
+// message line belong to the effect's next run, if any.
 async function LoadMenuOptions(load: MenuLoad): Promise<void> {
     try {
-        const response = await FetchMainMenu();
-        if (!load.IsIgnored()) {
+        const response = await FetchMainMenu({ signal: load.signal });
+        if (!load.signal.aborted) {
             load.SetOptions(response.options);
         }
     } catch (error) {
+        if (IsCancelledRequest(error)) {
+            return;
+        }
         const feedback = FeedbackFromError(error);
-        if (!load.IsIgnored()) {
+        if (!load.signal.aborted) {
             load.callContext.ShowFeedback(feedback);
         }
     } finally {
-        if (!load.IsIgnored()) {
+        if (!load.signal.aborted) {
             load.callContext.SetIsBusy(false);
         }
     }
@@ -272,12 +277,12 @@ function ShowPendingMessage(callContext: ScreenCallContext): void {
 function useMenuOptions(callContext: ScreenCallContext): readonly MenuOption[] {
     const [options, setOptions] = useState<readonly MenuOption[]>([]);
     useEffect(() => {
-        let isIgnored = false;
+        const controller = new AbortController();
         ShowPendingMessage(callContext);
         callContext.SetIsBusy(true);
-        void LoadMenuOptions({ callContext, SetOptions: setOptions, IsIgnored: () => isIgnored });
+        void LoadMenuOptions({ callContext, SetOptions: setOptions, signal: controller.signal });
         return () => {
-            isIgnored = true;
+            controller.abort();
         };
     }, [callContext]);
     return options;

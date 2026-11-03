@@ -2,12 +2,18 @@
 // filled from USRSEC before its XCTL to COADM01C for type A or to COMEN01C otherwise).
 import { Stack, Typography } from "@mui/material";
 import { act, render, screen, waitFor, type RenderResult } from "@testing-library/react";
-import { AxiosError, AxiosHeaders, type InternalAxiosRequestConfig } from "axios";
-import { useEffect, type ReactElement } from "react";
+import { AxiosError, AxiosHeaders, CanceledError, type InternalAxiosRequestConfig } from "axios";
+import { StrictMode, useEffect, type ReactElement } from "react";
 
 import { FetchCurrentUser, type CurrentUserResponse } from "@/lib/api/auth";
 import type * as ApiClientModule from "@/lib/apiClient";
-import { ClearHomeRoute, HOME_ROUTE_KEY, SetHomeRoute, SIGN_ON_ROUTE } from "@/lib/apiClient";
+import {
+    ClearHomeRoute,
+    HOME_ROUTE_KEY,
+    SetHomeRoute,
+    SIGN_ON_ROUTE,
+    type ReadOptions,
+} from "@/lib/apiClient";
 import { SessionProvider, useSession, type SessionContextValue } from "@/lib/session";
 
 jest.mock("@/lib/api/auth");
@@ -60,6 +66,21 @@ const NO_USER_SHOWN = "none";
 
 interface SessionConsumerProps {
     onValue?: (value: SessionContextValue) => void;
+}
+
+// One way the /auth/me read in flight is abandoned, and the session and home route it leaves.
+interface AbandonedReadCase {
+    caseName: string;
+    Abandon: (session: SessionContextValue, view: RenderResult) => void;
+    expectedUser: CurrentUserResponse | null;
+    expectedIsLoading: boolean;
+    expectedHomeRoute: string | null;
+}
+
+interface RefreshInFlight {
+    view: RenderResult;
+    session: SessionContextValue;
+    abandonedRefresh: Promise<CurrentUserResponse | null>;
 }
 
 interface MountReadCase {
@@ -117,6 +138,16 @@ function SessionConsumer({ onValue }: SessionConsumerProps): ReactElement {
     );
 }
 
+// A page that re-reads the session from its own mount effect, which React runs before the
+// provider's.
+function RefreshOnMount(): ReactElement {
+    const { RefreshSession } = useSession();
+    useEffect(() => {
+        void RefreshSession();
+    }, [RefreshSession]);
+    return <SessionConsumer />;
+}
+
 function RenderSessionConsumer(onValue?: (value: SessionContextValue) => void): RenderResult {
     return render(
         <SessionProvider>
@@ -165,6 +196,88 @@ async function RenderSignedOnSession(user: CurrentUserResponse): Promise<Session
     await WaitForSessionLoaded();
     return LatestSession();
 }
+
+// A /auth/me read that stays in flight until its signal is aborted, then rejects as axios does.
+function RejectOnAbort(options?: ReadOptions): Promise<CurrentUserResponse> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => {
+            reject(new CanceledError());
+        });
+    });
+}
+
+// A /auth/me read answered as axios answers it: one whose signal is already aborted is cancelled
+// unsent, any other gets the user. abortedAtSend records each call's signal state when sent.
+function AnswerUnlessAborted(
+    user: CurrentUserResponse,
+    abortedAtSend: (boolean | undefined)[],
+): (options?: ReadOptions) => Promise<CurrentUserResponse> {
+    return (options) => {
+        abortedAtSend.push(options?.signal?.aborted);
+        if (options?.signal?.aborted) {
+            return Promise.reject(new CanceledError());
+        }
+        return Promise.resolve(user);
+    };
+}
+
+// The AbortSignal the session gave one FetchCurrentUser call (0 = the first).
+function ReadSignal(callIndex: number): AbortSignal {
+    const signal = fetchCurrentUserMock.mock.calls[callIndex]?.[0]?.signal;
+    if (signal === undefined) {
+        throw new Error(`FetchCurrentUser call ${callIndex} carried no AbortSignal`);
+    }
+    return signal;
+}
+
+// Starts a RefreshSession inside act and returns its result, still pending.
+function StartRefresh(session: SessionContextValue): Promise<CurrentUserResponse | null> {
+    let refresh: Promise<CurrentUserResponse | null> = Promise.resolve(null);
+    act(() => {
+        refresh = session.RefreshSession();
+    });
+    return refresh;
+}
+
+// A signed-on session whose RefreshSession read stays in flight until its signal is aborted.
+async function RenderRefreshInFlight(): Promise<RefreshInFlight> {
+    fetchCurrentUserMock.mockResolvedValueOnce(REGULAR_USER).mockImplementation(RejectOnAbort);
+    const view = RenderSessionConsumer(CaptureSession);
+    await WaitForSessionLoaded();
+    const session = LatestSession();
+    return { view, session, abandonedRefresh: StartRefresh(session) };
+}
+
+// The newer read stays in flight, so it alone owns the loading state and the user shown.
+const ABANDONED_READ_CASES: readonly AbandonedReadCase[] = [
+    {
+        caseName: "a newer RefreshSession",
+        Abandon: (session) => {
+            void session.RefreshSession();
+        },
+        expectedUser: REGULAR_USER,
+        expectedIsLoading: true,
+        expectedHomeRoute: MAIN_MENU_ROUTE,
+    },
+    {
+        caseName: "ClearSession (F3 sign-off)",
+        Abandon: (session) => {
+            session.ClearSession();
+        },
+        expectedUser: null,
+        expectedIsLoading: false,
+        expectedHomeRoute: null,
+    },
+    {
+        caseName: "unmounting the provider",
+        Abandon: (_session, view) => {
+            view.unmount();
+        },
+        expectedUser: REGULAR_USER,
+        expectedIsLoading: true,
+        expectedHomeRoute: MAIN_MENU_ROUTE,
+    },
+];
 
 beforeEach(() => {
     sessionStorage.clear();
@@ -292,6 +405,79 @@ it("stored values never change the server's user type (USRSEC, not the terminal)
     expect(sessionStorage.getItem(HOME_ROUTE_KEY)).toBe(MAIN_MENU_ROUTE);
 });
 
+it.each(ABANDONED_READ_CASES)(
+    "$caseName aborts the /auth/me read in flight, whose cancellation changes nothing",
+    async ({ Abandon, expectedUser, expectedIsLoading, expectedHomeRoute }) => {
+        const { view, session, abandonedRefresh } = await RenderRefreshInFlight();
+        expect(fetchCurrentUserMock).toHaveBeenNthCalledWith(2, {
+            signal: expect.any(AbortSignal),
+        });
+        expect(ReadSignal(1).aborted).toBe(false);
+        act(() => {
+            Abandon(session, view);
+        });
+        expect(ReadSignal(1).aborted).toBe(true);
+        await act(async () => {
+            await expect(abandonedRefresh).resolves.toBeNull();
+        });
+        expect(LatestSession().currentUser).toEqual(expectedUser);
+        expect(LatestSession().isLoading).toBe(expectedIsLoading);
+        expect(setHomeRouteMock).toHaveBeenCalledTimes(1);
+        expect(sessionStorage.getItem(HOME_ROUTE_KEY)).toBe(expectedHomeRoute);
+    },
+);
+
+it("StrictMode's effect re-run reads /auth/me again once the first read is aborted", async () => {
+    fetchCurrentUserMock.mockImplementationOnce(RejectOnAbort).mockResolvedValue(REGULAR_USER);
+    render(
+        <StrictMode>
+            <SessionProvider>
+                <SessionConsumer />
+            </SessionProvider>
+        </StrictMode>,
+    );
+    await WaitForSessionLoaded();
+    expect(fetchCurrentUserMock).toHaveBeenCalledTimes(2);
+    expect(ReadSignal(0).aborted).toBe(true);
+    expect(ReadSignal(1).aborted).toBe(false);
+    expect(ShownValue(USER_ID_TEST_ID)).toBe(TEST_USER_ID);
+    expect(setHomeRouteMock).toHaveBeenCalledTimes(1);
+    expect(setHomeRouteMock).toHaveBeenCalledWith(MAIN_MENU_ROUTE);
+});
+
+it("a RefreshSession begun after the provider is disposed is cancelled unsent", async () => {
+    const abortedAtSend: (boolean | undefined)[] = [];
+    fetchCurrentUserMock.mockImplementation(AnswerUnlessAborted(REGULAR_USER, abortedAtSend));
+    const view = RenderSessionConsumer(CaptureSession);
+    await WaitForSessionLoaded();
+    view.unmount();
+    await act(async () => {
+        await expect(LatestSession().RefreshSession()).resolves.toBeNull();
+    });
+    expect(abortedAtSend).toEqual([false, true]);
+    expect(setHomeRouteMock).toHaveBeenCalledTimes(1);
+    expect(clearHomeRouteMock).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem(HOME_ROUTE_KEY)).toBe(MAIN_MENU_ROUTE);
+});
+
+it("a RefreshSession a page begins in its first mount effect is sent live", async () => {
+    const abortedAtSend: (boolean | undefined)[] = [];
+    fetchCurrentUserMock.mockImplementation(AnswerUnlessAborted(REGULAR_USER, abortedAtSend));
+    render(
+        <SessionProvider>
+            <RefreshOnMount />
+        </SessionProvider>,
+    );
+    await WaitForSessionLoaded();
+    // Both reads are sent live; the provider's own first read, begun after the page's, replaces it.
+    expect(abortedAtSend).toEqual([false, false]);
+    expect(ReadSignal(0).aborted).toBe(true);
+    expect(ReadSignal(1).aborted).toBe(false);
+    expect(ShownValue(USER_ID_TEST_ID)).toBe(TEST_USER_ID);
+    expect(setHomeRouteMock).toHaveBeenCalledTimes(1);
+    expect(setHomeRouteMock).toHaveBeenCalledWith(MAIN_MENU_ROUTE);
+});
+
 it.each(MOUNT_READ_CASES)(
     "mounted on $path reads /auth/me $reads time(s) and ends loading",
     async ({ path, reads, expectedUser }) => {
@@ -320,4 +506,21 @@ it("on the sign-on page RefreshSession after login reads /auth/me once", async (
     expect(ShownValue(USER_ID_TEST_ID)).toBe(TEST_ADMIN_ID);
     expect(ShownValue(LOADING_TEST_ID)).toBe("false");
     expect(setHomeRouteMock).toHaveBeenCalledWith(ADMIN_MENU_ROUTE);
+});
+
+it("on the sign-on page the provider's unsent mount read still aborts a page's read", async () => {
+    window.history.replaceState(null, "", SIGN_ON_ROUTE);
+    const abortedAtSend: (boolean | undefined)[] = [];
+    fetchCurrentUserMock.mockImplementation(AnswerUnlessAborted(REGULAR_USER, abortedAtSend));
+    render(
+        <SessionProvider>
+            <RefreshOnMount />
+        </SessionProvider>,
+    );
+    await WaitForSessionLoaded();
+    // Only the page's read is sent; the provider's read, which asks no server, replaces it.
+    expect(abortedAtSend).toEqual([false]);
+    expect(ReadSignal(0).aborted).toBe(true);
+    expect(ShownValue(USER_ID_TEST_ID)).toBe(NO_USER_SHOWN);
+    expect(setHomeRouteMock).not.toHaveBeenCalled();
 });

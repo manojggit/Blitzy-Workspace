@@ -6,7 +6,7 @@
 // sign-on literal, the 429 lockout literal or the 503 "Unable to verify the User ..." literal
 // rejects the call unchanged, and the apiClient.ts interceptor exempts login and logout from its
 // 401 redirect, so the calling page shows them.
-import { API_CLIENT } from "@/lib/apiClient";
+import { API_CLIENT, type ReadOptions } from "@/lib/apiClient";
 
 // The user's own menu, decided by the server: /admin (COADM01C) for user type exactly A,
 // /menu (COMEN01C) for every other type.
@@ -55,7 +55,10 @@ export async function Logout(): Promise<LogoutResponse> {
     return response.data;
 }
 
-export async function FetchCurrentUser(): Promise<CurrentUserResponse> {
-    const response = await API_CLIENT.get<CurrentUserResponse>("/auth/me");
+// options carries the owning read's AbortSignal; login and logout are writes and take none.
+export async function FetchCurrentUser(options?: ReadOptions): Promise<CurrentUserResponse> {
+    const response = await API_CLIENT.get<CurrentUserResponse>("/auth/me", {
+        signal: options?.signal,
+    });
     return response.data;
 }

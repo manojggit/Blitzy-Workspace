@@ -3,15 +3,24 @@
 // (2000-DECIDE-ACTION, 3250-SETUP-INFOMSG, 3300-SETUP-SCREEN-ATTRS, 3320-UNPROTECT-FEW-ATTRS);
 // the literals of backend/app/services/accounts/coactupc.py, copied verbatim.
 import { ThemeProvider } from "@mui/material/styles";
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+    act,
+    fireEvent,
+    render,
+    screen,
+    waitFor,
+    within,
+    type RenderResult,
+} from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
     AxiosHeaders,
+    CanceledError,
     type AxiosResponse,
     type InternalAxiosRequestConfig,
 } from "axios";
-import type { ReactNode } from "react";
+import { StrictMode, type ReactNode } from "react";
 
 import AccountUpdatePage from "@/app/accounts/update/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
@@ -29,6 +38,7 @@ import {
     UpdateScreenState,
     type LegacyErrorResponse,
     type MessageSeverity,
+    type ReadOptions,
 } from "@/lib/apiClient";
 import type { SessionContextValue } from "@/lib/session";
 
@@ -148,6 +158,8 @@ const MENU_ROUTE = "/menu";
 const BLANK_ACCOUNT_PATH = " ";
 // AAP 0.6.4: COACTUPC's TEST-NUMVAL-C accepts this text, so the page sends it as keyed.
 const KEYED_CREDIT_LIMIT = "$1,234.567";
+// The edit fetch is a read that carries its owner's AbortSignal; the PUT carries none.
+const READ_OPTIONS = { signal: expect.any(AbortSignal) };
 
 // The statuses coactupc.py assigns (app.core.errors).
 const HTTP_OK = 200;
@@ -450,13 +462,23 @@ function QueueUpdateOutcome(status: number, accountScreen: AccountScreen): void 
     mockUpdateAccount.mockRejectedValueOnce(BuildAxiosError(status, BuildErrorBody(accountScreen)));
 }
 
-function RenderScreen(): UserEvent {
-    const user = userEvent.setup();
-    render(
+function PageTree(): ReactNode {
+    return (
         <ThemeProvider theme={CARD_DEMO_THEME}>
             <AccountUpdatePage />
-        </ThemeProvider>,
+        </ThemeProvider>
     );
+}
+
+// Strict Mode, on in development (next.config reactStrictMode), runs every mount effect, its
+// cleanup, then the effect again.
+function RenderPage(isStrictMode = false): RenderResult {
+    return render(isStrictMode ? <StrictMode>{PageTree()}</StrictMode> : PageTree());
+}
+
+function RenderScreen(): UserEvent {
+    const user = userEvent.setup();
+    RenderPage();
     return user;
 }
 
@@ -699,7 +721,7 @@ async function StartsOnEmptyKeyScreen(): Promise<void> {
 
 async function FetchesAccountOfEntryKey(): Promise<void> {
     await RenderInState(UpdateScreenState.SHOW_DETAILS);
-    expect(mockFetchAccountForEdit).toHaveBeenCalledWith(TEST_ACCOUNT_ID);
+    expect(mockFetchAccountForEdit).toHaveBeenCalledWith(TEST_ACCOUNT_ID, READ_OPTIONS);
     expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID);
     const ssnParts = [InputOf("ssn_part_1"), InputOf("ssn_part_2"), InputOf("ssn_part_3")];
     expect(ssnParts.map((input) => input.value)).toEqual(["234", "56", "7890"]);
@@ -871,7 +893,7 @@ async function LeavesFetch401ToInterceptor(): Promise<void> {
     mockFetchAccountForEdit.mockRejectedValueOnce(unauthorized);
     RenderScreen();
     await WaitForIdle();
-    expect(mockFetchAccountForEdit).toHaveBeenCalledWith(TEST_ACCOUNT_ID);
+    expect(mockFetchAccountForEdit).toHaveBeenCalledWith(TEST_ACCOUNT_ID, READ_OPTIONS);
     ExpectSignOnLeftToInterceptor();
 }
 
@@ -882,6 +904,137 @@ async function LeavesUpdate401ToInterceptor(): Promise<void> {
     await PressFunctionKey(user, ENTER_KEY);
     expect(mockUpdateAccount).toHaveBeenCalledTimes(1);
     ExpectSignOnLeftToInterceptor();
+}
+
+// An edit fetch that stays in flight until its signal aborts it, then rejects as axios does.
+function PendingUntilAborted(_acctId: string, options?: ReadOptions): Promise<AccountScreen> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new CanceledError()));
+    });
+}
+
+// Holds the next edit fetch in flight; the returned function answers it with a screen.
+function HoldNextFetch(): (accountScreen: AccountScreen) => Promise<void> {
+    let answer: (accountScreen: AccountScreen) => void = () => undefined;
+    mockFetchAccountForEdit.mockImplementationOnce(
+        () =>
+            new Promise<AccountScreen>((resolve) => {
+                answer = resolve;
+            }),
+    );
+    return async (accountScreen) => {
+        await act(async () => answer(accountScreen));
+    };
+}
+
+// The AbortSignal the page passed with its n-th edit fetch (0-based).
+function FetchSignalOfCall(callIndex: number): AbortSignal {
+    const signal = mockFetchAccountForEdit.mock.calls[callIndex]?.[1]?.signal;
+    if (signal === undefined) {
+        throw new Error(`FetchAccountForEdit call ${callIndex} carried no AbortSignal`);
+    }
+    return signal;
+}
+
+// Lets an aborted fetch's rejection reach the page before the test inspects the outcome.
+async function SettleRejections(): Promise<void> {
+    await act(async () => undefined);
+}
+
+// Leaving the page aborts the entry fetch in flight; its rejection reaches no screen or log.
+async function AbortsEntryFetchOnLeaving(): Promise<void> {
+    const consoleErrorSpy = jest.spyOn(console, "error");
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    mockFetchAccountForEdit.mockImplementation(PendingUntilAborted);
+    const { unmount } = RenderPage();
+    await waitFor(() => expect(mockFetchAccountForEdit).toHaveBeenCalledTimes(1));
+    expect(FetchSignalOfCall(0).aborted).toBe(false);
+    unmount();
+    expect(FetchSignalOfCall(0).aborted).toBe(true);
+    await SettleRejections();
+    expect(mockFetchAccountForEdit).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+    consoleErrorSpy.mockRestore();
+}
+
+// The App Router keeps the page mounted until the menu has loaded, so F3 itself aborts the edit
+// fetch in flight before it navigates. The aborted fetch shows nothing and frees the screen.
+async function AbortsEntryFetchOnExit(method: InputMethod): Promise<void> {
+    const consoleErrorSpy = jest.spyOn(console, "error");
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    mockFetchAccountForEdit.mockImplementation(PendingUntilAborted);
+    const user = RenderScreen();
+    await waitFor(() => expect(mockFetchAccountForEdit).toHaveBeenCalledTimes(1));
+    const pushesBeforeAbort: number[] = [];
+    FetchSignalOfCall(0).addEventListener("abort", () => {
+        pushesBeforeAbort.push(mockRouterPush.mock.calls.length);
+    });
+    await PressFunctionKey(user, EXIT_KEY, method);
+    expect(pushesBeforeAbort).toEqual([0]);
+    expect(mockRouterPush.mock.calls).toEqual([[MENU_ROUTE]]);
+    expect(ShownAlerts()).toEqual([]);
+    expect(mockUpdateAccount).not.toHaveBeenCalled();
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+    consoleErrorSpy.mockRestore();
+}
+
+// A cancelled edit fetch shows nothing and leaves the key screen free for the next ENTER.
+async function IgnoresCancelledEntryFetch(): Promise<void> {
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    mockFetchAccountForEdit.mockRejectedValueOnce(new CanceledError());
+    const user = RenderScreen();
+    await WaitForIdle();
+    expect(mockFetchAccountForEdit).toHaveBeenCalledWith(TEST_ACCOUNT_ID, READ_OPTIONS);
+    expect(ShownAlerts()).toEqual([]);
+    expect(EditableFieldNames()).toEqual(KEY_FIELD_NAMES);
+    await user.type(InputOf("acct_id"), TEST_ACCOUNT_ID);
+    QueueUpdateOutcome(HTTP_OK, BuildAccountScreen(UpdateScreenState.SHOW_DETAILS));
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: "",
+        fields: { acct_id: TEST_ACCOUNT_ID },
+    });
+}
+
+// Development: Strict Mode's simulated unmount aborts the first entry fetch and the repeated
+// effect fetches again; the aborted fetch shows nothing and leaves the busy state to the second.
+async function StrictModeFetchesAgain(): Promise<void> {
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    mockFetchAccountForEdit.mockImplementationOnce(PendingUntilAborted);
+    const answerFetch = HoldNextFetch();
+    RenderPage(true);
+    await waitFor(() => expect(mockFetchAccountForEdit).toHaveBeenCalledTimes(2));
+    await SettleRejections();
+    expect([FetchSignalOfCall(0).aborted, FetchSignalOfCall(1).aborted]).toEqual([true, false]);
+    expect(mockFetchAccountForEdit).toHaveBeenNthCalledWith(2, TEST_ACCOUNT_ID, READ_OPTIONS);
+    expect(screen.getByRole("progressbar")).toBeInTheDocument();
+    expect(ShownAlerts()).toEqual([]);
+    await answerFetch(BuildAccountScreen(UpdateScreenState.SHOW_DETAILS));
+    await WaitForIdle();
+    expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID);
+    expect(ShownAlerts()).toEqual([[INFO_PROMPT_FOR_CHANGES, "info"]]);
+}
+
+// The screen the second Strict Mode fetch shows takes keys: ENTER's PUT carries its screen_token
+// and, being a write, no signal.
+async function StrictModeScreenTakesKeys(): Promise<void> {
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    mockFetchAccountForEdit.mockImplementationOnce(PendingUntilAborted);
+    mockFetchAccountForEdit.mockResolvedValueOnce(
+        BuildAccountScreen(UpdateScreenState.SHOW_DETAILS),
+    );
+    const user = userEvent.setup();
+    RenderPage(true);
+    await waitFor(() => expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID));
+    await WaitForIdle();
+    QueueUpdateOutcome(HTTP_OK, BuildAccountScreen(UpdateScreenState.SHOW_DETAILS));
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: FIRST_SCREEN_TOKEN,
+        fields: PickFields(TEST_FIELDS, DETAIL_FIELD_NAMES),
+    });
 }
 
 beforeEach(() => {
@@ -934,4 +1087,21 @@ describe("COACTUPC /accounts/update outcomes", () => {
     it("COACTUPC flags every failing field and focuses the first", MarksEveryFailingField);
     it("COACTUPC leaves an edit-fetch 401 to the sign-on redirect", LeavesFetch401ToInterceptor);
     it("COACTUPC leaves an update 401 to the sign-on redirect", LeavesUpdate401ToInterceptor);
+});
+
+describe("COACTUPC /accounts/update edit fetch cancellation", () => {
+    it("COACTUPC leaving aborts the ?acctId= edit fetch", AbortsEntryFetchOnLeaving);
+    it.each(INPUT_METHODS)(
+        "COACTUPC F3 by %s aborts the ?acctId= edit fetch before returning to /menu",
+        AbortsEntryFetchOnExit,
+    );
+    it("COACTUPC a cancelled edit fetch shows no message", IgnoresCancelledEntryFetch);
+    it(
+        "COACTUPC Strict Mode aborts the first edit fetch and shows the second",
+        StrictModeFetchesAgain,
+    );
+    it(
+        "COACTUPC Strict Mode's fetched screen sends ENTER with its token",
+        StrictModeScreenTakesKeys,
+    );
 });

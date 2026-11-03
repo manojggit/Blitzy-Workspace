@@ -7,7 +7,7 @@
 // query property is optional exactly where its Pydantic field has a default. A response property
 // is always present, because the server serialises every field of its response model. A 400 edit
 // literal rejects the call unchanged, for the page to show.
-import { API_CLIENT, type MoneyAmount } from "@/lib/apiClient";
+import { API_CLIENT, type MoneyAmount, type ReadOptions } from "@/lib/apiClient";
 
 const REPORT_PATH = "/reports/transactions";
 const EXPORT_PATH = `${REPORT_PATH}/export`;
@@ -82,12 +82,15 @@ export interface TransactionReportResponse {
     lines: ReportLine[];
 }
 
-// CR00 (CORPT00C): ENTER on the report screen.
+// CR00 (CORPT00C): ENTER on the report screen. options carries the owning read's AbortSignal, so
+// an abandoned report stops downloading.
 export async function FetchTransactionReport(
     query: ReportQuery,
+    options?: ReadOptions,
 ): Promise<TransactionReportResponse> {
     const response = await API_CLIENT.get<TransactionReportResponse>(REPORT_PATH, {
         params: query,
+        signal: options?.signal,
     });
     return response.data;
 }

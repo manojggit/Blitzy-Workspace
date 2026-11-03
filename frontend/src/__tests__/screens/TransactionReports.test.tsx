@@ -2,11 +2,12 @@
 // page /reports/transactions.
 import { alertClasses, tableCellClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { PointerEventsCheckLevel, type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
     AxiosHeaders,
+    CanceledError,
     type AxiosResponse,
     type InternalAxiosRequestConfig,
 } from "axios";
@@ -24,7 +25,12 @@ import {
     type ReportQuery,
     type TransactionReportResponse,
 } from "@/lib/api/reports";
-import { SIGN_ON_ROUTE, type LegacyErrorResponse, type MessageSeverity } from "@/lib/apiClient";
+import {
+    SIGN_ON_ROUTE,
+    type LegacyErrorResponse,
+    type MessageSeverity,
+    type ReadOptions,
+} from "@/lib/apiClient";
 import type { SessionContextValue } from "@/lib/session";
 
 const mockRouterPush = jest.fn();
@@ -191,6 +197,8 @@ const MONTHLY_CONFIRMED_QUERY: ReportQuery = {
     reportType: ReportType.MONTHLY,
     confirm: "Y",
 };
+// Every report read carries the AbortSignal of the controller that owns it.
+const READ_SIGNAL_OPTIONS = expect.objectContaining({ signal: expect.any(AbortSignal) });
 
 // A valid Custom range that matches no posted transaction, confirmed with Y.
 const EMPTY_RANGE_DATE_PARTS: DatePartValues = {
@@ -439,6 +447,29 @@ const DOWNLOAD_CASES: readonly (readonly [ExportFormat, string])[] = [
     [ExportFormat.PDF, "Download PDF"],
 ];
 
+// Leaving the screen while a report read runs: F3 aborts the read before it navigates to the
+// menu; an unmount, which every other navigation brings, aborts it with no route of its own. The
+// mocked router does not navigate, so cleanup() stands in for the unmount.
+interface LeaveCase {
+    leaving: string;
+    LeaveScreen: (user: UserEvent) => Promise<void>;
+    routes: readonly string[];
+}
+
+const LEAVE_CASES: readonly LeaveCase[] = [
+    {
+        leaving: "F3 by click",
+        LeaveScreen: (user) => PressScreenKey(user, F3_KEY, "click"),
+        routes: [MENU_ROUTE],
+    },
+    {
+        leaving: "F3 by key",
+        LeaveScreen: (user) => PressScreenKey(user, F3_KEY, "key"),
+        routes: [MENU_ROUTE],
+    },
+    { leaving: "an unmount", LeaveScreen: async () => cleanup(), routes: [] },
+];
+
 // The on-screen page size of the report table and the MUI TablePagination next-page control.
 const REPORT_LINES_PER_PAGE = 50;
 const NEXT_PAGE_BUTTON_NAME = "Go to next page";
@@ -645,6 +676,22 @@ async function SettleOutcome(
     });
 }
 
+// A report read that never answers: like axios, it rejects with CanceledError once its signal is
+// aborted.
+function PendUntilAborted(
+    _query: ReportQuery,
+    options?: ReadOptions,
+): Promise<TransactionReportResponse> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new CanceledError()));
+    });
+}
+
+// The signal the page handed to its first report read.
+function FirstReadSignal(): AbortSignal | undefined {
+    return mockFetchTransactionReport.mock.calls[0]?.[1]?.signal;
+}
+
 // The message line's one alert: its raw text and its MUI severity colour class.
 async function ExpectAlert(text: string, severity: MessageSeverity): Promise<void> {
     const alert = await screen.findByRole("alert");
@@ -816,6 +863,14 @@ function ExpectKeyboardLocked(): void {
     expect(screen.getByRole("button", { name: F3_KEY.buttonName })).toBeEnabled();
 }
 
+// The keyboard unlocked again: every criteria control and ENTER accept input.
+function ExpectKeyboardUnlocked(): void {
+    for (const control of CriteriaControls()) {
+        expect(control).toBeEnabled();
+    }
+    expect(screen.getByRole("button", { name: ENTER_KEY.buttonName })).toBeEnabled();
+}
+
 // Each keyed field is blank or full to its BMS LENGTH, so each edit deletes the last character
 // before typing; an unlocked field would change.
 const LOCKED_EDIT_KEYS = "{Backspace}9";
@@ -890,8 +945,12 @@ it.each(KEY_ENTRIES)(
         expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
         expect(mockFetchTransactionReport).toHaveBeenCalledWith(
             expect.not.objectContaining({ reportType: expect.anything() }),
+            READ_SIGNAL_OPTIONS,
         );
-        expect(mockFetchTransactionReport).toHaveBeenCalledWith(BLANK_TEXT_QUERY);
+        expect(mockFetchTransactionReport).toHaveBeenCalledWith(
+            BLANK_TEXT_QUERY,
+            READ_SIGNAL_OPTIONS,
+        );
     },
 );
 
@@ -906,6 +965,7 @@ it("CORPT00C pressing the chosen report type again clears the selection", async 
     await ExpectAlert(SELECT_REPORT_TYPE_MESSAGE, "error");
     expect(mockFetchTransactionReport).toHaveBeenCalledWith(
         expect.not.objectContaining({ reportType: expect.anything() }),
+        READ_SIGNAL_OPTIONS,
     );
 });
 
@@ -979,13 +1039,13 @@ it.each(LOCKED_CALL_CASES)(
         await TryToEditWhileLocked(confirm);
         await SettleOutcome(pendingReport, outcome);
         expect(screen.queryByRole("alert")?.textContent ?? "").toBe(outcome.literal);
-        for (const control of CriteriaControls()) {
-            expect(control).toBeEnabled();
-        }
-        expect(screen.getByRole("button", { name: ENTER_KEY.buttonName })).toBeEnabled();
+        ExpectKeyboardUnlocked();
         expect(FocusedControl()).toHaveFocus();
         expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
-        expect(mockFetchTransactionReport).toHaveBeenCalledWith({ ...CUSTOM_KEYED_QUERY, confirm });
+        expect(mockFetchTransactionReport).toHaveBeenCalledWith(
+            { ...CUSTOM_KEYED_QUERY, confirm },
+            READ_SIGNAL_OPTIONS,
+        );
     },
 );
 
@@ -1056,7 +1116,10 @@ it("CORPT00C Y shows the CBTRN03C report below the cleared form", async () => {
 
 it("CORPT00C empty confirmed range shows its range and both downloads, no table", async () => {
     await ShowEmptyCustomReport();
-    expect(mockFetchTransactionReport).toHaveBeenCalledWith(EMPTY_RANGE_CONFIRMED_QUERY);
+    expect(mockFetchTransactionReport).toHaveBeenCalledWith(
+        EMPTY_RANGE_CONFIRMED_QUERY,
+        READ_SIGNAL_OPTIONS,
+    );
     expect(
         screen.getByRole("heading", { level: 2, name: EMPTY_RANGE_HEADING }),
     ).toBeInTheDocument();
@@ -1159,4 +1222,36 @@ it("CORPT00C 401 leaves the sign-on redirect to the apiClient interceptor", asyn
     expect(mockRouterPush).not.toHaveBeenCalled();
     expect(mockRouterReplace).not.toHaveBeenCalled();
     expect(SIGN_ON_ROUTE).toBe("/signon");
+});
+
+// The abandoned read's CanceledError shows nothing on the screen still mounted after F3.
+it.each(LEAVE_CASES)(
+    "CORPT00C $leaving during a report read abandons the read without a message",
+    async ({ LeaveScreen, routes }) => {
+        mockFetchTransactionReport.mockImplementation(PendUntilAborted);
+        const user = await RenderScreen();
+        await PressScreenKey(user, ENTER_KEY, "click");
+        await screen.findByRole("progressbar");
+        expect(FirstReadSignal()?.aborted).toBe(false);
+        await LeaveScreen(user);
+        expect(FirstReadSignal()?.aborted).toBe(true);
+        expect(mockRouterPush.mock.calls).toEqual(routes.map((route) => [route]));
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+        expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
+    },
+);
+
+// A cancelled read is discarded before ToScreenFeedback, which would show the abend text: the
+// report shown keeps its message, its date range and its lines, and ENTER is active again.
+it("CORPT00C discards a cancelled report read and keeps the report shown", async () => {
+    const user = await ShowMonthlyReport();
+    mockFetchTransactionReport.mockRejectedValue(new CanceledError());
+    await PressScreenKey(user, ENTER_KEY, "click");
+    await waitFor(() => expect(mockFetchTransactionReport).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByRole("progressbar")).not.toBeInTheDocument());
+    await ExpectAlert(MONTHLY_SUBMITTED_MESSAGE, "success");
+    expect(screen.getByRole("heading", { level: 2, name: DATE_RANGE_HEADING })).toBeInTheDocument();
+    const table = screen.getByRole("table", { name: REPORT_TABLE_LABEL });
+    expect(within(table).getAllByRole("row")).toHaveLength(REPORT_LINES.length + 1);
+    expect(screen.getByRole("button", { name: ENTER_KEY.buttonName })).toBeEnabled();
 });

@@ -28,7 +28,7 @@ import {
 import axios from "axios";
 
 import { FetchCurrentUser, type CurrentUserResponse } from "@/lib/api/auth";
-import { ClearHomeRoute, SetHomeRoute, SIGN_ON_ROUTE } from "@/lib/apiClient";
+import { ClearHomeRoute, IsCancelledRequest, SetHomeRoute, SIGN_ON_ROUTE } from "@/lib/apiClient";
 
 export interface SessionContextValue {
     currentUser: CurrentUserResponse | null;
@@ -46,33 +46,49 @@ interface SessionState {
     isLoading: boolean;
 }
 
-// Only the latest read, while the provider is mounted, may update the context: a slower earlier
-// read, or one overtaken by ClearSession, is ignored, so a sign-off is never undone by an answer
-// still in flight.
+// Every read but the latest is aborted: a newer read aborts the one it replaces, ClearSession
+// aborts the one in flight, so a sign-off is never undone by its answer, and disposing of the
+// provider aborts it too. A read may update the context only if, when it answers, its signal is
+// unaborted and the provider is mounted.
 interface SessionReadTracker {
-    BeginRead: () => () => boolean;
+    BeginRead: () => SessionRead;
     InvalidateReads: () => void;
 }
 
-// Answers one session read; isCurrent reports whether that read is still the latest.
-type CurrentUserLoader = (isCurrent: () => boolean) => Promise<CurrentUserResponse | null>;
+// One session read: the signal its /auth/me call is sent with, and whether its answer may update
+// the context.
+interface SessionRead {
+    signal: AbortSignal;
+    IsCurrent: () => boolean;
+}
+
+// "pending" until the provider's first mount effect, which runs after its children's effects, and
+// "disposed" once a cleanup runs with no re-mount after it (StrictMode re-mounts once).
+type ProviderMountState = "pending" | "mounted" | "disposed";
+
+// Answers one session read begun through the tracker.
+type CurrentUserLoader = (read: SessionRead) => Promise<CurrentUserResponse | null>;
 
 const SESSION_CONTEXT = createContext<SessionContextValue | null>(null);
 const LOADING_SESSION_STATE: SessionState = { currentUser: null, isLoading: true };
 const SIGNED_OUT_SESSION_STATE: SessionState = { currentUser: null, isLoading: false };
 
-// An axios error (a 401 when signed out, another status, or no response) leaves no known user:
-// the apiClient interceptor already sends a 401 to sign-on, and each page's own calls show their
-// legacy feedback. Any other error is a defect and propagates. As in the apiClient home-route
-// lookup, the route is recorded only while the read is still current.
-async function LoadCurrentUser(isCurrent: () => boolean): Promise<CurrentUserResponse | null> {
+// A read the tracker aborted is discarded silently. An axios error (a 401 when signed out, another
+// status, or no response) leaves no known user: the apiClient interceptor already sends a 401 to
+// sign-on, and each page's own calls show their legacy feedback. Any other error is a defect and
+// propagates. As in the apiClient home-route lookup, the route is recorded only while the read is
+// still current.
+async function LoadCurrentUser(read: SessionRead): Promise<CurrentUserResponse | null> {
     try {
-        const user = await FetchCurrentUser();
-        if (isCurrent()) {
+        const user = await FetchCurrentUser({ signal: read.signal });
+        if (read.IsCurrent()) {
             SetHomeRoute(user.next_route);
         }
         return user;
     } catch (error) {
+        if (IsCancelledRequest(error)) {
+            return null;
+        }
         if (axios.isAxiosError(error)) {
             return null;
         }
@@ -80,7 +96,25 @@ async function LoadCurrentUser(isCurrent: () => boolean): Promise<CurrentUserRes
     }
 }
 
-// Before login there is no user to read, so the server is not asked.
+// Aborts the read it replaces. A read begun after the provider is disposed can never be current,
+// so its signal is aborted before it is sent. One begun before the first mount effect, as from a
+// child's own mount effect, is sent and judged when it answers.
+function ReplaceRead(
+    latestReadRef: RefObject<AbortController | null>,
+    mountStateRef: RefObject<ProviderMountState>,
+): SessionRead {
+    latestReadRef.current?.abort();
+    const controller = new AbortController();
+    latestReadRef.current = controller;
+    if (mountStateRef.current === "disposed") {
+        controller.abort();
+    }
+    const { signal } = controller;
+    return { signal, IsCurrent: () => !signal.aborted && mountStateRef.current === "mounted" };
+}
+
+// Before login there is no user to read, so the server is not asked. The read is still begun
+// through the tracker, so it aborts the read it replaces and is itself replaced like any other.
 async function NoUserBeforeLogin(): Promise<null> {
     return null;
 }
@@ -98,53 +132,53 @@ function LoadingUpdate(isLoading: boolean): SetStateAction<SessionState> {
 
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
-function useIsMountedRef(): RefObject<boolean> {
-    const isMountedRef = useRef(false);
+function useMountStateRef(): RefObject<ProviderMountState> {
+    const mountStateRef = useRef<ProviderMountState>("pending");
     useEffect(() => {
-        isMountedRef.current = true;
+        mountStateRef.current = "mounted";
         return () => {
-            isMountedRef.current = false;
+            mountStateRef.current = "disposed";
         };
     }, []);
-    return isMountedRef;
+    return mountStateRef;
 }
 
 function useSessionReadTracker(): SessionReadTracker {
-    const isMountedRef = useIsMountedRef();
-    const latestReadRef = useRef(0);
-    return useMemo(
+    const mountStateRef = useMountStateRef();
+    const latestReadRef = useRef<AbortController | null>(null);
+    const readTracker = useMemo(
         () => ({
-            BeginRead: () => {
-                latestReadRef.current += 1;
-                const readNumber = latestReadRef.current;
-                return () => isMountedRef.current && latestReadRef.current === readNumber;
-            },
+            BeginRead: () => ReplaceRead(latestReadRef, mountStateRef),
             InvalidateReads: () => {
-                latestReadRef.current += 1;
+                latestReadRef.current?.abort();
             },
         }),
-        [isMountedRef],
+        [mountStateRef],
     );
+    // Disposing of the provider aborts the read in flight, as ClearSession does.
+    useEffect(() => readTracker.InvalidateReads, [readTracker]);
+    return readTracker;
 }
 
 // The user stays shown until the answer arrives. A defect ends the loading state, keeps that
-// user, and still rejects to the caller. The mount read starts in the loading state, which the
-// loading flag leaves unchanged, so its state changes only once the loader answers.
+// user, and still rejects to the caller. A read aborted in flight changes nothing and gives null.
+// The mount read starts in the loading state, which the loading flag leaves unchanged, so its
+// state changes only once the loader answers.
 async function ReadSession(
     setSessionState: Dispatch<SetStateAction<SessionState>>,
     readTracker: SessionReadTracker,
     loadUser: CurrentUserLoader,
 ): Promise<CurrentUserResponse | null> {
-    const isCurrent = readTracker.BeginRead();
+    const read = readTracker.BeginRead();
     setSessionState(LoadingUpdate(true));
     try {
-        const user = await loadUser(isCurrent);
-        if (isCurrent()) {
+        const user = await loadUser(read);
+        if (read.IsCurrent()) {
             setSessionState({ currentUser: user, isLoading: false });
         }
         return user;
     } finally {
-        if (isCurrent()) {
+        if (read.IsCurrent()) {
             setSessionState(LoadingUpdate(false));
         }
     }

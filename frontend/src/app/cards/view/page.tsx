@@ -32,6 +32,7 @@ import { MessageLine, type MessageLineProps } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { ViewCard, type CardDetailResponse } from "@/lib/api/cards";
 import {
+    IsCancelledRequest,
     LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
@@ -111,17 +112,32 @@ interface EntryKeys {
     acctId: string;
 }
 
+// signal belongs to the lookup's own AbortController; it is aborted once the lookup is abandoned
+// (F3, leaving the screen, React's development remount or another card list selection), so an
+// aborted signal marks an answer the screen must not show.
 interface LookupRun {
     keys: LookupKeys;
-    IsLatest: () => boolean;
+    signal: AbortSignal;
+    setLookupState: Dispatch<SetStateAction<LookupState>>;
+}
+
+// Holds the AbortController of the lookup in flight, or null when no read is pending.
+type LookupControllerRef = RefObject<AbortController | null>;
+
+interface GuardedLookupRun {
+    keys: LookupKeys;
+    lookupControllerRef: LookupControllerRef;
     setLookupState: Dispatch<SetStateAction<LookupState>>;
 }
 
 type LookupRunner = (keys: LookupKeys) => Promise<void>;
 
+type LookupCanceller = () => void;
+
 interface CardLookup {
     lookupState: LookupState;
     RunLookup: LookupRunner;
+    CancelLookup: LookupCanceller;
 }
 
 // The ACCTSID and CARDSID texts exactly as keyed: no trim, case change or client validation.
@@ -142,6 +158,7 @@ interface ScreenKeyInputs {
     entry: EntryKeys;
     typedKeys: TypedKeys;
     RunLookup: LookupRunner;
+    CancelLookup: LookupCanceller;
     isBusy: boolean;
 }
 
@@ -275,12 +292,19 @@ function FeedbackFromError(error: unknown): CardViewFeedback {
     return ToViewFeedback(screenFeedback, true);
 }
 
-// A failed read clears the details, as the map shows them only for a card that was found.
-async function FetchLookupState(keys: LookupKeys): Promise<LookupState> {
+// A failed read clears the details, as the map shows them only for a card that was found. An
+// abandoned read answers null: it is neither a legacy outcome nor the abend, so nothing is shown.
+async function FetchLookupState(
+    keys: LookupKeys,
+    signal: AbortSignal,
+): Promise<LookupState | null> {
     try {
-        const detail = await ViewCard(keys.cardKey, keys.acctKey);
+        const detail = await ViewCard(keys.cardKey, keys.acctKey, { signal });
         return { detail, feedback: ToViewFeedback(detail, false), isBusy: false };
     } catch (error) {
+        if (IsCancelledRequest(error)) {
+            return null;
+        }
         return { detail: null, feedback: FeedbackFromError(error), isBusy: false };
     }
 }
@@ -300,25 +324,44 @@ function WithPendingMessage(previous: LookupState, message: string): LookupState
     return { ...previous, feedback: { ...EMPTY_FEEDBACK, message, severity } };
 }
 
-// Numbers each lookup, so an answer updates the screen only while its lookup is the latest: a
-// second check, behind useCardLookup's one-at-a-time guard, that no earlier answer overwrites a
-// newer one.
-function BeginLookup(latestLookupRef: RefObject<number>): () => boolean {
-    latestLookupRef.current += 1;
-    const lookupNumber = latestLookupRef.current;
-    return () => lookupNumber === latestLookupRef.current;
+// Each lookup owns an AbortController, held in the ref while its read is in flight. Abandoning
+// the lookup aborts it, so the read stops on the network and its answer never updates the screen.
+function BeginLookup(lookupControllerRef: LookupControllerRef): AbortController {
+    const lookupController = new AbortController();
+    lookupControllerRef.current = lookupController;
+    return lookupController;
 }
 
-async function RunLatestLookup({ keys, IsLatest, setLookupState }: LookupRun): Promise<void> {
+// The aborted-signal check is a second guard, behind the one-at-a-time guard, that no abandoned
+// answer overwrites the screen.
+async function RunLatestLookup({ keys, signal, setLookupState }: LookupRun): Promise<void> {
     setLookupState(StartLookup);
     try {
-        const nextState = await FetchLookupState(keys);
-        if (IsLatest()) {
+        const nextState = await FetchLookupState(keys, signal);
+        if (nextState !== null && !signal.aborted) {
             setLookupState(nextState);
         }
     } finally {
-        if (IsLatest()) {
+        if (!signal.aborted) {
             setLookupState(EndLookup);
+        }
+    }
+}
+
+// One read at a time, as one CICS task per key press: a lookup asked for while another holds the
+// ref is refused at once, before React re-renders the disabled Search key. Only the holder frees
+// the ref, so an abandoned read that settles late never frees the guard of the read after it.
+async function RunGuardedLookup(run: GuardedLookupRun): Promise<void> {
+    const { keys, lookupControllerRef, setLookupState } = run;
+    if (lookupControllerRef.current !== null) {
+        return;
+    }
+    const lookupController = BeginLookup(lookupControllerRef);
+    try {
+        await RunLatestLookup({ keys, signal: lookupController.signal, setLookupState });
+    } finally {
+        if (lookupControllerRef.current === lookupController) {
+            lookupControllerRef.current = null;
         }
     }
 }
@@ -387,24 +430,24 @@ function usePendingMessage(setLookupState: Dispatch<SetStateAction<LookupState>>
     }, [setLookupState]);
 }
 
-// One read at a time, as one CICS task per key press: a lookup asked for while another is in
-// flight is refused at once, before React re-renders the disabled Search key.
+// Leaving the screen abandons the lookup in flight. Cancelling also frees the one-at-a-time guard
+// and ends the busy state, which no aborted lookup ends itself, so the screen never stays busy
+// once its read is abandoned, and the read React's development remount starts is not refused.
 function useCardLookup(): CardLookup {
     const [lookupState, setLookupState] = useState<LookupState>(IDLE_LOOKUP_STATE);
-    const latestLookupRef = useRef(0);
-    const isLookupPendingRef = useRef(false);
-    const runLookup = useCallback((keys: LookupKeys): Promise<void> => {
-        if (isLookupPendingRef.current) {
-            return Promise.resolve();
-        }
-        isLookupPendingRef.current = true;
-        const isLatest = BeginLookup(latestLookupRef);
-        return RunLatestLookup({ keys, IsLatest: isLatest, setLookupState }).finally(() => {
-            isLookupPendingRef.current = false;
-        });
+    const lookupControllerRef = useRef<AbortController | null>(null);
+    const runLookup = useCallback(
+        (keys: LookupKeys) => RunGuardedLookup({ keys, lookupControllerRef, setLookupState }),
+        [],
+    );
+    const cancelLookup = useCallback(() => {
+        lookupControllerRef.current?.abort();
+        lookupControllerRef.current = null;
+        setLookupState(EndLookup);
     }, []);
+    useEffect(() => cancelLookup, [cancelLookup]);
     usePendingMessage(setLookupState);
-    return { lookupState, RunLookup: runLookup };
+    return { lookupState, RunLookup: runLookup, CancelLookup: cancelLookup };
 }
 
 function useTypedKeys(): TypedKeys {
@@ -428,17 +471,21 @@ function useEntryKeys(): EntryKeys {
     };
 }
 
-// From the card list the card is read once on arrival; from the menu the empty map waits for
-// ENTER. The ref keeps React's development double effect run from reading the card twice.
-function useListEntryLookup({ cardRef, acctId }: EntryKeys, runLookup: LookupRunner): void {
-    const hasReadEntryRef = useRef(false);
+// From the card list the card is read on arrival; from the menu the empty map waits for ENTER.
+// Leaving abandons the entry read, so React's development double effect run abandons the first
+// read and reads again, and only the second read's answer is shown.
+function useListEntryLookup(
+    { cardRef, acctId }: EntryKeys,
+    runLookup: LookupRunner,
+    cancelLookup: LookupCanceller,
+): void {
     useEffect(() => {
-        if (hasReadEntryRef.current || cardRef === "") {
-            return;
+        if (cardRef === "") {
+            return undefined;
         }
-        hasReadEntryRef.current = true;
         void runLookup({ cardKey: cardRef, acctKey: acctId });
-    }, [cardRef, acctId, runLookup]);
+        return cancelLookup;
+    }, [cardRef, acctId, runLookup, cancelLookup]);
 }
 
 // Every answer is a new feedback object, so the cursor moves after each response.
@@ -449,17 +496,19 @@ function useCursorFocus(inputRefs: KeyInputRefs, feedback: CardViewFeedback): vo
 }
 
 // A typed card number reaches only the API path ViewCard builds: never a route, URL or storage.
+// F3 abandons the lookup at once, as the screen stays mounted until the next route has loaded.
 function useScreenFunctionKeys(inputs: ScreenKeyInputs): FunctionKeyList {
     const router = useRouter();
-    const { RunLookup, isBusy } = inputs;
+    const { RunLookup, CancelLookup, isBusy } = inputs;
     const { cardRef, acctId } = inputs.entry;
     const { acctText, cardText } = inputs.typedKeys;
     const handleSearch = useCallback(() => {
         void RunLookup(LookupKeysFor({ cardRef, acctId }, { acctText, cardText }));
     }, [RunLookup, cardRef, acctId, acctText, cardText]);
     const handleExit = useCallback(() => {
+        CancelLookup();
         router.push(MENU_ROUTE);
-    }, [router]);
+    }, [CancelLookup, router]);
     return useMemo(
         () => BuildFunctionKeys(handleSearch, handleExit, isBusy),
         [handleSearch, handleExit, isBusy],
@@ -470,11 +519,11 @@ function useCardViewScreen(): CardViewScreenModel {
     const entry = useEntryKeys();
     const typedKeys = useTypedKeys();
     const inputRefs = useKeyInputRefs();
-    const { lookupState, RunLookup } = useCardLookup();
+    const { lookupState, RunLookup, CancelLookup } = useCardLookup();
     const { detail, feedback, isBusy } = lookupState;
-    useListEntryLookup(entry, RunLookup);
+    useListEntryLookup(entry, RunLookup, CancelLookup);
     useCursorFocus(inputRefs, feedback);
-    const keys = useScreenFunctionKeys({ entry, typedKeys, RunLookup, isBusy });
+    const keys = useScreenFunctionKeys({ entry, typedKeys, RunLookup, CancelLookup, isBusy });
     const fields = BuildKeyFields({ entry, typedKeys, detail, inputRefs });
     const isListEntry = entry.cardRef !== "";
     const keyFields = { isListEntry, fieldErrors: feedback.fieldErrors, fields };
@@ -582,7 +631,7 @@ function CardViewScreen() {
 }
 
 // Each arrival with another selection is a fresh COCRDSLC first entry, as every XCTL is, so the
-// screen state, its pending read and its one-read guard start over when the query changes.
+// screen state starts over and its pending read is abandoned when the query changes.
 function CardViewEntry() {
     const { cardRef, acctId } = useEntryKeys();
     return <CardViewScreen key={JSON.stringify([cardRef, acctId])} />;

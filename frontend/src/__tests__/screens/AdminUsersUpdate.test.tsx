@@ -5,18 +5,31 @@
 // backend/app/services/users/cousr02c.py; the user API module is mocked, so every server outcome
 // is a resolved or a rejected call.
 import { ThemeProvider } from "@mui/material/styles";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import {
+    act,
+    fireEvent,
+    render,
+    screen,
+    waitFor,
+    type RenderOptions,
+} from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
     AxiosHeaders,
+    CanceledError,
     type AxiosResponse,
     type InternalAxiosRequestConfig,
 } from "axios";
 
 import AdminUsersUpdatePage from "@/app/admin/users/update/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
-import { SIGN_ON_ROUTE, type LegacyErrorResponse, type MessageSeverity } from "@/lib/apiClient";
+import {
+    SIGN_ON_ROUTE,
+    type LegacyErrorResponse,
+    type MessageSeverity,
+    type ReadOptions,
+} from "@/lib/apiClient";
 import {
     FetchUser,
     UpdateUser,
@@ -78,9 +91,16 @@ const mockUpdateUser = jest.mocked(UpdateUser);
 
 interface ScreenView {
     user: UserEvent;
+    Unmount: () => void;
     // Renders the page again under the current mockSearchParams, as the App Router does on a
     // same-route push or a history step that changes the query.
     Rerender: () => void;
+}
+
+// A fetch left in flight when the screen unmounts: the first-entry read or an ENTER read.
+interface PendingFetchCase {
+    origin: string;
+    StartFetch: () => Promise<ScreenView>;
 }
 
 // A PF key of the COUSR02 legend: its KeyboardEvent.key and its button's accessible name.
@@ -111,6 +131,8 @@ const FETCHED_FIRST_NAME = "Test";
 const FETCHED_LAST_NAME = "User";
 const FETCHED_USER_TYPE = "U";
 const EDITED_LAST_NAME = "van Dyke";
+// The last name the newer of two overlapping fetches answers with.
+const NEWEST_LAST_NAME = "Newest";
 // Built at run time, so no password value is typed into the code (MK_Modernization Rule).
 const NEW_PASSWORD = "pw" + "new1";
 const BLANK_USER_ID = " ";
@@ -168,6 +190,9 @@ const LEGEND_ACTIONS: readonly ScreenAction[] = [
 
 // Every PF action is exercised through its on-screen button and through its physical key.
 const TRIGGER_MODES: readonly TriggerMode[] = ["click", "key"];
+
+// Every fetch carries the signal of the AbortController that owns it; a save never does.
+const SIGNALLED_READ_OPTIONS = expect.objectContaining({ signal: expect.any(AbortSignal) });
 
 // MUI 9 marks an Alert's colour as MuiAlert-color<Severity> (Alert/alertClasses.d.ts).
 const SEVERITY_CLASSES: Readonly<Record<MessageSeverity, string>> = {
@@ -288,6 +313,54 @@ function ArrangeSaveOutcome(literal: string, status: number): void {
     mockUpdateUser.mockRejectedValue(LegacyRejection(literal, status));
 }
 
+// Like axios, a read whose signal is aborted rejects with CanceledError; until then it is pending.
+function ReadUntilAborted(
+    userId: string,
+    fetchScreen: UserFetchScreen,
+    options?: ReadOptions,
+): Promise<UserDetailResponse> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => {
+            reject(new CanceledError());
+        });
+    });
+}
+
+// The next fetch stays pending until the test resolves it through the returned function.
+function DeferNextFetch(): (detail: UserDetailResponse) => void {
+    let resolveFetch: (detail: UserDetailResponse) => void = () => undefined;
+    mockFetchUser.mockImplementationOnce(
+        () =>
+            new Promise((resolve) => {
+                resolveFetch = resolve;
+            }),
+    );
+    return (detail) => resolveFetch(detail);
+}
+
+// The signal the page passed to the given FetchUser call.
+function FetchSignal(callIndex: number): AbortSignal | undefined {
+    return mockFetchUser.mock.calls[callIndex]?.[2]?.signal;
+}
+
+// Some fetch read the User ID exactly as given, through a signal of its own.
+function ExpectFetchOf(userIdText: string): void {
+    expect(mockFetchUser).toHaveBeenCalledWith(
+        userIdText,
+        UserFetchScreen.UPDATE,
+        SIGNALLED_READ_OPTIONS,
+    );
+}
+
+// The latest fetch read the User ID exactly as given, through a signal of its own.
+function ExpectLastFetchOf(userIdText: string): void {
+    expect(mockFetchUser).toHaveBeenLastCalledWith(
+        userIdText,
+        UserFetchScreen.UPDATE,
+        SIGNALLED_READ_OPTIONS,
+    );
+}
+
 function ScreenTree() {
     return (
         <ThemeProvider theme={CARD_DEMO_THEME}>
@@ -296,21 +369,10 @@ function ScreenTree() {
     );
 }
 
-function RenderScreen(): ScreenView {
+function RenderScreen(renderOptions: RenderOptions = {}): ScreenView {
     const user = userEvent.setup();
-    const { rerender } = render(<ScreenTree />);
-    return { user, Rerender: () => rerender(<ScreenTree />) };
-}
-
-// A FetchUser call that stays in flight until the returned function settles it.
-function DeferFetchUser(): (response: UserDetailResponse) => void {
-    let settle: (response: UserDetailResponse) => void = () => undefined;
-    mockFetchUser.mockReturnValueOnce(
-        new Promise<UserDetailResponse>((resolve) => {
-            settle = resolve;
-        }),
-    );
-    return (response) => settle(response);
+    const { rerender, unmount } = render(<ScreenTree />, renderOptions);
+    return { user, Unmount: unmount, Rerender: () => rerender(<ScreenTree />) };
 }
 
 // A same-route push or history step to the given userId query.
@@ -402,6 +464,47 @@ async function ExpectNavigationTo(route: string): Promise<void> {
     await WaitForIdle();
 }
 
+// Opened from COUSR00, with the first-entry fetch still in flight.
+async function StartEntryFetch(): Promise<ScreenView> {
+    mockSearchParams = new URLSearchParams({ userId: TEST_USER_ID });
+    mockFetchUser.mockImplementation(ReadUntilAborted);
+    const view = RenderScreen();
+    await waitFor(() => {
+        expect(mockFetchUser).toHaveBeenCalledTimes(1);
+    });
+    return view;
+}
+
+// Opened from the admin menu, with an ENTER fetch of a typed User ID still in flight.
+async function StartEnterFetch(): Promise<ScreenView> {
+    mockFetchUser.mockImplementation(ReadUntilAborted);
+    const view = RenderScreen();
+    await view.user.type(FieldInput(USER_ID_LABEL), TYPED_USER_ID);
+    await Trigger(view, FETCH_ACTION, "key");
+    expect(mockFetchUser).toHaveBeenCalledTimes(1);
+    return view;
+}
+
+const PENDING_FETCH_CASES: readonly PendingFetchCase[] = [
+    { origin: "first entry from COUSR00C", StartFetch: StartEntryFetch },
+    { origin: "ENTER", StartFetch: StartEnterFetch },
+];
+
+// Two ENTER presses before React re-renders: the second finds Fetch still enabled.
+function PressEnterTwiceBeforeRender(): void {
+    act(() => {
+        fireEvent.keyDown(window, { key: "Enter" });
+        fireEvent.keyDown(window, { key: "Enter" });
+    });
+}
+
+// Runs every continuation already queued, so a discarded answer has had its chance to show.
+async function SettleQueuedWork(): Promise<void> {
+    await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+}
+
 beforeEach(() => {
     mockSearchParams = new URLSearchParams();
     mockFetchUser.mockReset();
@@ -454,7 +557,7 @@ describe("COUSR02C first entry from COUSR00C", () => {
     it("COUSR02C fetches the user COUSR00C selected, once, on first entry", async () => {
         await RenderFromList();
         expect(mockFetchUser).toHaveBeenCalledTimes(1);
-        expect(mockFetchUser).toHaveBeenCalledWith(TEST_USER_ID, UserFetchScreen.UPDATE);
+        ExpectFetchOf(TEST_USER_ID);
         await ExpectAlert(PRESS_PF5_MESSAGE, "info");
     });
 
@@ -474,7 +577,7 @@ describe("COUSR02C same-route push that selects another user", () => {
     it("COUSR02C fetches the newly selected user and PF5 saves that user", async () => {
         const view = await RenderFromList();
         await SwitchToOtherUser(view);
-        expect(mockFetchUser).toHaveBeenLastCalledWith(OTHER_USER_ID, UserFetchScreen.UPDATE);
+        ExpectLastFetchOf(OTHER_USER_ID);
         expect(FieldInput(USER_ID_LABEL)).toHaveValue(OTHER_USER_ID);
         expect(FieldInput(FIRST_NAME_LABEL)).toHaveValue(OTHER_FIRST_NAME);
         mockUpdateUser.mockResolvedValue(BuildSaveResponse(OTHER_UPDATED_MESSAGE));
@@ -488,9 +591,10 @@ describe("COUSR02C same-route push that selects another user", () => {
 describe("COUSR02C late answer for the user selected before a same-route push", () => {
     it("COUSR02C discards the previous user's answer that arrives after the switch", async () => {
         mockSearchParams = new URLSearchParams({ userId: TEST_USER_ID });
-        const settleFirstFetch = DeferFetchUser();
+        const settleFirstFetch = DeferNextFetch();
         const view = RenderScreen();
         await SwitchToOtherUser(view);
+        expect([FetchSignal(0)?.aborted, FetchSignal(1)?.aborted]).toEqual([true, false]);
         await act(async () => {
             settleFirstFetch(BuildUserDetail());
         });
@@ -509,7 +613,7 @@ describe("COUSR02C history step back to the previously selected user", () => {
         await screen.findByDisplayValue(FETCHED_LAST_NAME);
         await WaitForIdle();
         expect(mockFetchUser).toHaveBeenCalledTimes(3);
-        expect(mockFetchUser).toHaveBeenLastCalledWith(TEST_USER_ID, UserFetchScreen.UPDATE);
+        ExpectLastFetchOf(TEST_USER_ID);
         expect(FieldInput(USER_ID_LABEL)).toHaveValue(TEST_USER_ID);
     });
 });
@@ -522,7 +626,7 @@ describe("COUSR02C ENTER (PROCESS-ENTER-KEY)", () => {
         await Trigger(view, FETCH_ACTION, mode);
         await ExpectAlert(PRESS_PF5_MESSAGE, "info");
         expect(mockFetchUser).toHaveBeenCalledTimes(1);
-        expect(mockFetchUser).toHaveBeenCalledWith(TYPED_USER_ID, UserFetchScreen.UPDATE);
+        ExpectFetchOf(TYPED_USER_ID);
         expect(FieldInput(FIRST_NAME_LABEL)).toHaveValue(FETCHED_FIRST_NAME);
         expect(FieldInput(PASSWORD_LABEL)).toHaveValue("");
     });
@@ -532,7 +636,7 @@ describe("COUSR02C ENTER (PROCESS-ENTER-KEY)", () => {
         const view = RenderScreen();
         await Trigger(view, FETCH_ACTION, "key");
         await ExpectAlert(USER_ID_EMPTY_MESSAGE, "error");
-        expect(mockFetchUser).toHaveBeenCalledWith(BLANK_USER_ID, UserFetchScreen.UPDATE);
+        ExpectFetchOf(BLANK_USER_ID);
     });
 });
 
@@ -544,7 +648,7 @@ describe("COUSR02C ENTER on a read that fails", () => {
         await view.user.type(FieldInput(USER_ID_LABEL), TYPED_USER_ID);
         await Trigger(view, FETCH_ACTION, "key");
         await ExpectAlert(USER_NOT_FOUND_MESSAGE, "error");
-        expect(mockFetchUser).toHaveBeenLastCalledWith(TYPED_USER_ID, UserFetchScreen.UPDATE);
+        ExpectLastFetchOf(TYPED_USER_ID);
         expect(FieldInput(USER_ID_LABEL)).toHaveValue(TYPED_USER_ID);
         expect(FieldInput(FIRST_NAME_LABEL)).toHaveValue("");
         expect(FieldInput(LAST_NAME_LABEL)).toHaveValue("");
@@ -709,6 +813,68 @@ describe("COUSR02C field errors and cursor (MOVE -1 TO <field>L)", () => {
         await waitFor(() => {
             expect(FieldInput(FIRST_NAME_LABEL)).toHaveFocus();
         });
+    });
+});
+
+describe("COUSR02C leaving the screen during a fetch", () => {
+    it.each(PENDING_FETCH_CASES)(
+        "COUSR02C unmounted during the $origin fetch aborts it and routes nowhere",
+        async ({ StartFetch }) => {
+            const view = await StartFetch();
+            const signal = FetchSignal(0);
+            expect(signal?.aborted).toBe(false);
+            view.Unmount();
+            expect(signal?.aborted).toBe(true);
+            await expect(mockFetchUser.mock.results[0]?.value).rejects.toBeInstanceOf(
+                CanceledError,
+            );
+            expect(mockRouterPush).not.toHaveBeenCalled();
+            expect(mockRouterReplace).not.toHaveBeenCalled();
+        },
+    );
+});
+
+describe("COUSR02C ENTER superseding a fetch in flight", () => {
+    it("COUSR02C a newer ENTER aborts the earlier fetch; only the newer one answers", async () => {
+        mockFetchUser.mockImplementationOnce(ReadUntilAborted);
+        const resolveNewest = DeferNextFetch();
+        const view = RenderScreen();
+        await view.user.type(FieldInput(USER_ID_LABEL), TEST_USER_ID);
+        PressEnterTwiceBeforeRender();
+        await SettleQueuedWork();
+        expect([FetchSignal(0)?.aborted, FetchSignal(1)?.aborted]).toEqual([true, false]);
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(screen.getByRole("progressbar")).toBeInTheDocument();
+        act(() => resolveNewest(BuildUserDetail({ last_name: NEWEST_LAST_NAME })));
+        await ExpectAlert(PRESS_PF5_MESSAGE, "info");
+        await WaitForIdle();
+        expect(FieldInput(LAST_NAME_LABEL)).toHaveValue(NEWEST_LAST_NAME);
+    });
+});
+
+describe("COUSR02C fetch answered by a cancellation", () => {
+    it("COUSR02C fetch rejected with CanceledError shows no message and ends busy", async () => {
+        mockFetchUser.mockRejectedValue(new CanceledError());
+        const view = RenderScreen();
+        await view.user.type(FieldInput(USER_ID_LABEL), TYPED_USER_ID);
+        await Trigger(view, FETCH_ACTION, "key");
+        await WaitForIdle();
+        expect(mockFetchUser).toHaveBeenCalledTimes(1);
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(screen.getByRole("button", { name: FETCH_ACTION.buttonName })).toBeEnabled();
+    });
+});
+
+describe("COUSR02C first entry under React Strict Mode", () => {
+    it("COUSR02C aborts the rehearsal mount's fetch and shows the remount's answer", async () => {
+        mockSearchParams = new URLSearchParams({ userId: TEST_USER_ID });
+        mockFetchUser.mockImplementationOnce(ReadUntilAborted).mockResolvedValue(BuildUserDetail());
+        RenderScreen({ reactStrictMode: true });
+        await ExpectAlert(PRESS_PF5_MESSAGE, "info");
+        await WaitForIdle();
+        expect(mockFetchUser).toHaveBeenCalledTimes(2);
+        expect([FetchSignal(0)?.aborted, FetchSignal(1)?.aborted]).toEqual([true, false]);
+        expect(FieldInput(LAST_NAME_LABEL)).toHaveValue(FETCHED_LAST_NAME);
     });
 });
 

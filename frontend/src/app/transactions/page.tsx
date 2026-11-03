@@ -36,6 +36,7 @@ import {
 } from "@/lib/api/transactions";
 import {
     Direction,
+    IsCancelledRequest,
     LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
@@ -43,6 +44,7 @@ import {
     type LegacyErrorResponse,
     type MessageSeverity,
     type PageState,
+    type ReadOptions,
 } from "@/lib/apiClient";
 import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
 
@@ -105,7 +107,9 @@ interface ListRefusalBody extends LegacyErrorResponse, PageState {
     search_cleared?: boolean;
 }
 
-type ListRequest = () => Promise<TransactionSelectionResponse>;
+// Every request is offered the signal of the runner's current controller; only the
+// ListTransactions reads forward it, so the ENTER selection is never aborted.
+type ListRequest = (readOptions: ReadOptions) => Promise<TransactionSelectionResponse>;
 
 type ListOutcome =
     | { response: TransactionSelectionResponse }
@@ -124,12 +128,14 @@ type ScreenSetters = Omit<ListUpdaters, "Navigate">;
 interface ListRequestRunner {
     Run: (request: ListRequest) => Promise<void>;
     Invalidate: () => void;
+    AbortRead: () => void;
 }
 
-// The number of the latest request, whether one is in flight, and where its answer goes.
+// The number of the latest request, the AbortController offered to the request in flight (null
+// while none is, so it is also the keyboard lock), and where its answer goes.
 interface RequestRunnerContext {
     latestRequestRef: RefObject<number>;
-    inFlightRef: RefObject<boolean>;
+    readControllerRef: RefObject<AbortController | null>;
     updaters: ListUpdaters;
 }
 
@@ -222,11 +228,19 @@ function RefusalOutcome(error: unknown): ListOutcome {
     };
 }
 
-// Only axios errors are screen outcomes; any other error is a defect and propagates.
-async function SettleRequest(request: ListRequest): Promise<ListOutcome> {
+// A read abandoned through its signal settles as null, so nothing of it is shown; it is checked
+// first because axios's CanceledError is itself an axios error, which ToScreenFeedback would show
+// as the abend text. Only other axios errors are screen outcomes; any other error propagates.
+async function SettleRequest(
+    request: ListRequest,
+    readOptions: ReadOptions,
+): Promise<ListOutcome | null> {
     try {
-        return { response: await request() };
+        return { response: await request(readOptions) };
     } catch (error) {
+        if (IsCancelledRequest(error)) {
+            return null;
+        }
         if (!axios.isAxiosError(error)) {
             throw error;
         }
@@ -236,9 +250,13 @@ async function SettleRequest(request: ListRequest): Promise<ListOutcome> {
 
 // A 200 answer is a route or a list page; a rejected call updates the screen as its body allows.
 // The selection codes are cleared after every answer, so no code carries over onto the rows of
-// another page. The search text is blanked only when the answer reports search_cleared.
-function ApplyOutcome(outcome: ListOutcome, updaters: ListUpdaters): void {
+// another page. The search text is blanked only when the answer reports search_cleared. A
+// cancelled read (null) only unlocks the keyboard, so the keys never stay locked behind it.
+function ApplyOutcome(outcome: ListOutcome | null, updaters: ListUpdaters): void {
     updaters.setIsBusy(false);
+    if (outcome === null) {
+        return;
+    }
     updaters.setSelectionCodes({});
     if ("screenUpdate" in outcome) {
         updaters.setScreen(outcome.screenUpdate);
@@ -300,6 +318,11 @@ function ForwardQuery(pageState: PageState | null): TransactionListQuery {
     };
 }
 
+// F7 and F8 are reads, so they forward the runner's signal and are aborted when replaced.
+function ReadRequestFor(query: TransactionListQuery): ListRequest {
+    return (readOptions) => ListTransactions(query, readOptions);
+}
+
 function BuildListActions(
     input: ListRequestInput,
     runner: ListRequestRunner,
@@ -312,8 +335,8 @@ function BuildListActions(
             runner.Invalidate();
             updaters.Navigate(MENU_ROUTE);
         },
-        HandlePageBackward: () => void runner.Run(() => ListTransactions(BackwardQuery(pageState))),
-        HandlePageForward: () => void runner.Run(() => ListTransactions(ForwardQuery(pageState))),
+        HandlePageBackward: () => void runner.Run(ReadRequestFor(BackwardQuery(pageState))),
+        HandlePageForward: () => void runner.Run(ReadRequestFor(ForwardQuery(pageState))),
     };
 }
 
@@ -362,45 +385,72 @@ function ToSelectionRows(
     }));
 }
 
+// A settled request frees the lock only while it still holds it: a read that unmount already
+// aborted and released settles later, and must not free the lock of the request after it.
+function ReleaseLock(
+    readControllerRef: RefObject<AbortController | null>,
+    readController: AbortController,
+): void {
+    if (readControllerRef.current === readController) {
+        readControllerRef.current = null;
+    }
+}
+
+// Unmount aborts the read in flight and frees the lock at once, so Strict Mode's re-run of the
+// first-page effect reads anew instead of being refused by the read it abandoned.
+function AbortAndRelease(readControllerRef: RefObject<AbortController | null>): void {
+    readControllerRef.current?.abort();
+    readControllerRef.current = null;
+}
+
 // The 3270 keyboard stays locked from a press until the program answers. Here ENTER, F7 and F8
-// are disabled while a request is out, and a second request is refused while one is in flight:
-// the disabled keys take effect a render after the press, so a second press in the same frame
-// is stopped by the flag. The flag clears when the request settles, a rethrown defect included.
-// F3 stays enabled; Invalidate discards the pending answer, so it never replaces the screen or
-// navigates away after the screen has been left.
+// are disabled while a request is out, and a second request is refused while one holds the
+// controller: the disabled keys take effect a render after the press, so a second press in the
+// same frame is stopped by the lock, and no live read is ever superseded. The lock clears when
+// the request settles, a rethrown defect included. Only the latest request's answer is applied,
+// so an answer Invalidate discarded never replaces the screen or navigates away.
 async function RunExclusive(request: ListRequest, runner: RequestRunnerContext): Promise<void> {
-    if (runner.inFlightRef.current) {
+    if (runner.readControllerRef.current !== null) {
         return;
     }
-    runner.inFlightRef.current = true;
+    const readController = new AbortController();
+    runner.readControllerRef.current = readController;
     runner.latestRequestRef.current += 1;
     const requestNumber = runner.latestRequestRef.current;
     runner.updaters.setIsBusy(true);
     try {
-        const outcome = await SettleRequest(request);
+        const outcome = await SettleRequest(request, { signal: readController.signal });
         if (requestNumber === runner.latestRequestRef.current) {
             ApplyOutcome(outcome, runner.updaters);
         }
     } finally {
-        runner.inFlightRef.current = false;
+        ReleaseLock(runner.readControllerRef, readController);
     }
 }
 
 // React recognises hooks only by the camelCase "use" prefix, so every hook name below is a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 
+// F3 (Invalidate) aborts the read in flight and discards any answer still to come; a selection is
+// never aborted, only discarded, and the lock clears when it settles. Unmount (AbortRead) aborts
+// the read in flight and frees the lock, and Strict Mode's re-run of the first-page effect reads
+// anew.
 function useListRequestRunner(updaters: ListUpdaters): ListRequestRunner {
     const latestRequestRef = useRef(0);
-    const inFlightRef = useRef(false);
-    return useMemo<ListRequestRunner>(() => {
-        const runner: RequestRunnerContext = { latestRequestRef, inFlightRef, updaters };
+    const readControllerRef = useRef<AbortController | null>(null);
+    const runner = useMemo<ListRequestRunner>(() => {
+        const context: RequestRunnerContext = { latestRequestRef, readControllerRef, updaters };
         return {
-            Run: (request) => RunExclusive(request, runner),
+            Run: (request) => RunExclusive(request, context),
             Invalidate: () => {
                 latestRequestRef.current += 1;
+                readControllerRef.current?.abort();
             },
+            AbortRead: () => AbortAndRelease(readControllerRef),
         };
     }, [updaters]);
+    useEffect(() => runner.AbortRead, [runner]);
+    return runner;
 }
 
 // The updaters never change identity, so the first page is requested once per mount: the
@@ -463,8 +513,9 @@ function useListKeys(state: ListState, runner: ListRequestRunner): FunctionKeyDe
 }
 
 // The first entry (EIBCALEN > 0, not re-entered) browses from the lowest TRAN-ID. Under React
-// Strict Mode the effect runs twice: the runner refuses the second browse while the first is in
-// flight, and the ref keeps the pending message the first run took.
+// Strict Mode the effect runs twice: the cleanup between the runs aborts the first browse and frees
+// the lock, so the second browse is the one answered, and the ref keeps the pending message the
+// first run took.
 function useFirstPage(runner: ListRequestRunner): void {
     const pendingMessageRef = useRef<string | null>(null);
     useEffect(() => {
@@ -472,7 +523,9 @@ function useFirstPage(runner: ListRequestRunner): void {
             pendingMessageRef.current = TakePendingMessage();
         }
         const pendingMessage = pendingMessageRef.current;
-        void runner.Run(async () => WithPendingMessage(await ListTransactions({}), pendingMessage));
+        void runner.Run(async (readOptions) =>
+            WithPendingMessage(await ListTransactions({}, readOptions), pendingMessage),
+        );
     }, [runner]);
 }
 

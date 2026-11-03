@@ -23,6 +23,7 @@ import { MessageLine, type MessageLineProps } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { ViewTransaction, type TransactionDetailResponse } from "@/lib/api/transactions";
 import {
+    IsCancelledRequest,
     SIGN_ON_ROUTE,
     SeverityForOutcome,
     TakePendingMessage,
@@ -208,17 +209,31 @@ const CLEARED_SCREEN: ViewScreen = Object.freeze({
 });
 const FETCHING_SCREEN: ViewScreen = Object.freeze({ ...CLEARED_SCREEN, isBusy: true });
 
+// signal belongs to the read's own AbortController; once it is aborted, a newer read or no screen
+// at all owns the display.
 interface FetchContext {
     router: AppRouter;
     setScreen: ScreenSetter;
+    signal: AbortSignal;
 }
 
-interface TransactionView {
+// StartRead aborts the read it replaces and returns the new read's signal; AbortRead aborts the
+// read in flight, if any.
+interface ReadController {
+    StartRead: () => AbortSignal;
+    AbortRead: () => void;
+}
+
+interface TransactionFetcher {
+    Fetch: (text: string) => void;
+    AbortFetch: () => void;
+}
+
+interface TransactionView extends TransactionFetcher {
     tranIdText: string;
     screen: ViewScreen;
     tranIdInputRef: RefObject<HTMLInputElement | null>;
     ChangeTranIdText: (text: string) => void;
-    Fetch: (text: string) => void;
     Clear: () => void;
 }
 
@@ -306,12 +321,19 @@ function EndBusy(screen: ViewScreen): ViewScreen {
     return screen.isBusy ? { ...screen, isBusy: false } : screen;
 }
 
-// A 401 also reaches the apiClient interceptor; routing it here keeps the sign-on redirect when
-// the API module is replaced. A 403 shows its refusal literal while the interceptor returns to
-// the user's own menu. Every other legacy outcome leaves the display cleared.
+// An abandoned read is discarded silently, before ToScreenFeedback would show it as the abend
+// text. A 401 also reaches the apiClient interceptor; routing it here keeps the sign-on redirect
+// when the API module is replaced. A 403 shows its refusal literal while the interceptor returns
+// to the user's own menu. Every other legacy outcome leaves the display cleared.
 function ApplyFetchError(error: unknown, context: FetchContext): void {
+    if (IsCancelledRequest(error)) {
+        return;
+    }
     if (!axios.isAxiosError(error)) {
         throw error;
+    }
+    if (context.signal.aborted) {
+        return;
     }
     if (error.response?.status === HTTP_UNAUTHORIZED) {
         context.router.replace(SIGN_ON_ROUTE);
@@ -321,21 +343,26 @@ function ApplyFetchError(error: unknown, context: FetchContext): void {
 }
 
 // PROCESS-ENTER-KEY: the message and the display fields are blanked, then TRANSACT is read with
-// the key exactly as typed. COTRN01C's blank-key edit runs on the server.
+// the key exactly as typed. COTRN01C's blank-key edit runs on the server. An answer that arrives
+// after its read was aborted changes neither the display nor the busy state.
 async function HandleFetch(text: string, context: FetchContext): Promise<void> {
     context.setScreen(FETCHING_SCREEN);
     try {
-        const detail = await ViewTransaction(text || BLANK_TRAN_ID);
-        context.setScreen({ detail, isBusy: false, feedback: FeedbackOfDetail(detail) });
+        const detail = await ViewTransaction(text || BLANK_TRAN_ID, { signal: context.signal });
+        if (!context.signal.aborted) {
+            context.setScreen({ detail, isBusy: false, feedback: FeedbackOfDetail(detail) });
+        }
     } catch (error) {
         ApplyFetchError(error, context);
     } finally {
-        context.setScreen(EndBusy);
+        if (!context.signal.aborted) {
+            context.setScreen(EndBusy);
+        }
     }
 }
 
 // The 3270 keyboard is locked while the host runs the task, so ENTER and F4 wait for the
-// response; F3 and F5 only navigate away.
+// response; F3 and F5 navigate away, abandoning a read in flight.
 function BuildFunctionKeys(actions: ViewKeyActions): readonly FunctionKeyDefinition[] {
     return [
         { key: "ENTER", label: "Fetch", onPress: actions.onFetch, disabled: actions.isBusy },
@@ -348,15 +375,30 @@ function BuildFunctionKeys(actions: ViewKeyActions): readonly FunctionKeyDefinit
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 
-// The first entry with CDEMO-CT01-TRN-SELECTED set displays that transaction once. The ref
-// keeps the development double effect run from reading it twice.
+// Each read owns an AbortController. A new read aborts the one it replaces; F3 and F5 abort the
+// one in flight as they leave, and the unmount does for any other navigation. The browser then
+// stops waiting for an answer nobody will see; the server may still complete the read.
+function useReadController(): ReadController {
+    const controllerRef = useRef<AbortController | null>(null);
+    const abortRead = useCallback(() => controllerRef.current?.abort(), []);
+    useEffect(() => abortRead, [abortRead]);
+    const startRead = useCallback(() => {
+        abortRead();
+        const controller = new AbortController();
+        controllerRef.current = controller;
+        return controller.signal;
+    }, [abortRead]);
+    return { StartRead: startRead, AbortRead: abortRead };
+}
+
+// The first entry with CDEMO-CT01-TRN-SELECTED set displays that transaction. The development
+// StrictMode remount aborts the first read with its simulated unmount and runs this effect again,
+// so the second read displays it; a production mount reads once.
 function useInitialFetch(initialTranId: string, fetchTransaction: (text: string) => void): void {
-    const hasFetchedRef = useRef(false);
     useEffect(() => {
-        if (hasFetchedRef.current || IsBlank(initialTranId)) {
+        if (IsBlank(initialTranId)) {
             return;
         }
-        hasFetchedRef.current = true;
         fetchTransaction(initialTranId);
     }, [initialTranId, fetchTransaction]);
 }
@@ -397,12 +439,14 @@ function useClearScreen(
 
 // A non-axios error rejects the returned promise unhandled: it is a defect, never a screen
 // message.
-function useFetchTransaction(setScreen: ScreenSetter): (text: string) => void {
+function useFetchTransaction(setScreen: ScreenSetter): TransactionFetcher {
     const router = useRouter();
-    return useCallback(
-        (text: string) => void HandleFetch(text, { router, setScreen }),
-        [router, setScreen],
+    const { StartRead, AbortRead } = useReadController();
+    const fetchTransaction = useCallback(
+        (text: string) => void HandleFetch(text, { router, setScreen, signal: StartRead() }),
+        [router, setScreen, StartRead],
     );
+    return { Fetch: fetchTransaction, AbortFetch: AbortRead };
 }
 
 // The key starts as the CT00 selection, as COTRN01C moves CDEMO-CT01-TRN-SELECTED to TRNIDINI.
@@ -411,9 +455,9 @@ function useTransactionView(initialTranId: string): TransactionView {
     const [screen, setScreen] = useState<ViewScreen>(CLEARED_SCREEN);
     const tranIdInputRef = useRef<HTMLInputElement>(null);
     const fieldRefs = useMemo<FieldRefs>(() => ({ [TRAN_ID_FIELD]: tranIdInputRef }), []);
-    const fetchTransaction = useFetchTransaction(setScreen);
+    const fetcher = useFetchTransaction(setScreen);
     const clearScreen = useClearScreen(setTranIdText, setScreen, tranIdInputRef);
-    useInitialFetch(initialTranId, fetchTransaction);
+    useInitialFetch(initialTranId, fetcher.Fetch);
     usePendingMessage(setScreen);
     useCursorFocus(screen.feedback, fieldRefs);
     return {
@@ -421,9 +465,16 @@ function useTransactionView(initialTranId: string): TransactionView {
         screen,
         tranIdInputRef,
         ChangeTranIdText: setTranIdText,
-        Fetch: fetchTransaction,
+        ...fetcher,
         Clear: clearScreen,
     };
+}
+
+// F3 and F5 abort the read in flight before they leave, because the route change keeps this
+// screen mounted until the next screen has loaded.
+function LeaveTo(route: string, view: TransactionView, router: AppRouter): void {
+    view.AbortFetch();
+    router.push(route);
 }
 
 function useViewFunctionKeys(view: TransactionView): readonly FunctionKeyDefinition[] {
@@ -431,9 +482,9 @@ function useViewFunctionKeys(view: TransactionView): readonly FunctionKeyDefinit
     const functionKeys = BuildFunctionKeys({
         isBusy: view.screen.isBusy,
         onFetch: () => view.Fetch(view.tranIdText),
-        onBack: () => router.push(MAIN_MENU_ROUTE),
+        onBack: () => LeaveTo(MAIN_MENU_ROUTE, view, router),
         onClear: view.Clear,
-        onBrowse: () => router.push(TRANSACTION_LIST_ROUTE),
+        onBrowse: () => LeaveTo(TRANSACTION_LIST_ROUTE, view, router),
     });
     useFunctionKeys(functionKeys);
     return functionKeys;

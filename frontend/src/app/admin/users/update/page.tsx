@@ -21,6 +21,7 @@ import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
+    IsCancelledRequest,
     SeverityForOutcome,
     TakePendingMessage,
     ToScreenFeedback,
@@ -61,6 +62,9 @@ type UserFieldName = "user_id" | "first_name" | "last_name" | "password" | "user
 type UserFieldValues = Record<UserFieldName, string>;
 type FieldRefs = Record<UserFieldName, RefObject<HTMLInputElement | null>>;
 type AppRouter = ReturnType<typeof useRouter>;
+// The controller of the fetch in flight, null once it settles. A newer fetch and the screen's
+// unmount abort it; the saves are writes and never take a signal.
+type FetchControllerRef = RefObject<AbortController | null>;
 
 // One COUSR2A input: the BMS INITIAL label, the field LENGTH and the PASSWD and USRTYPE hints.
 interface FieldDefinition {
@@ -94,6 +98,7 @@ interface UpdateScreenContext {
     SetIsBusy: Dispatch<SetStateAction<boolean>>;
     router: AppRouter;
     openedFromList: boolean;
+    fetchControllerRef: FetchControllerRef;
 }
 
 interface UserUpdateModel {
@@ -270,20 +275,56 @@ function ShowFetchedUser(context: UpdateScreenContext, user: UserDetailResponse)
     });
 }
 
+// A newer fetch aborts the one in flight, so only the newest read changes the screen.
+function TakeOverFetch(context: UpdateScreenContext): AbortController {
+    context.fetchControllerRef.current?.abort();
+    const controller = new AbortController();
+    context.fetchControllerRef.current = controller;
+    return controller;
+}
+
+// Only the fetch still owning the screen ends the busy state, never one a newer fetch replaced.
+function ReleaseFetch(context: UpdateScreenContext, controller: AbortController): void {
+    if (context.fetchControllerRef.current !== controller) {
+        return;
+    }
+    context.fetchControllerRef.current = null;
+    context.SetIsBusy(false);
+}
+
+// An aborted read rejects with axios's CanceledError. It is not a server outcome, so it is
+// dropped before ApplyFailure would show it as the abend text, and the fields stay as they are.
+async function ReadUser(
+    context: UpdateScreenContext,
+    userIdText: string,
+    signal: AbortSignal,
+): Promise<void> {
+    try {
+        const user = await FetchUser(userIdText || BLANK_USER_ID, UserFetchScreen.UPDATE, {
+            signal,
+        });
+        ShowFetchedUser(context, user);
+    } catch (error) {
+        if (IsCancelledRequest(error)) {
+            return;
+        }
+        ApplyFailure(context, error);
+    }
+}
+
 // PROCESS-ENTER-KEY: a non-blank user ID blanks the details before the read, so a failed read
 // shows them blank; a blank one keeps what was typed.
 async function RunFetch(context: UpdateScreenContext, userIdText: string): Promise<void> {
+    const controller = TakeOverFetch(context);
     if (!IsBlank(userIdText)) {
         context.SetValues({ ...EMPTY_FIELD_VALUES, user_id: userIdText });
     }
-    await RunBusy(context, async () => {
-        try {
-            const user = await FetchUser(userIdText || BLANK_USER_ID, UserFetchScreen.UPDATE);
-            ShowFetchedUser(context, user);
-        } catch (error) {
-            ApplyFailure(context, error);
-        }
-    });
+    context.SetIsBusy(true);
+    try {
+        await ReadUser(context, userIdText, controller.signal);
+    } finally {
+        ReleaseFetch(context, controller);
+    }
 }
 
 // UPDATE-USER-INFO with the text exactly as typed; the server runs every COUSR02C edit. The
@@ -375,12 +416,37 @@ function ShowPendingMessage(context: UpdateScreenContext): void {
     });
 }
 
-// React recognises hooks only by the camelCase "use" prefix, so the three hook names below are a
+// Reads the controller at unmount time, so it aborts the fetch in flight then, if any, and
+// reopens the first-entry guard for a remount.
+function AbortPendingFetch(
+    fetchControllerRef: FetchControllerRef,
+    hasStartedRef: RefObject<boolean>,
+): void {
+    const pendingFetch = fetchControllerRef.current;
+    if (pendingFetch === null) {
+        return;
+    }
+    pendingFetch.abort();
+    hasStartedRef.current = false;
+}
+
+// React recognises hooks only by the camelCase "use" prefix, so the four hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 
+// Leaving the screen aborts the fetch in flight. React Strict Mode's rehearsal unmount aborts the
+// first-entry fetch that way, so the entry guard is reopened and the remount fetches again.
+function useAbortFetchOnUnmount(
+    fetchControllerRef: FetchControllerRef,
+    hasStartedRef: RefObject<boolean>,
+): void {
+    useEffect(() => {
+        return () => AbortPendingFetch(fetchControllerRef, hasStartedRef);
+    }, [fetchControllerRef, hasStartedRef]);
+}
+
 // First entry: a user selected on COUSR00 is fetched at once, as COUSR02C performs
-// PROCESS-ENTER-KEY when CDEMO-CU02-USR-SELECTED is set. The ref keeps Strict Mode's second
-// effect run from fetching again.
+// PROCESS-ENTER-KEY when CDEMO-CU02-USR-SELECTED is set. The effect runs after every render, so
+// the ref limits it to one fetch, until an unmount aborts that fetch.
 function useInitialFetch(context: UpdateScreenContext, userId: string | null): void {
     const hasStartedRef = useRef(false);
     useEffect(() => {
@@ -394,6 +460,7 @@ function useInitialFetch(context: UpdateScreenContext, userId: string | null): v
             void RunFetch(context, userId);
         }
     }, [context, userId]);
+    useAbortFetchOnUnmount(context.fetchControllerRef, hasStartedRef);
 }
 
 // Each response moves the cursor to the field it names, as MOVE -1 TO <field>L did.
@@ -419,6 +486,7 @@ function useUserUpdate(userId: string | null): UserUpdateModel {
         SetIsBusy: setIsBusy,
         router,
         openedFromList: !IsMissingQueryValue(userId),
+        fetchControllerRef: useRef<AbortController | null>(null),
     };
     useInitialFetch(context, userId);
     useCursorFocus(feedback, fieldRefs);
@@ -507,8 +575,9 @@ function UserUpdateScreen({ selectedUserId }: UserUpdateScreenProps) {
 }
 
 // Each arrival with another selected user is a fresh COUSR02C first entry, as every XCTL is, so
-// the screen state starts over whenever the userId query parameter changes. An answer still in
-// flight for the previous user lands on the discarded screen and never reaches the new one.
+// the screen state starts over whenever the userId query parameter changes. The discarded
+// screen's unmount aborts a fetch still in flight for the previous user, so its answer never
+// reaches the new one.
 function UserUpdateEntry() {
     const selectedUserId = useSearchParams().get(USER_ID_QUERY_KEY);
     return <UserUpdateScreen key={selectedUserId ?? ""} selectedUserId={selectedUserId} />;

@@ -53,6 +53,7 @@ import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import {
+    IsCancelledRequest,
     SeverityForOutcome,
     TakePendingMessage,
     ToScreenFeedback,
@@ -425,6 +426,7 @@ interface FieldFocus {
 interface ReportSubmission {
     isBusy: boolean;
     submit: SubmitAction;
+    abortRead: ReadAborter;
 }
 
 interface ReportForm {
@@ -523,39 +525,102 @@ function useFeedback(): FeedbackStore {
     return { feedback: feedback ?? PendingFeedback(pendingMessage), setFeedback };
 }
 
-// Only axios errors carry a legacy outcome; any other error is a defect and propagates.
-function useReportSubmit(inputs: ReportInputs, setters: ScreenSetters): ReportSubmission {
-    const [isBusy, setIsBusy] = useState(false);
-    const submit = useCallback(async () => {
-        const query = BuildQueryFromInputs(inputs);
-        setIsBusy(true);
-        try {
-            ApplyResponse(await FetchTransactionReport(query), query, setters);
-        } catch (error) {
-            if (!axios.isAxiosError(error)) {
-                throw error;
-            }
-            ApplyError(error, setters);
-        } finally {
-            setIsBusy(false);
-        }
-    }, [inputs, setters]);
-    return { isBusy, submit };
+// Starts a read: aborts the read it replaces and returns the new read's signal.
+type ReadStarter = () => AbortSignal;
+// Aborts the read in flight, if any.
+type ReadAborter = () => void;
+
+interface ReadController {
+    startRead: ReadStarter;
+    abortRead: ReadAborter;
 }
 
-// The same definitions drive the physical keys and the on-screen buttons.
-function useScreenKeys(submit: SubmitAction, isBusy: boolean): readonly FunctionKeyDefinition[] {
+// Each report read owns an AbortController. A new read aborts the one it replaces; F3 aborts the
+// one in flight as it leaves, and the unmount does for any other navigation. The browser then
+// stops downloading and parsing a report nobody will see; the server may still finish building it.
+function useReadController(): ReadController {
+    const controllerRef = useRef<AbortController | null>(null);
+    const abortRead = useCallback(() => controllerRef.current?.abort(), []);
+    useEffect(() => abortRead, [abortRead]);
+    const startRead = useCallback(() => {
+        abortRead();
+        const controller = new AbortController();
+        controllerRef.current = controller;
+        return controller.signal;
+    }, [abortRead]);
+    return { startRead, abortRead };
+}
+
+// An abandoned read is discarded silently, before ToScreenFeedback would show it as the abend
+// text. Only axios errors carry a legacy outcome; any other error is a defect and propagates.
+function ApplyReadError(error: unknown, signal: AbortSignal, setters: ScreenSetters): void {
+    if (IsCancelledRequest(error)) {
+        return;
+    }
+    if (!axios.isAxiosError(error)) {
+        throw error;
+    }
+    if (!signal.aborted) {
+        ApplyError(error, setters);
+    }
+}
+
+// An answer that arrives after its read was aborted belongs to a disposed or replaced screen, so
+// it changes neither the message, the lines nor the dates.
+async function RunReportRead(
+    query: ReportQuery,
+    signal: AbortSignal,
+    setters: ScreenSetters,
+): Promise<void> {
+    try {
+        const response = await FetchTransactionReport(query, { signal });
+        if (!signal.aborted) {
+            ApplyResponse(response, query, setters);
+        }
+    } catch (error) {
+        ApplyReadError(error, signal, setters);
+    }
+}
+
+// An aborted read leaves the busy state alone: the read replacing it owns that state, and a screen
+// that was left has none.
+function useReportSubmit(inputs: ReportInputs, setters: ScreenSetters): ReportSubmission {
+    const [isBusy, setIsBusy] = useState(false);
+    const { startRead, abortRead } = useReadController();
+    const submit = useCallback(async () => {
+        const query = BuildQueryFromInputs(inputs);
+        const signal = startRead();
+        setIsBusy(true);
+        try {
+            await RunReportRead(query, signal, setters);
+        } finally {
+            if (!signal.aborted) {
+                setIsBusy(false);
+            }
+        }
+    }, [inputs, setters, startRead]);
+    return { isBusy, submit, abortRead };
+}
+
+// The same definitions drive the physical keys and the on-screen buttons. F3 aborts the read in
+// flight before it leaves, because the route change keeps this screen mounted until the menu has
+// loaded.
+function useScreenKeys(submission: ReportSubmission): readonly FunctionKeyDefinition[] {
     const router = useRouter();
+    const { submit, isBusy, abortRead } = submission;
     const keys = useMemo(
         () =>
             BuildFunctionKeys({
                 onEnter: () => {
                     void submit();
                 },
-                onBack: () => router.push(MENU_ROUTE),
+                onBack: () => {
+                    abortRead();
+                    router.push(MENU_ROUTE);
+                },
                 isBusy,
             }),
-        [submit, router, isBusy],
+        [submit, abortRead, router, isBusy],
     );
     useFunctionKeys(keys);
     return keys;
@@ -570,8 +635,9 @@ function useReportForm(): ReportForm {
         () => ({ setInputs, setFeedback, setResult, requestFocus }),
         [setInputs, setFeedback, setResult, requestFocus],
     );
-    const { isBusy, submit } = useReportSubmit(inputs, setters);
-    const keys = useScreenKeys(submit, isBusy);
+    const submission = useReportSubmit(inputs, setters);
+    const keys = useScreenKeys(submission);
+    const { isBusy } = submission;
     return { inputs, setReportType, setTextInput, feedback, result, isBusy, bindRef, keys };
 }
 

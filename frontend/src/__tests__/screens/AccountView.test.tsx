@@ -2,19 +2,23 @@
 // Every literal and builder output below is copied verbatim from
 // backend/app/services/accounts/coactvwc.py (cbl/COACTVWC.cbl lines 111-137, 641-672, 744-856).
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within, type RenderResult } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
-import { AxiosError, AxiosHeaders, type InternalAxiosRequestConfig } from "axios";
-import type { ReactNode } from "react";
+import { AxiosError, AxiosHeaders, CanceledError, type InternalAxiosRequestConfig } from "axios";
+import { StrictMode, type ReactNode } from "react";
 
 import AccountViewPage from "@/app/accounts/view/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
 import { ViewAccount, type AccountViewResponse } from "@/lib/api/accounts";
 import {
+    ABEND_MESSAGE,
     HandleResponseError,
+    PENDING_MESSAGE_KEY,
     SIGN_ON_ROUTE,
+    StorePendingMessage,
     type LegacyErrorResponse,
     type MessageSeverity,
+    type ReadOptions,
 } from "@/lib/apiClient";
 
 const mockRouterPush = jest.fn();
@@ -74,6 +78,12 @@ interface KeyPressMethod {
     Press: (user: UserEvent) => Promise<void>;
 }
 
+// A lookup the page starts and leaves in flight; Start returns the unmount that leaves the page.
+interface PendingLookupCase {
+    name: string;
+    Start: () => Promise<() => void>;
+}
+
 const TEST_ACCOUNT_ID = "00000000004";
 const TEST_ACCOUNT_URL = `/accounts/${TEST_ACCOUNT_ID}`;
 // The account key the not-found builders below are rendered for.
@@ -99,6 +109,10 @@ const UNMASKED_SSN_PATTERN = /\d{3}-\d{2}-\d{4}/;
 // jsdom implements no navigation, so the interceptor's window.location.assign reaches
 // console.error with this text.
 const NAVIGATION_NOT_IMPLEMENTED = "Not implemented: navigation";
+// Every lookup is a read that carries the AbortSignal of the controller owning it.
+const READ_OPTIONS = { signal: expect.any(AbortSignal) };
+// A refusal the apiClient interceptor carries across a navigation (backend ADMIN_ONLY_MESSAGE).
+const PENDING_REFUSAL = "No access - Admin Only option... ";
 
 const HTTP_BAD_REQUEST = 400;
 const HTTP_UNAUTHORIZED = 401;
@@ -251,13 +265,23 @@ function BuildAxiosError(status: number, body: LegacyErrorResponse): AxiosError 
     );
 }
 
-function RenderScreen(): UserEvent {
-    const user = userEvent.setup();
-    render(
+function PageTree(): ReactNode {
+    return (
         <ThemeProvider theme={CARD_DEMO_THEME}>
             <AccountViewPage />
-        </ThemeProvider>,
+        </ThemeProvider>
     );
+}
+
+// Strict Mode, on in development (next.config reactStrictMode), runs every mount effect, its
+// cleanup, then the effect again.
+function RenderPage(isStrictMode = false): RenderResult {
+    return render(isStrictMode ? <StrictMode>{PageTree()}</StrictMode> : PageTree());
+}
+
+function RenderScreen(): UserEvent {
+    const user = userEvent.setup();
+    RenderPage();
     return user;
 }
 
@@ -285,12 +309,21 @@ function InDocumentOrder(first: Node, second: Node): number {
     return first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
 }
 
-// The Alerts whose raw text is exactly the literal, blanks included, in screen order: ERRMSG has
-// role alert and INFOMSG role status.
+// The message line's Alerts in screen order: ERRMSG has role alert and INFOMSG role status.
+function ShownAlerts(): HTMLElement[] {
+    return [...screen.queryAllByRole("alert"), ...screen.queryAllByRole("status")].sort(
+        InDocumentOrder,
+    );
+}
+
+// The Alerts whose raw text is exactly the literal, blanks included, in screen order.
 function AlertsHolding(text: string): HTMLElement[] {
-    return [...screen.queryAllByRole("alert"), ...screen.queryAllByRole("status")]
-        .sort(InDocumentOrder)
-        .filter((alert) => alert.textContent === text);
+    return ShownAlerts().filter((alert) => alert.textContent === text);
+}
+
+// Every Alert's raw text in screen order.
+function AlertTexts(): (string | null)[] {
+    return ShownAlerts().map((alert) => alert.textContent);
 }
 
 async function ExpectAlert(text: string, severity: MessageSeverity): Promise<void> {
@@ -343,6 +376,61 @@ const EXIT_METHODS: readonly KeyPressMethod[] = [
     { name: "the F3 key", Press: (user) => PressKey(user, "F3") },
 ];
 
+// A lookup that stays in flight until its signal aborts it, then rejects as axios does.
+function PendingUntilAborted(_acctId: string, options?: ReadOptions): Promise<AccountViewResponse> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new CanceledError()));
+    });
+}
+
+// The AbortSignal the page passed with its n-th lookup (0-based).
+function SignalOfCall(callIndex: number): AbortSignal {
+    const signal = mockViewAccount.mock.calls[callIndex]?.[1]?.signal;
+    if (signal === undefined) {
+        throw new Error(`ViewAccount call ${callIndex} carried no AbortSignal`);
+    }
+    return signal;
+}
+
+// Lets an aborted lookup's rejection reach the page before the test inspects the outcome.
+async function SettleRejections(): Promise<void> {
+    await act(async () => undefined);
+}
+
+// Holds the next lookup in flight; the returned function answers it with a view.
+function HoldNextLookup(): (view: AccountViewResponse) => Promise<void> {
+    let answer: (view: AccountViewResponse) => void = () => undefined;
+    mockViewAccount.mockImplementationOnce(
+        () =>
+            new Promise<AccountViewResponse>((resolve) => {
+                answer = resolve;
+            }),
+    );
+    return async (view) => {
+        await act(async () => answer(view));
+    };
+}
+
+async function StartMountLookup(): Promise<() => void> {
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    const { unmount } = RenderPage();
+    await waitFor(() => expect(mockViewAccount).toHaveBeenCalledTimes(1));
+    return unmount;
+}
+
+async function StartEnterLookup(): Promise<() => void> {
+    const user = userEvent.setup();
+    const { unmount } = RenderPage();
+    await user.type(AccountIdInput(), TEST_ACCOUNT_ID);
+    await ClickButton(user, SEARCH_BUTTON_NAME);
+    return unmount;
+}
+
+const PENDING_LOOKUP_CASES: readonly PendingLookupCase[] = [
+    { name: "?acctId= entry", Start: StartMountLookup },
+    { name: "ENTER", Start: StartEnterLookup },
+];
+
 beforeEach(() => {
     mockSearchParams = new URLSearchParams();
     mockViewAccount.mockReset();
@@ -385,7 +473,7 @@ describe("COACTVWC acctId prefill on /accounts/view?acctId=", () => {
         await RenderPrefilledScreen(BuildAccountView());
         expect(AccountIdInput()).toHaveValue(TEST_ACCOUNT_ID);
         expect(mockViewAccount).toHaveBeenCalledTimes(1);
-        expect(mockViewAccount).toHaveBeenCalledWith(TEST_ACCOUNT_ID);
+        expect(mockViewAccount).toHaveBeenCalledWith(TEST_ACCOUNT_ID, READ_OPTIONS);
         expect(DisplayedValues()).toEqual(ExpectedValues(TEST_ACCOUNT_VIEW));
         await ExpectAlert(INFO_PROMPT, "info");
         expect(screen.queryByTestId("message-line-error")).toBeNull();
@@ -414,7 +502,7 @@ describe("COACTVWC ENTER on /accounts/view", () => {
         await method.Press(user);
         await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance);
         expect(mockViewAccount).toHaveBeenCalledTimes(1);
-        expect(mockViewAccount).toHaveBeenCalledWith("4");
+        expect(mockViewAccount).toHaveBeenCalledWith("4", READ_OPTIONS);
     });
 
     it.each(ENTER_METHODS)("COACTVWC blank ENTER by $name sends one space", async (method) => {
@@ -424,7 +512,7 @@ describe("COACTVWC ENTER on /accounts/view", () => {
         await method.Press(user);
         await ExpectAlert(NO_INPUT_MESSAGE, "error");
         expect(mockViewAccount).toHaveBeenCalledTimes(1);
-        expect(mockViewAccount).toHaveBeenCalledWith(BLANK_ACCOUNT_ID);
+        expect(mockViewAccount).toHaveBeenCalledWith(BLANK_ACCOUNT_ID, READ_OPTIONS);
     });
 });
 
@@ -449,7 +537,7 @@ describe("COACTVWC failed ENTER after a shown account on /accounts/view", () => 
         await user.type(AccountIdInput(), NOT_FOUND_ACCOUNT_ID);
         await ClickButton(user, SEARCH_BUTTON_NAME);
         await ExpectAlert(XREF_NOT_FOUND_MESSAGE, "error");
-        expect(mockViewAccount).toHaveBeenLastCalledWith(NOT_FOUND_ACCOUNT_ID);
+        expect(mockViewAccount).toHaveBeenLastCalledWith(NOT_FOUND_ACCOUNT_ID, READ_OPTIONS);
         expect(Object.values(DisplayedValues()).every((value) => value === "")).toBe(true);
         expect(AccountIdInput()).toHaveValue(NOT_FOUND_ACCOUNT_ID);
     });
@@ -506,4 +594,128 @@ describe("COACTVWC ACCTSID field error and cursor on /accounts/view", () => {
         expect(AccountIdInput()).toHaveFocus();
         expect(AccountIdInput()).toHaveValue("ABC");
     });
+});
+
+// Leaving the page aborts the lookup in flight; its rejection then reaches no screen and no log.
+async function AbortsLookupOnLeaving(lookup: PendingLookupCase): Promise<void> {
+    const consoleErrorSpy = jest.spyOn(console, "error");
+    mockViewAccount.mockImplementation(PendingUntilAborted);
+    const leavePage = await lookup.Start();
+    expect(SignalOfCall(0).aborted).toBe(false);
+    leavePage();
+    expect(SignalOfCall(0).aborted).toBe(true);
+    await SettleRejections();
+    expect(mockViewAccount).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+}
+
+// ENTER is disabled while a lookup is in flight, so a new ?acctId= is what supersedes one.
+async function ShowsOnlyLatestLookup(): Promise<void> {
+    const latestView = BuildAccountView({ curr_balance: "250.00" });
+    mockViewAccount.mockImplementationOnce(PendingUntilAborted);
+    const answerLatest = HoldNextLookup();
+    mockSearchParams = new URLSearchParams({ acctId: NOT_FOUND_ACCOUNT_ID });
+    const { rerender } = RenderPage();
+    await waitFor(() => expect(mockViewAccount).toHaveBeenCalledTimes(1));
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    rerender(PageTree());
+    await SettleRejections();
+    expect([SignalOfCall(0).aborted, SignalOfCall(1).aborted]).toEqual([true, false]);
+    // The aborted lookup shows nothing and leaves the busy state to the one in flight.
+    expect(SearchButton()).toBeDisabled();
+    expect(AlertTexts()).toEqual([]);
+    await answerLatest(latestView);
+    await WaitForBalance(latestView.curr_balance);
+    expect(mockViewAccount).toHaveBeenNthCalledWith(1, NOT_FOUND_ACCOUNT_ID, READ_OPTIONS);
+    expect(mockViewAccount).toHaveBeenNthCalledWith(2, TEST_ACCOUNT_ID, READ_OPTIONS);
+    expect(AlertTexts()).toEqual([INFO_PROMPT]);
+    expect(SearchButton()).toBeEnabled();
+}
+
+async function IgnoresCancelledLookup(): Promise<void> {
+    const user = await RenderPrefilledScreen(BuildAccountView());
+    mockViewAccount.mockRejectedValueOnce(new CanceledError());
+    await user.clear(AccountIdInput());
+    await user.type(AccountIdInput(), NOT_FOUND_ACCOUNT_ID);
+    await ClickButton(user, SEARCH_BUTTON_NAME);
+    await waitFor(() => expect(SearchButton()).toBeEnabled());
+    expect(mockViewAccount).toHaveBeenLastCalledWith(NOT_FOUND_ACCOUNT_ID, READ_OPTIONS);
+    expect(AlertsHolding(ABEND_MESSAGE)).toHaveLength(0);
+    expect(AlertTexts()).toEqual([INFO_PROMPT]);
+    expect(DisplayedValues()).toEqual(ExpectedValues(TEST_ACCOUNT_VIEW));
+}
+
+// The App Router keeps the page mounted until the menu has loaded, so F3 itself aborts the lookup
+// in flight before it navigates. The aborted lookup shows nothing and leaves ENTER free.
+async function AbortsLookupOnExit(method: KeyPressMethod): Promise<void> {
+    const consoleErrorSpy = jest.spyOn(console, "error");
+    mockViewAccount.mockImplementation(PendingUntilAborted);
+    await StartMountLookup();
+    const pushesBeforeAbort: number[] = [];
+    SignalOfCall(0).addEventListener("abort", () => {
+        pushesBeforeAbort.push(mockRouterPush.mock.calls.length);
+    });
+    await method.Press(userEvent.setup());
+    await SettleRejections();
+    expect(pushesBeforeAbort).toEqual([0]);
+    expect(mockRouterPush.mock.calls).toEqual([[MENU_ROUTE]]);
+    expect(AlertTexts()).toEqual([]);
+    expect(SearchButton()).toBeEnabled();
+    expect(mockViewAccount).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+}
+
+// Development: the first mount lookup is aborted by the simulated unmount, the second answers.
+async function StrictModeLooksUpAgain(): Promise<void> {
+    mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+    mockViewAccount.mockImplementationOnce(PendingUntilAborted);
+    mockViewAccount.mockResolvedValueOnce(BuildAccountView());
+    RenderPage(true);
+    await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance);
+    expect(mockViewAccount.mock.calls).toEqual([
+        [TEST_ACCOUNT_ID, READ_OPTIONS],
+        [TEST_ACCOUNT_ID, READ_OPTIONS],
+    ]);
+    expect([SignalOfCall(0).aborted, SignalOfCall(1).aborted]).toEqual([true, false]);
+    expect(DisplayedValues()).toEqual(ExpectedValues(TEST_ACCOUNT_VIEW));
+    await ExpectAlert(INFO_PROMPT, "info");
+    expect(SearchButton()).toBeEnabled();
+}
+
+async function StrictModeShowsPendingMessage(): Promise<void> {
+    StorePendingMessage(PENDING_REFUSAL);
+    RenderPage(true);
+    await ExpectAlert(PENDING_REFUSAL, "error");
+    expect(window.sessionStorage.getItem(PENDING_MESSAGE_KEY)).toBeNull();
+    expect(mockViewAccount).not.toHaveBeenCalled();
+}
+
+describe("COACTVWC lookup cancellation on /accounts/view", () => {
+    it.each(PENDING_LOOKUP_CASES)(
+        "COACTVWC leaving aborts the $name lookup",
+        AbortsLookupOnLeaving,
+    );
+    it(
+        "COACTVWC a new ?acctId= aborts the pending lookup; only its answer shows",
+        ShowsOnlyLatestLookup,
+    );
+    it(
+        "COACTVWC a cancelled lookup shows no message and keeps the account",
+        IgnoresCancelledLookup,
+    );
+    it.each(EXIT_METHODS)(
+        "COACTVWC F3 by $name aborts the pending lookup before returning to /menu",
+        AbortsLookupOnExit,
+    );
+});
+
+describe("COACTVWC under React Strict Mode on /accounts/view", () => {
+    it(
+        "COACTVWC Strict Mode aborts the first ?acctId= lookup and shows the second",
+        StrictModeLooksUpAgain,
+    );
+    it(
+        "COACTVWC Strict Mode takes the pending refusal once and shows it",
+        StrictModeShowsPendingMessage,
+    );
 });

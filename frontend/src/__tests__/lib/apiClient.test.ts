@@ -3,6 +3,7 @@
 import axios, {
     AxiosError,
     AxiosHeaders,
+    CanceledError,
     type AxiosResponse,
     type InternalAxiosRequestConfig,
 } from "axios";
@@ -21,6 +22,7 @@ import {
     HandleResponseError,
     HOME_ROUTE_ALLOWANCE,
     HOME_ROUTE_KEY,
+    IsCancelledRequest,
     LegacyErrorBody,
     PENDING_MESSAGE_KEY,
     REQUEST_TIMEOUT_MILLISECONDS,
@@ -142,6 +144,28 @@ const ABEND_CASES: readonly { label: string; error: AxiosError }[] = [
     { label: "502 proxy page", error: BuildAxiosError(502, "<html>Bad Gateway</html>", "/cards") },
     { label: "422 detail list", error: BuildAxiosError(422, VALIDATION_BODY, "/transactions") },
     { label: "network failure", error: BuildNetworkError("/billpay") },
+];
+
+// Only a call abandoned through its signal is a cancellation; every other failure keeps its
+// legacy feedback or the abend text.
+const CANCELLATION_CASES: readonly { label: string; error: unknown; isCancelled: boolean }[] = [
+    { label: "axios CanceledError", error: new CanceledError(), isCancelled: true },
+    { label: "500 response", error: BuildAxiosError(500, {}, ACCOUNT_URL), isCancelled: false },
+    { label: "network failure", error: BuildNetworkError("/cards"), isCancelled: false },
+    {
+        label: "timeout",
+        error: new AxiosError("timeout exceeded", AxiosError.ECONNABORTED),
+        isCancelled: false,
+    },
+    { label: "plain Error", error: new Error("canceled"), isCancelled: false },
+    { label: "non-error value", error: "canceled", isCancelled: false },
+    { label: "undefined", error: undefined, isCancelled: false },
+];
+
+// A read aborted before it is sent, or while its answer is in flight, whose answer is discarded.
+const ABORT_TIMING_CASES: readonly { timing: string; abortsInFlight: boolean }[] = [
+    { timing: "before it is sent", abortsInFlight: false },
+    { timing: "while its answer is in flight", abortsInFlight: true },
 ];
 
 const SEVERITY_CASES: readonly {
@@ -525,6 +549,34 @@ it("a non-axios defect is rethrown instead of shown as a message", () => {
     expect(() => ToScreenFeedback(error)).toThrow(error);
     expect(() => LegacyErrorBody(error)).toThrow(error);
 });
+
+it.each(CANCELLATION_CASES)("$label is a cancellation: $isCancelled", ({ error, isCancelled }) => {
+    expect(IsCancelledRequest(error)).toBe(isCancelled);
+});
+
+it.each(ABORT_TIMING_CASES)(
+    "API_CLIENT rejects a read aborted $timing as a cancellation, with no refusal action",
+    async ({ abortsInFlight }) => {
+        window.history.pushState({}, "", "/cards");
+        const controller = new AbortController();
+        const adapter = jest.fn((config: InternalAxiosRequestConfig) => {
+            controller.abort();
+            return Promise.resolve(BuildAxiosResponse(200, {}, config));
+        });
+        if (!abortsInFlight) {
+            controller.abort();
+        }
+        const read = API_CLIENT.get(ACCOUNT_URL, { adapter, signal: controller.signal });
+        const rejection: unknown = await read.then(
+            () => undefined,
+            (error: unknown) => error,
+        );
+        expect(rejection).toBeInstanceOf(CanceledError);
+        expect(IsCancelledRequest(rejection)).toBe(true);
+        expect(adapter).toHaveBeenCalledTimes(abortsInFlight ? 1 : 0);
+        ExpectNoRefusalEffects();
+    },
+);
 
 it("LegacyErrorBody keeps the screen keys beside the completed feedback (CAUP COMMAREA)", () => {
     const screenBody = {

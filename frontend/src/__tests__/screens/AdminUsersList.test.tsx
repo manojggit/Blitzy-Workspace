@@ -1,10 +1,19 @@
 // Screen tests: BMS COUSR00, program COUSR00C (CU00), page /admin/users.
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import {
+    act,
+    cleanup,
+    render,
+    screen,
+    waitFor,
+    within,
+    type RenderOptions,
+} from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
     AxiosHeaders,
+    CanceledError,
     type AxiosResponse,
     type InternalAxiosRequestConfig,
 } from "axios";
@@ -32,6 +41,7 @@ import {
     type LegacyErrorResponse,
     type MessageSeverity,
     type PageState,
+    type ReadOptions,
 } from "@/lib/apiClient";
 import { PF_KEY_ACTIONS, type PfKey } from "@/lib/useFunctionKeys";
 
@@ -145,6 +155,9 @@ const HTTP_UNAUTHORIZED = 401;
 const HTTP_INTERNAL_SERVER_ERROR = 500;
 const HTTP_SERVICE_UNAVAILABLE = 503;
 
+// Every ListUsers browse carries the signal that lets the page abandon it.
+const READ_OPTIONS: ReadOptions = { signal: expect.any(AbortSignal) };
+
 // The header clock re-renders only when the epoch second changes; a frozen clock keeps its
 // one-second tick from rendering outside act().
 const FROZEN_CLOCK_MS = new Date(2022, 6, 18, 9, 5, 7).getTime();
@@ -233,12 +246,13 @@ function ExpectedSelections(rows: readonly UserListRow[], chosen?: ChosenCode): 
     }));
 }
 
-function RenderScreen(): UserEvent {
+function RenderScreen(options: Pick<RenderOptions, "reactStrictMode"> = {}): UserEvent {
     const user = userEvent.setup();
     render(
         <ThemeProvider theme={CARD_DEMO_THEME}>
             <AdminUsersListPage />
         </ThemeProvider>,
+        options,
     );
     return user;
 }
@@ -331,7 +345,7 @@ beforeEach(() => {
 it("COUSR00C first entry browses from a blank key and shows the COUSR00 header", async () => {
     await RenderLoadedScreen();
     expect(mockListUsers).toHaveBeenCalledTimes(1);
-    expect(mockListUsers).toHaveBeenCalledWith({});
+    expect(mockListUsers).toHaveBeenCalledWith({}, READ_OPTIONS);
     expect(screen.getByRole("heading", { level: 1, name: SCREEN_TITLE })).toBeVisible();
     expect(screen.getByText("Tran: CU00")).toBeVisible();
     expect(screen.getByText("Prog: COUSR00C")).toBeVisible();
@@ -485,7 +499,7 @@ it.each(PAGE_CASES)(
         await user.type(SearchField(), SEARCH_TEXT);
         await TriggerKey(user, key, trigger);
         const expectedQuery: UserListQuery = { startKey, direction, page: SHOWN_PAGE };
-        expect(mockListUsers).toHaveBeenLastCalledWith(expectedQuery);
+        expect(mockListUsers).toHaveBeenLastCalledWith(expectedQuery, READ_OPTIONS);
         expect(BodyRowTexts()).toEqual(RowTextsOf(OTHER_PAGE_ROWS));
         expect(screen.getByText(`Page: ${resultPage}`)).toBeVisible();
         expect(SearchField()).toHaveValue(searchAfter);
@@ -580,7 +594,7 @@ it("COUSR00C ENTER STARTBR NOTFND shows page 1 with the rows read again and refu
     mockListUsers.mockRejectedValueOnce(BuildAxiosError(HTTP_BAD_REQUEST, refusal));
     await PressKey(user, "F8");
     const expectedQuery: UserListQuery = { startKey: "", direction: Direction.FORWARD, page: 1 };
-    expect(mockListUsers).toHaveBeenLastCalledWith(expectedQuery);
+    expect(mockListUsers).toHaveBeenLastCalledWith(expectedQuery, READ_OPTIONS);
     await ExpectAlert(ALREADY_AT_BOTTOM, ERRMSG_SEVERITY);
 });
 
@@ -609,7 +623,7 @@ it("COUSR00C ENTER invalid-selection 400 shows its body's page and keeps the cod
     expect(SearchField()).toHaveFocus();
     expect(ShownSelectionCodes()).toEqual(["", "", "D"]);
     await PressKey(user, "F8");
-    expect(mockListUsers).toHaveBeenLastCalledWith(REBROWSED_F8_QUERY);
+    expect(mockListUsers).toHaveBeenLastCalledWith(REBROWSED_F8_QUERY, READ_OPTIONS);
 });
 
 it("COUSR00C keeps a code at its row across F8 and sends it beside the user shown there", async () => {
@@ -777,6 +791,136 @@ it.each(CARRIED_MESSAGE_CASES)(
         await RenderLoadedScreen();
         await ExpectAlert(shownMessage, ERRMSG_SEVERITY);
         expect(window.sessionStorage.getItem(PENDING_MESSAGE_KEY)).toBeNull();
+    },
+);
+
+type ListRead = "first entry" | "F7" | "F8";
+
+// A browse the server has not answered. Only its signal settles it, rejecting with the
+// CanceledError axios raises for an aborted call.
+function PendingUntilAborted(
+    _query: UserListQuery,
+    options?: ReadOptions,
+): Promise<UserListResponse> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new CanceledError()));
+    });
+}
+
+// The first entry's browse, or an F7 or F8 browse from the loaded page 1 with the search key
+// typed, answered by the given call.
+async function StartListRead(read: ListRead, answer: typeof ListUsers): Promise<void> {
+    if (read === "first entry") {
+        mockListUsers.mockImplementationOnce(answer);
+        RenderScreen();
+        return;
+    }
+    const user = await RenderLoadedScreen();
+    mockListUsers.mockImplementationOnce(answer);
+    await user.type(SearchField(), SEARCH_TEXT);
+    await PressKey(user, read);
+}
+
+function ReadSignal(callIndex: number): AbortSignal | undefined {
+    return mockListUsers.mock.calls[callIndex]?.[1]?.signal;
+}
+
+// A macrotask boundary, so every promise reaction an abort or answer queued has run.
+async function SettlePendingWork(): Promise<void> {
+    await act(
+        () =>
+            new Promise<void>((resolve) => {
+                setTimeout(resolve, 0);
+            }),
+    );
+}
+
+interface PendingReadCase {
+    read: ListRead;
+    callCount: number;
+}
+
+const PENDING_READ_CASES: readonly PendingReadCase[] = [
+    { read: "first entry", callCount: 1 },
+    { read: "F7", callCount: 2 },
+    { read: "F8", callCount: 2 },
+];
+
+it.each(PENDING_READ_CASES)(
+    "COUSR00C leaving the screen during the $read browse aborts it and sends nothing more",
+    async ({ read, callCount }) => {
+        await StartListRead(read, PendingUntilAborted);
+        expect(mockListUsers).toHaveBeenCalledTimes(callCount);
+        const signal = ReadSignal(callCount - 1);
+        expect(signal?.aborted).toBe(false);
+        expect(screen.queryByRole("alert")).toBeNull();
+        cleanup();
+        expect(signal?.aborted).toBe(true);
+        await SettlePendingWork();
+        expect(mockListUsers).toHaveBeenCalledTimes(callCount);
+        expect(mockSelectUsers).not.toHaveBeenCalled();
+    },
+);
+
+// React StrictMode runs the first-entry effect, its cleanup and the effect again, as next dev
+// does: the second browse supersedes the first, whose cancellation changes nothing.
+it("COUSR00C StrictMode's second first-entry browse alone answers the screen", async () => {
+    let answerSecondBrowse: (response: UserListResponse) => void = () => undefined;
+    mockListUsers.mockImplementationOnce(PendingUntilAborted).mockReturnValueOnce(
+        new Promise((resolve) => {
+            answerSecondBrowse = resolve;
+        }),
+    );
+    RenderScreen({ reactStrictMode: true });
+    expect(mockListUsers).toHaveBeenCalledTimes(2);
+    expect(ReadSignal(0)?.aborted).toBe(true);
+    expect(ReadSignal(1)?.aborted).toBe(false);
+    await SettlePendingWork();
+    expect(screen.getByRole("button", { name: KEY_BUTTON_NAMES.ENTER })).toBeDisabled();
+    expect(screen.queryByRole("alert")).toBeNull();
+    answerSecondBrowse(BuildListResponse({ rows: OTHER_PAGE_ROWS, message: REACHED_BOTTOM }));
+    await ExpectKeysReady();
+    expect(BodyRowTexts()).toEqual(RowTextsOf(OTHER_PAGE_ROWS));
+    await ExpectAlert(REACHED_BOTTOM, ERRMSG_SEVERITY);
+});
+
+interface CancelledReadCase extends PendingReadCase {
+    keptRows: readonly UserListRow[];
+    keptSearch: string;
+    keptPageLine: string;
+}
+
+// No answer came, so the screen keeps what it showed: nothing yet on the first entry, and the
+// page 1 rows, the typed search key and the page number on F7 or F8.
+const CANCELLED_READ_CASES: readonly CancelledReadCase[] = [
+    { read: "first entry", callCount: 1, keptRows: [], keptSearch: "", keptPageLine: "Page:" },
+    {
+        read: "F7",
+        callCount: 2,
+        keptRows: FIRST_PAGE_ROWS,
+        keptSearch: SEARCH_TEXT,
+        keptPageLine: "Page: 1",
+    },
+    {
+        read: "F8",
+        callCount: 2,
+        keptRows: FIRST_PAGE_ROWS,
+        keptSearch: SEARCH_TEXT,
+        keptPageLine: "Page: 1",
+    },
+];
+
+it.each(CANCELLED_READ_CASES)(
+    "COUSR00C $read browse rejected as cancelled shows no message and changes no field",
+    async ({ read, callCount, keptRows, keptSearch, keptPageLine }) => {
+        await StartListRead(read, () => Promise.reject(new CanceledError()));
+        await ExpectKeysReady();
+        expect(mockListUsers).toHaveBeenCalledTimes(callCount);
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(BodyRowTexts()).toEqual(RowTextsOf(keptRows));
+        expect(SearchField()).toHaveValue(keptSearch);
+        expect(SearchField()).toHaveAttribute("aria-invalid", "false");
+        expect(screen.getByText(keptPageLine)).toBeVisible();
     },
 );
 

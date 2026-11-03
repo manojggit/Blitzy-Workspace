@@ -4,7 +4,7 @@
 import { ThemeProvider } from "@mui/material/styles";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { AxiosError, AxiosHeaders, type AxiosResponse } from "axios";
+import { AxiosError, AxiosHeaders, CanceledError, type AxiosResponse } from "axios";
 import { StrictMode, type ReactNode } from "react";
 
 import CardListPage from "@/app/cards/page";
@@ -23,8 +23,10 @@ import {
 import {
     Direction,
     SIGN_ON_ROUTE,
+    StorePendingMessage,
     type LegacyErrorResponse,
     type MessageSeverity,
+    type ReadOptions,
 } from "@/lib/apiClient";
 import type { SessionContextValue } from "@/lib/session";
 
@@ -144,6 +146,9 @@ const SEVERITY_CLASSES: Readonly<Record<MessageSeverity, string>> = {
 
 const KEY_TRIGGERS: readonly KeyTrigger[] = ["click", "key"];
 
+// Every list read carries the AbortSignal of the controller that owns it.
+const READ_OPTIONS: ReadOptions = { signal: expect.any(AbortSignal) };
+
 // A refused selection redisplays rows and page keys beside the legacy feedback, and on GET /cards
 // the page number after the redisplay.
 interface CardListErrorBody extends LegacyErrorResponse {
@@ -224,7 +229,8 @@ interface RenderedPage {
     Unmount: () => void;
 }
 
-// next.config.ts sets reactStrictMode, so the development page renders inside StrictMode.
+// next.config.ts sets reactStrictMode, so the development page renders inside StrictMode, which
+// runs every effect as mount, cleanup and mount again, as next dev does.
 function RenderPage(isStrictMode: boolean): RenderedPage {
     const user = userEvent.setup();
     const page = (
@@ -301,12 +307,16 @@ function InDocumentOrder(first: Node, second: Node): number {
     return first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
 }
 
-// The first Alert in screen order whose raw text is the literal: ERRMSG has role alert and
-// INFOMSG role status.
+// Every Alert shown, in screen order: ERRMSG has role alert and INFOMSG role status.
+function ShownAlerts(): HTMLElement[] {
+    return [...screen.queryAllByRole("alert"), ...screen.queryAllByRole("status")].sort(
+        InDocumentOrder,
+    );
+}
+
+// The first Alert in screen order whose raw text is the literal.
 function AlertWithText(text: string): HTMLElement | undefined {
-    return [...screen.queryAllByRole("alert"), ...screen.queryAllByRole("status")]
-        .sort(InDocumentOrder)
-        .find((alert) => alert.textContent === text);
+    return ShownAlerts().find((alert) => alert.textContent === text);
 }
 
 // The text is compared raw, so the server literal must arrive unchanged, blanks included.
@@ -418,7 +428,7 @@ describe("COCRDLIC BMS COCRDLI content on /cards", () => {
     it("COCRDLIC first entry shows the title, filters, headers and 7 masked cards", async () => {
         await RenderScreen();
         expect(mockListCards).toHaveBeenCalledTimes(1);
-        expect(mockListCards).toHaveBeenCalledWith({});
+        expect(mockListCards).toHaveBeenCalledWith({}, READ_OPTIONS);
         ExpectScreenHeader();
         ExpectFilterFields();
         ExpectMaskedCardRows();
@@ -503,7 +513,7 @@ describe("COCRDLIC paging on /cards", () => {
                 page: SHOWN_PAGE,
             };
             expect(mockListCards).toHaveBeenCalledTimes(2);
-            expect(mockListCards).toHaveBeenLastCalledWith(expectedQuery);
+            expect(mockListCards).toHaveBeenLastCalledWith(expectedQuery, READ_OPTIONS);
             expect(mockSelectCards).not.toHaveBeenCalled();
         },
     );
@@ -667,12 +677,110 @@ describe("COCRDLIC filter field errors on /cards", () => {
             startKey: FIRST_KEY,
             page: SHOWN_PAGE,
         };
-        expect(mockListCards).toHaveBeenLastCalledWith(expectedQuery);
+        expect(mockListCards).toHaveBeenLastCalledWith(expectedQuery, READ_OPTIONS);
         expect(FilterInput(ACCOUNT_FILTER_LABEL)).toHaveAttribute("aria-invalid", "true");
         expect(FilterInput(CARD_FILTER_LABEL)).toHaveAttribute("aria-invalid", "true");
         expect(FilterInput(ACCOUNT_FILTER_LABEL)).toHaveFocus();
     });
 });
+
+interface PendingReadCase {
+    readName: string;
+    key?: ScreenKey;
+}
+
+// The list reads a key starts. F3 starts none, and like every key it is locked while a read runs,
+// so a page with a read in flight is left by browser navigation.
+const KEYED_READS: readonly Required<PendingReadCase>[] = [
+    { readName: "forward", key: "F8" },
+    { readName: "backward", key: "F7" },
+    { readName: "re-read", key: "Enter" },
+];
+
+const PENDING_READ_CASES: readonly PendingReadCase[] = [{ readName: "first-page" }, ...KEYED_READS];
+
+// Shown on entry, as a refusal or sign-off literal carried across a navigation would be.
+const PENDING_MESSAGE = "MESSAGE CARRIED TO THE CARD LIST";
+const LATEST_PAGE = 1;
+const LATEST_ROW_COUNT = 3;
+
+// Settles only when its signal is aborted, rejecting with axios's CanceledError as the API client
+// does.
+function PendingUntilAborted(
+    _query: CardListQuery,
+    options?: ReadOptions,
+): Promise<CardListResponse> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new CanceledError()));
+    });
+}
+
+// The next list read stays in flight until the returned function settles it.
+function DeferNextListRead(): (response: CardListResponse) => void {
+    let settleRead: (response: CardListResponse) => void = () => undefined;
+    mockListCards.mockImplementationOnce(
+        () =>
+            new Promise<CardListResponse>((resolve) => {
+                settleRead = resolve;
+            }),
+    );
+    return (response) => settleRead(response);
+}
+
+function ListReadSignal(callIndex: number): AbortSignal | undefined {
+    return mockListCards.mock.calls[callIndex]?.[1]?.signal;
+}
+
+function AlertTexts(): (string | null)[] {
+    return ShownAlerts().map((alert) => alert.textContent);
+}
+
+function ExpectBusy(): void {
+    expect(screen.getByRole("progressbar", { name: "Processing" })).toBeVisible();
+}
+
+// A macrotask runs only once every settled promise has run its handlers, so by then a cancelled
+// read has done everything it will do.
+async function FlushSettledReads(): Promise<void> {
+    await act(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+}
+
+// Leaves the case's read in flight: the first page itself, or the key's read once the first page
+// is shown.
+async function StartPendingRead({ key }: PendingReadCase): Promise<RenderedPage> {
+    if (key === undefined) {
+        mockListCards.mockImplementationOnce(PendingUntilAborted);
+        return RenderPage(false);
+    }
+    const page = RenderPage(false);
+    await WaitForIdle();
+    mockListCards.mockImplementationOnce(PendingUntilAborted);
+    await page.user.click(screen.getByRole("button", { name: KEY_BUTTON_NAMES[key] }));
+    return page;
+}
+
+describe("COCRDLIC leaving /cards with a list read in flight", () => {
+    it.each(PENDING_READ_CASES)(
+        "COCRDLIC leaving the page aborts the pending $readName read and shows no message",
+        async (readCase) => {
+            const { Unmount } = await StartPendingRead(readCase);
+            const signal = ListReadSignal(mockListCards.mock.calls.length - 1);
+            expect(signal).toBeInstanceOf(AbortSignal);
+            expect(signal?.aborted).toBe(false);
+            ExpectBusy();
+            Unmount();
+            expect(signal?.aborted).toBe(true);
+            await FlushSettledReads();
+            expect(AlertTexts()).toEqual([]);
+            expect(mockRouterPush).not.toHaveBeenCalled();
+        },
+    );
+});
+
+// The last list read sent the query with the signal of the controller that owns it.
+function ExpectLastListRead(query: CardListQuery): void {
+    expect(mockListCards).toHaveBeenLastCalledWith(query, READ_OPTIONS);
+}
 
 function NextPageResponse(rowCount: number): CardListResponse {
     return BuildListResponse({
@@ -681,17 +789,22 @@ function NextPageResponse(rowCount: number): CardListResponse {
     });
 }
 
+// The remount aborts the first read; its answer, arriving last as one already on the wire would,
+// must not replace the F8 page.
 describe("COCRDLIC first page under React Strict Mode on /cards", () => {
-    it("COCRDLIC reads the first page once, and the F8 page that follows stays shown", async () => {
+    it("COCRDLIC drops the aborted first read; the F8 page that follows stays shown", async () => {
+        const abortedPage = Promise.withResolvers<CardListResponse>();
         const firstPage = Promise.withResolvers<CardListResponse>();
         const nextPage = Promise.withResolvers<CardListResponse>();
+        mockListCards.mockReturnValueOnce(abortedPage.promise);
         mockListCards.mockReturnValueOnce(firstPage.promise).mockReturnValueOnce(nextPage.promise);
         const { user } = RenderPage(true);
-        expect(mockListCards).toHaveBeenCalledTimes(1);
+        expect([ListReadSignal(0)?.aborted, ListReadSignal(1)?.aborted]).toEqual([true, false]);
         await AnswerPendingCall(firstPage, BuildListResponse());
         await user.click(screen.getByRole("button", { name: KEY_BUTTON_NAMES.F8 }));
         await AnswerPendingCall(nextPage, NextPageResponse(PAGE_SIZE));
-        expect(mockListCards).toHaveBeenCalledTimes(2);
+        await AnswerPendingCall(abortedPage, BuildListResponse());
+        expect(mockListCards).toHaveBeenCalledTimes(3);
         expect(screen.getByText(`Page ${NEXT_PAGE}`)).toBeVisible();
         const nextRows = NextPageResponse(PAGE_SIZE).rows;
         expect(CardNumbersShown()).toEqual(nextRows.map((row) => row.card_num_masked));
@@ -783,13 +896,60 @@ describe("COCRDLIC selection codes on the paging keys on /cards", () => {
             const body = PagingRefusalBody(refusalCase.literal);
             mockListCards.mockRejectedValueOnce(BuildAxiosError(HTTP_BAD_REQUEST, body));
             await PressScreenKey(user, refusalCase.key, "click");
-            expect(mockListCards).toHaveBeenLastCalledWith(PagingRefusalQuery(refusalCase));
+            ExpectLastListRead(PagingRefusalQuery(refusalCase));
             expect(mockSelectCards).not.toHaveBeenCalled();
             await ExpectAlert(refusalCase.literal, ERRMSG_SEVERITY);
             expect(FlaggedRowNumbers()).toEqual([2, 4]);
             expect(SelectionField(2)).toHaveFocus();
             expect(screen.getByText(`Page ${REDISPLAYED_PAGE}`)).toBeVisible();
             expect(mockRouterPush).not.toHaveBeenCalled();
+        },
+    );
+});
+
+// The first read is aborted and has changed nothing: the pending message still shows and the keys
+// stay locked for the remount's read, the only one left in flight.
+function ExpectOnlyRemountReadInFlight(): void {
+    expect(mockListCards.mock.calls).toEqual([
+        [{}, READ_OPTIONS],
+        [{}, READ_OPTIONS],
+    ]);
+    expect([ListReadSignal(0)?.aborted, ListReadSignal(1)?.aborted]).toEqual([true, false]);
+    ExpectBusy();
+    expect(AlertTexts()).toEqual([PENDING_MESSAGE]);
+}
+
+describe("COCRDLIC first page under the development remount on /cards", () => {
+    it("COCRDLIC the remount aborts the first read and applies only the second", async () => {
+        StorePendingMessage(PENDING_MESSAGE);
+        mockListCards.mockImplementationOnce(PendingUntilAborted);
+        const settleLatestRead = DeferNextListRead();
+        RenderPage(true);
+        await FlushSettledReads();
+        ExpectOnlyRemountReadInFlight();
+        const rows = BuildListRows(LATEST_ROW_COUNT);
+        act(() =>
+            settleLatestRead(BuildListResponse({ page: LATEST_PAGE, rows, info_message: "" })),
+        );
+        await WaitForIdle();
+        expect(CardNumbersShown()).toEqual(rows.map((row) => row.card_num_masked));
+        expect(screen.getByText(`Page ${LATEST_PAGE}`)).toBeVisible();
+        expect(AlertTexts()).toEqual([PENDING_MESSAGE]);
+    });
+});
+
+describe("COCRDLIC cancelled list reads on /cards", () => {
+    it.each(KEYED_READS)(
+        "COCRDLIC a cancelled $readName read shows no message and keeps the page shown",
+        async ({ key }) => {
+            const user = await RenderScreen();
+            mockListCards.mockRejectedValueOnce(new CanceledError());
+            await PressScreenKey(user, key, "click");
+            expect(mockListCards).toHaveBeenCalledTimes(2);
+            expect(AlertTexts()).toEqual([RECORD_ACTIONS_INFO]);
+            ExpectMaskedCardRows();
+            expect(screen.getByText(`Page ${SHOWN_PAGE}`)).toBeVisible();
+            expect(screen.getByRole("button", { name: KEY_BUTTON_NAMES[key] })).toBeEnabled();
         },
     );
 });
@@ -824,4 +984,65 @@ describe("COCRDLIC single selection code on F8 on /cards", () => {
             expect(mockRouterPush).not.toHaveBeenCalled();
         },
     );
+});
+
+// A selection the server answers with no action is COCRDLIC's WHEN OTHER path: the page shown is
+// re-read from first_key with every row's code.
+const UNACTIONED_SELECTION: CardSelectionResponse = {
+    ...BuildSelectionResponse("view"),
+    action: null,
+    card_ref: "",
+};
+const UNACTIONED_REREAD_QUERY: CardListQuery = {
+    acctId: "",
+    cardNum: "",
+    startKey: FIRST_KEY,
+    page: SHOWN_PAGE,
+    selections: SELECTED_ROW_CODES,
+};
+
+// S on SELECTED_ROW and ENTER, once the first page is shown.
+async function SubmitSelectedRow(): Promise<RenderedPage> {
+    const page = RenderPage(false);
+    await WaitForIdle();
+    await ChooseSelection(page.user, SELECTED_ROW, "S");
+    await page.user.click(screen.getByRole("button", { name: KEY_BUTTON_NAMES.Enter }));
+    return page;
+}
+
+describe("COCRDLIC re-read after an unactioned selection on /cards", () => {
+    it("COCRDLIC sends the re-read with its signal, and leaving the page aborts it", async () => {
+        mockSelectCards.mockResolvedValueOnce(UNACTIONED_SELECTION);
+        mockListCards.mockResolvedValueOnce(BuildListResponse());
+        mockListCards.mockImplementationOnce(PendingUntilAborted);
+        const { Unmount } = await SubmitSelectedRow();
+        await waitFor(() => {
+            expect(mockListCards).toHaveBeenCalledTimes(2);
+        });
+        ExpectLastListRead(UNACTIONED_REREAD_QUERY);
+        expect(ListReadSignal(1)?.aborted).toBe(false);
+        ExpectBusy();
+        Unmount();
+        expect(ListReadSignal(1)?.aborted).toBe(true);
+        await FlushSettledReads();
+        expect(mockSelectCards).toHaveBeenCalledWith(ExpectedSelectionRequest("S"));
+        expect(mockRouterPush).not.toHaveBeenCalled();
+    });
+});
+
+// Leaving while the selection runs aborts the re-read's controller, so axios rejects that read
+// without sending it; the selection itself carries no signal to abort.
+describe("COCRDLIC leaving /cards while a selection runs", () => {
+    it("COCRDLIC hands the re-read of an unactioned selection an aborted signal", async () => {
+        const selection = Promise.withResolvers<CardSelectionResponse>();
+        mockSelectCards.mockReturnValueOnce(selection.promise);
+        const { Unmount } = await SubmitSelectedRow();
+        expect(mockSelectCards).toHaveBeenCalledWith(ExpectedSelectionRequest("S"));
+        Unmount();
+        await AnswerPendingCall(selection, UNACTIONED_SELECTION);
+        expect(mockListCards).toHaveBeenCalledTimes(2);
+        ExpectLastListRead(UNACTIONED_REREAD_QUERY);
+        expect(ListReadSignal(1)?.aborted).toBe(true);
+        expect(mockRouterPush).not.toHaveBeenCalled();
+    });
 });

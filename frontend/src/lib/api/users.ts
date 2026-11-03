@@ -8,7 +8,13 @@
 // On COUSR00, an invalid selection code is a rejected call whose 400 body carries the re-browsed
 // page (rows, page, first_key, last_key), and a search finding no user ID is a 200 page 1 with
 // a blank last_key, from which F8 is refused.
-import { API_CLIENT, EncodePathKey, type Direction, type PageState } from "@/lib/apiClient";
+import {
+    API_CLIENT,
+    EncodePathKey,
+    type Direction,
+    type PageState,
+    type ReadOptions,
+} from "@/lib/apiClient";
 
 const USERS_PATH = "/admin/users";
 const SELECTION_PATH = `${USERS_PATH}/selection`;
@@ -104,9 +110,16 @@ function UserPath(userId: string): string {
     return `${USERS_PATH}/${EncodePathKey(userId)}`;
 }
 
-// CU00 (COUSR00C): ENTER, F7 and F8 on the user list.
-export async function ListUsers(query: UserListQuery): Promise<UserListResponse> {
-    const response = await API_CLIENT.get<UserListResponse>(USERS_PATH, { params: query });
+// CU00 (COUSR00C): ENTER, F7 and F8 on the user list. options carries the owning read's
+// AbortSignal, as on FetchUser; the selection, add, update and delete are writes and take none.
+export async function ListUsers(
+    query: UserListQuery,
+    options?: ReadOptions,
+): Promise<UserListResponse> {
+    const response = await API_CLIENT.get<UserListResponse>(USERS_PATH, {
+        params: query,
+        signal: options?.signal,
+    });
     return response.data;
 }
 
@@ -126,9 +139,13 @@ export async function AddUser(request: UserCreateRequest): Promise<UserMessageRe
 export async function FetchUser(
     userId: string,
     screen: UserFetchScreen,
+    options?: ReadOptions,
 ): Promise<UserDetailResponse> {
     const params: UserFetchQuery = { screen };
-    const response = await API_CLIENT.get<UserDetailResponse>(UserPath(userId), { params });
+    const response = await API_CLIENT.get<UserDetailResponse>(UserPath(userId), {
+        params,
+        signal: options?.signal,
+    });
     return response.data;
 }
 

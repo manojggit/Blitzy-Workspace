@@ -2,11 +2,11 @@
 // Literals verbatim from backend/app/services/menu/comen01c.py, menu_options.py,
 // backend/app/core/messages.py and cbl/COMEN01C.cbl; option labels from cpy/COMEN02Y.cpy.
 import { ThemeProvider } from "@mui/material/styles";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
-import { AxiosError, AxiosHeaders, type InternalAxiosRequestConfig } from "axios";
+import { AxiosError, AxiosHeaders, CanceledError, type InternalAxiosRequestConfig } from "axios";
 import type * as NavigationModule from "next/navigation";
-import type { ReactNode } from "react";
+import { StrictMode, type ReactNode } from "react";
 
 import MainMenuPage from "@/app/menu/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
@@ -26,6 +26,7 @@ import {
     TakePendingMessage,
     type LegacyErrorResponse,
     type MessageSeverity,
+    type ReadOptions,
 } from "@/lib/apiClient";
 import type { SessionContextValue } from "@/lib/session";
 
@@ -276,6 +277,24 @@ function ExpectCalledOnceInOrder(sources: readonly CallOrderSource[]): void {
     expect(callOrders).toEqual([...callOrders].sort((first, second) => first - second));
 }
 
+// A menu read that stays in flight until its signal is aborted, then rejects as axios does.
+function RejectOnAbort(options?: ReadOptions): Promise<MenuResponse> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => {
+            reject(new CanceledError());
+        });
+    });
+}
+
+// The AbortSignal the page gave one FetchMainMenu call (0 = the first).
+function MenuReadSignal(callIndex: number): AbortSignal {
+    const signal = mockFetchMainMenu.mock.calls[callIndex]?.[0]?.signal;
+    if (signal === undefined) {
+        throw new Error(`FetchMainMenu call ${callIndex} carried no AbortSignal`);
+    }
+    return signal;
+}
+
 const ENTER_CASES: readonly KeyPressCase[] = [
     {
         keyName: "the Continue (Enter) button",
@@ -452,6 +471,37 @@ it.each(UNAUTHORIZED_CASES)(
         expect(SIGN_ON_ROUTE).toBe("/signon");
     },
 );
+
+it("COMEN01C leaving the menu while its read is pending aborts the menu GET", async () => {
+    mockFetchMainMenu.mockImplementation(RejectOnAbort);
+    RenderScreen();
+    expect(mockFetchMainMenu).toHaveBeenCalledTimes(1);
+    expect(mockFetchMainMenu).toHaveBeenCalledWith({ signal: expect.any(AbortSignal) });
+    expect(MenuReadSignal(0).aborted).toBe(false);
+    cleanup();
+    expect(MenuReadSignal(0).aborted).toBe(true);
+    await expect(mockFetchMainMenu.mock.results[0]?.value).rejects.toBeInstanceOf(CanceledError);
+    expect(mockRouterPush).not.toHaveBeenCalled();
+});
+
+it("COMEN01C StrictMode re-run reloads the menu; the aborted read shows no message", async () => {
+    StorePendingMessage(ADMIN_ONLY_MESSAGE);
+    mockFetchMainMenu.mockImplementationOnce(RejectOnAbort).mockResolvedValue(BuildMenuResponse());
+    render(
+        <StrictMode>
+            <ThemeProvider theme={CARD_DEMO_THEME}>
+                <MainMenuPage />
+            </ThemeProvider>
+        </StrictMode>,
+    );
+    await WaitForIdle();
+    expect(mockFetchMainMenu).toHaveBeenCalledTimes(2);
+    expect(MenuReadSignal(0).aborted).toBe(true);
+    expect(MenuReadSignal(1).aborted).toBe(false);
+    expect(within(MenuList()).getAllByRole("button")).toHaveLength(MAIN_MENU_LABELS.length);
+    const alertTexts = screen.queryAllByRole("alert").map((alert) => alert.textContent);
+    expect(alertTexts).toEqual([ADMIN_ONLY_MESSAGE]);
+});
 
 // CSMSG02Y ABEND-MSG: the menu's answer to a route no installed option has.
 const ABEND_MESSAGE = "UNEXPECTED ABEND OCCURRED.";

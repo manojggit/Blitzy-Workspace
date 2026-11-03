@@ -28,6 +28,7 @@ import {
 import {
     ABEND_MESSAGE,
     Direction,
+    IsCancelledRequest,
     LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
@@ -57,7 +58,7 @@ const SEARCH_MAX_LENGTH = 8;
 const SEARCH_LABEL = "Search User ID:";
 const PAGE_LABEL = "Page:";
 // The polite page status, built from the screen's own Page:, row and user ID fields so that no
-// ERRMSG literal is invented or changed: "Page: 2, 10 users shown, QAUSR006 to USER0003".
+// ERRMSG literal is invented or changed: "Page: 2, 10 users shown, QAUSR006 to QAUSR015".
 const SHOWN_COUNT_SUFFIX = "users shown";
 const STATUS_PART_SEPARATOR = ", ";
 const SHOWN_RANGE_SEPARATOR = " to ";
@@ -105,10 +106,14 @@ interface ListScreenState {
 }
 
 type ScreenUpdate = Dispatch<SetStateAction<ListScreenState>>;
+// Starts an F7 or F8 browse: aborts the one still in flight and returns the new one's signal.
+type PageReadStarter = () => AbortSignal;
+type ReadControllerRef = RefObject<AbortController | null>;
 
 interface ScreenActions {
     setScreen: ScreenUpdate;
     router: PageRouter;
+    startPageRead: PageReadStarter;
 }
 
 // The body of ENTER's invalid-selection 400: the four legacy keys plus the re-browsed page.
@@ -258,46 +263,70 @@ function PageQuery(pageState: PageState, direction: Direction): UserListQuery {
 }
 
 // A refused page keeps the rows, keys and selection codes on the screen, as
-// SEND-USRLST-SCREEN's SEND without ERASE did (cbl/COUSR00C.cbl lines 522-543).
+// SEND-USRLST-SCREEN's SEND without ERASE did (cbl/COUSR00C.cbl lines 522-543). An abandoned
+// browse changes nothing.
 async function HandlePage(
     actions: ScreenActions,
     screen: ListScreenState,
     direction: Direction,
+    signal: AbortSignal,
 ): Promise<void> {
     try {
-        const response = await ListUsers(PageQuery(screen.pageState, direction));
+        const response = await ListUsers(PageQuery(screen.pageState, direction), { signal });
         const blanksSearch = direction === Direction.FORWARD;
         PatchScreen(actions.setScreen, ShownPageUpdate(response, blanksSearch));
     } catch (error) {
+        if (IsCancelledRequest(error)) {
+            return;
+        }
         PatchScreen(actions.setScreen, { feedback: FailureFeedback(error) });
     }
 }
 
 // The first entry runs PROCESS-ENTER-KEY with a blank search key. A message carried here from
-// another screen shows unless the browse sets one of its own.
-async function LoadFirstPage(setScreen: ScreenUpdate, pendingMessage: string): Promise<void> {
+// another screen shows unless the browse sets one of its own. An abandoned browse changes nothing.
+async function LoadFirstPage(
+    setScreen: ScreenUpdate,
+    pendingMessage: string,
+    signal: AbortSignal,
+): Promise<void> {
     try {
-        const response = await ListUsers({});
+        const response = await ListUsers({}, { signal });
         const shownPage = ShownPageUpdate(response, true);
         const responseMessage = response.message ?? BLANK_TEXT;
         const message = IsBlank(responseMessage) ? pendingMessage : responseMessage;
         PatchScreen(setScreen, { ...shownPage, feedback: { ...FeedbackOf(response), message } });
     } catch (error) {
+        if (IsCancelledRequest(error)) {
+            return;
+        }
         setScreen(EnterFailureUpdate(error));
     }
 }
 
-async function SettleBusy(setScreen: ScreenUpdate, task: () => Promise<void>): Promise<void> {
+// A browse abandoned through its signal leaves the keys locked: the screen has gone, or the
+// browse that replaced it unlocks them when it answers.
+async function SettleBusy(
+    setScreen: ScreenUpdate,
+    task: () => Promise<void>,
+    signal?: AbortSignal,
+): Promise<void> {
     try {
         await task();
     } finally {
-        PatchScreen(setScreen, { isBusy: false });
+        if (signal?.aborted !== true) {
+            PatchScreen(setScreen, { isBusy: false });
+        }
     }
 }
 
-async function RunBusy(setScreen: ScreenUpdate, task: () => Promise<void>): Promise<void> {
+async function RunBusy(
+    setScreen: ScreenUpdate,
+    task: () => Promise<void>,
+    signal?: AbortSignal,
+): Promise<void> {
     PatchScreen(setScreen, { isBusy: true });
-    await SettleBusy(setScreen, task);
+    await SettleBusy(setScreen, task, signal);
 }
 
 // One server round trip per key press, with every key locked until it answers.
@@ -307,12 +336,25 @@ function BusyKeyPress(actions: ScreenActions, task: () => Promise<void>): () => 
     };
 }
 
+// F7 or F8: a busy key press whose browse supersedes any browse still in flight.
+function PageKeyPress(
+    actions: ScreenActions,
+    screen: ListScreenState,
+    direction: Direction,
+): () => void {
+    return () => {
+        const signal = actions.startPageRead();
+        const task = (): Promise<void> => HandlePage(actions, screen, direction, signal);
+        void RunBusy(actions.setScreen, task, signal);
+    };
+}
+
 // The legend ENTER=Continue  F3=Back  F7=Backward  F8=Forward, in its order.
 function BuildKeys(actions: ScreenActions, screen: ListScreenState): FunctionKeyDefinition[] {
     const disabled = screen.isBusy;
     const enter = BusyKeyPress(actions, () => HandleEnter(actions, screen));
-    const backward = BusyKeyPress(actions, () => HandlePage(actions, screen, Direction.BACKWARD));
-    const forward = BusyKeyPress(actions, () => HandlePage(actions, screen, Direction.FORWARD));
+    const backward = PageKeyPress(actions, screen, Direction.BACKWARD);
+    const forward = PageKeyPress(actions, screen, Direction.FORWARD);
     const back = (): void => actions.router.push(ADMIN_MENU_ROUTE);
     return [
         { key: "ENTER", label: "Continue", onPress: enter, disabled },
@@ -346,18 +388,42 @@ function WithSelectionCode(position: number, code: string): SetStateAction<ListS
     });
 }
 
-// React recognises hooks only by the camelCase "use" prefix, so useFirstEntry, useCursorFocus
-// and useUserList are a framework-mandated exception to the MK_Modernization Rule's PascalCase
-// function naming.
+function StartPageRead(controllerRef: ReadControllerRef): AbortSignal {
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    return controller.signal;
+}
 
-// The pending message is taken once, so an effect React runs twice still shows it.
+function AbortPageRead(controllerRef: ReadControllerRef): void {
+    controllerRef.current?.abort();
+}
+
+// React recognises hooks only by the camelCase "use" prefix, so useFirstEntry, usePageRead,
+// useCursorFocus and useUserList are a framework-mandated exception to the MK_Modernization
+// Rule's PascalCase function naming.
+
+// The pending message is taken once, so an effect React runs twice still shows it. Leaving the
+// screen abandons the first browse; StrictMode's second run then browses again.
 function useFirstEntry(setScreen: ScreenUpdate): void {
     const pendingMessageRef = useRef<string | null>(null);
     useEffect(() => {
         pendingMessageRef.current ??= TakePendingMessage();
         const pendingMessage = pendingMessageRef.current;
-        void SettleBusy(setScreen, () => LoadFirstPage(setScreen, pendingMessage));
+        const controller = new AbortController();
+        const { signal } = controller;
+        void SettleBusy(setScreen, () => LoadFirstPage(setScreen, pendingMessage, signal), signal);
+        return () => controller.abort();
     }, [setScreen]);
+}
+
+// Holds the F7 or F8 browse in flight, which leaving the screen abandons.
+function usePageRead(): PageReadStarter {
+    const controllerRef = useRef<AbortController | null>(null);
+    useEffect(() => {
+        return () => AbortPageRead(controllerRef);
+    }, []);
+    return () => StartPageRead(controllerRef);
 }
 
 // Replaces MOVE -1 TO USRIDINL: every answer puts the cursor on the field the server names.
@@ -382,11 +448,12 @@ function useUserList(): UserListModel {
     const [screen, setScreen] = useState<ListScreenState>(INITIAL_SCREEN);
     const fieldRefs = useRef<FieldRefs>({});
     useFirstEntry(setScreen);
+    const startPageRead = usePageRead();
     useCursorFocus(screen.feedback, fieldRefs);
     const searchInputRef = (element: HTMLInputElement | null): void => {
         fieldRefs.current[SEARCH_FIELD] = element;
     };
-    const keys = BuildKeys({ setScreen, router }, screen);
+    const keys = BuildKeys({ setScreen, router, startPageRead }, screen);
     return { screen, setScreen, keys, searchInputRef };
 }
 

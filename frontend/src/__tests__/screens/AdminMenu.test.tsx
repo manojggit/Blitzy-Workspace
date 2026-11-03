@@ -2,10 +2,10 @@
 // Copybooks COADM02Y (the six admin options) and CSMSG01Y (the sign-off literal). The literals are
 // copied verbatim from backend/app/services/menu/coadm01c.py, menu_options.py and core/messages.py.
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
-import { AxiosError, AxiosHeaders, type InternalAxiosRequestConfig } from "axios";
-import type { ReactNode } from "react";
+import { AxiosError, AxiosHeaders, CanceledError, type InternalAxiosRequestConfig } from "axios";
+import { StrictMode, type ReactNode } from "react";
 
 import AdminMenuPage from "@/app/admin/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
@@ -19,9 +19,11 @@ import {
 } from "@/lib/api/menu";
 import {
     SIGN_ON_ROUTE,
+    StorePendingMessage,
     TakePendingMessage,
     type LegacyErrorResponse,
     type MessageSeverity,
+    type ReadOptions,
 } from "@/lib/apiClient";
 
 // The "mock" prefix lets the hoisted jest.mock factories read these at call time.
@@ -187,6 +189,17 @@ function RenderScreen(): UserEvent {
     return user;
 }
 
+// StrictMode mounts, cleans up and mounts again, as next dev does under reactStrictMode.
+function RenderStrictModeScreen(): void {
+    render(
+        <StrictMode>
+            <ThemeProvider theme={CARD_DEMO_THEME}>
+                <AdminMenuPage />
+            </ThemeProvider>
+        </StrictMode>,
+    );
+}
+
 // Busy ends when the last call settles: the progress bar goes and the keys unlock.
 async function WaitForIdle(): Promise<void> {
     await waitFor(() => expect(screen.queryByRole("progressbar")).toBeNull());
@@ -243,6 +256,24 @@ async function SubmitOption(user: UserEvent, optionText: string): Promise<void> 
         await user.type(OptionField(), optionText);
     }
     await user.click(screen.getByRole("button", { name: CONTINUE_BUTTON }));
+}
+
+// A menu read that stays in flight until its signal is aborted, then rejects as axios does.
+function RejectOnAbort(options?: ReadOptions): Promise<MenuResponse> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => {
+            reject(new CanceledError());
+        });
+    });
+}
+
+// The AbortSignal the page gave one FetchAdminMenu call (0 = the first).
+function MenuReadSignal(callIndex: number): AbortSignal {
+    const signal = mockFetchAdminMenu.mock.calls[callIndex]?.[0]?.signal;
+    if (signal === undefined) {
+        throw new Error(`FetchAdminMenu call ${callIndex} carried no AbortSignal`);
+    }
+    return signal;
 }
 
 // A selection call that stays in flight until the returned function answers it.
@@ -551,6 +582,39 @@ describe("COADM01C 401 session refusal on a selection", () => {
         expect(mockSelectAdminMenuOption).toHaveBeenCalledWith({ option: "1" });
         expect(screen.queryByRole("alert")).toBeNull();
         expect(mockRouterPush).not.toHaveBeenCalled();
+    });
+});
+
+describe("COADM01C menu read abandoned on leaving the screen", () => {
+    it("COADM01C leaving the menu while its read is pending aborts the menu GET", async () => {
+        mockFetchAdminMenu.mockImplementation(RejectOnAbort);
+        RenderScreen();
+        expect(mockFetchAdminMenu).toHaveBeenCalledTimes(1);
+        expect(mockFetchAdminMenu).toHaveBeenCalledWith({ signal: expect.any(AbortSignal) });
+        expect(MenuReadSignal(0).aborted).toBe(false);
+        cleanup();
+        expect(MenuReadSignal(0).aborted).toBe(true);
+        await expect(mockFetchAdminMenu.mock.results[0]?.value).rejects.toBeInstanceOf(
+            CanceledError,
+        );
+        expect(mockRouterPush).not.toHaveBeenCalled();
+    });
+});
+
+// StrictMode's mount, cleanup and mount: the first read is aborted and the re-run's read loads.
+describe("COADM01C menu read under StrictMode", () => {
+    it("COADM01C StrictMode re-run reloads the menu and keeps the pending message", async () => {
+        StorePendingMessage(ADMIN_ONLY_MESSAGE);
+        mockFetchAdminMenu
+            .mockImplementationOnce(RejectOnAbort)
+            .mockResolvedValue(BuildMenuResponse());
+        RenderStrictModeScreen();
+        await WaitForIdle();
+        expect(mockFetchAdminMenu).toHaveBeenCalledTimes(2);
+        expect(MenuReadSignal(0).aborted).toBe(true);
+        expect(MenuReadSignal(1).aborted).toBe(false);
+        expect(within(OptionList()).getAllByRole("button")).toHaveLength(LABEL_CASES.length);
+        await ExpectAlert(ADMIN_ONLY_MESSAGE, "error");
     });
 });
 

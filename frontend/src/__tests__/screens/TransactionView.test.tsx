@@ -3,20 +3,21 @@
 // backend/app/services/transactions/cotrn01c.py, which ports cbl/COTRN01C.cbl lines 149, 285
 // and 292. The API module is mocked, so each response body is the one the backend sends.
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
     AxiosHeaders,
+    CanceledError,
     type AxiosResponse,
     type InternalAxiosRequestConfig,
 } from "axios";
-import type { ReactNode } from "react";
+import { StrictMode, type ReactNode } from "react";
 
 import { CARD_DEMO_THEME } from "@/app/theme";
 import TransactionViewPage from "@/app/transactions/view/page";
 import { ViewTransaction, type TransactionDetailResponse } from "@/lib/api/transactions";
-import type { LegacyErrorResponse, MessageSeverity } from "@/lib/apiClient";
+import type { LegacyErrorResponse, MessageSeverity, ReadOptions } from "@/lib/apiClient";
 import type { SessionContextValue } from "@/lib/session";
 
 type CurrentUser = NonNullable<SessionContextValue["currentUser"]>;
@@ -47,6 +48,18 @@ interface LiteralCase {
     severity: MessageSeverity;
     typedText: string;
     sentKey: string;
+}
+
+// A read running as the screen is left: the arrival read of a CT00 selection (typedText empty) or
+// an ENTER read of the typed key. F3 and F5 abort it before they navigate to routes; an unmount,
+// which every other navigation brings, aborts it with no route of its own.
+interface PendingReadCase {
+    origin: string;
+    queryTranId: string;
+    typedText: string;
+    leaving: string;
+    LeaveScreen: (user: UserEvent) => Promise<void>;
+    routes: readonly string[];
 }
 
 interface ScreenStatus {
@@ -268,6 +281,61 @@ const BACK_CASES: readonly BackCase[] = PRESS_MODES.flatMap((mode) => [
     { mode, origin: "the main menu", tranId: "", route: MAIN_MENU_ROUTE },
 ]);
 
+// The mocked router does not navigate, so cleanup() stands in for the unmount.
+const PENDING_READ_CASES: readonly PendingReadCase[] = [
+    {
+        origin: "the arrival read",
+        queryTranId: TEST_TRAN_ID,
+        typedText: "",
+        leaving: "F3",
+        LeaveScreen: (user) => PressFunctionKey(user, BACK_KEY, "key"),
+        routes: [MAIN_MENU_ROUTE],
+    },
+    {
+        origin: "an ENTER read",
+        queryTranId: "",
+        typedText: TEST_TRAN_ID,
+        leaving: "F3",
+        LeaveScreen: (user) => PressFunctionKey(user, BACK_KEY, "key"),
+        routes: [MAIN_MENU_ROUTE],
+    },
+    {
+        origin: "an ENTER read",
+        queryTranId: "",
+        typedText: TEST_TRAN_ID,
+        leaving: "F5",
+        LeaveScreen: (user) => PressFunctionKey(user, BROWSE_KEY, "key"),
+        routes: [TRANSACTION_LIST_ROUTE],
+    },
+    {
+        origin: "the arrival read",
+        queryTranId: TEST_TRAN_ID,
+        typedText: "",
+        leaving: "an unmount",
+        LeaveScreen: async () => cleanup(),
+        routes: [],
+    },
+];
+
+// Every read carries the AbortSignal of the controller that owns it.
+const READ_SIGNAL_OPTIONS = expect.objectContaining({ signal: expect.any(AbortSignal) });
+
+// A read that never answers: like axios, it rejects with CanceledError once its signal is
+// aborted.
+function PendUntilAborted(
+    _tranId: string,
+    options?: ReadOptions,
+): Promise<TransactionDetailResponse> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new CanceledError()));
+    });
+}
+
+// The signal the page handed to the read made by its call at that position.
+function ReadSignal(callPosition: number): AbortSignal | undefined {
+    return mockViewTransaction.mock.calls[callPosition]?.[1]?.signal;
+}
+
 // Outcomes that take a displayed record off the screen, each starting from a shown record.
 const EMPTIED_STATUS_CASES: readonly EmptiedStatusCase[] = [
     {
@@ -296,6 +364,17 @@ function RenderScreen(): UserEvent {
         </ThemeProvider>,
     );
     return user;
+}
+
+// The page as next dev renders it, inside StrictMode (reactStrictMode in next.config.ts).
+function RenderStrictScreen(): void {
+    render(
+        <StrictMode>
+            <ThemeProvider theme={CARD_DEMO_THEME}>
+                <TransactionViewPage />
+            </ThemeProvider>
+        </StrictMode>,
+    );
 }
 
 // A non-blank tranId is a CT00 S selection, which COTRN01C displays on its first entry; the
@@ -347,6 +426,21 @@ async function TypeTranId(user: UserEvent, text: string): Promise<void> {
     }
 }
 
+// Renders the entry and leaves its read running: the arrival read, or ENTER on the typed key.
+async function StartPendingRead(readCase: PendingReadCase): Promise<UserEvent> {
+    mockViewTransaction.mockImplementation(PendUntilAborted);
+    mockSearchParams = new URLSearchParams(
+        readCase.queryTranId === "" ? {} : { tranId: readCase.queryTranId },
+    );
+    const user = RenderScreen();
+    if (readCase.typedText !== "") {
+        await TypeTranId(user, readCase.typedText);
+        await PressFunctionKey(user, FETCH_KEY, "button");
+    }
+    await screen.findByRole("progressbar");
+    return user;
+}
+
 // The ERRMSG line holds exactly the server's text, blanks included, in its severity colour.
 async function ExpectAlert(text: string, severity: MessageSeverity): Promise<void> {
     const alert = await screen.findByRole("alert");
@@ -380,6 +474,8 @@ function DeferRead(): (detail: TransactionDetailResponse) => void {
 beforeEach(() => {
     mockSearchParams = new URLSearchParams();
     mockCurrentUser = SIGNED_ON_USER;
+    // The reset drops any one-time answer a failed test left unconsumed.
+    mockViewTransaction.mockReset();
     mockViewTransaction.mockResolvedValue(BuildTransactionDetail());
     window.sessionStorage.clear();
 });
@@ -423,7 +519,7 @@ describe("COTRN01C first entry from a CT00 selection (/transactions/view?tranId)
     it("COTRN01C reads the selected transaction once and shows its key in TRNIDIN", async () => {
         await RenderFrom(TEST_TRAN_ID);
         expect(mockViewTransaction).toHaveBeenCalledTimes(1);
-        expect(mockViewTransaction).toHaveBeenCalledWith(TEST_TRAN_ID);
+        expect(mockViewTransaction).toHaveBeenCalledWith(TEST_TRAN_ID, READ_SIGNAL_OPTIONS);
         expect(TranIdInput()).toHaveValue(TEST_TRAN_ID);
         expect(screen.queryByRole("alert")).toBeNull();
     });
@@ -454,7 +550,7 @@ describe("COTRN01C ENTER (PROCESS-ENTER-KEY)", () => {
             await PressFunctionKey(user, FETCH_KEY, mode);
             await screen.findByDisplayValue(MASKED_CARD_NUMBER);
             expect(mockViewTransaction).toHaveBeenCalledTimes(1);
-            expect(mockViewTransaction).toHaveBeenCalledWith(TYPED_TRAN_ID);
+            expect(mockViewTransaction).toHaveBeenCalledWith(TYPED_TRAN_ID, READ_SIGNAL_OPTIONS);
             expect(DetailValues()).toEqual(DETAIL_FIELD_CASES.map((field) => field.shownValue));
         },
     );
@@ -468,7 +564,7 @@ describe("COTRN01C legacy literals on ERRMSG", () => {
         await PressFunctionKey(user, FETCH_KEY, "button");
         await ExpectAlert(literal.shownText, literal.severity);
         expect(mockViewTransaction).toHaveBeenCalledTimes(1);
-        expect(mockViewTransaction).toHaveBeenCalledWith(literal.sentKey);
+        expect(mockViewTransaction).toHaveBeenCalledWith(literal.sentKey, READ_SIGNAL_OPTIONS);
         expect(DetailValues()).toEqual(EMPTY_DETAIL_VALUES);
     });
 });
@@ -556,6 +652,61 @@ describe("COTRN01C unauthenticated read", () => {
         expect(mockRouterReplace).toHaveBeenCalledTimes(1);
         expect(mockRouterPush).not.toHaveBeenCalled();
         expect(screen.queryByRole("alert")).toBeNull();
+    });
+});
+
+// ENTER stays locked while the read runs, so no second read replaces it; the abandoned read's
+// CanceledError shows nothing on the screen still mounted.
+describe("COTRN01C leaving the screen during a read", () => {
+    it.each(PENDING_READ_CASES)(
+        "COTRN01C $leaving during $origin abandons the read without a message",
+        async (readCase) => {
+            const user = await StartPendingRead(readCase);
+            expect(screen.getByRole("button", { name: FETCH_KEY.buttonName })).toBeDisabled();
+            expect(ReadSignal(0)?.aborted).toBe(false);
+            await readCase.LeaveScreen(user);
+            expect(ReadSignal(0)?.aborted).toBe(true);
+            expect(mockRouterPush.mock.calls).toEqual(readCase.routes.map((route) => [route]));
+            expect(screen.queryByRole("alert")).toBeNull();
+            expect(mockViewTransaction).toHaveBeenCalledTimes(1);
+        },
+    );
+});
+
+// React StrictMode runs the arrival effect, its cleanup and the effect again in development: the
+// simulated unmount abandons the first read, the second displays the selection, and an answer
+// the first read still delivers afterwards is ignored.
+describe("COTRN01C arrival read under StrictMode", () => {
+    it("COTRN01C abandons the first arrival read and shows only the second", async () => {
+        let answerFirstRead: (detail: TransactionDetailResponse) => void = () => undefined;
+        mockViewTransaction
+            .mockImplementationOnce(() => new Promise((resolve) => (answerFirstRead = resolve)))
+            .mockResolvedValueOnce(BuildTransactionDetail());
+        mockSearchParams = new URLSearchParams({ tranId: TEST_TRAN_ID });
+        RenderStrictScreen();
+        await screen.findByDisplayValue(MASKED_CARD_NUMBER);
+        expect(mockViewTransaction).toHaveBeenCalledTimes(2);
+        expect([ReadSignal(0)?.aborted, ReadSignal(1)?.aborted]).toEqual([true, false]);
+        await act(async () => answerFirstRead(BuildTransactionDetail({ tran_desc: "Stale" })));
+        expect(DetailValues()).toEqual(DETAIL_FIELD_CASES.map((field) => field.shownValue));
+        expect(screen.getByRole("button", { name: FETCH_KEY.buttonName })).toBeEnabled();
+    });
+});
+
+// A cancelled read is discarded before ToScreenFeedback, which would show the abend text.
+describe("COTRN01C cancelled read", () => {
+    it("COTRN01C shows no message for a read rejected as cancelled", async () => {
+        mockViewTransaction.mockRejectedValue(new CanceledError());
+        const user = RenderScreen();
+        await TypeTranId(user, TEST_TRAN_ID);
+        await PressFunctionKey(user, FETCH_KEY, "button");
+        await waitFor(() =>
+            expect(screen.getByRole("button", { name: FETCH_KEY.buttonName })).toBeEnabled(),
+        );
+        expect(mockViewTransaction).toHaveBeenCalledTimes(1);
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(mockRouterReplace).not.toHaveBeenCalled();
+        expect(DetailValues()).toEqual(EMPTY_DETAIL_VALUES);
     });
 });
 

@@ -38,6 +38,7 @@ import {
 } from "@/lib/api/cards";
 import {
     Direction,
+    IsCancelledRequest,
     LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
@@ -101,6 +102,10 @@ type CardFilterTexts = Record<FilterFieldName, string>;
 type FilterInputs = Record<string, HTMLInputElement | null>;
 
 type AppRouter = ReturnType<typeof useRouter>;
+
+// The controller of the list read in flight: the first page, an ENTER, F7 or F8 read, or the
+// re-read after a selection the server answers with no action.
+type ListReadRef = RefObject<AbortController | null>;
 
 interface FilterFieldDefinition {
     name: FilterFieldName;
@@ -189,6 +194,7 @@ interface ScreenContext extends ScreenCalls {
     filters: CardFilterTexts;
     list: ListState;
     router: AppRouter;
+    listReadRef: ListReadRef;
 }
 
 interface CursorTargets {
@@ -342,15 +348,19 @@ function ApplyCallFailure(setters: ScreenSetters, error: AxiosError): void {
     setters.setMessages(MessagesFrom(body));
 }
 
-// The 401 and 403 redirects belong to the API client interceptor. Anything other than an axios
-// error is a defect and propagates.
+// A read abandoned through its signal was superseded or its page has gone, so it settles with no
+// update at all, not even the abend text. The 401 and 403 redirects belong to the API client
+// interceptor. Anything other than an axios error is a defect and propagates.
 async function SettleScreenRequest(
     setters: ScreenSetters,
     request: () => Promise<ScreenUpdate>,
-): Promise<ScreenUpdate> {
+): Promise<ScreenUpdate | null> {
     try {
         return await request();
     } catch (error) {
+        if (IsCancelledRequest(error)) {
+            return null;
+        }
         if (axios.isAxiosError(error)) {
             return () => ApplyCallFailure(setters, error);
         }
@@ -359,7 +369,9 @@ async function SettleScreenRequest(
 }
 
 // The keys stay disabled until the latest call settles; a superseded or unmounted call's
-// outcome is dropped.
+// outcome is dropped. An aborted read is never the latest call of a mounted page: it is aborted by
+// a newer call, which takes the next ticket, or by the page leaving, which clears the mounted
+// mark. So it leaves the busy state to the call in flight, or to no one once the page has gone.
 async function RunScreenCall(
     calls: ScreenCalls,
     request: () => Promise<ScreenUpdate>,
@@ -368,7 +380,7 @@ async function RunScreenCall(
     calls.setters.setIsBusy(true);
     try {
         const update = await SettleScreenRequest(calls.setters, request);
-        if (calls.gate.IsCurrent(ticket)) {
+        if (update !== null && calls.gate.IsCurrent(ticket)) {
             update();
         }
     } finally {
@@ -378,41 +390,65 @@ async function RunScreenCall(
     }
 }
 
+// Aborts whichever list read is in flight at the moment of the call.
+function AbortListRead(listReadRef: ListReadRef): void {
+    listReadRef.current?.abort();
+}
+
+// The new read supersedes the one still in flight, which is aborted.
+function BeginListRead(listReadRef: ListReadRef): AbortSignal {
+    AbortListRead(listReadRef);
+    const controller = new AbortController();
+    listReadRef.current = controller;
+    return controller.signal;
+}
+
 function ReadPage(context: ScreenContext, query: CardListQuery): Promise<void> {
-    return RunScreenCall(context, async () => ListUpdate(context.setters, await ListCards(query)));
+    const signal = BeginListRead(context.listReadRef);
+    return RunScreenCall(context, async () =>
+        ListUpdate(context.setters, await ListCards(query, { signal })),
+    );
 }
 
 // A pending message is shown at once and kept when the first page brings no message of its own.
-async function LoadFirstPage(calls: ScreenCalls, pendingMessage: string): Promise<void> {
+async function LoadFirstPage(
+    calls: ScreenCalls,
+    pendingMessage: string,
+    signal: AbortSignal,
+): Promise<void> {
     if (pendingMessage !== "") {
         calls.setters.setMessages(MessagesFrom({ message: pendingMessage }));
     }
     await RunScreenCall(calls, async () => {
-        const response = await ListCards(FIRST_ENTRY_QUERY);
+        const response = await ListCards(FIRST_ENTRY_QUERY, { signal });
         const message = response.message || pendingMessage;
         return ListUpdate(calls.setters, { ...response, message });
     });
 }
 
 // S opens the card view (COCRDSLC) and U the card update (COCRDUPC). No action is the WHEN OTHER
-// path, which re-reads the page shown.
+// path, which re-reads the page shown under the signal its selection call was given.
 async function FollowSelection(
     context: ScreenContext,
     response: CardSelectionResponse,
+    signal: AbortSignal,
 ): Promise<ScreenUpdate> {
     if (response.action === null) {
-        return ListUpdate(context.setters, await ListCards(ListQuery(context)));
+        return ListUpdate(context.setters, await ListCards(ListQuery(context), { signal }));
     }
     const acctId = SelectedRow(context.list)?.acct_id ?? "";
     const route = CardRoute(response.action, response.card_ref, acctId);
     return () => context.router.push(route);
 }
 
+// The selection is a write and takes no signal. Its WHEN OTHER re-read is owned from the start, so
+// leaving the page while the selection runs aborts that read before it is sent.
 function SubmitSelection(context: ScreenContext): Promise<void> {
     const rows = BuildSelectionRows(context.list);
     const { acct_id, card_num } = context.filters;
+    const rereadSignal = BeginListRead(context.listReadRef);
     return RunScreenCall(context, async () =>
-        FollowSelection(context, await SelectCards({ acct_id, card_num, rows })),
+        FollowSelection(context, await SelectCards({ acct_id, card_num, rows }), rereadSignal),
     );
 }
 
@@ -573,24 +609,33 @@ function useFilterHandlers(
     );
 }
 
-// The first page is read once per page instance: the ref survives React's development remount,
-// whose re-run of the effect neither takes the pending message again nor starts a second read.
-function useFirstPageLoad(setters: ScreenSetters, gate: RequestGate): void {
-    const hasStartedRef = useRef(false);
+// The pending message is taken once per page instance, so React's development remount of the
+// effect still shows it. Leaving the page aborts the list read in flight, the first page or a
+// later one. The development remount aborts the first read and reads the first page again; the
+// request gate drops the aborted read, so only the second one changes the screen or ends the busy
+// state, and a production mount reads the first page once.
+function useFirstPageLoad(
+    setters: ScreenSetters,
+    gate: RequestGate,
+    listReadRef: ListReadRef,
+): void {
+    const pendingMessageRef = useRef<string | null>(null);
     useEffect(() => {
-        if (hasStartedRef.current) {
-            return;
+        if (pendingMessageRef.current === null) {
+            pendingMessageRef.current = TakePendingMessage();
         }
-        hasStartedRef.current = true;
-        void LoadFirstPage({ setters, gate }, TakePendingMessage());
-    }, [setters, gate]);
+        const signal = BeginListRead(listReadRef);
+        void LoadFirstPage({ setters, gate }, pendingMessageRef.current, signal);
+        return () => AbortListRead(listReadRef);
+    }, [setters, gate, listReadRef]);
 }
 
 function useScreenContext(state: ScreenState): ScreenContext {
     const router = useRouter();
+    const listReadRef = useRef<AbortController | null>(null);
     const { filters, list, setters, gate } = state;
     return useMemo(
-        () => ({ filters, list, setters, gate, router }),
+        () => ({ filters, list, setters, gate, router, listReadRef }),
         [filters, list, setters, gate, router],
     );
 }
@@ -608,7 +653,7 @@ function useCardListScreen(): CardListScreenModel {
         [setters],
     );
     useFunctionKeys(keys);
-    useFirstPageLoad(setters, gate);
+    useFirstPageLoad(setters, gate, context.listReadRef);
     const { filters, list, messages } = state;
     return { filters, list, messages, isBusy, keys, filterHandlers, tableRef, onSelectionChange };
 }

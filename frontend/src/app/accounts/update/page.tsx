@@ -8,6 +8,7 @@ import axios from "axios";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
     Suspense,
+    startTransition,
     useCallback,
     useEffect,
     useMemo,
@@ -29,6 +30,7 @@ import {
     type AccountUpdateRequest,
 } from "@/lib/api/accounts";
 import {
+    IsCancelledRequest,
     LegacyErrorBody,
     SeverityForOutcome,
     TakePendingMessage,
@@ -102,7 +104,13 @@ type InputRefMap = Partial<Record<AccountFieldName, HTMLInputElement | null>>;
 
 type AccountRequest = () => Promise<AccountScreen>;
 
-type RequestRunner = (request: AccountRequest) => void;
+// signal is passed for a read only: the entry fetch carries its owner's AbortSignal, while a PUT
+// takes none and always runs to its answer.
+type RequestRunner = (request: AccountRequest, signal?: AbortSignal) => void;
+
+interface InFlightRequest {
+    signal?: AbortSignal;
+}
 
 // The 4xx and 5xx CAUP bodies carry the screen beside the standard legacy keys.
 type AccountErrorBody = LegacyErrorResponse &
@@ -442,8 +450,12 @@ function AdoptErrorScreen(model: ScreenModel, body: AccountErrorBody): ScreenMod
     };
 }
 
-// Only an axios error is a legacy outcome; anything else is a defect and propagates.
+// A read its owner aborted shows nothing; a PUT carries no signal, so no save ends here. Only an
+// axios error is a legacy outcome; anything else is a defect and propagates.
 function ApplyErrorBody(error: unknown, setters: ScreenSetters): void {
+    if (IsCancelledRequest(error)) {
+        return;
+    }
     if (!axios.isAxiosError(error)) {
         throw error;
     }
@@ -488,7 +500,7 @@ function HandleAction(action: UpdateAction, context: ActionContext): void {
 
 // The FKEYS legend ENTER=Process F3=Exit, with F5=Save and F12=Cancel offered in every state: the
 // server processes a save or cancel its state does not allow as ENTER. ENTER, F5 and F12 each
-// send a request, so they are disabled while one is in flight; F3 only navigates.
+// send a request, so they are disabled while one is in flight; F3 sends none and stays enabled.
 function BuildFunctionKeys(handlers: KeyHandlers, isBusy: boolean): FunctionKeyDefinition[] {
     const requestKey = (key: PfKey, label: string, action: UpdateAction) => ({
         key,
@@ -517,6 +529,21 @@ function WithFieldValue(model: ScreenModel, name: AccountFieldName, value: strin
     return { ...model, fields: { ...model.fields, [name]: value } };
 }
 
+// A request holds the screen until it settles, unless it is a read its owner has aborted.
+function HoldsScreen(inFlight: InFlightRequest | null): boolean {
+    return inFlight !== null && inFlight.signal?.aborted !== true;
+}
+
+// An aborted read ends the busy state as a transition, so the F3 task that aborted it ends at
+// once and the browser cancels the request without waiting for a re-render.
+function EndBusyState(inFlight: InFlightRequest, setters: ScreenSetters): void {
+    if (inFlight.signal?.aborted === true) {
+        startTransition(() => setters.setIsBusy(false));
+        return;
+    }
+    setters.setIsBusy(false);
+}
+
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 function useScreenStore(): ScreenStore {
@@ -528,33 +555,46 @@ function useScreenStore(): ScreenStore {
 }
 
 // One request at a time, as one CICS task per key press: a key pressed while a request is in
-// flight is ignored.
+// flight is ignored. An aborted read gives the screen to the next request, and only the request
+// in flight ends the busy state.
 function useRequestRunner(setters: ScreenSetters): RequestRunner {
-    const isBusyRef = useRef(false);
+    const inFlightRef = useRef<InFlightRequest | null>(null);
     return useCallback(
-        (request: AccountRequest) => {
-            if (isBusyRef.current) {
+        (request: AccountRequest, signal?: AbortSignal) => {
+            if (HoldsScreen(inFlightRef.current)) {
                 return;
             }
-            isBusyRef.current = true;
+            const inFlight: InFlightRequest = { signal };
+            inFlightRef.current = inFlight;
             setters.setIsBusy(true);
             void RunAccountRequest(request, setters).finally(() => {
-                isBusyRef.current = false;
-                setters.setIsBusy(false);
+                if (inFlightRef.current === inFlight) {
+                    inFlightRef.current = null;
+                    EndBusyState(inFlight, setters);
+                }
             });
         },
         [setters],
     );
 }
 
-// Entry from the menu shows the empty key screen; entry with ?acctId= fetches that account.
+// Entry from the menu shows the empty key screen; entry with ?acctId= fetches that account. The
+// fetch is a read: leaving the page or a new ?acctId= aborts it, so Strict Mode's repeated mount
+// effect fetches again. The returned function aborts it for F3, as the page stays mounted until
+// the next route has loaded.
 function useEntryRequest(acctId: string | null, runRequest: RequestRunner, setters: ScreenSetters) {
+    const controllerRef = useRef<AbortController | null>(null);
     useEffect(() => {
         ShowPendingMessage(setters);
+        const controller = new AbortController();
+        controllerRef.current = controller;
         if (acctId !== null) {
-            runRequest(() => FetchAccountForEdit(acctId));
+            const { signal } = controller;
+            runRequest(() => FetchAccountForEdit(acctId, { signal }), signal);
         }
+        return () => controller.abort();
     }, [acctId, runRequest, setters]);
+    return useCallback(() => controllerRef.current?.abort(), []);
 }
 
 // Every response moves the cursor, a repeated cursor field included.
@@ -569,14 +609,23 @@ function useCursorFocus(store: ScreenStore, inputRefs: RefObject<InputRefMap>) {
     }, [feedback, model.state, inputRefs]);
 }
 
-function useFunctionKeyDefinitions(store: ScreenStore, runRequest: RequestRunner) {
+// F3 aborts an entry fetch still in flight, then leaves; the aborted read stops holding the
+// screen at once (HoldsScreen). A PUT carries no signal, so a save in flight is never aborted.
+function useFunctionKeyDefinitions(
+    store: ScreenStore,
+    runRequest: RequestRunner,
+    abortEntryFetch: () => void,
+) {
     const router = useRouter();
     const { model, isBusy } = store;
     const onAction = useCallback(
         (action: UpdateAction) => HandleAction(action, { model, runRequest }),
         [model, runRequest],
     );
-    const onExit = useCallback(() => router.push(MENU_ROUTE), [router]);
+    const onExit = useCallback(() => {
+        abortEntryFetch();
+        router.push(MENU_ROUTE);
+    }, [abortEntryFetch, router]);
     return useMemo(
         () => BuildFunctionKeys({ onAction, onExit }, isBusy),
         [onAction, onExit, isBusy],
@@ -619,9 +668,9 @@ function useAccountUpdateScreen(): AccountUpdateScreenModel {
     const runRequest = useRequestRunner(store.setters);
     const registry = useInputRegistry();
     const acctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY);
-    useEntryRequest(acctId, runRequest, store.setters);
+    const abortEntryFetch = useEntryRequest(acctId, runRequest, store.setters);
     useCursorFocus(store, registry.inputRefs);
-    const keys = useFunctionKeyDefinitions(store, runRequest);
+    const keys = useFunctionKeyDefinitions(store, runRequest, abortEntryFetch);
     const view = useFieldView(store, registry);
     return { view, keys, isBusy: store.isBusy, feedback: store.feedback };
 }

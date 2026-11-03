@@ -1,8 +1,17 @@
 // Screen tests: BMS COTRN00, program COTRN00C (CT00), page /transactions.
 import { ThemeProvider } from "@mui/material/styles";
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+    act,
+    cleanup,
+    fireEvent,
+    render,
+    screen,
+    waitFor,
+    within,
+    type RenderOptions,
+} from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
-import { AxiosError, AxiosHeaders } from "axios";
+import { AxiosError, AxiosHeaders, CanceledError } from "axios";
 import type { ReactNode } from "react";
 
 import TransactionListPage from "@/app/transactions/page";
@@ -19,8 +28,10 @@ import {
 import {
     Direction,
     SIGN_ON_ROUTE,
+    StorePendingMessage,
     type LegacyErrorResponse,
     type MessageSeverity,
+    type ReadOptions,
 } from "@/lib/apiClient";
 import { PF_KEY_ACTIONS } from "@/lib/useFunctionKeys";
 
@@ -115,6 +126,13 @@ interface SearchLifecycleCase {
     shownSearch: string;
 }
 
+// A read left unanswered, how it is started and its index among the ListTransactions calls.
+interface PendingReadCase {
+    read: string;
+    callIndex: number;
+    StartRead: () => Promise<UserEvent>;
+}
+
 // The row-4 title and TRNIDIN of bms/COTRN00.bms (LENGTH=16).
 const SCREEN_TITLE = "List Transactions";
 const SEARCH_LABEL = "Search Tran ID:";
@@ -166,6 +184,12 @@ const NUMERIC_SEARCH = "Tran ID must be Numeric ...";
 const LOOKUP_FAILED = "Unable to lookup transaction...";
 // A 500 shows the CSMSG02Y abend text.
 const ABEND = "UNEXPECTED ABEND OCCURRED.";
+// A message StorePendingMessage carried across a navigation: the apiClient 403 refusal literal,
+// whose trailing space is part of it (cbl/COMEN01C.cbl).
+const CARRIED_MESSAGE = "No access - Admin Only option... ";
+
+// Every ListTransactions call is a read and carries the AbortSignal of the runner's controller.
+const READ_OPTIONS = { signal: expect.any(AbortSignal) };
 
 const ALERT_COLOR_CLASSES: Readonly<Record<MessageSeverity, string>> = {
     error: "MuiAlert-colorError",
@@ -178,6 +202,8 @@ const ALERT_COLOR_CLASSES: Readonly<Record<MessageSeverity, string>> = {
 const FIXED_NOW_MILLISECONDS = new Date(2022, 6, 18, 9, 5, 7).getTime();
 
 const PRESS_MODES: readonly PressMode[] = ["button", "key"];
+// The paging keys, whose answers come from ListTransactions reads.
+const PAGE_KEYS: readonly ListKey[] = ["F7", "F8"];
 // The legend keys that send a request; F3 only leaves the screen.
 const REQUEST_KEYS: readonly ListKey[] = ["ENTER", "F7", "F8"];
 // The keys whose answer can blank TRNIDIN through search_cleared.
@@ -323,12 +349,14 @@ function BuildRefusal(status: number, literal: string, refusedPage?: ListPageBod
     return BuildAxiosError(status, { ...BuildSearchErrorBody(literal), ...refusedPage });
 }
 
-function RenderScreen(): UserEvent {
+// options.reactStrictMode mounts the page as next.config's reactStrictMode does in development.
+function RenderScreen(options: RenderOptions = {}): UserEvent {
     const user = userEvent.setup();
     render(
         <ThemeProvider theme={CARD_DEMO_THEME}>
             <TransactionListPage />
         </ThemeProvider>,
+        options,
     );
     return user;
 }
@@ -445,12 +473,86 @@ function MockKeyOutcome(literalCase: LiteralCase): void {
     MockKeyAnswer(literalCase.key, () => OutcomeFor(literalCase));
 }
 
+// A read that never answers: once its signal aborts it rejects with axios's CanceledError, as an
+// abandoned API_CLIENT call does.
+function PendingUntilAborted(
+    _query: TransactionListQuery,
+    options?: ReadOptions,
+): Promise<TransactionListResponse> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new CanceledError()));
+    });
+}
+
+// Leaves the next ListTransactions read unanswered until the returned function answers it; an
+// abort of its signal first rejects it with axios's CanceledError instead.
+function DeferListAnswer(): (response: TransactionListResponse) => void {
+    const { promise, resolve } = Promise.withResolvers<TransactionListResponse>();
+    mockListTransactions.mockImplementationOnce((query, options) =>
+        Promise.race([promise, PendingUntilAborted(query, options)]),
+    );
+    return resolve;
+}
+
+// Leaves the next ENTER unanswered until the returned function answers it.
+function DeferSelectionAnswer(): (response: TransactionSelectionResponse) => void {
+    let answer: (response: TransactionSelectionResponse) => void = () => undefined;
+    mockSelectTransactions.mockImplementationOnce(
+        () =>
+            new Promise((resolve) => {
+                answer = resolve;
+            }),
+    );
+    return (response) => answer(response);
+}
+
+// The signal the page gave the ListTransactions call at callIndex, counted from 0.
+function ListCallSignal(callIndex: number): AbortSignal | undefined {
+    return mockListTransactions.mock.calls[callIndex]?.[1]?.signal;
+}
+
+// One macrotask runs every settled promise chain first, so any answer the page would apply has
+// been applied before an assertion that nothing was.
+async function FlushPendingAnswers(): Promise<void> {
+    await act(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+}
+
+// The first-entry read, left unanswered.
+async function StartPendingFirstEntry(): Promise<UserEvent> {
+    mockListTransactions.mockImplementationOnce(PendingUntilAborted);
+    const user = RenderScreen();
+    await waitFor(() => expect(mockListTransactions).toHaveBeenCalledTimes(1));
+    return user;
+}
+
+// An F8 read over the first page, left unanswered.
+async function StartPendingForward(): Promise<UserEvent> {
+    const user = await RenderFirstPage();
+    mockListTransactions.mockImplementationOnce(PendingUntilAborted);
+    await PressKey(user, "F8", "button");
+    return user;
+}
+
+const PENDING_READ_CASES: readonly PendingReadCase[] = [
+    { read: "the first-entry read", callIndex: 0, StartRead: StartPendingFirstEntry },
+    { read: "an F8 read", callIndex: 1, StartRead: StartPendingForward },
+];
+
 // The page the server browses for both SEARCH_CASES: rows 13-22, the first at or after the key.
 const FOUND_FIRST_ROW_NUMBER = 13;
 const FOUND_PAGE: Partial<TransactionListResponse> = {
     rows: BuildRows(FOUND_FIRST_ROW_NUMBER),
     first_key: TranIdFor(FOUND_FIRST_ROW_NUMBER),
     last_key: TranIdFor(FOUND_FIRST_ROW_NUMBER + PAGE_SIZE - 1),
+};
+
+// The page a read held open answers with: rows 21-30, page 3.
+const LATEST_FIRST_ROW_NUMBER = 21;
+const LATEST_PAGE: Partial<TransactionListResponse> = {
+    rows: BuildRows(LATEST_FIRST_ROW_NUMBER),
+    page: 3,
+    first_key: TranIdFor(LATEST_FIRST_ROW_NUMBER),
+    last_key: TranIdFor(LATEST_FIRST_ROW_NUMBER + PAGE_SIZE - 1),
 };
 
 // The page F8 shows after the first: rows 11-20 on page 2.
@@ -487,7 +589,7 @@ describe("COTRN00C first entry on /transactions", () => {
     it("COTRN00C first entry browses from the lowest TRAN-ID and shows ten rows", async () => {
         await RenderFirstPage();
         expect(mockListTransactions).toHaveBeenCalledTimes(1);
-        expect(mockListTransactions).toHaveBeenCalledWith({});
+        expect(mockListTransactions).toHaveBeenCalledWith({}, READ_OPTIONS);
         expect(screen.getByRole("heading", { level: 1, name: SCREEN_TITLE })).toBeVisible();
         expect(screen.getByText("Tran: CT00")).toBeVisible();
         expect(screen.getByText("Prog: COTRN00C")).toBeVisible();
@@ -594,7 +696,7 @@ describe("COTRN00C F8 after an edit failure", () => {
             mockListTransactions.mockResolvedValueOnce(pagingAnswer);
             await PressKey(user, "F8", "button");
             await screen.findByText(BOTTOM_ALREADY);
-            expect(mockListTransactions).toHaveBeenLastCalledWith(query);
+            expect(mockListTransactions).toHaveBeenLastCalledWith(query, READ_OPTIONS);
         },
     );
 });
@@ -641,7 +743,7 @@ describe("COTRN00C F7 and F8 paging", () => {
             await PressKey(user, key, mode);
             await screen.findByText(TranIdFor(20));
             expect(mockListTransactions).toHaveBeenCalledTimes(2);
-            expect(mockListTransactions).toHaveBeenLastCalledWith(query);
+            expect(mockListTransactions).toHaveBeenLastCalledWith(query, READ_OPTIONS);
             expect(ShownTranIds()).toEqual(TranIdsFrom(11));
             expect(screen.getByText("2")).toBeVisible();
         },
@@ -765,7 +867,7 @@ describe("COTRN00C keys pressed twice in one frame", () => {
         resolve(PENDING_ANSWER);
         await screen.findByText(TranIdFor(20));
         expect(mockListTransactions).toHaveBeenCalledTimes(2);
-        expect(mockListTransactions).toHaveBeenLastCalledWith(FORWARD_QUERY);
+        expect(mockListTransactions).toHaveBeenLastCalledWith(FORWARD_QUERY, READ_OPTIONS);
     });
 });
 
@@ -822,4 +924,117 @@ describe("COTRN00C cursor without an error mark", () => {
         expect(SearchField()).toHaveFocus();
         expect(SearchField()).toHaveAttribute("aria-invalid", "false");
     });
+});
+
+// The cleanup between the two effect runs aborts the first read and frees the lock, so the second
+// read is sent; the first read's late cancellation leaves the keys locked until the second answers.
+describe("COTRN00C first entry under React Strict Mode", () => {
+    it("COTRN00C Strict Mode aborts the first read and shows the second one", async () => {
+        StorePendingMessage(CARRIED_MESSAGE);
+        mockListTransactions.mockImplementationOnce(PendingUntilAborted);
+        const answerSecondRead = DeferListAnswer();
+        RenderScreen({ reactStrictMode: true });
+        await waitFor(() => expect(mockListTransactions).toHaveBeenCalledTimes(2));
+        await FlushPendingAnswers();
+        expect(ListCallSignal(0)?.aborted).toBe(true);
+        ExpectRequestKeysDisabled(true);
+        await act(async () => answerSecondRead(BuildListResponse()));
+        await screen.findByText(TranIdFor(PAGE_SIZE));
+        expect(mockListTransactions).toHaveBeenNthCalledWith(1, {}, READ_OPTIONS);
+        expect(mockListTransactions).toHaveBeenNthCalledWith(2, {}, READ_OPTIONS);
+        expect(ListCallSignal(1)?.aborted).toBe(false);
+        ExpectRequestKeysDisabled(false);
+        await ExpectAlert(CARRIED_MESSAGE, "error");
+    });
+});
+
+describe("COTRN00C unmount with a read pending", () => {
+    it.each(PENDING_READ_CASES)(
+        "COTRN00C unmount while $read is pending aborts it and applies nothing",
+        async ({ callIndex, StartRead }) => {
+            await StartRead();
+            expect(ListCallSignal(callIndex)?.aborted).toBe(false);
+            // cleanup() unmounts the page, as leaving /transactions does.
+            cleanup();
+            await FlushPendingAnswers();
+            expect(ListCallSignal(callIndex)?.aborted).toBe(true);
+            expect(mockRouterPush).not.toHaveBeenCalled();
+        },
+    );
+});
+
+describe("COTRN00C F3 with a read pending", () => {
+    it.each(PENDING_READ_CASES)(
+        "COTRN00C F3 while $read is pending aborts it and returns to the main menu",
+        async ({ callIndex, StartRead }) => {
+            const user = await StartRead();
+            await PressKey(user, "F3", "button");
+            await FlushPendingAnswers();
+            expect(ListCallSignal(callIndex)?.aborted).toBe(true);
+            expect(mockRouterPush).toHaveBeenCalledTimes(1);
+            expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
+            expect(screen.queryByRole("alert")).toBeNull();
+        },
+    );
+});
+
+// A key pressed in the frame of an F8, before its keys disable, reaches the runner, whose lock
+// refuses it: the press neither supersedes nor aborts the F8 read, whose answer is then shown.
+describe("COTRN00C keys pressed over a pending read", () => {
+    it.each(REQUEST_KEYS)(
+        "COTRN00C %s pressed in the frame of an F8 leaves the F8 read running",
+        async (key) => {
+            await RenderFirstPage();
+            const answerRead = DeferListAnswer();
+            act(() => {
+                DispatchKeyDown("F8");
+                DispatchKeyDown(key);
+            });
+            await FlushPendingAnswers();
+            expect(RequestCount()).toBe(2);
+            expect(ListCallSignal(1)?.aborted).toBe(false);
+            await act(async () => answerRead(BuildListResponse(LATEST_PAGE)));
+            await screen.findByText(TranIdFor(LATEST_FIRST_ROW_NUMBER + PAGE_SIZE - 1));
+            expect(screen.getByText("3")).toBeVisible();
+            expect(screen.queryByRole("alert")).toBeNull();
+        },
+    );
+});
+
+// F3 aborts the controller the ENTER selection was offered, but a selection never takes the
+// signal, so it runs to its answer, which F3 discards: no view route follows the menu.
+describe("COTRN00C F3 over a pending selection", () => {
+    it("COTRN00C F3 discards a pending ENTER's answer; the selection takes no signal", async () => {
+        const user = await RenderFirstPage();
+        const answerSelection = DeferSelectionAnswer();
+        await ChooseSelection(user, SELECTED_ROW_NUMBER, "S");
+        await PressKey(user, "ENTER", "button");
+        await PressKey(user, "F3", "button");
+        await act(async () => answerSelection({ route: VIEW_ROUTE }));
+        await FlushPendingAnswers();
+        expect(mockSelectTransactions.mock.calls[0]).toHaveLength(1);
+        expect(mockRouterPush).toHaveBeenCalledTimes(1);
+        expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
+    });
+});
+
+// A cancelled read still current shows nothing, but frees the lock and unlocks the keys, so the
+// next press is answered.
+describe("COTRN00C cancelled read", () => {
+    it.each(PAGE_KEYS)(
+        "COTRN00C %s rejected with a CanceledError shows no message and unlocks the keys",
+        async (key) => {
+            const user = await RenderFirstPage();
+            mockListTransactions.mockRejectedValueOnce(new CanceledError());
+            await PressKey(user, key, "button");
+            await FlushPendingAnswers();
+            expect(mockListTransactions).toHaveBeenCalledTimes(2);
+            expect(screen.queryByRole("alert")).toBeNull();
+            expect(ShownTranIds()).toEqual(TranIdsFrom(1));
+            ExpectRequestKeysDisabled(false);
+            mockListTransactions.mockResolvedValueOnce(BuildListResponse(LATEST_PAGE));
+            await PressKey(user, key, "button");
+            await screen.findByText(TranIdFor(LATEST_FIRST_ROW_NUMBER + PAGE_SIZE - 1));
+        },
+    );
 });

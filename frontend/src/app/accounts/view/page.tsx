@@ -5,13 +5,22 @@
 import { Grid, Stack, TextField, Typography, type GridProps } from "@mui/material";
 import axios from "axios";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import {
+    Suspense,
+    startTransition,
+    useCallback,
+    useEffect,
+    useRef,
+    useState,
+    type RefObject,
+} from "react";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { ViewAccount, type AccountViewResponse } from "@/lib/api/accounts";
 import {
+    IsCancelledRequest,
     SeverityForOutcome,
     TakePendingMessage,
     ToScreenFeedback,
@@ -71,11 +80,21 @@ interface ViewState {
 
 type ViewUpdater = (update: Partial<ViewState>) => void;
 
+type LookupStarter = (acctText: string) => void;
+
+interface AccountLookup {
+    StartLookup: LookupStarter;
+    AbortLookup: () => void;
+}
+
+type AppRouter = ReturnType<typeof useRouter>;
+
 interface AccountViewScreenState extends ViewState {
     acctText: string;
     inputRef: RefObject<HTMLInputElement | null>;
     SetAcctText: (acctText: string) => void;
     Search: () => void;
+    AbortLookup: () => void;
 }
 
 type AccountDisplayField = Exclude<keyof AccountViewResponse, keyof ScreenFeedback>;
@@ -196,24 +215,37 @@ function ApplyViewResult(response: AccountViewResponse, updateView: ViewUpdater)
 }
 
 // COACTVWC sends the map back initialised and the error body carries no record, so the details
-// are cleared; the typed account number stays in its field.
+// are cleared; the typed account number stays in its field. An aborted lookup was superseded or
+// left behind, so it shows nothing.
 function ApplyViewError(error: unknown, updateView: ViewUpdater): void {
+    if (IsCancelledRequest(error)) {
+        return;
+    }
     if (!axios.isAxiosError(error)) {
         throw error;
     }
     updateView({ account: null, feedback: FeedbackFrom(ToScreenFeedback(error), true) });
 }
 
-// The ENTER path: the ACCTSID text goes to the server exactly as typed.
-async function RunSearch(acctText: string, updateView: ViewUpdater): Promise<void> {
+// The ENTER path: the ACCTSID text goes to the server exactly as typed. An aborted lookup no
+// longer owns the busy state: the lookup that superseded it does, or AbortLookup has ended it.
+async function RunSearch(
+    acctText: string,
+    updateView: ViewUpdater,
+    signal: AbortSignal,
+): Promise<void> {
     updateView({ isBusy: true });
     try {
-        const response = await ViewAccount(acctText === "" ? BLANK_ACCOUNT_ID : acctText);
+        const response = await ViewAccount(acctText === "" ? BLANK_ACCOUNT_ID : acctText, {
+            signal,
+        });
         ApplyViewResult(response, updateView);
     } catch (error) {
         ApplyViewError(error, updateView);
     } finally {
-        updateView({ isBusy: false });
+        if (!signal.aborted) {
+            updateView({ isBusy: false });
+        }
     }
 }
 
@@ -228,19 +260,47 @@ function ShowPendingMessage(updateView: ViewUpdater): void {
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 //
-// The ref keeps Strict Mode's repeated mount effect from taking the message or fetching twice.
-function useInitialScreen(initialAcctId: string, updateView: ViewUpdater): void {
-    const hasStartedRef = useRef(false);
+// Each lookup owns an AbortController: a new lookup aborts the one before it, and leaving the
+// page or F3 aborts the one in flight. AbortLookup also ends the busy state, which no aborted
+// lookup ends itself, so the keys stay free if the page is not left after all. It does so as a
+// transition, so the F3 task ends at once and the browser cancels the request without waiting
+// for a re-render.
+function useAccountLookup(updateView: ViewUpdater): AccountLookup {
+    const controllerRef = useRef<AbortController | null>(null);
+    const abortLookup = useCallback(() => {
+        controllerRef.current?.abort();
+        startTransition(() => updateView({ isBusy: false }));
+    }, [updateView]);
+    useEffect(() => abortLookup, [abortLookup]);
+    const startLookup = useCallback(
+        (acctText: string) => {
+            controllerRef.current?.abort();
+            const controller = new AbortController();
+            controllerRef.current = controller;
+            void RunSearch(acctText, updateView, controller.signal);
+        },
+        [updateView],
+    );
+    return { StartLookup: startLookup, AbortLookup: abortLookup };
+}
+
+// The ref keeps Strict Mode's repeated mount effect from taking the message twice. Strict Mode's
+// simulated unmount aborts the first lookup, so the repeated effect looks the account up again.
+function useInitialScreen(
+    initialAcctId: string,
+    updateView: ViewUpdater,
+    startLookup: LookupStarter,
+): void {
+    const hasShownMessageRef = useRef(false);
     useEffect(() => {
-        if (hasStartedRef.current) {
-            return;
+        if (!hasShownMessageRef.current) {
+            hasShownMessageRef.current = true;
+            ShowPendingMessage(updateView);
         }
-        hasStartedRef.current = true;
-        ShowPendingMessage(updateView);
         if (initialAcctId !== "") {
-            void RunSearch(initialAcctId, updateView);
+            startLookup(initialAcctId);
         }
-    }, [initialAcctId, updateView]);
+    }, [initialAcctId, updateView, startLookup]);
 }
 
 // Replaces the BMS IC attribute and COACTVWC's MOVE -1 TO ACCTSIDL: the cursor starts on ACCTSID
@@ -268,12 +328,14 @@ function useAccountViewScreen(): AccountViewScreenState {
         (update) => setView((current) => ({ ...current, ...update })),
         [],
     );
-    useInitialScreen(initialAcctId, updateView);
+    const lookup = useAccountLookup(updateView);
+    useInitialScreen(initialAcctId, updateView, lookup.StartLookup);
     useCursorFocus(inputRef, view.feedback);
     const search = (): void => {
-        void RunSearch(acctText, updateView);
+        lookup.StartLookup(acctText);
     };
-    return { ...view, acctText, inputRef, SetAcctText: setAcctText, Search: search };
+    const actions = { SetAcctText: setAcctText, Search: search, AbortLookup: lookup.AbortLookup };
+    return { ...view, acctText, inputRef, ...actions };
 }
 
 function BuildFunctionKeys(
@@ -378,12 +440,19 @@ function CustomerDetails({ account }: RecordProps) {
     );
 }
 
+// F3 aborts the lookup in flight before it leaves, because the route change keeps this page
+// mounted until the menu has loaded.
+function ExitToMenu(screen: AccountViewScreenState, router: AppRouter): void {
+    screen.AbortLookup();
+    router.push(MENU_ROUTE);
+}
+
 // COACTVWC accepts ENTER and PF3 only (any other key is processed as ENTER), so no other key is
 // bound. F3 replaces the XCTL back to the main menu.
 function AccountViewScreen() {
     const router = useRouter();
     const screen = useAccountViewScreen();
-    const keys = BuildFunctionKeys(screen, () => router.push(MENU_ROUTE));
+    const keys = BuildFunctionKeys(screen, () => ExitToMenu(screen, router));
     useFunctionKeys(keys);
     return (
         <ScreenShell {...SCREEN_IDENTITY} isBusy={screen.isBusy}>

@@ -3,7 +3,7 @@
 // The server owns every option edit and literal. A 400 option literal or a 403 role refusal
 // rejects the call unchanged: the page shows it, and the apiClient.ts interceptor returns a
 // refused user to their own menu.
-import { API_CLIENT } from "@/lib/apiClient";
+import { API_CLIENT, type ReadOptions } from "@/lib/apiClient";
 
 // One entry of the COMEN02Y (11 options) or COADM02Y (6 options) table, label verbatim.
 export interface MenuOption {
@@ -29,8 +29,10 @@ export interface MenuSelectionResponse {
     message: string;
 }
 
-export async function FetchMainMenu(): Promise<MenuResponse> {
-    const response = await API_CLIENT.get<MenuResponse>("/menu/main");
+// options carries the owning read's AbortSignal, as on FetchAdminMenu; a selection is a write and
+// takes none.
+export async function FetchMainMenu(options?: ReadOptions): Promise<MenuResponse> {
+    const response = await API_CLIENT.get<MenuResponse>("/menu/main", { signal: options?.signal });
     return response.data;
 }
 
@@ -41,8 +43,8 @@ export async function SelectMainMenuOption(
     return response.data;
 }
 
-export async function FetchAdminMenu(): Promise<MenuResponse> {
-    const response = await API_CLIENT.get<MenuResponse>("/menu/admin");
+export async function FetchAdminMenu(options?: ReadOptions): Promise<MenuResponse> {
+    const response = await API_CLIENT.get<MenuResponse>("/menu/admin", { signal: options?.signal });
     return response.data;
 }
 

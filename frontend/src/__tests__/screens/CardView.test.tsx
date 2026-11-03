@@ -7,6 +7,7 @@ import userEvent from "@testing-library/user-event";
 import {
     AxiosError,
     AxiosHeaders,
+    CanceledError,
     type AxiosResponse,
     type InternalAxiosRequestConfig,
 } from "axios";
@@ -20,6 +21,7 @@ import {
     SIGN_ON_ROUTE,
     type LegacyErrorResponse,
     type MessageSeverity,
+    type ReadOptions,
 } from "@/lib/apiClient";
 import type { SessionContextValue } from "@/lib/session";
 
@@ -98,6 +100,10 @@ const TEST_EMBOSSED_NAME = "TEST CARD HOLDER";
 const TEST_ACTIVE_STATUS = "Y";
 const TEST_EXPIRY_MONTH = "07";
 const TEST_EXPIRY_YEAR = "2027";
+// The name an answer abandoned by a newer lookup carries; it must never reach the screen.
+const STALE_EMBOSSED_NAME = "STALE CARD HOLDER";
+// Every read is handed the signal of the AbortController that owns it.
+const READ_SIGNAL_OPTIONS = expect.objectContaining({ signal: expect.any(AbortSignal) });
 
 // The COCRDSL title, INITIAL texts (internal blanks kept) and FKEYS legend buttons.
 const SCREEN_TITLE = "View Credit Card Detail";
@@ -284,6 +290,44 @@ function HoldReads(): (detail: CardDetailResponse) => void {
     return releaseRead;
 }
 
+function SelectFromCardList(): void {
+    mockSearchParams = new URLSearchParams({ cardRef: TEST_CARD_REF, acctId: TEST_ACCOUNT_ID });
+}
+
+// A second COCRDLIC selection while the screen is shown: the query names another card.
+function SelectOtherFromCardList(): void {
+    mockSearchParams = new URLSearchParams({ cardRef: OTHER_CARD_REF, acctId: OTHER_ACCOUNT_ID });
+}
+
+// The screen alone, for a case that leaves it; the answer is the screen's unmount.
+function RenderUnmountableScreen(): () => void {
+    const { unmount } = render(ScreenTree());
+    return unmount;
+}
+
+// A read still in flight: it settles only as axios does once its signal is aborted.
+function PendUntilAborted(options?: ReadOptions): Promise<never> {
+    return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new CanceledError()));
+    });
+}
+
+// The arguments of one ViewCard call: both keys as sent, and the read's own signal.
+function ReadCall(cardKey: string, acctKey: string): unknown[] {
+    return [cardKey, acctKey, READ_SIGNAL_OPTIONS];
+}
+
+// The signal ViewCard was handed on the call with this index.
+function SignalOfCall(callIndex: number): AbortSignal | undefined {
+    return mockViewCard.mock.calls[callIndex]?.[2]?.signal;
+}
+
+// The ViewCard calls whose read is still live: neither abandoned nor sent without a signal.
+function LiveReadCount(): number {
+    return mockViewCard.mock.calls.filter(([, , options]) => options?.signal?.aborted === false)
+        .length;
+}
+
 // The 1200-SETUP-SCREEN-VARS answer for a found card: the number masked and no CVV.
 function BuildCardDetail(overrides: Partial<CardDetailResponse> = {}): CardDetailResponse {
     return {
@@ -378,9 +422,11 @@ async function WaitForLookupEnd(): Promise<void> {
     });
 }
 
+// clearMocks keeps queued answers, so each case starts from an empty ViewCard queue.
 beforeEach(() => {
     jest.useFakeTimers(CLOCK_ONLY_FAKE_TIMERS);
     mockSearchParams = new URLSearchParams();
+    mockViewCard.mockReset();
 });
 
 afterEach(() => {
@@ -456,7 +502,7 @@ describe("COCRDSLC entered from the COCRDLIC card list on /cards/view", () => {
         RenderFromCardList();
         await ExpectAlert(DETAILS_SHOWN_INFO, "info");
         expect(mockViewCard).toHaveBeenCalledTimes(1);
-        expect(mockViewCard).toHaveBeenCalledWith(TEST_CARD_REF, TEST_ACCOUNT_ID);
+        expect(mockViewCard).toHaveBeenCalledWith(...ReadCall(TEST_CARD_REF, TEST_ACCOUNT_ID));
     });
 
     it("COCRDSLC protects both keys and shows the card number only masked", async () => {
@@ -472,26 +518,28 @@ describe("COCRDSLC entered from the COCRDLIC card list on /cards/view", () => {
 });
 
 describe("COCRDSLC entered from the COCRDLIC card list under StrictMode on /cards/view", () => {
-    it("COCRDSLC reads the selected card once under the StrictMode double effect run", async () => {
+    it("COCRDSLC keeps one live read of the selected card under the double effect run", async () => {
         RenderFromCardList(true);
         await ExpectAlert(DETAILS_SHOWN_INFO, "info");
-        expect(mockViewCard).toHaveBeenCalledTimes(1);
-        expect(mockViewCard).toHaveBeenCalledWith(TEST_CARD_REF, TEST_ACCOUNT_ID);
+        expect(mockViewCard.mock.calls).toEqual([
+            ReadCall(TEST_CARD_REF, TEST_ACCOUNT_ID),
+            ReadCall(TEST_CARD_REF, TEST_ACCOUNT_ID),
+        ]);
+        expect(LiveReadCount()).toBe(1);
     });
 });
 
 describe("COCRDSLC entered again with another COCRDLIC selection on /cards/view", () => {
     it("COCRDSLC reads a newly selected card while the previous read is pending", async () => {
         const releaseRead = HoldReads();
-        mockSearchParams = new URLSearchParams({ cardRef: TEST_CARD_REF, acctId: TEST_ACCOUNT_ID });
+        SelectFromCardList();
         const { rerender } = render(ScreenTree());
-        mockSearchParams = new URLSearchParams({
-            cardRef: OTHER_CARD_REF,
-            acctId: OTHER_ACCOUNT_ID,
-        });
+        SelectOtherFromCardList();
         rerender(ScreenTree());
         expect(mockViewCard).toHaveBeenCalledTimes(2);
-        expect(mockViewCard).toHaveBeenLastCalledWith(OTHER_CARD_REF, OTHER_ACCOUNT_ID);
+        expect(mockViewCard).toHaveBeenLastCalledWith(
+            ...ReadCall(OTHER_CARD_REF, OTHER_ACCOUNT_ID),
+        );
         releaseRead(BuildCardDetail());
         await ExpectAlert(DETAILS_SHOWN_INFO, "info");
     });
@@ -517,7 +565,9 @@ describe("COCRDSLC ENTER after a COCRDLIC selection on /cards/view", () => {
             await action(user);
             await waitFor(() => expect(mockViewCard).toHaveBeenCalledTimes(2));
             await ExpectAlert(DETAILS_SHOWN_INFO, "info");
-            expect(mockViewCard).toHaveBeenLastCalledWith(TEST_CARD_REF, TEST_ACCOUNT_ID);
+            expect(mockViewCard).toHaveBeenLastCalledWith(
+                ...ReadCall(TEST_CARD_REF, TEST_ACCOUNT_ID),
+            );
         },
     );
 });
@@ -540,7 +590,7 @@ describe("COCRDSLC PF keys from the main menu on /cards/view", () => {
         await action(user);
         await ExpectAlert(DETAILS_SHOWN_INFO, "info");
         expect(mockViewCard).toHaveBeenCalledTimes(1);
-        expect(mockViewCard).toHaveBeenCalledWith(TYPED_CARD_NUMBER, TEST_ACCOUNT_ID);
+        expect(mockViewCard).toHaveBeenCalledWith(...ReadCall(TYPED_CARD_NUMBER, TEST_ACCOUNT_ID));
         ExpectNoCardNumberInUrls();
     });
 
@@ -590,7 +640,7 @@ describe("COCRDSLC busy Search Cards key from the main menu on /cards/view", () 
 
 describe("COCRDSLC F3 during a pending read from the main menu on /cards/view", () => {
     it.each(EXIT_ACTIONS)(
-        "COCRDSLC F3 by %s returns to /menu while a read is pending",
+        "COCRDSLC F3 by %s returns to /menu while a read is pending and abandons it",
         async (_, action) => {
             const releaseRead = HoldReads();
             const user = RenderScreen();
@@ -599,8 +649,12 @@ describe("COCRDSLC F3 during a pending read from the main menu on /cards/view", 
             await action(user);
             expect(mockRouterPush).toHaveBeenCalledTimes(1);
             expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
-            releaseRead(BuildCardDetail());
-            await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+            expect(SignalOfCall(0)?.aborted).toBe(true);
+            await act(async () => releaseRead(BuildCardDetail()));
+            await WaitForLookupEnd();
+            expect(InputFor(NAME_LABEL)).toHaveValue("");
+            expect(screen.queryAllByRole("alert")).toHaveLength(0);
+            expect(screen.queryAllByRole("status")).toHaveLength(0);
         },
     );
 });
@@ -613,7 +667,7 @@ describe("COCRDSLC key edits stay on the server on /cards/view", () => {
         await TypeKeys(user, SHORT_ACCOUNT_TEXT, SHORT_CARD_TEXT);
         await ClickButton(user, SEARCH_BUTTON_NAME);
         await ExpectAlert(ACCOUNT_FILTER_MESSAGE, "error");
-        expect(mockViewCard).toHaveBeenCalledWith(SHORT_CARD_TEXT, SHORT_ACCOUNT_TEXT);
+        expect(mockViewCard).toHaveBeenCalledWith(...ReadCall(SHORT_CARD_TEXT, SHORT_ACCOUNT_TEXT));
     });
 });
 
@@ -684,4 +738,89 @@ describe("COCRDSLC field errors and cursor on /cards/view", () => {
             await waitFor(() => expect(InputFor(cursorLabel)).toHaveFocus());
         },
     );
+});
+
+describe("COCRDSLC entry read under React StrictMode on /cards/view", () => {
+    it("COCRDSLC under StrictMode abandons the first entry read and shows the second", async () => {
+        mockViewCard.mockImplementationOnce((_cardNum, _acctId, options) =>
+            PendUntilAborted(options),
+        );
+        RenderFromCardList(true);
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        await WaitForLookupEnd();
+        expect(mockViewCard).toHaveBeenCalledTimes(2);
+        expect([SignalOfCall(0)?.aborted, SignalOfCall(1)?.aborted]).toEqual([true, false]);
+        expect(screen.queryByText(ABEND_MESSAGE)).not.toBeInTheDocument();
+    });
+});
+
+describe("COCRDSLC leaving the screen during a read on /cards/view", () => {
+    it("COCRDSLC leaving the screen aborts the pending read and logs nothing", async () => {
+        const consoleErrorSpy = jest.spyOn(console, "error");
+        SelectFromCardList();
+        mockViewCard.mockImplementationOnce((_cardNum, _acctId, options) =>
+            PendUntilAborted(options),
+        );
+        const unmount = RenderUnmountableScreen();
+        await waitFor(() => expect(mockViewCard).toHaveBeenCalledTimes(1));
+        expect(SignalOfCall(0)?.aborted).toBe(false);
+        unmount();
+        expect(SignalOfCall(0)?.aborted).toBe(true);
+        await act(async () => undefined);
+        expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        expect(screen.queryAllByRole("status")).toHaveLength(0);
+        expect(consoleErrorSpy).not.toHaveBeenCalled();
+        consoleErrorSpy.mockRestore();
+    });
+});
+
+describe("COCRDSLC F3 during a pending read on /cards/view", () => {
+    it("COCRDSLC F3 aborts the pending read before the route changes", async () => {
+        SelectFromCardList();
+        mockViewCard.mockImplementationOnce((_cardNum, _acctId, options) =>
+            PendUntilAborted(options),
+        );
+        const user = RenderScreen();
+        await waitFor(() => expect(mockViewCard).toHaveBeenCalledTimes(1));
+        await PressKey(user, "F3");
+        expect(SignalOfCall(0)?.aborted).toBe(true);
+        expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
+        await WaitForLookupEnd();
+        expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        expect(screen.queryAllByRole("status")).toHaveLength(0);
+    });
+});
+
+// ENTER cannot supersede a pending read, as the one-at-a-time guard refuses it; another card
+// list selection is the one lookup that replaces a read still in flight.
+describe("COCRDSLC a superseded read on /cards/view", () => {
+    it("COCRDSLC a new selection aborts the pending read and only its own answer shows", async () => {
+        const staleRead = Promise.withResolvers<CardDetailResponse>();
+        mockViewCard.mockReturnValueOnce(staleRead.promise);
+        mockViewCard.mockResolvedValueOnce(BuildCardDetail());
+        SelectFromCardList();
+        const { rerender } = render(ScreenTree());
+        SelectOtherFromCardList();
+        rerender(ScreenTree());
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        expect([SignalOfCall(0)?.aborted, SignalOfCall(1)?.aborted]).toEqual([true, false]);
+        await act(async () =>
+            staleRead.resolve(BuildCardDetail({ embossed_name: STALE_EMBOSSED_NAME })),
+        );
+        expect(InputFor(NAME_LABEL)).toHaveValue(TEST_EMBOSSED_NAME);
+        await WaitForLookupEnd();
+    });
+});
+
+describe("COCRDSLC a cancelled read on /cards/view", () => {
+    it("COCRDSLC an abandoned read (CanceledError) shows no message and ends busy", async () => {
+        mockViewCard.mockRejectedValueOnce(new CanceledError());
+        const user = RenderScreen();
+        await ClickButton(user, SEARCH_BUTTON_NAME);
+        await WaitForLookupEnd();
+        expect(mockViewCard).toHaveBeenCalledTimes(1);
+        expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        expect(screen.queryAllByRole("status")).toHaveLength(0);
+        expect(screen.getByRole("button", { name: SEARCH_BUTTON_NAME })).toBeEnabled();
+    });
 });
