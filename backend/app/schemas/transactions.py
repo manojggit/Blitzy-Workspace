@@ -59,6 +59,17 @@ class TransactionListQuery(QueryModel):
             "of at most 16 code-page-037 characters."
         ),
     )
+    first_key: ScreenText(16) = Field(
+        default="",
+        alias="firstKey",
+        description=(
+            "The shown page's first_key (CDEMO-CT00-TRNID-FIRST), sent with direction forward: "
+            "with a startKey (F8) and with an empty one (a search). When COTRN00C re-sends the "
+            "screen with its rows unchanged (F8 with no page after the last key, a non-numeric "
+            "search, a search that finds nothing), the service re-reads those rows from it. "
+            "A raw TRAN-ID of at most 16 code-page-037 characters; empty when no page is shown."
+        ),
+    )
     direction: Direction = Field(
         default=Direction.FORWARD,
         alias="direction",
@@ -95,7 +106,9 @@ class TransactionListResponse(PageState):
 
     The inherited ``page``, ``first_key`` and ``last_key`` carry the page number and the raw
     TRAN-IDs of the first and last rows shown (CDEMO-CT00-PAGE-NUM, CDEMO-CT00-TRNID-FIRST,
-    CDEMO-CT00-TRNID-LAST).
+    CDEMO-CT00-TRNID-LAST). Two outcomes differ, as COTRN00C leaves those keys: a backward page
+    shorter than 10 rows keeps the first_key it browsed from, and a search that finds nothing
+    returns last_key HIGH-VALUES (sixteen U+00FF), after which F8 finds no page.
     """
 
     rows: list[TransactionListRow] = Field(

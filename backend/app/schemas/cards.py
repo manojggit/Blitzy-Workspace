@@ -57,14 +57,19 @@ class CardListQuery(QueryModel):
         default="",
         alias="startKey",
         description=(
-            "The first_key (F7) or last_key (F8) of the page shown: an opaque card_ref token, "
-            "never a card number. Blank reads the first page."
+            "The first_key (ENTER, F7) or last_key (F8) of the page shown: an opaque paging "
+            "token, never a card number. A blank, expired or foreign key reads the first page."
         ),
     )
-    direction: Direction = Field(
-        default=Direction.FORWARD,
+    # None, not FORWARD, is the default: FastAPI fills an omitted query value with the default,
+    # so only a None default lets COCRDLIC tell ENTER from F8 (as users.UserListQuery does).
+    direction: Direction | None = Field(
+        default=None,
         alias="direction",
-        description="Paging key: forward (F8, READNEXT) or backward (F7, READPREV).",
+        description=(
+            "Paging key: forward (F8, READNEXT) or backward (F7, READPREV). Omitted for ENTER, "
+            "which re-reads the page shown from startKey."
+        ),
     )
     page: int = Field(
         default=0,
@@ -104,9 +109,10 @@ class CardListRow(BaseModel):
 class CardListResponse(PageState, ScreenFeedback):
     """A COCRDLI page from COCRDLIC (CCLI): at most 7 rows (WS-MAX-SCREEN-LINES).
 
-    ``first_key`` and ``last_key`` are the ``card_ref`` tokens of the first and last row's card,
-    never card numbers. ``message`` carries ERRMSG literals such as
-    ``NO RECORDS FOUND FOR THIS SEARCH CONDITION.`` and ``NO MORE PAGES TO DISPLAY``;
+    ``first_key`` and ``last_key`` are opaque tokens holding the COMMAREA paging state (the first
+    and last card keys and the page flags), never card numbers. ``message`` carries ERRMSG
+    literals such as ``NO RECORDS FOUND FOR THIS SEARCH CONDITION.`` and
+    ``NO MORE PAGES TO DISPLAY``;
     ``info_message`` carries ``TYPE S FOR DETAIL, U TO UPDATE ANY RECORD``. ``field_errors`` and
     ``cursor_field`` name the failing filters ``acct_id`` and ``card_num``.
     """

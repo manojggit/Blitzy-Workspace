@@ -134,8 +134,9 @@ class TransactionAddAction(StrEnum):
 class Direction(StrEnum):
     """The paging keys of CCLI, CT00 and CU00: F8 (READNEXT) and F7 (READPREV).
 
-    In CCLI and CT00, ``FORWARD`` is the default and also reads the first page when no start
-    key is sent. CU00 sends no direction for ENTER (``users.UserListQuery``).
+    In CT00, ``FORWARD`` is the default and also reads the first page when no start key is
+    sent. CU00 and CCLI send no direction for ENTER (``users.UserListQuery``,
+    ``cards.CardListQuery``).
     """
 
     FORWARD = "forward"
