@@ -314,3 +314,26 @@ def ConfigureLogging() -> None:
     InstallStdoutHandler()
     for loggerName in UVICORN_LOGGERS:
         ProtectUvicornLogger(loggerName)
+
+
+# SQLAlchemy's Engine writes every statement with its bound parameters at INFO and every
+# fetched row at DEBUG to this logger, which every CardDemo engine uses (none sets a
+# logging_name), as soon as it or the "sqlalchemy" logger above it allows those levels.
+SQLALCHEMY_ENGINE_LOGGER = "sqlalchemy.engine.Engine"
+
+
+def SuppressEngineStatementLogging() -> None:
+    """Keep SQLAlchemy from creating statement, parameter and result-row log records.
+
+    Bound parameters and fetched rows carry password hashes, SSNs, CVVs and customer data,
+    which no log may hold. The engine logger's own level is raised to WARNING unless it is
+    already WARNING or above, so isEnabledFor(INFO) and isEnabledFor(DEBUG) stay false and
+    SQLAlchemy never builds those records, even with the "sqlalchemy" logger at DEBUG; engine
+    warnings and errors still propagate. logging.config.fileConfig and dictConfig reset this
+    logger to NOTSET when they configure "sqlalchemy.engine", so each engine builder calls this
+    after logging is configured, and also sets hide_parameters=True, which keeps bound values
+    out of SQLAlchemy's error text.
+    """
+    engineLogger = logging.getLogger(SQLALCHEMY_ENGINE_LOGGER)
+    if engineLogger.level < logging.WARNING:
+        engineLogger.setLevel(logging.WARNING)

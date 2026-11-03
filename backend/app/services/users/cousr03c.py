@@ -32,8 +32,10 @@ from app.core.errors import (
     HTTP_FILE_ERROR,
     HTTP_NOT_FOUND,
     LegacyMessageError,
+    RecordLockError,
     RepositoryError,
 )
+from app.core.locks import FileNotOpenError
 from app.repositories.user_repository import USER_FILE_NAME, UserRepository
 from app.schemas.users import UserDetailResponse, UserMessageResponse
 
@@ -55,6 +57,10 @@ FIRST_NAME_FIELD = "first_name"
 # The WHEN OTHER ``DISPLAY 'RESP:' WS-RESP-CD 'REAS:' WS-REAS-CD`` of both file paragraphs.
 FILE_ERROR_LOG = "RESP:%d REAS:%d"
 
+# The USRSEC conditions online use expects and clears by retrying: the batch window's NOTOPEN
+# and a record another task holds. Any other condition is an I/O failure, logged as an error.
+EXPECTED_FILE_CONDITIONS = (FileNotOpenError, RecordLockError)
+
 
 def RequireUserId(userId: str) -> None:
     """Reject a blank user ID, the first edit of PROCESS-ENTER-KEY and DELETE-USER-INFO.
@@ -75,9 +81,13 @@ def FileErrorOutcome(error: RepositoryError, message: str) -> LegacyMessageError
     """Return the WHEN OTHER outcome of a USRSEC command: 503, ``message``, cursor first name.
 
     The condition is logged as the source's RESP and REAS DISPLAY. The batch window's NOTOPEN
-    (FileNotOpenError), a record lock (RecordLockError) and an I/O error all arrive here.
+    (FileNotOpenError), a record lock (RecordLockError) and an I/O error all arrive here. The
+    first two are EXPECTED_FILE_CONDITIONS, logged at WARNING; every other condition, an I/O
+    error (FileIoError) among them, is logged at ERROR.
     """
-    LOGGER.warning(FILE_ERROR_LOG, error.resp, error.resp2)
+    isExpectedCondition = isinstance(error, EXPECTED_FILE_CONDITIONS)
+    logLevel = logging.WARNING if isExpectedCondition else logging.ERROR
+    LOGGER.log(logLevel, FILE_ERROR_LOG, error.resp, error.resp2)
     return LegacyMessageError(message, field=FIRST_NAME_FIELD, httpStatus=HTTP_FILE_ERROR)
 
 

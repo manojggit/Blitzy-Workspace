@@ -20,14 +20,24 @@ WriteUnit, on a pooled connection of its own:
 - CCUP (COCRDUPC), CU02 (COUSR02C) and CU03 (COUSR03C) use one unit each.
 
 Units never take the batch-window lock: core.locks.EnterOnlineWindow holds it on a separate
-connection for the whole request. main.CreateApp keeps the settings, the engine and the session
-factory on app.state, and everything here reads them from there, so tests can swap engines.
+connection for the whole request.
+
+A request therefore holds up to four pooled connections at once: the session, the window
+connection and two units. GetSession admits at most ADMITTED_REQUEST_LIMIT requests at a time,
+so admitted requests never need more connections than the pool holds, and a request waits for
+admission before it holds any. Requests can thus never each hold a connection while waiting for
+another until the pool timeout.
+
+main.CreateApp keeps the settings, the engine and the session factory on app.state, and
+everything here reads them from there, so tests can swap engines. The admission semaphore is
+added to app.state by the first request.
 """
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import asyncpg
+from anyio import Semaphore
 from fastapi import Request
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
@@ -40,19 +50,33 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from app.core.config import Settings
+from app.core.config import ParseDatabaseUrl, Settings
 from app.core.errors import FileIoError, MapDatabaseError, RepositoryError
+from app.core.logging import SuppressEngineStatementLogging
 
 # The first statement of every unit: a SELECT ... FOR UPDATE waits at most 5 seconds for a
 # record another task holds, then fails with SQLSTATE 55P03 (RecordLockError).
 WRITE_UNIT_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '5s'"
 
-# One request can hold four pooled connections at once: the request session, the batch-window
-# connection and, in CAUP and CB00, two write units. With SQLAlchemy's default 5 + 10, about
-# eight concurrent requests can hold every connection while each waits for its next one; these
-# sizes keep ten four-connection requests running before checkouts queue.
+# The most pooled connections one request holds at once: the request session (from its first
+# read to the end of the request), the batch-window connection and, in CAUP and CB00, two
+# nested write units.
+REQUEST_CONNECTION_LIMIT = 4
 POOL_SIZE = 10
 POOL_MAX_OVERFLOW = 30
+POOL_CAPACITY = POOL_SIZE + POOL_MAX_OVERFLOW
+# Connections no admitted request counts on: GET /health/ready connects without admission, and
+# a cancelled request's session can still be closing after its admission is freed.
+POOL_HEADROOM_CONNECTIONS = 4
+# GetSession admits at most this many requests at once, and a request waits for admission
+# before it holds any connection. All admitted requests together need at most
+# POOL_CAPACITY - POOL_HEADROOM_CONNECTIONS connections, so an admitted request's checkout waits
+# only for a connection that is free or that its holder returns without waiting for another.
+# No cycle of requests each holding a connection while waiting for the next can form, however
+# many requests arrive, so none of them stalls until the pool timeout.
+ADMITTED_REQUEST_LIMIT = (POOL_CAPACITY - POOL_HEADROOM_CONNECTIONS) // REQUEST_CONNECTION_LIMIT
+# The app.state attribute of the admission semaphore, created by the first GetSession call.
+REQUEST_ADMISSION_ATTRIBUTE = "requestAdmission"
 
 # Failures a unit can meet besides a wrapped DBAPIError, all reported as CICS IOERR. The
 # asyncpg dialect raises connect-time rejections unwrapped (database starting up 57P03, too
@@ -67,18 +91,26 @@ def BuildEngine(settings: Settings) -> AsyncEngine:
 
     asyncpg takes ``timeout`` as the connect timeout and ``command_timeout`` as the timeout of
     each statement. Connections open on first use, so the backend starts while PostgreSQL is
-    down and GET /health/ready reports 503 until the database is reachable.
+    down and GET /health/ready reports 503 until the database is reachable. A DATABASE_URL
+    that does not parse raises ParseDatabaseUrl's ValueError, which never repeats the URL.
+
+    Password hashes, SSNs, CVVs and customer data travel as bound parameters and result rows,
+    so hide_parameters=True keeps parameters out of SQLAlchemy's error text, and
+    SuppressEngineStatementLogging stops statement, parameter and row log records from being
+    created at all.
     """
+    SuppressEngineStatementLogging()
     connectArgs = {
         "timeout": settings.DB_CONNECT_TIMEOUT_SECONDS,
         "command_timeout": settings.DB_COMMAND_TIMEOUT_SECONDS,
     }
     return create_async_engine(
-        settings.DATABASE_URL,
+        ParseDatabaseUrl(settings.DATABASE_URL, "DATABASE_URL"),
         pool_pre_ping=True,
         pool_size=POOL_SIZE,
         max_overflow=POOL_MAX_OVERFLOW,
         connect_args=connectArgs,
+        hide_parameters=True,
     )
 
 
@@ -92,16 +124,35 @@ async def DisposeEngine(engine: AsyncEngine) -> None:
     await engine.dispose()
 
 
-async def GetSession(request: Request) -> AsyncIterator[AsyncSession]:
-    """Yield the request's session, for reads that lock nothing.
+def RequestAdmission(request: Request) -> Semaphore:
+    """Return the application's admission semaphore of ADMITTED_REQUEST_LIMIT permits.
 
-    The session never commits and nothing writes through it: every write, the login throttle's
-    included, runs in a WriteUnit. Leaving the request rolls back the read-only transaction and
-    returns the connection to the pool. Tests replace this dependency through
+    The first call creates it on app.state, beside the engine. Nothing is awaited between the
+    lookup and the store, so concurrent first requests on the event loop share one semaphore.
+    """
+    admission: Semaphore | None = getattr(request.app.state, REQUEST_ADMISSION_ATTRIBUTE, None)
+    if admission is None:
+        admission = Semaphore(ADMITTED_REQUEST_LIMIT)
+        setattr(request.app.state, REQUEST_ADMISSION_ATTRIBUTE, admission)
+    return admission
+
+
+async def GetSession(request: Request) -> AsyncIterator[AsyncSession]:
+    """Yield the request's session, for reads that lock nothing, once the request is admitted.
+
+    The request first waits, in arrival order, for one of the ADMITTED_REQUEST_LIMIT
+    admissions, before it holds any pooled connection. Its batch-window connection and write
+    units are taken and returned while it is admitted, because every online context depends on
+    this dependency and ends first. The session never commits and nothing writes through it:
+    every write, the login throttle's included, runs in a WriteUnit. Leaving the request rolls
+    back the read-only transaction, returns the connection to the pool and then frees the
+    admission, whether the request succeeds, fails or is cancelled; when a repeated
+    cancellation interrupts the close, the close finishes in the background, within
+    POOL_HEADROOM_CONNECTIONS. Tests replace this dependency, admission included, through
     ``app.dependency_overrides[GetSession]``.
     """
     sessionFactory: async_sessionmaker[AsyncSession] = request.app.state.sessionFactory
-    async with sessionFactory() as session:
+    async with RequestAdmission(request), sessionFactory() as session:
         yield session
 
 

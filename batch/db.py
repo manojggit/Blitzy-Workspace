@@ -20,8 +20,15 @@ Importing this module creates no engine and opens no connection; batch/cli.py bu
 engines of each command and disposes of them when it ends. Connection failures propagate as
 sqlalchemy.exc.OperationalError for the caller to map to an exit status. Nothing here logs the
 URL; a message that must show it uses url.render_as_string(hide_password=True).
+
+Diagnostics policy: the jobs bind password hashes, SSNs, card numbers and customer data as
+parameters and fetch them in rows. Both engines set hide_parameters=True, which keeps bound
+values out of SQLAlchemy's error text, and call app.core.logging's
+SuppressEngineStatementLogging, so SQLAlchemy never creates a statement, parameter or row log
+record, whatever level the "sqlalchemy" logger is given.
 """
 
+from app.core.logging import SuppressEngineStatementLogging
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
@@ -45,11 +52,13 @@ def SyncDatabaseUrl(settings: BatchSettings) -> URL:
     A postgresql+psycopg2 URL is returned unchanged and a bare postgresql URL gets the psycopg2
     driver. Raises ValueError for an unparsable URL or any other driver, such as asyncpg. The
     messages never contain the URL, and the parse error is not chained, because the URL holds
-    the database password.
+    the database password. Both of SQLAlchemy's parse errors quote the input: ArgumentError
+    the whole URL, and the ValueError of a non-numeric port the port slot, which holds the
+    password when the URL lacks its "@".
     """
     try:
         databaseUrl = make_url(settings.SYNC_DATABASE_URL)
-    except ArgumentError:
+    except (ArgumentError, ValueError):
         raise ValueError(INVALID_URL_MESSAGE) from None
     if databaseUrl.drivername == PSYCOPG2_DRIVER_NAME:
         return databaseUrl
@@ -63,12 +72,15 @@ def BuildEngine(settings: BatchSettings) -> Engine:
 
     The isolation level stays PostgreSQL's default, READ COMMITTED, and pool_pre_ping replaces
     a connection the server has dropped. Callers own the transaction scope through
-    engine.begin(), or engine.connect() with explicit commits, and dispose of the engine.
+    engine.begin(), or engine.connect() with explicit commits, and dispose of the engine. The
+    diagnostics policy of the module docstring applies.
     """
+    SuppressEngineStatementLogging()
     return create_engine(
         SyncDatabaseUrl(settings),
         pool_pre_ping=True,
         connect_args={"connect_timeout": CONNECT_TIMEOUT_SECONDS},
+        hide_parameters=True,
     )
 
 
@@ -78,11 +90,13 @@ def BuildAutocommitEngine(settings: BatchSettings) -> Engine:
     NullPool makes every connect() open a new physical connection and every close() end it, so
     closing the window's connection ends its session and releases the session-level advisory
     lock it holds. AUTOCOMMIT keeps that idle connection outside any transaction, separate from
-    every job connection.
+    every job connection. The diagnostics policy of the module docstring applies.
     """
+    SuppressEngineStatementLogging()
     return create_engine(
         SyncDatabaseUrl(settings),
         poolclass=NullPool,
         isolation_level="AUTOCOMMIT",
         connect_args={"connect_timeout": CONNECT_TIMEOUT_SECONDS},
+        hide_parameters=True,
     )

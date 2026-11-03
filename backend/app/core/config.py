@@ -13,7 +13,8 @@ defaults to blank and fails closed. CommonSettings requires SYNC_DATABASE_URL, a
 subclass Settings requires DATABASE_URL as well; both are declared without a default.
 MigrationSettings defaults SYNC_DATABASE_URL to blank so that offline migration SQL
 (alembic upgrade --sql) can be generated without a database. A blank default holds no
-credential, so no credential is written in code.
+credential, so no credential is written in code. The engines and Alembic parse a URL through
+ParseDatabaseUrl, whose error names the setting and never repeats the URL or its password.
 
 Importing this module reads no setting; values are read when a settings class is built.
 """
@@ -24,6 +25,8 @@ from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import ArgumentError
 
 from app.core.paths import ENV_FILE, ResolveRepoPath
 
@@ -33,6 +36,8 @@ REJECTED_KEY_MESSAGE = (
     f"SECRET_KEY must be set to at least {MINIMUM_SECRET_KEY_LENGTH} characters"
     " (generate one with: openssl rand -hex 32)"
 )
+# Names the setting that held a URL SQLAlchemy cannot parse, never the URL itself.
+INVALID_DATABASE_URL_MESSAGE = "{variableName} is not a valid database URL"
 # The largest count security.login_attempts.failure_count holds: the PostgreSQL SMALLINT
 # maximum. LOGIN_MAX_ATTEMPTS above it could never be counted to, so no lockout would follow.
 MAXIMUM_LOGIN_FAILURE_COUNT = 32767
@@ -143,3 +148,18 @@ class MigrationSettings(CommonSettings):
     # database URL, and alembic/env.py raises its own actionable error when an online run
     # finds the URL blank. A blank default holds no credential.
     SYNC_DATABASE_URL: str = Field(default="", repr=False, exclude=True)
+
+
+def ParseDatabaseUrl(databaseUrl: str, variableName: str) -> URL:
+    """Return a configured database URL as a SQLAlchemy URL, for an engine or Alembic.
+
+    SQLAlchemy repeats the rejected text, password included, in its parse errors: ArgumentError
+    quotes a string that does not match the URL form, and the ValueError of a non-numeric port
+    quotes the port slot, which holds the password when the URL lacks its "@". Either becomes
+    a ValueError that names only ``variableName``, such as DATABASE_URL, and is raised from
+    None, so the traceback shows no chained error holding the URL.
+    """
+    try:
+        return make_url(databaseUrl)
+    except (ArgumentError, ValueError):
+        raise ValueError(INVALID_DATABASE_URL_MESSAGE.format(variableName=variableName)) from None

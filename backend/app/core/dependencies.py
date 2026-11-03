@@ -116,10 +116,11 @@ class OnlineContext:
     settings: Settings
     user: CurrentUser | None = None
 
-    @property
-    def engine(self) -> AsyncEngine:
+    def Engine(self) -> AsyncEngine:
         """Return the app.state engine of core.database.WriteUnit and core.locks windows."""
         return self.request.app.state.engine
+
+    engine = property(Engine)
 
 
 async def GetOnlineContext(
