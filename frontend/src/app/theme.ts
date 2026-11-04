@@ -25,10 +25,8 @@ export const M3_COLOR_TOKENS = {
     tertiary: "#7D5260",
     error: "#B3261E",
     errorContainer: "#F9DEDC",
-    onErrorContainer: "#8C1D18",
     surface: "#FEF7FF",
     surfaceContainer: "#F3EDF7",
-    surfaceContainerHighest: "#E6E0E9",
     onSurface: "#1D1B20",
     onSurfaceVariant: "#49454F",
     outline: "#79747E",
@@ -95,6 +93,9 @@ const M3_DISABLED_CONTAINER_OPACITY = 0.04;
 const M3_FOCUS_STATE_LAYER_OPACITY = 0.1;
 const M3_DISABLED_CONTENT_OPACITY = 0.38;
 const M3_DISABLED_CONTROL_CONTAINER_OPACITY = 0.12;
+// A filled field's container: on-surface at the 6 % MUI derives its own filled container from,
+// which over the surface container reads as the M3 highest surface container.
+const FILLED_CONTAINER_OPACITY = 0.06;
 
 // MUI paints the resting outline of an outlined field grey again while a touch device keeps a
 // hover after a tap. This selector re-applies the outline role there, and only on a field no
@@ -207,13 +208,17 @@ interface FloatingLabelStateProps {
     shrink?: boolean;
 }
 
-// One placement of a floating label: MUI's offset from the top of the field, in px, and whether
-// the label is shrunk.
+// One placement of a floating label: MUI's offset from the top of the field, in px, whether the
+// label is shrunk, and whether it sits in the outline's notch, above the row the error icon holds.
 interface FloatingLabelPlacement {
     props: FloatingLabelStateProps;
     offsetYPx: number;
     isShrunk: boolean;
+    isInNotch?: boolean;
 }
+
+// Where a floating label is drawn, apart from the states that put it there.
+type FloatingLabelPosition = Omit<FloatingLabelPlacement, "props">;
 
 // MUI's label heights, kept as MUI places them; only the x offset moves to the 16 dp inset. A
 // label with no matching row rests at restingOffsetYPx, and, as in MUI, a later row wins where
@@ -227,7 +232,7 @@ const OUTLINED_LABEL_GEOMETRY: FloatingLabelGeometry = {
     restingOffsetYPx: 16,
     placements: [
         { props: { size: "small" }, offsetYPx: 9, isShrunk: false },
-        { props: { shrink: true }, offsetYPx: -9, isShrunk: true },
+        { props: { shrink: true }, offsetYPx: -9, isShrunk: true, isInNotch: true },
     ],
 };
 
@@ -256,6 +261,45 @@ const NOTCH_LABEL_LETTER_SPACING = `calc(${LABEL_LETTER_SPACING} * ${LABEL_SCALE
 
 // The Select arrow sits 8 px in from the field's edge, inside the 32 px MUI keeps beside the value.
 const SELECT_ICON_INSET_UNITS = 2;
+
+// The M3 text field marks an error with a trailing error icon as well as the error colour, so the
+// state shows without colour and under forced colours. The icon is the 24 px ErrorOutline glyph
+// the message line's error Alert shows, 12 px in from the field's end; the field's text keeps its
+// 16 dp inset clear of the icon, so in error it ends 52 px in from that end.
+const M3_ICON_SIZE_PX = 24;
+const ERROR_ICON_INSET_UNITS = 3;
+const ERROR_ICON_ROOM_UNITS =
+    ERROR_ICON_INSET_UNITS + M3_ICON_SIZE_PX / SPACING_UNIT_PX + TEXT_FIELD_INSET_UNITS;
+const ERROR_ICON_PATH = [
+    "M11 15h2v2h-2zm0-8h2v6h-2z",
+    "m.99-5C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2z",
+    "M12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z",
+].join("");
+const ERROR_ICON_SVG =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">` +
+    `<path d="${ERROR_ICON_PATH}"/></svg>`;
+const ERROR_ICON_MASK_IMAGE = `url("data:image/svg+xml,${encodeURIComponent(ERROR_ICON_SVG)}")`;
+
+// The glyph masks the icon's fill, so the fill gives it a colour role, or a system colour under
+// forced colours. The -webkit- image serves browsers that read only the prefixed mask.
+const ERROR_ICON_MASK_STYLE: CSSObject = {
+    maskImage: ERROR_ICON_MASK_IMAGE,
+    WebkitMaskImage: ERROR_ICON_MASK_IMAGE,
+    maskRepeat: "no-repeat",
+    maskPosition: "center",
+    maskSize: "100% 100%",
+};
+
+// MUI's state class on a field, its label and its input root while the field is in error.
+const FIELD_ERROR_SELECTOR = "&.Mui-error";
+// Inside a field in error: the input whose own padding keeps the icon's room, which is any
+// single-line input with no end adornment after it except a Select's value, and the roots that
+// keep the room themselves, around a textarea or an end adornment sized by MUI.
+const ERROR_ROOM_INPUT_SELECTOR =
+    "&:not(.MuiInputBase-adornedEnd) > .MuiInputBase-input:not(textarea):not(.MuiSelect-select)";
+const ERROR_ROOM_ROOT_SELECTOR = "&.MuiInputBase-multiline, &.MuiInputBase-adornedEnd";
+// A filled field in error, as its TextField's state reads.
+const FILLED_ERROR_PROPS = { variant: "filled", error: true } as const;
 
 // MUI's InputBase learns of browser autofill from the animationstart event of its input: a resting
 // input starts the cancel animation, an autofilled one the other, which marks the field filled so
@@ -562,15 +606,18 @@ function BuildMediumSegmentStyle({ theme }: ThemedStyleProps): CSSObject {
     return { minHeight: M3_BUTTON_HEIGHT_PX, padding: theme.spacing(2, 3) };
 }
 
+/** The M3 focus ring itself; under forced colours it takes the Highlight system colour. */
+function FocusRingStyle(theme: StyleTheme): CSSObject {
+    return {
+        outline: `${M3_FOCUS_RING_WIDTH_PX}px solid ${theme.palette.secondary.main}`,
+        outlineOffset: M3_FOCUS_RING_OFFSET_PX,
+        [FORCED_COLORS_QUERY]: { outlineColor: SYSTEM_COLORS.highlight },
+    };
+}
+
 /** The M3 focus indicator on every MUI button, segment, list item, menu item and icon button. */
 function BuildFocusRingStyle({ theme }: ThemedStyleProps): CSSObject {
-    return {
-        [FOCUS_VISIBLE_SELECTOR]: {
-            outline: `${M3_FOCUS_RING_WIDTH_PX}px solid ${theme.palette.secondary.main}`,
-            outlineOffset: M3_FOCUS_RING_OFFSET_PX,
-            [FORCED_COLORS_QUERY]: { outlineColor: SYSTEM_COLORS.highlight },
-        },
-    };
+    return { [FOCUS_VISIBLE_SELECTOR]: FocusRingStyle(theme) };
 }
 
 /** The 16 dp inset beside a single-line input's text, on each side that holds no adornment. */
@@ -606,24 +653,30 @@ function MultilineFieldVariants(theme: StyleTheme, padding: FieldPadding): CSSOb
 
 /**
  * A floating label on the 16 dp inset at one of MUI's heights. It spans the field between the two
- * insets, so a shrunk label's unscaled width is that span over its scale.
+ * insets, so a shrunk label's unscaled width is that span over its scale. In error, a label on the
+ * input's row ends clear of the trailing error icon; a label in the notch sits above the icon.
  */
-function FloatingLabelStyle(theme: StyleTheme, offsetYPx: number, isShrunk: boolean): CSSObject {
+function FloatingLabelStyle(theme: StyleTheme, position: FloatingLabelPosition): CSSObject {
     const inset = theme.spacing(TEXT_FIELD_INSET_UNITS);
-    const scale = isShrunk ? LABEL_SCALE.shrunk : LABEL_SCALE.resting;
+    const iconRoom = theme.spacing(ERROR_ICON_ROOM_UNITS);
+    const scale = position.isShrunk ? LABEL_SCALE.shrunk : LABEL_SCALE.resting;
+    const maxWidth = `calc((100% - 2 * ${inset}) / ${scale})`;
+    const errorMaxWidth = `calc((100% - ${inset} - ${iconRoom}) / ${scale})`;
     return {
-        transform: `translate(${inset}, ${offsetYPx}px) scale(${scale})`,
-        maxWidth: `calc((100% - 2 * ${inset}) / ${scale})`,
+        transform: `translate(${inset}, ${position.offsetYPx}px) scale(${scale})`,
+        maxWidth,
+        [FIELD_ERROR_SELECTOR]: { maxWidth: position.isInNotch ? maxWidth : errorMaxWidth },
     };
 }
 
 /** Restates every placement of a label, since this rule outranks each of MUI's own. */
 function FloatingLabelGeometryStyle(theme: StyleTheme, geometry: FloatingLabelGeometry): CSSObject {
-    const variants = geometry.placements.map(({ props, offsetYPx, isShrunk }) => ({
+    const variants = geometry.placements.map(({ props, ...position }) => ({
         props,
-        style: FloatingLabelStyle(theme, offsetYPx, isShrunk),
+        style: FloatingLabelStyle(theme, position),
     }));
-    return { ...FloatingLabelStyle(theme, geometry.restingOffsetYPx, false), variants };
+    const restingPosition = { offsetYPx: geometry.restingOffsetYPx, isShrunk: false };
+    return { ...FloatingLabelStyle(theme, restingPosition), variants };
 }
 
 function BuildOutlinedLabelStyle({ theme }: ThemedStyleProps): CSSObject {
@@ -642,8 +695,65 @@ function NotchPaddingStyle(theme: StyleTheme, outlineWidthPx: number): CSSObject
 }
 
 /**
+ * The error icon's fill: a colour role, and under forced colours a system colour set as is, since
+ * the mode would paint any other fill as Canvas and hide the icon.
+ */
+function ErrorIconColourStyle(colour: string, forcedColour: string): CSSObject {
+    return {
+        backgroundColor: colour,
+        [FORCED_COLORS_QUERY]: { forcedColorAdjust: "none", backgroundColor: forcedColour },
+    };
+}
+
+/** A disabled field's error icon: disabled content, or GrayText under forced colours. */
+function DisabledErrorIconColourStyle(theme: StyleTheme): CSSObject {
+    return ErrorIconColourStyle(theme.palette.action.disabled, SYSTEM_COLORS.grayText);
+}
+
+/**
+ * The M3 trailing error icon, at the given height 12 px in from the field's end, in the error
+ * role. It is decorative: the field's aria-invalid and its tie to the message line name the error.
+ */
+function ErrorIconStyle(theme: StyleTheme, placement: CSSObject): CSSObject {
+    return {
+        content: '""',
+        position: "absolute",
+        width: M3_ICON_SIZE_PX,
+        height: M3_ICON_SIZE_PX,
+        right: theme.spacing(ERROR_ICON_INSET_UNITS),
+        pointerEvents: "none",
+        ...ERROR_ICON_MASK_STYLE,
+        ...ErrorIconColourStyle(theme.palette.error.main, SYSTEM_COLORS.canvasText),
+        ...placement,
+    };
+}
+
+/** The room a field in error keeps at its end for the error icon, inside its root. */
+function ErrorIconRoomStyle(theme: StyleTheme): CSSObject {
+    const iconRoom = { paddingRight: theme.spacing(ERROR_ICON_ROOM_UNITS) };
+    return { [ERROR_ROOM_INPUT_SELECTOR]: iconRoom, [ERROR_ROOM_ROOT_SELECTOR]: iconRoom };
+}
+
+/**
+ * An outlined field's error icon, centred on its height, on the root, which has no pseudo-elements
+ * of its own. On a Select the icon takes the arrow's place, 8 px in from the end, as the M3 text
+ * field swaps its trailing icon for the error icon, so the Select keeps its width.
+ */
+function OutlinedErrorIconStyle(theme: StyleTheme): CSSObject {
+    const centred = { top: "50%", transform: "translateY(-50%)" };
+    return {
+        "&::after": ErrorIconStyle(theme, centred),
+        "&.Mui-disabled::after": DisabledErrorIconColourStyle(theme),
+        "&.MuiSelect-root::after": { right: theme.spacing(SELECT_ICON_INSET_UNITS) },
+        "&.MuiSelect-root .MuiSelect-icon": { display: "none" },
+        ...ErrorIconRoomStyle(theme),
+    };
+}
+
+/**
  * Keeps the outline role on a resting outlined field while a touch device holds a tap's hover,
- * keeps the notch edge in place while focus widens the outline, and pads a multiline field.
+ * keeps the notch edge in place while focus widens the outline, pads a multiline field, and adds
+ * the error icon.
  */
 function BuildOutlinedFieldStyle({ theme }: ThemedStyleProps): CSSObject {
     const focusedNotchStyle = NotchPaddingStyle(theme, FIELD_OUTLINE_WIDTH_PX.focused);
@@ -652,6 +762,7 @@ function BuildOutlinedFieldStyle({ theme }: ThemedStyleProps): CSSObject {
             [TOUCH_HOVER_RESTING_OUTLINE_SELECTOR]: { borderColor: theme.palette.m3.outline },
         },
         [FOCUSED_NOTCHED_OUTLINE_SELECTOR]: focusedNotchStyle,
+        [FIELD_ERROR_SELECTOR]: OutlinedErrorIconStyle(theme),
         variants: MultilineFieldVariants(theme, OUTLINED_MULTILINE_PADDING),
     };
 }
@@ -762,12 +873,12 @@ function BuildOutlinedButtonStyle({ theme }: ThemedStyleProps): CSSObject {
 }
 
 /**
- * The M3 filled text field: the highest surface container with an on-surface-variant active
+ * The M3 filled text field: a 6 % on-surface container with an on-surface-variant active
  * indicator. MUI's hover, focus and error rules keep the on-surface, primary and error indicator.
  * A multiline field is padded as a single-line filled input is.
  */
 function BuildFilledFieldStyle({ theme }: ThemedStyleProps): CSSObject {
-    const containerColor = theme.palette.m3.surfaceContainerHighest;
+    const containerColor = theme.alpha(theme.palette.text.primary, FILLED_CONTAINER_OPACITY);
     const hoverLayerColor = theme.palette.action.hover;
     return {
         backgroundColor: containerColor,
@@ -781,6 +892,8 @@ function BuildFilledFieldStyle({ theme }: ThemedStyleProps): CSSObject {
             backgroundColor: theme.alpha(theme.palette.text.primary, M3_DISABLED_CONTAINER_OPACITY),
         },
         "&::before": { borderBottomColor: theme.palette.text.secondary },
+        // The TextField around the field draws its error icon (BuildFilledErrorIconStyle).
+        [FIELD_ERROR_SELECTOR]: ErrorIconRoomStyle(theme),
         [FORCED_COLORS_QUERY]: { border: ForcedBoundary(SYSTEM_COLORS.canvasText) },
         variants: MultilineFieldVariants(theme, FILLED_MULTILINE_PADDING),
     };
@@ -808,18 +921,60 @@ function BuildFilledFieldInputStyle({ theme }: ThemedStyleProps): CSSObject {
     };
 }
 
+/** The icon's top, centring it on a filled input box: its padding around the 24 px line box. */
+function FilledErrorIconTop(theme: StyleTheme, units: VerticalPaddingUnits): string {
+    return theme.spacing((units.top + units.bottom) / 2);
+}
+
+/**
+ * A filled field's error icon, 12 px in from its end and centred on its input box at each of its
+ * heights. FilledInput draws its active indicator with both pseudo-elements, so the TextField root
+ * around it holds the icon. A filled Select keeps its arrow there, so it takes no icon.
+ */
+function BuildFilledErrorIconStyle({ theme }: ThemedStyleProps): CSSObject {
+    const iconTop = { top: FilledErrorIconTop(theme, FILLED_INPUT_PADDING_UNITS) };
+    const heightVariants = FILLED_INPUT_PADDING_VARIANTS.map(({ props, units }) => ({
+        props: { ...FILLED_ERROR_PROPS, ...props },
+        style: { "&::after": { top: FilledErrorIconTop(theme, units) } },
+    }));
+    const iconStyle = { "&::after": ErrorIconStyle(theme, iconTop) };
+    const disabledStyle = { "&::after": DisabledErrorIconColourStyle(theme) };
+    return {
+        variants: [
+            { props: { ...FILLED_ERROR_PROPS, select: false }, style: iconStyle },
+            ...heightVariants,
+            { props: { ...FILLED_ERROR_PROPS, disabled: true }, style: disabledStyle },
+        ],
+    };
+}
+
 function BuildTableCellStyle({ theme }: ThemedStyleProps): CSSObject {
     return { borderBottomColor: theme.palette.divider };
 }
+
+/** The inset beside the text of a small table cell, in theme spacing units: 16 px on each side. */
+export const SMALL_TABLE_CELL_INLINE_PADDING_UNITS = 4;
 
 /**
  * A small cell on the 4 dp grid: 8 px above and below its text. Only a normally padded cell takes
  * it, so MUI's checkbox and unpadded cells keep their own padding.
  */
 function BuildSmallTableCellStyle({ theme }: ThemedStyleProps): CSSObject {
-    return {
-        variants: [{ props: { padding: "normal" }, style: { padding: theme.spacing(2, 4) } }],
-    };
+    const padding = theme.spacing(2, SMALL_TABLE_CELL_INLINE_PADDING_UNITS);
+    return { variants: [{ props: { padding: "normal" }, style: { padding } }] };
+}
+
+/** A header cell in the M3 titleSmall role, in place of MUI's 24 px medium-weight line. */
+function BuildHeadTableCellStyle({ theme }: ThemedStyleProps): CSSObject {
+    return { ...theme.typography.titleSmall };
+}
+
+/**
+ * A total line's cell in the M3 titleSmall role on on-surface, so totals stand out from the
+ * bodyMedium detail rows where MUI's footer cell is smaller and in on-surface-variant.
+ */
+function BuildFooterTableCellStyle({ theme }: ThemedStyleProps): CSSObject {
+    return { ...theme.typography.titleSmall, color: theme.palette.text.primary };
 }
 
 /** Helper text in the M3 bodySmall role, 4 px below its field. */
@@ -845,14 +1000,16 @@ function BuildSelectIconStyle({ theme }: ThemedStyleProps): CSSObject {
 }
 
 /**
- * The M3 container pairs of the standard error and info Alerts, each icon in the matching accent
- * role. Success keeps MUI's green, which the legacy confirmations need and no M3 role provides.
+ * The standard error and info Alerts on their M3 containers. An error is red, as the legacy
+ * message line was: its text and icon take the error role. An info Alert pairs the primary
+ * container with its on-colour text and a primary icon. Success keeps MUI's green, which the
+ * legacy confirmations need and no M3 role provides.
  */
 function ReadAlertSeverityRoles({ palette }: StyleTheme): AlertSeverityRoles {
     return {
         error: {
             containerColor: palette.m3.errorContainer,
-            contentColor: palette.m3.onErrorContainer,
+            contentColor: palette.error.main,
             iconColor: palette.error.main,
         },
         info: {
@@ -901,7 +1058,12 @@ export const CARD_DEMO_THEME = createTheme({
             default: M3_COLOR_TOKENS.surface,
             paper: M3_COLOR_TOKENS.surfaceContainer,
         },
-        text: { primary: M3_COLOR_TOKENS.onSurface, secondary: M3_COLOR_TOKENS.onSurfaceVariant },
+        // Disabled field text and labels take the same 38 % on-surface content as disabled buttons.
+        text: {
+            primary: M3_COLOR_TOKENS.onSurface,
+            secondary: M3_COLOR_TOKENS.onSurfaceVariant,
+            disabled: alpha(M3_COLOR_TOKENS.onSurface, M3_DISABLED_CONTENT_OPACITY),
+        },
         divider: M3_COLOR_TOKENS.outlineVariant,
         // Icons in on-surface-variant; state layers and disabled content and containers in
         // on-surface. The selected and activated values stay MUI's.
@@ -923,8 +1085,6 @@ export const CARD_DEMO_THEME = createTheme({
             onPrimaryContainer: M3_COLOR_TOKENS.onPrimaryContainer,
             tertiary: M3_COLOR_TOKENS.tertiary,
             errorContainer: M3_COLOR_TOKENS.errorContainer,
-            onErrorContainer: M3_COLOR_TOKENS.onErrorContainer,
-            surfaceContainerHighest: M3_COLOR_TOKENS.surfaceContainerHighest,
             outline: M3_COLOR_TOKENS.outline,
         },
     },
@@ -962,7 +1122,10 @@ export const CARD_DEMO_THEME = createTheme({
             defaultProps: { disableInjectingGlobalStyles: true },
             styleOverrides: { input: INPUT_BASE_INPUT_STYLE },
         },
-        MuiTextField: { defaultProps: { variant: "outlined" } },
+        MuiTextField: {
+            defaultProps: { variant: "outlined" },
+            styleOverrides: { root: BuildFilledErrorIconStyle },
+        },
         MuiOutlinedInput: {
             styleOverrides: {
                 root: BuildOutlinedFieldStyle,
@@ -978,7 +1141,12 @@ export const CARD_DEMO_THEME = createTheme({
         },
         MuiSelect: { styleOverrides: { icon: BuildSelectIconStyle } },
         MuiTableCell: {
-            styleOverrides: { root: BuildTableCellStyle, sizeSmall: BuildSmallTableCellStyle },
+            styleOverrides: {
+                root: BuildTableCellStyle,
+                head: BuildHeadTableCellStyle,
+                footer: BuildFooterTableCellStyle,
+                sizeSmall: BuildSmallTableCellStyle,
+            },
         },
         MuiFormHelperText: {
             styleOverrides: {
@@ -1012,3 +1180,64 @@ export const VISUALLY_HIDDEN_STYLE: SxProps<Theme> = {
     whiteSpace: "nowrap",
     width: "1px",
 };
+
+// The edge cue of a horizontally scrolling region, in theme spacing units: a shadow 12 px deep at
+// each edge, under a 40 px cover in the paper colour whose solid first 12 px hide that shadow.
+const SCROLL_SHADOW_WIDTH_UNITS = 3;
+const SCROLL_COVER_WIDTH_UNITS = 10;
+const SCROLL_COVER_SOLID_STOP = "30%";
+const FOCUS_VISIBLE_PSEUDO_SELECTOR = "&:focus-visible";
+
+/**
+ * Each edge of a horizontally scrolling region shows a shadow in the shadow role only while content
+ * lies beyond it: the paper-coloured covers scroll with the content (attachment local) and hide the
+ * shadows fixed to the edges (attachment scroll) wherever the content's own edge is in view. Table
+ * cells have no fill, so the cue shows through them.
+ */
+function ScrollEdgeCueStyle(theme: StyleTheme): CSSObject {
+    const cover = theme.palette.background.paper;
+    const shadow = alpha(M3_COLOR_TOKENS.shadow, M3_KEY_SHADOW_OPACITY);
+    const coverSize = `${theme.spacing(SCROLL_COVER_WIDTH_UNITS)} 100%`;
+    const shadowSize = `${theme.spacing(SCROLL_SHADOW_WIDTH_UNITS)} 100%`;
+    return {
+        backgroundImage: [
+            `linear-gradient(to right, ${cover} ${SCROLL_COVER_SOLID_STOP}, transparent)`,
+            `linear-gradient(to left, ${cover} ${SCROLL_COVER_SOLID_STOP}, transparent)`,
+            `linear-gradient(to right, ${shadow}, transparent)`,
+            `linear-gradient(to left, ${shadow}, transparent)`,
+        ].join(", "),
+        backgroundPosition: "left center, right center, left center, right center",
+        backgroundSize: [coverSize, coverSize, shadowSize, shadowSize].join(", "),
+        backgroundRepeat: "no-repeat",
+        backgroundAttachment: "local, local, scroll, scroll",
+    };
+}
+
+/**
+ * A scrolling region the keyboard reaches as a tab stop, as an sx style: the edge cue on each side
+ * that hides content, a thin scrollbar in the outline role where the platform draws one, and the M3
+ * focus ring while it holds visible focus.
+ */
+export const SCROLL_REGION_STYLE: SxProps<Theme> = (theme) => ({
+    ...ScrollEdgeCueStyle(theme),
+    scrollbarWidth: "thin",
+    scrollbarColor: `${theme.palette.m3.outline} transparent`,
+    [FOCUS_VISIBLE_PSEUDO_SELECTOR]: FocusRingStyle(theme),
+});
+
+// A cell text wider than its fixed column breaks inside it rather than run under the next column.
+const TABLE_CELL_SELECTOR = "& .MuiTableCell-root";
+
+/**
+ * A table whose columns keep the widths its heading row declares, whatever rows a page holds or
+ * when it holds none, as an sx style. It is never narrower than those widths together, given in
+ * theme spacing units, so a narrower container scrolls it; a wider one widens every column in
+ * proportion.
+ */
+export function FixedLayoutTableStyle(minWidthUnits: number): SxProps<Theme> {
+    return {
+        tableLayout: "fixed",
+        minWidth: (theme) => theme.spacing(minWidthUnits),
+        [TABLE_CELL_SELECTOR]: { overflowWrap: "anywhere" },
+    };
+}

@@ -2,7 +2,7 @@
 // COCOM01Y, COTTL01Y, CSDAT01Y, CSMSG01Y
 "use client";
 
-import { Box, Grid, Stack, TextField, Typography, type SxProps, type Theme } from "@mui/material";
+import { Box, Grid, TextField, Typography, type SxProps, type Theme } from "@mui/material";
 import axios from "axios";
 import { useRouter } from "next/navigation";
 import {
@@ -76,12 +76,16 @@ const PAGE_LABEL = "Page:";
 const SEARCH_FIELD = "search_tran_id";
 const ALLOWED_SELECTION_CODES: readonly string[] = ["S"];
 const SELECTION_INSTRUCTION = "Type 'S' to View Transaction details from the list";
-// The TRNIDnn, TDATEnn, TDESCnn and TAMTnnn columns, keyed by the API row's field names.
+// The TRNIDnn, TDATEnn, TDESCnn and TAMTnnn columns, keyed by the API row's field names. Each
+// width, in theme spacing units, holds the wider of the heading and the BMS LENGTH (16, 8, 26 and
+// 12), save that a long description wraps onto a second line rather than widen the list, which
+// fits a 768 px screen without scrolling. Amounts and their heading are right-aligned, so their
+// decimals line up as in the report table.
 const LIST_COLUMNS: readonly SelectionColumn[] = [
-    { field: "tran_id", header: "Transaction ID" },
-    { field: "tran_date", header: "Date" },
-    { field: "tran_desc", header: "Description" },
-    { field: "tran_amt", header: "Amount" },
+    { field: "tran_id", header: "Transaction ID", widthUnits: 42 },
+    { field: "tran_date", header: "Date", widthUnits: 24 },
+    { field: "tran_desc", header: "Description", widthUnits: 51 },
+    { field: "tran_amt", header: "Amount", widthUnits: 32, align: "right" },
 ];
 // ERRMSG is COLOR=RED and COTRN00C never sets its colour, so every literal on this map is red.
 const ERRMSG_SEVERITY: MessageSeverity = SeverityForOutcome({
@@ -677,16 +681,13 @@ function SearchField({ view }: ListViewProps) {
     );
 }
 
+// The Page: label and PAGENUM in one labelLarge line, the one type role /cards gives its page.
 function PageNumber({ view }: ListViewProps) {
+    const pageText = `${PAGE_LABEL} ${PageNumberText(view.screen.pageState)}`.trimEnd();
     return (
-        <Stack direction="row" spacing={2} useFlexGap>
-            <Typography variant="labelLarge" component="p">
-                {PAGE_LABEL}
-            </Typography>
-            <Typography variant="bodyLarge" component="p">
-                {PageNumberText(view.screen.pageState)}
-            </Typography>
-        </Stack>
+        <Typography variant="labelLarge" component="p">
+            {pageText}
+        </Typography>
     );
 }
 
@@ -716,7 +717,8 @@ function SearchBar({ view }: ListViewProps) {
 }
 
 // At most 10 rows (SEL0001-SEL0010), each with its Sel code. Amounts show as the server's decimal
-// string rather than in TAMT's +99999999.99 picture.
+// string rather than in TAMT's +99999999.99 picture. The codes are read-only while a request is
+// out, as TRNIDIN is, so no code keyed meanwhile is cleared by that request's answer.
 function TransactionRows({ view }: ListViewProps) {
     return (
         <SelectionTable
@@ -724,6 +726,8 @@ function TransactionRows({ view }: ListViewProps) {
             rows={ToSelectionRows(view.screen.rows, view.selectionCodes)}
             allowedCodes={ALLOWED_SELECTION_CODES}
             onSelectionChange={view.onSelectionChange}
+            label={SCREEN_TITLE}
+            readOnly={view.isBusy}
         />
     );
 }

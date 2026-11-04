@@ -1,7 +1,14 @@
 // Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE,
-// AUTOFILL_KEYFRAMES_STYLE), the Material Design 3 token theme of AAP 0.5.3–0.5.4.
-import type { Theme, TypeAction } from "@mui/material/styles";
-import { AUTOFILL_KEYFRAMES_STYLE, CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE } from "@/app/theme";
+// AUTOFILL_KEYFRAMES_STYLE, SCROLL_REGION_STYLE, FixedLayoutTableStyle), the Material Design 3
+// token theme of AAP 0.5.3–0.5.4.
+import type { SxProps, Theme, TypeAction } from "@mui/material/styles";
+import {
+    AUTOFILL_KEYFRAMES_STYLE,
+    CARD_DEMO_THEME,
+    FixedLayoutTableStyle,
+    SCROLL_REGION_STYLE,
+    VISUALLY_HIDDEN_STYLE,
+} from "@/app/theme";
 
 type ColourReader = (theme: Theme) => string | undefined;
 
@@ -145,16 +152,6 @@ const M3_COLOR_EXPECTATIONS: readonly ColourExpectation[] = [
         read: (theme) => theme.palette.m3.errorContainer,
         expected: "#F9DEDC",
     },
-    {
-        token: "onErrorContainer",
-        read: (theme) => theme.palette.m3.onErrorContainer,
-        expected: "#8C1D18",
-    },
-    {
-        token: "surfaceContainerHighest",
-        read: (theme) => theme.palette.m3.surfaceContainerHighest,
-        expected: "#E6E0E9",
-    },
     { token: "surface", read: (theme) => theme.palette.background.default, expected: "#FEF7FF" },
     {
         token: "surfaceContainer",
@@ -170,6 +167,17 @@ const M3_COLOR_EXPECTATIONS: readonly ColourExpectation[] = [
     { token: "outline", read: (theme) => theme.palette.m3.outline, expected: "#79747E" },
     { token: "outlineVariant", read: (theme) => theme.palette.divider, expected: "#CAC4D0" },
 ];
+
+// The only colour roles the token table places under the augmented palette.m3 key, sorted.
+const M3_AUGMENTED_COLOUR_ROLES = [
+    "errorContainer",
+    "onPrimaryContainer",
+    "outline",
+    "primaryContainer",
+    "tertiary",
+];
+// Disabled field text and labels: on-surface at 38 %, as disabled buttons take it.
+const ON_SURFACE_DISABLED_CONTENT = "rgba(29, 27, 32, 0.38)";
 
 const M3_SHAPE_SCALE_EXPECTED = { extraSmall: 4, small: 8, medium: 12, large: 16, extraLarge: 28 };
 const MEDIUM_CORNER_RADIUS = 12;
@@ -383,18 +391,18 @@ const OUTLINE_AND_FILL_RULES: readonly ThemeRuleExpectation[] = [
         expectedStyle: { "--variant-outlinedBorder": OUTLINE_HEX },
     },
     {
-        rule: "a filled field sits on the highest surface container",
+        rule: "a filled field sits on the 6 % on-surface container",
         component: "MuiFilledInput",
         slot: "root",
         selectorPath: [],
-        expectedStyle: { backgroundColor: "#E6E0E9" },
+        expectedStyle: { backgroundColor: "rgba(29, 27, 32, 0.06)" },
     },
     {
-        rule: "a hovered or focused filled field keeps the highest surface container",
+        rule: "a hovered or focused filled field keeps the 6 % on-surface container",
         component: "MuiFilledInput",
         slot: "root",
         selectorPath: ["&:hover, &.Mui-focused"],
-        expectedStyle: { backgroundColor: "#E6E0E9" },
+        expectedStyle: { backgroundColor: "rgba(29, 27, 32, 0.06)" },
     },
     {
         rule: "a pointer hover lays the 8 % on-surface state layer over a filled field",
@@ -621,6 +629,15 @@ const FORCED_COLOUR_RULES: readonly ThemeRuleExpectation[] = [
     },
 ];
 
+// The M3 titleSmall role on Roboto, which table header and total cells take.
+const TITLE_SMALL_CELL_STYLE = {
+    fontFamily: ROBOTO_FONT_STACK,
+    fontSize: "14px",
+    lineHeight: "20px",
+    fontWeight: 500,
+    letterSpacing: "0.1px",
+};
+
 // Component typography and spacing on the M3 type scale and the 4 dp grid.
 const TYPE_AND_SPACING_RULES: readonly ThemeRuleExpectation[] = [
     {
@@ -674,6 +691,20 @@ const TYPE_AND_SPACING_RULES: readonly ThemeRuleExpectation[] = [
         slot: "sizeMedium",
         selectorPath: [],
         expectedStyle: { minHeight: 40, padding: "8px 12px" },
+    },
+    {
+        rule: "a table header cell is Roboto titleSmall",
+        component: "MuiTableCell",
+        slot: "head",
+        selectorPath: [],
+        expectedStyle: TITLE_SMALL_CELL_STYLE,
+    },
+    {
+        rule: "a table total cell is Roboto titleSmall in on-surface",
+        component: "MuiTableCell",
+        slot: "footer",
+        selectorPath: [],
+        expectedStyle: { ...TITLE_SMALL_CELL_STYLE, color: "#1D1B20" },
     },
 ];
 
@@ -824,6 +855,214 @@ const AUTOFILL_DETECTION_RULES: readonly ThemeRuleExpectation[] = [
     },
 ];
 
+// The M3 text field's trailing error icon, written out here rather than read from app/theme.ts:
+// MUI's ErrorOutline glyph, which the error Alert shows, as a 24 px icon 12 px in from the field's
+// end. The field's text, and a label on the input's row, end 12 + 24 + 16 = 52 px in from it.
+const ERROR_OUTLINE_PATH =
+    "M11 15h2v2h-2zm0-8h2v6h-2zm.99-5C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 " +
+    "12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z";
+const MASK_DATA_URI_PREFIX = 'url("data:image/svg+xml,';
+const MASK_DATA_URI_SUFFIX = '")';
+const FIELD_ERROR_SELECTOR = "&.Mui-error";
+const ERROR_ROOM_INPUT_SELECTOR =
+    "&:not(.MuiInputBase-adornedEnd) > .MuiInputBase-input:not(textarea):not(.MuiSelect-select)";
+const ERROR_ROOM_ROOT_SELECTOR = "&.MuiInputBase-multiline, &.MuiInputBase-adornedEnd";
+const ERROR_ICON_ROOM = { paddingRight: "52px" };
+const ERROR_ICON_BOX = {
+    content: '""',
+    position: "absolute",
+    width: 24,
+    height: 24,
+    right: "12px",
+    pointerEvents: "none",
+    maskRepeat: "no-repeat",
+    maskPosition: "center",
+    maskSize: "100% 100%",
+    backgroundColor: "#B3261E",
+};
+// Disabled content is on-surface at 38 %. Forced colours keep the icon in a system colour.
+const DISABLED_ERROR_ICON_COLOUR = "rgba(29, 27, 32, 0.38)";
+const FORCED_ERROR_ICON_FILL = { forcedColorAdjust: "none", backgroundColor: "CanvasText" };
+const FORCED_DISABLED_ERROR_ICON_FILL = { forcedColorAdjust: "none", backgroundColor: "GrayText" };
+const RESTING_ERROR_LABEL_MAX_WIDTH = "calc((100% - 16px - 52px) / 1)";
+const SHRUNK_ERROR_LABEL_MAX_WIDTH = "calc((100% - 16px - 52px) / 0.75)";
+// The TextField state of a filled, non-Select field in error, whose root holds the icon.
+const FILLED_ERROR_ICON_PROPS = { variant: "filled", error: true, select: false };
+
+// A field in error shows a non-colour cue: the trailing error icon (QAVIS2-F09, QAUX1-F14).
+const FIELD_ERROR_ICON_RULES: readonly ThemeRuleExpectation[] = [
+    {
+        rule: "an outlined field in error shows the error icon centred 12 px in from its end",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        selectorPath: [FIELD_ERROR_SELECTOR, "&::after"],
+        expectedStyle: { ...ERROR_ICON_BOX, top: "50%", transform: "translateY(-50%)" },
+    },
+    {
+        rule: "an outlined field's error icon is CanvasText under forced colours",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        selectorPath: [FIELD_ERROR_SELECTOR, "&::after", FORCED_COLORS_QUERY],
+        expectedStyle: FORCED_ERROR_ICON_FILL,
+    },
+    {
+        rule: "a disabled outlined field's error icon is disabled content",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        selectorPath: [FIELD_ERROR_SELECTOR, "&.Mui-disabled::after"],
+        expectedStyle: { backgroundColor: DISABLED_ERROR_ICON_COLOUR },
+    },
+    {
+        rule: "a disabled outlined field's error icon is GrayText under forced colours",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        selectorPath: [FIELD_ERROR_SELECTOR, "&.Mui-disabled::after", FORCED_COLORS_QUERY],
+        expectedStyle: FORCED_DISABLED_ERROR_ICON_FILL,
+    },
+    {
+        rule: "an outlined field's input in error ends its text 52 px in, clear of the icon",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        selectorPath: [FIELD_ERROR_SELECTOR, ERROR_ROOM_INPUT_SELECTOR],
+        expectedStyle: ERROR_ICON_ROOM,
+    },
+    {
+        rule: "a multiline or end-adorned outlined field in error keeps the icon's room itself",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        selectorPath: [FIELD_ERROR_SELECTOR, ERROR_ROOM_ROOT_SELECTOR],
+        expectedStyle: ERROR_ICON_ROOM,
+    },
+    {
+        rule: "a Select in error shows the icon in its arrow's place, 8 px in from its end",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        selectorPath: [FIELD_ERROR_SELECTOR, "&.MuiSelect-root::after"],
+        expectedStyle: { right: "8px" },
+    },
+    {
+        rule: "a Select in error hides its arrow under the icon",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        selectorPath: [FIELD_ERROR_SELECTOR, "&.MuiSelect-root .MuiSelect-icon"],
+        expectedStyle: { display: "none" },
+    },
+    {
+        rule: "a filled field's input in error ends its text 52 px in, clear of the icon",
+        component: "MuiFilledInput",
+        slot: "root",
+        selectorPath: [FIELD_ERROR_SELECTOR, ERROR_ROOM_INPUT_SELECTOR],
+        expectedStyle: ERROR_ICON_ROOM,
+    },
+    {
+        rule: "a multiline or end-adorned filled field in error keeps the icon's room itself",
+        component: "MuiFilledInput",
+        slot: "root",
+        selectorPath: [FIELD_ERROR_SELECTOR, ERROR_ROOM_ROOT_SELECTOR],
+        expectedStyle: ERROR_ICON_ROOM,
+    },
+    {
+        rule: "an outlined field's resting label in error ends clear of the icon",
+        component: "MuiInputLabel",
+        slot: "outlined",
+        selectorPath: [FIELD_ERROR_SELECTOR],
+        expectedStyle: { maxWidth: RESTING_ERROR_LABEL_MAX_WIDTH },
+    },
+    {
+        rule: "a filled field's resting label in error ends clear of the icon",
+        component: "MuiInputLabel",
+        slot: "filled",
+        selectorPath: [FIELD_ERROR_SELECTOR],
+        expectedStyle: { maxWidth: RESTING_ERROR_LABEL_MAX_WIDTH },
+    },
+];
+
+// The filled field's icon on its TextField root at each field height, and each label placement's
+// width in error.
+const FIELD_ERROR_ICON_VARIANTS: readonly SlotVariantExpectation[] = [
+    {
+        rule: "a filled field in error shows the error icon 16 px from its top, 12 px from its end",
+        component: "MuiTextField",
+        slot: "root",
+        variantProps: FILLED_ERROR_ICON_PROPS,
+        expectedStyle: {
+            "&::after": {
+                ...ERROR_ICON_BOX,
+                top: "16px",
+                [FORCED_COLORS_QUERY]: FORCED_ERROR_ICON_FILL,
+            },
+        },
+    },
+    {
+        rule: "a small filled field's error icon is centred 12 px from its top",
+        component: "MuiTextField",
+        slot: "root",
+        variantProps: { variant: "filled", error: true, size: "small" },
+        expectedStyle: { "&::after": { top: "12px" } },
+    },
+    {
+        rule: "a filled field with a hidden label centres its error icon 16 px from its top",
+        component: "MuiTextField",
+        slot: "root",
+        variantProps: { variant: "filled", error: true, hiddenLabel: true },
+        expectedStyle: { "&::after": { top: "16px" } },
+    },
+    {
+        rule: "a small filled field with a hidden label centres its error icon 8 px from its top",
+        component: "MuiTextField",
+        slot: "root",
+        variantProps: { variant: "filled", error: true, hiddenLabel: true, size: "small" },
+        expectedStyle: { "&::after": { top: "8px" } },
+    },
+    {
+        rule: "a disabled filled field's error icon is disabled content, or GrayText when forced",
+        component: "MuiTextField",
+        slot: "root",
+        variantProps: { variant: "filled", error: true, disabled: true },
+        expectedStyle: {
+            "&::after": {
+                backgroundColor: DISABLED_ERROR_ICON_COLOUR,
+                [FORCED_COLORS_QUERY]: FORCED_DISABLED_ERROR_ICON_FILL,
+            },
+        },
+    },
+    {
+        rule: "a small outlined field's resting label in error ends clear of the icon",
+        component: "MuiInputLabel",
+        slot: "outlined",
+        variantProps: { size: "small" },
+        expectedStyle: { [FIELD_ERROR_SELECTOR]: { maxWidth: RESTING_ERROR_LABEL_MAX_WIDTH } },
+    },
+    {
+        rule: "an outlined label shrunk into the notch keeps its width in error, above the icon",
+        component: "MuiInputLabel",
+        slot: "outlined",
+        variantProps: { shrink: true },
+        expectedStyle: { [FIELD_ERROR_SELECTOR]: { maxWidth: SHRUNK_LABEL_MAX_WIDTH } },
+    },
+    {
+        rule: "a small filled field's resting label in error ends clear of the icon",
+        component: "MuiInputLabel",
+        slot: "filled",
+        variantProps: { size: "small" },
+        expectedStyle: { [FIELD_ERROR_SELECTOR]: { maxWidth: RESTING_ERROR_LABEL_MAX_WIDTH } },
+    },
+    {
+        rule: "a filled field's shrunk label in error ends clear of the icon",
+        component: "MuiInputLabel",
+        slot: "filled",
+        variantProps: { shrink: true },
+        expectedStyle: { [FIELD_ERROR_SELECTOR]: { maxWidth: SHRUNK_ERROR_LABEL_MAX_WIDTH } },
+    },
+    {
+        rule: "a small filled field's shrunk label in error ends clear of the icon",
+        component: "MuiInputLabel",
+        slot: "filled",
+        variantProps: { shrink: true, size: "small" },
+        expectedStyle: { [FIELD_ERROR_SELECTOR]: { maxWidth: SHRUNK_ERROR_LABEL_MAX_WIDTH } },
+    },
+];
+
 const THEME_RULE_GROUPS: readonly [string, readonly ThemeRuleExpectation[]][] = [
     ["M3 outlines, fills and dividers", OUTLINE_AND_FILL_RULES],
     ["M3 focus ring", FOCUS_RING_RULES],
@@ -832,6 +1071,7 @@ const THEME_RULE_GROUPS: readonly [string, readonly ThemeRuleExpectation[]][] = 
     ["M3 component typography and spacing", TYPE_AND_SPACING_RULES],
     ["M3 text-field insets (FE2A-F12)", TEXT_FIELD_INSET_RULES],
     ["MUI autofill detection (QPERF2-F01)", AUTOFILL_DETECTION_RULES],
+    ["M3 field error icon (QAVIS2-F09, QAUX1-F14)", FIELD_ERROR_ICON_RULES],
 ];
 
 // Overrides MUI applies only to components in one state: a small or hidden-label field, a dense
@@ -942,13 +1182,13 @@ const SLOT_VARIANT_EXPECTATIONS: readonly SlotVariantExpectation[] = [
         },
     },
     {
-        rule: "an error Alert is the error-container pair with an error icon",
+        rule: "an error Alert is red error text and icon on the error container",
         component: "MuiAlert",
         slot: "root",
         variantProps: { variant: "standard", colorSeverity: "error" },
         expectedStyle: {
             backgroundColor: "#F9DEDC",
-            color: "#8C1D18",
+            color: "#B3261E",
             "& .MuiAlert-icon": { color: "#B3261E" },
         },
     },
@@ -1074,6 +1314,47 @@ const MUI_VISUALLY_HIDDEN_VALUES = {
     whiteSpace: "nowrap",
     width: "1px",
 };
+
+// The list tables' scrolling region: edge shadows in the shadow role under 40 px paper-coloured
+// covers that scroll with the content, so only an edge with hidden content shows its 12 px shadow;
+// a thin outline-role scrollbar; and the M3 focus ring, 3 px secondary 2 px outside the region.
+const SCROLL_REGION_VALUES = {
+    backgroundImage: [
+        "linear-gradient(to right, #F3EDF7 30%, transparent)",
+        "linear-gradient(to left, #F3EDF7 30%, transparent)",
+        "linear-gradient(to right, rgba(0, 0, 0, 0.3), transparent)",
+        "linear-gradient(to left, rgba(0, 0, 0, 0.3), transparent)",
+    ].join(", "),
+    backgroundPosition: "left center, right center, left center, right center",
+    backgroundSize: "40px 100%, 40px 100%, 12px 100%, 12px 100%",
+    backgroundRepeat: "no-repeat",
+    backgroundAttachment: "local, local, scroll, scroll",
+    scrollbarWidth: "thin",
+    scrollbarColor: "#79747E transparent",
+    "&:focus-visible": {
+        outline: "3px solid #625B71",
+        outlineOffset: 2,
+        "@media (forced-colors: active)": { outlineColor: "Highlight" },
+    },
+};
+
+// The list tables' fixed layout: every column keeps its declared width and a wider text breaks
+// inside its column. The minimum width is the columns' total in 4 dp units: the CCLI, CU00 and
+// CT00 totals.
+const FIXED_TABLE_VALUES = {
+    tableLayout: "fixed",
+    "& .MuiTableCell-root": { overflowWrap: "anywhere" },
+};
+const FIXED_TABLE_MIN_WIDTHS: readonly [number, string][] = [
+    [121, "484px"],
+    [172, "688px"],
+    [173, "692px"],
+];
+
+// An sx style written as a theme callback resolves against the CardDemo theme.
+function ResolveSx(style: SxProps<Theme>): unknown {
+    return typeof style === "function" ? style(CARD_DEMO_THEME) : style;
+}
 
 function FontSizeToPixels(value: string | number | undefined): number {
     if (typeof value === "number") {
@@ -1213,6 +1494,35 @@ function FindSlotVariantStyle(
     return variants.find((entry) => MatchesVariantProps(entry, variantProps))?.style;
 }
 
+// The SVG a CSS url() holding an SVG data URI carries, or "" for any other value.
+function DecodeMaskSvg(maskImage: unknown): string {
+    const isSvgDataUri =
+        typeof maskImage === "string" &&
+        maskImage.startsWith(MASK_DATA_URI_PREFIX) &&
+        maskImage.endsWith(MASK_DATA_URI_SUFFIX);
+    if (!isSvgDataUri) {
+        return "";
+    }
+    return decodeURIComponent(
+        maskImage.slice(MASK_DATA_URI_PREFIX.length, -MASK_DATA_URI_SUFFIX.length),
+    );
+}
+
+// The error icon of each field variant: on an outlined field's root, on a filled field's TextField.
+const ERROR_ICON_HOSTS: readonly [string, () => StyleRecord | undefined][] = [
+    [
+        "outlined",
+        () => ReadThemeRule("MuiOutlinedInput", "root", [FIELD_ERROR_SELECTOR, "&::after"]),
+    ],
+    [
+        "filled",
+        () =>
+            AsStyleRecord(
+                FindSlotVariantStyle("MuiTextField", "root", FILLED_ERROR_ICON_PROPS)?.["&::after"],
+            ),
+    ],
+];
+
 function ExpectedShadowAt(muiIndex: number): string {
     const levelRange = M3_LEVEL_INDEX_RANGES.find(
         ({ first, last }) => muiIndex >= first && muiIndex <= last,
@@ -1228,6 +1538,15 @@ const SHADOW_EXPECTATIONS: readonly ShadowExpectation[] = Array.from(
 describe("M3 colour roles (AAP 0.5.3)", () => {
     it.each(M3_COLOR_EXPECTATIONS)("$token is $expected", ({ read, expected }) => {
         expect(NormaliseColour(read(CARD_DEMO_THEME))).toBe(expected.toUpperCase());
+    });
+
+    it("palette.m3 holds only the augmented token-table roles", () => {
+        const augmentedRoles = Object.keys(CARD_DEMO_THEME.palette.m3).sort();
+        expect(augmentedRoles).toEqual(M3_AUGMENTED_COLOUR_ROLES);
+    });
+
+    it(`text.disabled is the ${ON_SURFACE_DISABLED_CONTENT} on-surface disabled content`, () => {
+        expect(CARD_DEMO_THEME.palette.text.disabled).toBe(ON_SURFACE_DISABLED_CONTENT);
     });
 });
 
@@ -1329,6 +1648,39 @@ describe("Floating-label placements (FE2A-F12)", () => {
     );
 });
 
+describe("Field error icon placements (QAVIS2-F09, QAUX1-F14)", () => {
+    it.each(FIELD_ERROR_ICON_VARIANTS)(
+        "$rule",
+        ({ component, slot, variantProps, expectedStyle }) => {
+            expect(FindSlotVariantStyle(component, slot, variantProps)).toMatchObject(
+                expectedStyle,
+            );
+        },
+    );
+});
+
+describe("Field error icon glyph and hosts (QAVIS2-F09, QAUX1-F14)", () => {
+    it.each(ERROR_ICON_HOSTS)(
+        "the %s field's error icon is MUI's ErrorOutline glyph",
+        (_hostName, read) => {
+            const iconStyle = read();
+            const glyph = DecodeMaskSvg(iconStyle?.maskImage);
+            expect(glyph).toContain('viewBox="0 0 24 24"');
+            expect(glyph).toContain(`<path d="${ERROR_OUTLINE_PATH}"/>`);
+            expect(iconStyle?.WebkitMaskImage).toBe(iconStyle?.maskImage);
+        },
+    );
+
+    it("only a filled, non-Select TextField in error draws the icon on its root", () => {
+        const variants = ReadSlotVariants("MuiTextField", "root");
+        const iconRows = variants.filter(
+            (entry) => AsStyleRecord(entry.style["&::after"])?.content !== undefined,
+        );
+        expect(variants.every(({ props }) => props.variant === "filled" && props.error)).toBe(true);
+        expect(iconRows.map((entry) => entry.props)).toEqual([FILLED_ERROR_ICON_PROPS]);
+    });
+});
+
 describe("Small table cells on the 4 dp grid (FE2A-F12)", () => {
     it("small checkbox and unpadded cells keep MUI's padding", () => {
         const paddedStates = ReadSlotVariants("MuiTableCell", "sizeSmall").map(
@@ -1399,4 +1751,23 @@ describe("Visually hidden text", () => {
     it("VISUALLY_HIDDEN_STYLE carries MUI's visuallyHidden values", () => {
         expect(VISUALLY_HIDDEN_STYLE).toEqual(MUI_VISUALLY_HIDDEN_VALUES);
     });
+});
+
+describe("List table scrolling regions", () => {
+    it("SCROLL_REGION_STYLE draws edge cues, an outline scrollbar and the M3 focus ring", () => {
+        expect(ResolveSx(SCROLL_REGION_STYLE)).toEqual(SCROLL_REGION_VALUES);
+    });
+});
+
+// A fixed layout at least as wide as its columns, whose texts break inside their column.
+describe("Fixed-layout list tables", () => {
+    it.each(FIXED_TABLE_MIN_WIDTHS)(
+        "FixedLayoutTableStyle(%i) is a fixed layout at least %s wide",
+        (minWidthUnits, minWidth) => {
+            const tableStyle = FixedLayoutTableStyle(minWidthUnits) as Record<string, unknown>;
+            const { minWidth: minWidthOf, ...fixedValues } = tableStyle;
+            expect(fixedValues).toEqual(FIXED_TABLE_VALUES);
+            expect(typeof minWidthOf === "function" && minWidthOf(CARD_DEMO_THEME)).toBe(minWidth);
+        },
+    );
 });

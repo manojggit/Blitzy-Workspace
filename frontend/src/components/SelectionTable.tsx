@@ -15,18 +15,31 @@ import {
     type SelectChangeEvent,
     type SelectProps,
     type SxProps,
+    type TableCellProps,
     type Theme,
 } from "@mui/material";
 import { useState, type HTMLAttributes, type ReactElement, type SyntheticEvent } from "react";
 
+import {
+    FixedLayoutTableStyle,
+    SCROLL_REGION_STYLE,
+    SMALL_TABLE_CELL_INLINE_PADDING_UNITS,
+} from "@/app/theme";
 import { IsScreenEnterKey, SCREEN_ENTER_PROPS } from "@/lib/useFunctionKeys";
 
 import { ErrorMessageReference } from "@/components/MessageLine";
 
-/** A protected display column of a list map; `field` is the key of `SelectionRow.cells`. */
+/**
+ * A protected display column of a list map; `field` is the key of `SelectionRow.cells`. Its width,
+ * in theme spacing units of 4 dp, holds its BMS LENGTH of text or its heading, whichever is wider,
+ * beside the cell's insets, and every page of the list keeps it. `align` places the heading and
+ * every text of the column, so amounts can line up on their decimals.
+ */
 export interface SelectionColumn {
     field: string;
     header: string;
+    widthUnits: number;
+    align?: TableCellProps["align"];
 }
 
 /**
@@ -40,15 +53,26 @@ export interface SelectionRow {
     isError?: boolean;
 }
 
+/**
+ * `label` names the scrolling region that holds the table, a tab stop of its own, so the keyboard
+ * can scroll columns a narrow screen hides. While `readOnly` holds, as the 3270 keyboard locks
+ * while the program runs, every code stays as shown: the fields stay focusable but no menu opens
+ * and no code is typed or picked.
+ */
 export interface SelectionTableProps {
     columns: readonly SelectionColumn[];
     rows: readonly SelectionRow[];
     allowedCodes: readonly string[];
     onSelectionChange: (rowKey: string, code: string) => void;
+    label: string;
     selectionHeader?: string;
+    readOnly?: boolean;
 }
 
-type SelectionHandlers = Pick<SelectionTableProps, "allowedCodes" | "onSelectionChange">;
+type SelectionHandlers = Pick<
+    SelectionTableProps,
+    "allowedCodes" | "onSelectionChange" | "readOnly"
+>;
 
 interface SelectionTableHeadProps {
     columns: readonly SelectionColumn[];
@@ -88,12 +112,18 @@ const ZERO_WIDTH_SPACE = "\u200b";
 const SELECTION_DISPLAY_PROPS: HTMLAttributes<HTMLDivElement> & typeof SCREEN_ENTER_PROPS = {
     ...SCREEN_ENTER_PROPS,
 };
-// A content-sized field grows when a code replaces the blank, and the table's automatic layout
-// then shifts every column, so the field keeps one width: MUI's select padding plus the widest
-// glyph a one-character code can hold (code page 037), in theme spacing units of 4 dp each.
+// A content-sized field grows when a code replaces the blank and would outgrow its column, so the
+// field keeps one width: MUI's select padding plus the widest glyph a one-character code can hold
+// (code page 037), in theme spacing units of 4 dp each.
 const SELECTION_FIELD_WIDTH_UNITS = 16;
 const SELECTION_FIELD_STYLE: SxProps<Theme> = {
     width: (theme) => theme.spacing(SELECTION_FIELD_WIDTH_UNITS),
+};
+// The selection column holds that field between the cell's insets.
+const SELECTION_COLUMN_WIDTH_UNITS =
+    SELECTION_FIELD_WIDTH_UNITS + 2 * SMALL_TABLE_CELL_INLINE_PADDING_UNITS;
+const SELECTION_COLUMN_STYLE: SxProps<Theme> = {
+    width: (theme) => theme.spacing(SELECTION_COLUMN_WIDTH_UNITS),
 };
 // The props every row's selection field shares: its size, the blank shown as a value, its fixed
 // width and the screen-ENTER marker on its combobox.
@@ -144,14 +174,19 @@ function IsScreenEnterPress(event: SyntheticEvent): boolean {
 
 // The menu opens on Space, the arrow keys and the pointer, and stays closed on the Enter the
 // screen takes as its ENTER, so one press is one action; inside the open menu Enter picks an
-// option. React recognises hooks only by the camelCase "use" prefix, so this name is a
-// framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
-function useSelectionMenu(): SelectionMenuState {
+// option. A physical PF key can start a request while a menu is open, so the lock closes it, and
+// for good: it does not reopen when the lock clears. React recognises hooks only by the camelCase
+// "use" prefix, so this name is a framework-mandated exception to the MK_Modernization Rule's
+// PascalCase function naming.
+function useSelectionMenu(isLocked: boolean): SelectionMenuState {
     const [isOpen, setIsOpen] = useState(false);
+    if (isLocked && isOpen) {
+        setIsOpen(false);
+    }
     return {
-        open: isOpen,
+        open: isOpen && !isLocked,
         onOpen: (event) => {
-            if (!IsScreenEnterPress(event)) {
+            if (!isLocked && !IsScreenEnterPress(event)) {
                 setIsOpen(true);
             }
         },
@@ -173,14 +208,16 @@ function SelectionMenuPropsFor(rowNumber: number): Partial<MenuProps> {
     return { slotProps: { list: { "aria-label": SelectionLabelFor(rowNumber) } } };
 }
 
+// A read-only Select marks its combobox aria-readonly and ignores the pointer and every key.
 function SelectionCell({ row, rowNumber, tableProps }: SelectionCellProps) {
-    const { allowedCodes, onSelectionChange } = tableProps;
-    const menu = useSelectionMenu();
+    const { allowedCodes, onSelectionChange, readOnly = false } = tableProps;
+    const menu = useSelectionMenu(readOnly);
     return (
         <Select
             {...SELECTION_FIELD_PROPS}
             error={row.isError ?? false}
             value={row.selectedCode}
+            readOnly={readOnly}
             {...menu}
             inputProps={SelectionInputProps(row, rowNumber)}
             MenuProps={SelectionMenuPropsFor(rowNumber)}
@@ -200,7 +237,9 @@ function SelectionTableRow({ row, rowNumber, columns, tableProps }: SelectionTab
                 <SelectionCell row={row} rowNumber={rowNumber} tableProps={tableProps} />
             </TableCell>
             {columns.map((column) => (
-                <TableCell key={column.field}>{row.cells[column.field] ?? ""}</TableCell>
+                <TableCell key={column.field} align={column.align}>
+                    {row.cells[column.field] ?? ""}
+                </TableCell>
             ))}
         </TableRow>
     );
@@ -222,13 +261,32 @@ function SelectionTableBody({ rows, columns, tableProps }: SelectionTableBodyPro
     );
 }
 
+// The fixed table layout takes each column's width from its heading cell.
+function ColumnWidthStyle(widthUnits: number): SxProps<Theme> {
+    return { width: (theme) => theme.spacing(widthUnits) };
+}
+
+// The table is never narrower than all its columns, the selection column included.
+function TableWidthUnits(columns: readonly SelectionColumn[]): number {
+    return columns.reduce(
+        (total, column) => total + column.widthUnits,
+        SELECTION_COLUMN_WIDTH_UNITS,
+    );
+}
+
 function SelectionTableHead({ columns, selectionHeader }: SelectionTableHeadProps) {
     return (
         <TableHead>
             <TableRow>
-                <TableCell>{selectionHeader}</TableCell>
+                <TableCell sx={SELECTION_COLUMN_STYLE}>{selectionHeader}</TableCell>
                 {columns.map((column) => (
-                    <TableCell key={column.field}>{column.header}</TableCell>
+                    <TableCell
+                        key={column.field}
+                        align={column.align}
+                        sx={ColumnWidthStyle(column.widthUnits)}
+                    >
+                        {column.header}
+                    </TableCell>
                 ))}
             </TableRow>
         </TableHead>
@@ -240,11 +298,16 @@ function SelectionTableHead({ columns, selectionHeader }: SelectionTableHeadProp
  * `onSelectionChange` unchanged: the page posts them and the server returns the legacy messages.
  */
 export function SelectionTable(props: SelectionTableProps) {
-    const { columns, rows, allowedCodes, onSelectionChange, selectionHeader } = props;
-    const tableProps: SelectionHandlers = { allowedCodes, onSelectionChange };
+    const { columns, rows, allowedCodes, onSelectionChange, selectionHeader, readOnly } = props;
+    const tableProps: SelectionHandlers = { allowedCodes, onSelectionChange, readOnly };
     return (
-        <TableContainer>
-            <Table size="small">
+        <TableContainer
+            role="region"
+            aria-label={props.label}
+            tabIndex={0}
+            sx={SCROLL_REGION_STYLE}
+        >
+            <Table size="small" sx={FixedLayoutTableStyle(TableWidthUnits(columns))}>
                 <SelectionTableHead
                     columns={columns}
                     selectionHeader={selectionHeader ?? DEFAULT_SELECTION_HEADER}

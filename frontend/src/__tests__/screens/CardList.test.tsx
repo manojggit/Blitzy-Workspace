@@ -402,11 +402,23 @@ function InDocumentOrder(first: Node, second: Node): number {
     return first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
 }
 
-// Every Alert shown, in screen order: ERRMSG has role alert and INFOMSG role status.
+// Every Alert shown, in screen order: ERRMSG has role alert and INFOMSG role status. The page's
+// own result status is a status region too, but no Alert.
 function ShownAlerts(): HTMLElement[] {
-    return [...screen.queryAllByRole("alert"), ...screen.queryAllByRole("status")].sort(
-        InDocumentOrder,
-    );
+    return [...screen.queryAllByRole("alert"), ...screen.queryAllByRole("status")]
+        .filter((region) => region.classList.contains("MuiAlert-root"))
+        .sort(InDocumentOrder);
+}
+
+// The page's polite result status: the one status region that is not the INFOMSG Alert.
+function ResultStatusRegion(): HTMLElement {
+    const regions = screen
+        .getAllByRole("status")
+        .filter((region) => !region.classList.contains("MuiAlert-root"));
+    expect(regions).toHaveLength(1);
+    const [resultStatus] = regions as [HTMLElement];
+    expect(resultStatus).toHaveAttribute("aria-live", "polite");
+    return resultStatus;
 }
 
 // The first Alert in screen order whose raw text is the literal.
@@ -1076,8 +1088,8 @@ describe("COCRDLIC session refusal on /cards", () => {
         mockListCards.mockRejectedValueOnce(BuildAxiosError(HTTP_UNAUTHORIZED, body));
         await RenderScreen();
         expect(mockListCards).toHaveBeenCalledTimes(1);
-        expect(screen.queryAllByRole("alert")).toEqual([]);
-        expect(screen.queryAllByRole("status")).toEqual([]);
+        expect(ShownAlerts()).toEqual([]);
+        expect(ResultStatusRegion().textContent).toBe("");
         expect(BodyRows()).toEqual([]);
         expect(mockRouterPush).not.toHaveBeenCalled();
         expect(mockRouterReplace).not.toHaveBeenCalled();
@@ -1473,4 +1485,140 @@ describe("COCRDLIC leaving /cards while a selection runs", () => {
         expect(ListReadSignal(1)?.aborted).toBe(true);
         expect(mockRouterPush).not.toHaveBeenCalled();
     });
+});
+
+const FILTER_LABEL_LIST: readonly string[] = [ACCOUNT_FILTER_LABEL, CARD_FILTER_LABEL];
+
+// While a read is out both filters are read-only, so typing changes neither, and every CRDSELn
+// field is aria-readonly, so a click opens no menu: the answer is shown under the filters and
+// codes it was read with.
+async function ExpectFiltersAndCodesLocked(user: UserSession): Promise<void> {
+    for (const label of FILTER_LABEL_LIST) {
+        expect(FilterInput(label)).toHaveAttribute("readonly");
+    }
+    await user.type(FilterInput(ACCOUNT_FILTER_LABEL), KEYED_FILTERS.acctId);
+    expect(FilterInput(ACCOUNT_FILTER_LABEL)).toHaveValue("");
+    for (const field of screen.getAllByRole("combobox")) {
+        expect(field).toHaveAttribute("aria-readonly", "true");
+    }
+    await user.click(SelectionField(SELECTED_ROW));
+    expect(screen.queryByRole("listbox")).toBeNull();
+}
+
+function ExpectFiltersAndCodesUnlocked(): void {
+    for (const label of FILTER_LABEL_LIST) {
+        expect(FilterInput(label)).not.toHaveAttribute("readonly");
+    }
+    for (const field of screen.getAllByRole("combobox")) {
+        expect(field).not.toHaveAttribute("aria-readonly");
+    }
+}
+
+describe("COCRDLIC filters and codes locked while a list read is out on /cards", () => {
+    it.each(KEYED_READS)(
+        "COCRDLIC the $readName read keeps the filters and CRDSEL1-7 read-only until it answers",
+        async ({ key }) => {
+            const user = await RenderScreen();
+            const settleRead = DeferNextListRead();
+            await user.click(screen.getByRole("button", { name: KEY_BUTTON_NAMES[key] }));
+            ExpectBusy();
+            await ExpectFiltersAndCodesLocked(user);
+            act(() => settleRead(NextPageResponse(PAGE_SIZE)));
+            await WaitForIdle();
+            ExpectFiltersAndCodesUnlocked();
+            ExpectShownRows(NextPageResponse(PAGE_SIZE).rows);
+            expect(SelectionCodesShown()).toEqual(RowCodesFor([]));
+            expect(mockListCards).toHaveBeenCalledTimes(2);
+        },
+    );
+});
+
+// A physical key press dispatched straight to the window, where useFunctionKeys listens.
+function DispatchKeyDown(key: ScreenKey): void {
+    window.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+}
+
+// Both presses land before React re-renders the disabled keys, so the request gate alone refuses
+// the second: the first read is neither aborted nor joined by another.
+describe("COCRDLIC keys pressed twice in one frame on /cards", () => {
+    it.each(KEYED_READS)(
+        "COCRDLIC two $key presses in one frame send one $readName read",
+        async ({ key }) => {
+            await RenderScreen();
+            const settleRead = DeferNextListRead();
+            act(() => {
+                DispatchKeyDown(key);
+                DispatchKeyDown(key);
+            });
+            expect(mockListCards).toHaveBeenCalledTimes(2);
+            expect(ListReadSignal(1)?.aborted).toBe(false);
+            act(() => settleRead(NextPageResponse(PAGE_SIZE)));
+            await WaitForIdle();
+            expect(mockListCards).toHaveBeenCalledTimes(2);
+            expect(screen.getByText(`Page ${NEXT_PAGE}`)).toBeVisible();
+        },
+    );
+});
+
+interface ResultStatusCase {
+    readName: string;
+    key: ScreenKey;
+    rowCount: number;
+    statusText: string;
+}
+
+// The page number and row count of the page each key shows, a full, a one-row and an empty page.
+const RESULT_STATUS_CASES: readonly ResultStatusCase[] = [
+    { readName: "forward", key: "F8", rowCount: PAGE_SIZE, statusText: "Page 3: 7 cards" },
+    { readName: "backward", key: "F7", rowCount: 1, statusText: "Page 3: 1 card" },
+    { readName: "re-read", key: "Enter", rowCount: 0, statusText: "Page 3: no cards" },
+];
+
+// The first entry's page 2 of 7 cards, as BuildListResponse answers it.
+const FIRST_ENTRY_STATUS = "Page 2: 7 cards";
+
+// The first entry announces its page; the key's read empties the status while it is out and
+// announces the page it shows. The status is client text, so ERRMSG and INFOMSG stay as answered.
+async function AnnouncesEachPageShown({ key, rowCount, statusText }: ResultStatusCase) {
+    const user = await RenderScreen();
+    expect(ResultStatusRegion().textContent).toBe(FIRST_ENTRY_STATUS);
+    expect(ResultStatusRegion()).toHaveStyle({ position: "absolute", width: "1px" });
+    const settleRead = DeferNextListRead();
+    await user.click(screen.getByRole("button", { name: KEY_BUTTON_NAMES[key] }));
+    expect(ResultStatusRegion().textContent).toBe("");
+    act(() => settleRead(NextPageResponse(rowCount)));
+    await WaitForIdle();
+    expect(ResultStatusRegion().textContent).toBe(statusText);
+    expect(AlertTexts()).toEqual([RECORD_ACTIONS_INFO]);
+}
+
+async function LeavesStatusEmptyOnRefusal() {
+    const user = await RenderScreen();
+    mockListCards.mockRejectedValueOnce(BuildAxiosError(HTTP_BAD_REQUEST, FilterRefusalBody()));
+    await PressScreenKey(user, "Enter", "click");
+    await ExpectAlert(ACCOUNT_FILTER_MESSAGE, ERRMSG_SEVERITY);
+    expect(ResultStatusRegion().textContent).toBe("");
+}
+
+async function AnnouncesUnactionedSelectionReread() {
+    mockSelectCards.mockResolvedValueOnce(UNACTIONED_SELECTION);
+    mockListCards
+        .mockResolvedValueOnce(BuildListResponse())
+        .mockResolvedValueOnce(NextPageResponse(PAGE_SIZE));
+    await SubmitSelectedRow();
+    await WaitForIdle();
+    ExpectLastListRead(UNACTIONED_REREAD_QUERY);
+    expect(ResultStatusRegion().textContent).toBe("Page 3: 7 cards");
+}
+
+describe("COCRDLIC polite result status on /cards", () => {
+    it.each(RESULT_STATUS_CASES)(
+        "COCRDLIC the $readName read empties the status, then announces $statusText",
+        AnnouncesEachPageShown,
+    );
+    it("COCRDLIC a refused read leaves the status empty", LeavesStatusEmptyOnRefusal);
+    it(
+        "COCRDLIC the re-read after an unactioned selection announces its page",
+        AnnouncesUnactionedSelectionReread,
+    );
 });

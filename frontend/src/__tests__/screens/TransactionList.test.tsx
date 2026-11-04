@@ -394,6 +394,11 @@ function SearchField(): HTMLElement {
     return screen.getByRole("textbox", { name: SEARCH_LABEL });
 }
 
+// The Page: label and PAGENUM, shown together as one line.
+function PageIndicator(pageNumber: number): HTMLElement {
+    return screen.getByText(`Page: ${pageNumber}`);
+}
+
 function SelectionField(rowNumber: number): HTMLElement {
     return screen.getByRole("combobox", { name: `Selection for row ${rowNumber}` });
 }
@@ -642,8 +647,7 @@ describe("COTRN00C first entry on /transactions", () => {
         expect(screen.getByText("Tran: CT00")).toBeVisible();
         expect(screen.getByText("Prog: COTRN00C")).toBeVisible();
         ExpectShownRows(1);
-        expect(screen.getByText("Page:")).toBeVisible();
-        expect(screen.getByText("1")).toBeVisible();
+        expect(PageIndicator(1)).toBeVisible();
         expect(screen.queryByRole("alert")).toBeNull();
     });
 });
@@ -664,6 +668,30 @@ describe("COTRN00C BMS COTRN00 fields", () => {
             .getAllByRole("option")
             .map((option) => option.getAttribute("data-value"));
         expect(offeredCodes).toEqual(OFFERED_SELECTION_CODES);
+    });
+});
+
+// The TAMTnnn heading and the amount cell of every body row, the fifth cell after Sel.
+function AmountColumnCells(): HTMLElement[] {
+    const bodyRows = screen.getAllByRole("row").slice(1);
+    const amountCells = bodyRows.map((row) => within(row).getAllByRole("cell")[4]);
+    return [screen.getByRole("columnheader", { name: "Amount" }), ...amountCells].filter(
+        (cell): cell is HTMLElement => cell !== undefined,
+    );
+}
+
+// Amounts line up on their decimals, as in the report table; PAGENUM shares the labelLarge role of
+// its Page: label, as /cards shows its page.
+describe("COTRN00C amount column and page number", () => {
+    it("COTRN00C right-aligns Amount and shows Page: 1 as one labelLarge line", async () => {
+        await RenderFirstPage();
+        const amountCells = AmountColumnCells();
+        expect(amountCells).toHaveLength(PAGE_SIZE + 1);
+        for (const cell of amountCells) {
+            expect(cell).toHaveStyle({ textAlign: "right" });
+        }
+        expect(PageIndicator(1)).toHaveClass("MuiTypography-labelLarge");
+        expect(screen.queryByText("Page:")).toBeNull();
     });
 });
 
@@ -746,7 +774,7 @@ describe("COTRN00C ENTER answered with an unexpected route", () => {
             expect(mockRouterPush).not.toHaveBeenCalled();
             expect(mockRouterReplace).not.toHaveBeenCalled();
             ExpectShownRows(1);
-            expect(screen.getByText("1")).toBeVisible();
+            expect(PageIndicator(1)).toBeVisible();
             expect(SearchField()).toHaveValue(SEARCH_KEY);
             expect(SearchField()).toHaveFocus();
             expect(ResultStatusRegion().textContent).toBe("");
@@ -781,7 +809,7 @@ describe("COTRN00C ENTER with a non-numeric search key", () => {
             await ExpectAlert(NUMERIC_SEARCH, "error");
             ExpectSearchOnlyRequest(searchKey);
             ExpectShownRows(1);
-            expect(screen.getByText("1")).toBeVisible();
+            expect(PageIndicator(1)).toBeVisible();
             expect(SearchField()).toHaveAttribute("aria-invalid", "true");
             expect(SearchField()).toHaveFocus();
             expect(SearchField()).toHaveValue(searchKey);
@@ -798,14 +826,14 @@ describe("COTRN00C ENTER answered 400 with an invalid selection code", () => {
         const user = await RenderFirstPage();
         mockListTransactions.mockResolvedValueOnce(BuildListResponse(SECOND_PAGE));
         await PressKey(user, "F8", "button");
-        await screen.findByText("2");
+        await screen.findByText("Page: 2");
         const refusal = BuildRefusal(HTTP_EDIT_FAILURE, INVALID_SELECTION, REBROWSED_PAGE);
         mockSelectTransactions.mockRejectedValueOnce(refusal);
         await user.type(SearchField(), SEARCH_KEY);
         await PressKey(user, "ENTER", "button");
         await ExpectAlert(INVALID_SELECTION, "error");
         ExpectShownRows(FOUND_FIRST_ROW_NUMBER);
-        expect(screen.getByText("1")).toBeVisible();
+        expect(PageIndicator(1)).toBeVisible();
         expect(SearchField()).toHaveAttribute("aria-invalid", "true");
         expect(SearchField()).toHaveFocus();
         expect(SearchField()).toHaveValue("");
@@ -874,7 +902,7 @@ describe("COTRN00C F7 and F8 paging", () => {
             expect(mockListTransactions).toHaveBeenCalledTimes(2);
             expect(mockListTransactions).toHaveBeenLastCalledWith(query, READ_OPTIONS);
             ExpectShownRows(11);
-            expect(screen.getByText("2")).toBeVisible();
+            expect(PageIndicator(2)).toBeVisible();
         },
     );
 });
@@ -1024,6 +1052,34 @@ describe("COTRN00C TRNIDIN locked while a request is out", () => {
             expect(SearchField()).not.toHaveAttribute("readonly");
             await SearchFromNextKey(user);
             ExpectSearchOnlyRequest(NEXT_SEARCH_KEY);
+        },
+    );
+});
+
+function ExpectSelectionCodesReadOnly(isReadOnly: boolean): void {
+    for (const field of screen.getAllByRole("combobox")) {
+        expect(field.getAttribute("aria-readonly")).toBe(isReadOnly ? "true" : null);
+    }
+}
+
+// The Sel codes are read-only while a request is out, as TRNIDIN is, so no code can be keyed for
+// that request's answer to clear; a click opens no menu until the answer is shown.
+describe("COTRN00C Sel codes locked while a request is out", () => {
+    it.each(REQUEST_KEYS)(
+        "COTRN00C %s keeps SEL0001-SEL0010 read-only until it is answered",
+        async (key) => {
+            const user = await RenderFirstPage();
+            const { promise, resolve } = Promise.withResolvers<TransactionSelectionResponse>();
+            MockKeyAnswer(key, () => promise);
+            await PressKey(user, key, "button");
+            ExpectSelectionCodesReadOnly(true);
+            await user.click(SelectionField(SELECTED_ROW_NUMBER));
+            expect(screen.queryByRole("listbox")).toBeNull();
+            resolve(PENDING_ANSWER);
+            await screen.findByText(TranIdFor(20));
+            ExpectSelectionCodesReadOnly(false);
+            await ChooseSelection(user, SELECTED_ROW_NUMBER, "S");
+            expect(SelectionField(SELECTED_ROW_NUMBER)).toHaveTextContent("S");
         },
     );
 });
@@ -1182,7 +1238,7 @@ describe("COTRN00C keys pressed over a pending read", () => {
             expect(ListCallSignal(1)?.aborted).toBe(false);
             await act(async () => answerRead(BuildListResponse(LATEST_PAGE)));
             await screen.findByText(TranIdFor(LATEST_FIRST_ROW_NUMBER + PAGE_SIZE - 1));
-            expect(screen.getByText("3")).toBeVisible();
+            expect(PageIndicator(3)).toBeVisible();
             expect(screen.queryByRole("alert")).toBeNull();
         },
     );

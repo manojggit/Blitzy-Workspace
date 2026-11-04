@@ -17,6 +17,7 @@ import {
     type SetStateAction,
 } from "react";
 
+import { VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
@@ -67,6 +68,14 @@ const CARD_FILTER_MAX_LENGTH = 16;
 const SELECTION_HEADER = "Select";
 const SELECTION_CODES = ["S", "U"] as const;
 const PAGE_LABEL = "Page";
+// The polite result status is client accessibility text, never a COCRDLIC literal: a search or a
+// page key often leaves ERRMSG and the information line as they were, so this text reports the
+// page number PAGENO shows and the row count, as in "Page 2: 7 cards", "Page 3: 1 card" or
+// "Page 1: no cards".
+const RESULT_STATUS_ONE_ROW = "card";
+const RESULT_STATUS_ROWS = "cards";
+const RESULT_STATUS_NO_ROWS = "no cards";
+const NO_RESULT_STATUS = "";
 const MENU_ROUTE = "/menu";
 const VIEW_ROUTE = "/cards/view";
 const UPDATE_ROUTE = "/cards/update";
@@ -81,11 +90,13 @@ const FORWARD_LABEL = "Forward";
 const ACCT_ID_FIELD = "acct_id";
 const CARD_NUM_FIELD = "card_num";
 
-// The column headings of COCRDLI row 9, trimmed of their padding blanks.
+// The column headings of COCRDLI row 9, trimmed of their padding blanks. Each width, in theme
+// spacing units, holds the wider of the heading and the field's BMS LENGTH (ACCTNOn 11, CRDNUMn 16,
+// CRDSTSn 1), so the list fits a 600 px screen without scrolling.
 const CARD_LIST_COLUMNS: readonly SelectionColumn[] = [
-    { field: "acct_id", header: "Account Number" },
-    { field: "card_num_masked", header: "Card Number" },
-    { field: "active_status", header: "Active" },
+    { field: "acct_id", header: "Account Number", widthUnits: 37 },
+    { field: "card_num_masked", header: "Card Number", widthUnits: 41 },
+    { field: "active_status", header: "Active", widthUnits: 19 },
 ];
 
 // The first entry from the menu reads the first page with no filters.
@@ -139,14 +150,21 @@ const EMPTY_FILTERS: CardFilterTexts = { acct_id: "", card_num: "" };
 
 // The rows shown, the page position the server returned, and the CRDSELn code keyed on each
 // row. Codes are kept by row position, as WS-EDIT-SELECT holds them, because every response
-// issues fresh card_ref tokens.
+// issues fresh card_ref tokens. resultStatus is set only from a 200 list page and is emptied
+// whenever a call starts, so every other answer leaves it empty.
 interface ListState {
     rows: readonly CardListRow[];
     pageState: PageState | null;
     selectionCodes: readonly string[];
+    resultStatus: string;
 }
 
-const EMPTY_LIST: ListState = { rows: [], pageState: null, selectionCodes: [] };
+const EMPTY_LIST: ListState = {
+    rows: [],
+    pageState: null,
+    selectionCodes: [],
+    resultStatus: NO_RESULT_STATUS,
+};
 
 interface ScreenMessages {
     message: string;
@@ -177,10 +195,19 @@ interface ScreenSetters {
 
 // Each screen call takes a ticket. Only the latest ticket, while the page is mounted, may change
 // the screen, navigate or end the busy state, so a slower earlier response never replaces a
-// newer page or its keys.
+// newer page or its keys. The gate is in flight from a ticket's start until the latest ticket
+// settles; a superseded ticket settling earlier never frees it.
 interface RequestGate {
     Begin: () => number;
     IsCurrent: (ticket: number) => boolean;
+    IsInFlight: () => boolean;
+    Settle: (ticket: number) => void;
+}
+
+// The latest ticket issued and the latest one settled.
+interface RequestTickets {
+    latest: number;
+    settled: number;
 }
 
 interface ScreenCalls {
@@ -219,6 +246,19 @@ function MessagesFrom(feedback: ScreenFeedback): ScreenMessages {
     };
 }
 
+// PAGENO's text: the label alone until the first page arrives.
+function PageText(page: number | undefined): string {
+    return page === undefined ? PAGE_LABEL : `${PAGE_LABEL} ${page}`;
+}
+
+// The page number and the count of rows shown; the rows themselves are never read out.
+function ResultStatusText(response: CardListResponse): string {
+    const rowCount = response.rows.length;
+    const rowText = rowCount === 1 ? RESULT_STATUS_ONE_ROW : RESULT_STATUS_ROWS;
+    const countText = rowCount === 0 ? RESULT_STATUS_NO_ROWS : `${rowCount} ${rowText}`;
+    return `${PageText(response.page)}: ${countText}`;
+}
+
 // A new page keeps each selection code on its row position, as 1200-SCREEN-ARRAY-INIT moves
 // WS-EDIT-SELECT(n) to CRDSELnO of every row it sends; rows the new page lacks drop their codes.
 function ListStateFrom(response: CardListResponse, selectionCodes: readonly string[]): ListState {
@@ -230,6 +270,7 @@ function ListStateFrom(response: CardListResponse, selectionCodes: readonly stri
             last_key: response.last_key,
         },
         selectionCodes: selectionCodes.slice(0, response.rows.length),
+        resultStatus: ResultStatusText(response),
     };
 }
 
@@ -247,7 +288,14 @@ function RedisplayedListState(current: ListState, body: CardListErrorBody): List
             last_key: body.last_key,
         },
         selectionCodes: current.selectionCodes.slice(0, body.rows.length),
+        resultStatus: NO_RESULT_STATUS,
     };
+}
+
+// Each call empties the result status, so no status describes a page while a call is out and a
+// page answered again with the same text is announced again.
+function WithoutResultStatus(list: ListState): ListState {
+    return { ...list, resultStatus: NO_RESULT_STATUS };
 }
 
 function WithSelectionCode(list: ListState, rowKey: string, code: string): ListState {
@@ -372,19 +420,22 @@ async function SettleScreenRequest(
 // The keys stay disabled until the latest call settles; a superseded or unmounted call's
 // outcome is dropped. An aborted read is never the latest call of a mounted page: it is aborted by
 // a newer call, which takes the next ticket, or by the page leaving, which clears the mounted
-// mark. So it leaves the busy state to the call in flight, or to no one once the page has gone.
+// mark. So it leaves the busy state and the gate to the call in flight, or to no one once the page
+// has gone.
 async function RunScreenCall(
     calls: ScreenCalls,
     request: () => Promise<ScreenUpdate>,
 ): Promise<void> {
     const ticket = calls.gate.Begin();
     calls.setters.setIsBusy(true);
+    calls.setters.setList(WithoutResultStatus);
     try {
         const update = await SettleScreenRequest(calls.setters, request);
         if (update !== null && calls.gate.IsCurrent(ticket)) {
             update();
         }
     } finally {
+        calls.gate.Settle(ticket);
         if (calls.gate.IsCurrent(ticket)) {
             calls.setters.setIsBusy(false);
         }
@@ -474,18 +525,28 @@ function HandleExit(context: ScreenContext): void {
     context.router.push(MENU_ROUTE);
 }
 
+type ScreenCallHandler = (context: ScreenContext) => Promise<void>;
+
 interface ScreenKeyAction {
     key: PfKey;
     label: string;
     Run: (context: ScreenContext) => Promise<void> | void;
 }
 
+// The 3270 keyboard stays locked from a press until the program answers. The keys are disabled a
+// render after the press, so a second press in the same frame is refused here, before it could
+// abort the call in flight or send another; the response is then adopted under the filters and
+// codes it was sent with, which stay read-only meanwhile.
+function WhenIdle(handler: ScreenCallHandler): ScreenCallHandler {
+    return (context) => (context.gate.IsInFlight() ? Promise.resolve() : handler(context));
+}
+
 // The PF-key legend "F3=Exit F7=Backward  F8=Forward", with ENTER implicit on the map.
 const SCREEN_KEY_ACTIONS: readonly ScreenKeyAction[] = [
-    { key: "ENTER", label: ENTER_LABEL, Run: HandleEnter },
+    { key: "ENTER", label: ENTER_LABEL, Run: WhenIdle(HandleEnter) },
     { key: "F3", label: EXIT_LABEL, Run: HandleExit },
-    { key: "F7", label: BACKWARD_LABEL, Run: HandlePageBackward },
-    { key: "F8", label: FORWARD_LABEL, Run: HandlePageForward },
+    { key: "F7", label: BACKWARD_LABEL, Run: WhenIdle(HandlePageBackward) },
+    { key: "F8", label: FORWARD_LABEL, Run: WhenIdle(HandlePageForward) },
 ];
 
 // The keys are inactive while a call runs, as the 3270 keyboard locks until the screen returns.
@@ -549,10 +610,9 @@ interface CardListScreenModel {
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 
-// Both values are refs, which survive React Strict Mode's simulated unmount and remount; its
-// cleanup and re-run leave the page marked mounted, and a real unmount clears the mark.
-function useRequestGate(): RequestGate {
-    const latestTicketRef = useRef(0);
+// A ref survives React Strict Mode's simulated unmount and remount; its cleanup and re-run leave
+// the page marked mounted, and a real unmount clears the mark.
+function useMountedRef(): RefObject<boolean> {
     const isMountedRef = useRef(false);
     useEffect(() => {
         isMountedRef.current = true;
@@ -560,15 +620,29 @@ function useRequestGate(): RequestGate {
             isMountedRef.current = false;
         };
     }, []);
+    return isMountedRef;
+}
+
+// The tickets are a ref too, so the remount's first-page read takes the next ticket and the
+// aborted first read can neither change the screen nor free the gate.
+function useRequestGate(): RequestGate {
+    const ticketsRef = useRef<RequestTickets>({ latest: 0, settled: 0 });
+    const isMountedRef = useMountedRef();
     return useMemo<RequestGate>(
         () => ({
             Begin: () => {
-                latestTicketRef.current += 1;
-                return latestTicketRef.current;
+                ticketsRef.current.latest += 1;
+                return ticketsRef.current.latest;
             },
-            IsCurrent: (ticket) => isMountedRef.current && ticket === latestTicketRef.current,
+            IsCurrent: (ticket) => isMountedRef.current && ticket === ticketsRef.current.latest,
+            IsInFlight: () => ticketsRef.current.settled !== ticketsRef.current.latest,
+            Settle: (ticket) => {
+                if (ticket === ticketsRef.current.latest) {
+                    ticketsRef.current.settled = ticket;
+                }
+            },
         }),
-        [],
+        [isMountedRef],
     );
 }
 
@@ -662,49 +736,80 @@ function useCardListScreen(): CardListScreenModel {
 }
 
 interface PageIndicatorProps {
-    pageState: PageState | null;
+    list: ListState;
 }
 
+interface ResultStatusProps {
+    statusText: string;
+}
+
+// isLocked holds while a call runs: the filters and codes then stay as they were sent.
 interface CardFilterFieldProps {
     definition: FilterFieldDefinition;
     value: string;
     isError: boolean;
+    isLocked: boolean;
     handlers: FilterHandlers;
 }
 
 interface CardFilterFieldsProps {
     filters: CardFilterTexts;
     fieldErrors: readonly string[];
+    isLocked: boolean;
     handlers: FilterHandlers;
 }
 
 interface CardListTableProps {
     list: ListState;
     fieldErrors: readonly string[];
+    isLocked: boolean;
     tableRef: RefObject<HTMLDivElement | null>;
     onSelectionChange: (rowKey: string, code: string) => void;
 }
 
-// PAGENO, right of the title as on the map; blank until the first page arrives.
-function PageIndicator({ pageState }: PageIndicatorProps) {
-    const page = pageState?.page;
-    const pageText = page === undefined ? PAGE_LABEL : `${PAGE_LABEL} ${page}`;
+// A visually hidden polite live region of its own, apart from MessageLine's ERRMSG alert and
+// INFOMSG status. It stays rendered while empty, so each shown page changes its text from empty
+// and is announced once, without reading the rows or moving the cursor.
+function ResultStatus({ statusText }: ResultStatusProps) {
     return (
-        <Typography variant="labelLarge" component="p" align="right">
-            {pageText}
-        </Typography>
+        <Box role="status" aria-live="polite" sx={VISUALLY_HIDDEN_STYLE}>
+            {statusText}
+        </Box>
     );
 }
 
-// The BMS LENGTH and, while the server names the filter in field_errors, its tie to the ERRMSG
-// line, so assistive technology reads the literal when the cursor lands on the field.
-function FilterHtmlInputProps(definition: FilterFieldDefinition, isError: boolean) {
-    return { maxLength: definition.maxLength, ...ErrorMessageReference(isError) };
+// PAGENO, right of the title as on the map, blank until the first page arrives, beside the
+// result status that announces each page shown.
+function PageIndicator({ list }: PageIndicatorProps) {
+    return (
+        <>
+            <Typography variant="labelLarge" component="p" align="right">
+                {PageText(list.pageState?.page)}
+            </Typography>
+            <ResultStatus statusText={list.resultStatus} />
+        </>
+    );
+}
+
+// The BMS LENGTH, read-only while a call runs, and, while the server names the filter in
+// field_errors, its tie to the ERRMSG line, so assistive technology reads the literal when the
+// cursor lands on the field.
+function FilterHtmlInputProps(
+    definition: FilterFieldDefinition,
+    isError: boolean,
+    isLocked: boolean,
+) {
+    return {
+        maxLength: definition.maxLength,
+        readOnly: isLocked,
+        ...ErrorMessageReference(isError),
+    };
 }
 
 // The value is sent as typed: no trim, case change or digit filter, so every server literal
 // stays reachable. Only the BMS LENGTH is enforced.
-function CardFilterField({ definition, value, isError, handlers }: CardFilterFieldProps) {
+function CardFilterField(props: CardFilterFieldProps) {
+    const { definition, value, isError, isLocked, handlers } = props;
     const { name } = definition;
     return (
         <Grid size={{ xs: 12, md: 6 }}>
@@ -717,13 +822,13 @@ function CardFilterField({ definition, value, isError, handlers }: CardFilterFie
                 autoFocus={definition.autoFocus}
                 onChange={(event) => handlers.onFilterChange(name, event.target.value)}
                 inputRef={(element: HTMLInputElement | null) => handlers.onInputRef(name, element)}
-                slotProps={{ htmlInput: FilterHtmlInputProps(definition, isError) }}
+                slotProps={{ htmlInput: FilterHtmlInputProps(definition, isError, isLocked) }}
             />
         </Grid>
     );
 }
 
-function CardFilterFields({ filters, fieldErrors, handlers }: CardFilterFieldsProps) {
+function CardFilterFields({ filters, fieldErrors, isLocked, handlers }: CardFilterFieldsProps) {
     return (
         <Grid container spacing={4}>
             {FILTER_FIELDS.map((definition) => (
@@ -732,6 +837,7 @@ function CardFilterFields({ filters, fieldErrors, handlers }: CardFilterFieldsPr
                     definition={definition}
                     value={filters[definition.name]}
                     isError={fieldErrors.includes(definition.name)}
+                    isLocked={isLocked}
                     handlers={handlers}
                 />
             ))}
@@ -741,7 +847,8 @@ function CardFilterFields({ filters, fieldErrors, handlers }: CardFilterFieldsPr
 
 // List rows carry only the masked card number and an opaque card_ref token; the full number on
 // this page is the card filter as the user keyed it.
-function CardListTable({ list, fieldErrors, tableRef, onSelectionChange }: CardListTableProps) {
+function CardListTable(props: CardListTableProps) {
+    const { list, fieldErrors, isLocked, tableRef, onSelectionChange } = props;
     return (
         <Box ref={tableRef}>
             <SelectionTable
@@ -749,7 +856,9 @@ function CardListTable({ list, fieldErrors, tableRef, onSelectionChange }: CardL
                 rows={SelectionRowsFor(list, fieldErrors)}
                 allowedCodes={SELECTION_CODES}
                 onSelectionChange={onSelectionChange}
+                label={SCREEN_TITLE}
                 selectionHeader={SELECTION_HEADER}
+                readOnly={isLocked}
             />
         </Box>
     );
@@ -762,15 +871,17 @@ interface CardListContentProps {
 function CardListContent({ model }: CardListContentProps) {
     return (
         <>
-            <PageIndicator pageState={model.list.pageState} />
+            <PageIndicator list={model.list} />
             <CardFilterFields
                 filters={model.filters}
                 fieldErrors={model.messages.fieldErrors}
+                isLocked={model.isBusy}
                 handlers={model.filterHandlers}
             />
             <CardListTable
                 list={model.list}
                 fieldErrors={model.messages.fieldErrors}
+                isLocked={model.isBusy}
                 tableRef={model.tableRef}
                 onSelectionChange={model.onSelectionChange}
             />

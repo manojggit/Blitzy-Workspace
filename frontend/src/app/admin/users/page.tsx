@@ -67,12 +67,14 @@ const SHOWN_RANGE_SEPARATOR = " to ";
 // The JSON name the server gives USRIDIN in cursor_field and field_errors.
 const SEARCH_FIELD = "search_user_id";
 const ALLOWED_SELECTION_CODES = ["U", "D"] as const;
-// The row-8 column headings, their centring blanks trimmed, bound to the UserListRow keys.
+// The row-8 column headings, their centring blanks trimmed, bound to the UserListRow keys. Each
+// width, in theme spacing units, holds the wider of the heading and the BMS LENGTH (USRIDnn 8,
+// FNAMEnn and LNAMEnn 20, UTYPEnn 1), and together they fit the 768 px screen without scrolling.
 const LIST_COLUMNS: SelectionColumn[] = [
-    { field: "user_id", header: "User ID" },
-    { field: "first_name", header: "First Name" },
-    { field: "last_name", header: "Last Name" },
-    { field: "user_type", header: "Type" },
+    { field: "user_id", header: "User ID", widthUnits: 28 },
+    { field: "first_name", header: "First Name", widthUnits: 52 },
+    { field: "last_name", header: "Last Name", widthUnits: 52 },
+    { field: "user_type", header: "Type", widthUnits: 16 },
 ];
 const SELECTION_INSTRUCTION = "Type 'U' to Update or 'D' to Delete a User from the list";
 // SEL0001-SEL0010: one selection code field per screen row.
@@ -547,6 +549,7 @@ function UserRows({ screen, setScreen }: UserRowsProps) {
                 onSelectionChange={(rowKey, code) =>
                     setScreen(WithSelectionCode(Number(rowKey), code))
                 }
+                label={SCREEN_TITLE}
             />
             <Typography variant="bodyLarge" component="p">
                 {SELECTION_INSTRUCTION}

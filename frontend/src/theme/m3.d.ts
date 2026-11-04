@@ -9,8 +9,6 @@ export interface M3PaletteTokens {
     onPrimaryContainer: string;
     tertiary: string;
     errorContainer: string;
-    onErrorContainer: string;
-    surfaceContainerHighest: string;
     outline: string;
 }
 

@@ -13,13 +13,17 @@ import {
 } from "@/components/SelectionTable";
 import { SCREEN_ENTER_ATTRIBUTE } from "@/lib/useFunctionKeys";
 
-/** One list map: its replaced BMS selection fields, codes, rows and trimmed INITIAL headers. */
+/**
+ * One list map: its replaced BMS selection fields, codes, rows, trimmed INITIAL headers, and the
+ * map title its page names the table's scrolling region by.
+ */
 interface MapCase {
     mapName: string;
     fieldNames: string;
     allowedCodes: readonly string[];
     rowCount: number;
     columns: readonly SelectionColumn[];
+    label: string;
     selectionHeader?: string;
 }
 
@@ -36,10 +40,11 @@ const COCRDLI_CASE: MapCase = {
     allowedCodes: ["S", "U"],
     rowCount: 7,
     columns: [
-        { field: "acct_id", header: "Account Number" },
-        { field: "card_num_masked", header: "Card Number" },
-        { field: "active_status", header: "Active" },
+        { field: "acct_id", header: "Account Number", widthUnits: 37 },
+        { field: "card_num_masked", header: "Card Number", widthUnits: 41 },
+        { field: "active_status", header: "Active", widthUnits: 19 },
     ],
+    label: "List Credit Cards",
     selectionHeader: "Select",
 };
 
@@ -49,11 +54,12 @@ const COTRN00_CASE: MapCase = {
     allowedCodes: ["S"],
     rowCount: 10,
     columns: [
-        { field: "tran_id", header: "Transaction ID" },
-        { field: "tran_date", header: "Date" },
-        { field: "description", header: "Description" },
-        { field: "amount", header: "Amount" },
+        { field: "tran_id", header: "Transaction ID", widthUnits: 42 },
+        { field: "tran_date", header: "Date", widthUnits: 24 },
+        { field: "description", header: "Description", widthUnits: 51 },
+        { field: "amount", header: "Amount", widthUnits: 32 },
     ],
+    label: "List Transactions",
 };
 
 const COUSR00_CASE: MapCase = {
@@ -62,11 +68,12 @@ const COUSR00_CASE: MapCase = {
     allowedCodes: ["U", "D"],
     rowCount: 10,
     columns: [
-        { field: "user_id", header: "User ID" },
-        { field: "first_name", header: "First Name" },
-        { field: "last_name", header: "Last Name" },
-        { field: "user_type", header: "Type" },
+        { field: "user_id", header: "User ID", widthUnits: 28 },
+        { field: "first_name", header: "First Name", widthUnits: 52 },
+        { field: "last_name", header: "Last Name", widthUnits: 52 },
+        { field: "user_type", header: "Type", widthUnits: 16 },
     ],
+    label: "List Users",
 };
 
 const MAP_CASES: readonly MapCase[] = [COCRDLI_CASE, COTRN00_CASE, COUSR00_CASE];
@@ -112,6 +119,7 @@ function RenderTable(mapCase: MapCase, onSelectionChange = jest.fn()) {
             rows={BuildRows(mapCase.columns, mapCase.rowCount)}
             allowedCodes={mapCase.allowedCodes}
             onSelectionChange={onSelectionChange}
+            label={mapCase.label}
             selectionHeader={mapCase.selectionHeader}
         />,
     );
@@ -169,6 +177,17 @@ describe("SelectionTable list rows", () => {
     });
 });
 
+// A narrow screen scrolls the columns sideways, so the region holding the table is a named tab stop
+// the arrow keys scroll.
+describe("SelectionTable scrolling region", () => {
+    it.each(MAP_CASES)("$mapName holds its table in a tab-stop region named $label", (mapCase) => {
+        RenderTable(mapCase);
+        const region = screen.getByRole("region", { name: mapCase.label });
+        expect(region).toHaveAttribute("tabindex", "0");
+        expect(within(region).getByRole("table")).toBeVisible();
+    });
+});
+
 describe("SelectionTable offered codes", () => {
     it.each(MAP_CASES)("$mapName $fieldNames offers blank plus its codes", async (mapCase) => {
         const user = userEvent.setup();
@@ -215,10 +234,17 @@ const CLOSED_FIELD_KEY_CASES: readonly { press: string; keys: string; opens: boo
     { press: "Ctrl+Enter", keys: "{Control>}{Enter}{/Control}", opens: true },
 ];
 
+// The scrolling region is the first tab stop and row 1's field the next.
+async function TabToFirstSelectionField(user: UserEvent, mapCase: MapCase) {
+    await user.tab();
+    expect(screen.getByRole("region", { name: mapCase.label })).toHaveFocus();
+    await user.tab();
+}
+
 async function PressOnClosedField({ keys, opens }: { keys: string; opens: boolean }) {
     const user = userEvent.setup();
     const onSelectionChange = RenderTable(COCRDLI_CASE);
-    await user.tab();
+    await TabToFirstSelectionField(user, COCRDLI_CASE);
     const field = screen.getByRole("combobox", { name: SelectionFieldName(1) });
     expect(field).toHaveFocus();
     expect(field).toHaveAttribute(SCREEN_ENTER_ATTRIBUTE);
@@ -237,7 +263,7 @@ describe("SelectionTable keyboard", () => {
     it("COCRDLI CRDSEL1 Enter in the open menu picks the highlighted code and closes it", async () => {
         const user = userEvent.setup();
         const onSelectionChange = RenderTable(COCRDLI_CASE);
-        await user.tab();
+        await TabToFirstSelectionField(user, COCRDLI_CASE);
         await user.keyboard("{ArrowDown}");
         await user.keyboard("{ArrowDown}{Enter}");
         expect(onSelectionChange.mock.calls).toEqual([["KEY1", "S"]]);
@@ -263,6 +289,7 @@ function RenderFlaggedCardRows() {
             rows={rows}
             allowedCodes={COCRDLI_CASE.allowedCodes}
             onSelectionChange={jest.fn()}
+            label={COCRDLI_CASE.label}
         />,
     );
 }
@@ -323,6 +350,7 @@ function TableTree(
     mapCase: MapCase,
     rows: readonly SelectionRow[],
     onSelectionChange: SelectionChangeMock,
+    readOnly?: boolean,
 ): ReactElement {
     return (
         <ThemeProvider theme={CARD_DEMO_THEME}>
@@ -331,7 +359,9 @@ function TableTree(
                 rows={rows}
                 allowedCodes={mapCase.allowedCodes}
                 onSelectionChange={onSelectionChange}
+                label={mapCase.label}
                 selectionHeader={mapCase.selectionHeader}
+                readOnly={readOnly}
             />
         </ThemeProvider>
     );
@@ -472,5 +502,117 @@ describe("SelectionTable field width", () => {
     it.each(CODE_CASES)(
         "$mapName $fieldNames keeps every field one width, blank and with echoed code $code",
         KeepsFieldWidthWithEchoedCode,
+    );
+});
+
+// A locked field ignores the pointer, the keys that open its menu and a typed code, which MUI would
+// otherwise pick on the closed field.
+async function RefusesEveryCodeWhileLocked(mapCase: MapCase) {
+    const user = userEvent.setup();
+    const onSelectionChange: SelectionChangeMock = jest.fn();
+    const rows = BuildRows(mapCase.columns, mapCase.rowCount);
+    render(TableTree(mapCase, rows, onSelectionChange, true));
+    const fields = screen.getAllByRole("combobox");
+    expect(fields.map((field) => field.getAttribute("aria-readonly"))).toEqual(
+        fields.map(() => "true"),
+    );
+    const field = screen.getByRole("combobox", { name: SelectionFieldName(CONTROLLED_ROW_NUMBER) });
+    await user.click(field);
+    await user.keyboard(`[Space]{ArrowDown}${mapCase.allowedCodes[0] ?? ""}`);
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(DisplayedCode(CONTROLLED_ROW_NUMBER)).toBe("");
+    expect(onSelectionChange).not.toHaveBeenCalled();
+}
+
+// A physical PF key can start a request while a menu is open: the lock closes the menu, which
+// stays closed when the lock clears, and the field opens again on the next click.
+async function LockClosesTheOpenMenu(mapCase: MapCase) {
+    const user = userEvent.setup();
+    const onSelectionChange: SelectionChangeMock = jest.fn();
+    const rows = BuildRows(mapCase.columns, mapCase.rowCount);
+    const { rerender } = render(TableTree(mapCase, rows, onSelectionChange));
+    const field = screen.getByRole("combobox", { name: SelectionFieldName(CONTROLLED_ROW_NUMBER) });
+    await user.click(field);
+    expect(screen.getByRole("listbox")).toBeInTheDocument();
+    rerender(TableTree(mapCase, rows, onSelectionChange, true));
+    await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+    rerender(TableTree(mapCase, rows, onSelectionChange, false));
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    expect(field).not.toHaveAttribute("aria-readonly");
+    await user.click(field);
+    expect(screen.getByRole("listbox")).toBeInTheDocument();
+    expect(onSelectionChange).not.toHaveBeenCalled();
+}
+
+describe("SelectionTable read-only lock", () => {
+    it.each(MAP_CASES)(
+        "$mapName $fieldNames refuses every code while read-only",
+        RefusesEveryCodeWhileLocked,
+    );
+    it.each(MAP_CASES)(
+        "$mapName $fieldNames closes an open menu when locked and keeps it closed after",
+        LockClosesTheOpenMenu,
+    );
+});
+
+// COTRN00 with its amount column right-aligned, as the transaction list declares it.
+const RIGHT_ALIGNED_AMOUNT_CASE: MapCase = {
+    ...COTRN00_CASE,
+    columns: COTRN00_CASE.columns.map((column) =>
+        column.field === "amount" ? { ...column, align: "right" } : column,
+    ),
+};
+
+// The text alignment of each column's heading and body cells, in column order after Sel.
+function ColumnAlignments(columnCount: number): string[][] {
+    const rows = screen.getAllByRole("row");
+    return Array.from({ length: columnCount }, (_unused, index) =>
+        rows.map((row) => getComputedStyle(row.children[index + 1] as Element).textAlign),
+    );
+}
+
+describe("SelectionTable column alignment", () => {
+    it("COTRN00 right-aligns only the amount heading and cells its column declares", () => {
+        RenderTable(RIGHT_ALIGNED_AMOUNT_CASE);
+        const rowCount = COTRN00_CASE.rowCount + 1;
+        const alignments = ColumnAlignments(COTRN00_CASE.columns.length);
+        expect(alignments.map((cells) => new Set(cells).size)).toEqual([1, 1, 1, 1]);
+        expect(alignments.map((cells) => cells[0])).toEqual(["left", "left", "left", "right"]);
+        expect(alignments.every((cells) => cells.length === rowCount)).toBe(true);
+    });
+});
+
+// The selection column holds the 16-unit field between two 4-unit cell insets.
+const SELECTION_COLUMN_WIDTH_UNITS = 24;
+
+// Each list map with a full page and with an empty one, which must keep the same column widths.
+const COLUMN_WIDTH_CASES: readonly (MapCase & { shownRows: number })[] = MAP_CASES.flatMap(
+    (mapCase) => [mapCase.rowCount, 0].map((shownRows) => ({ ...mapCase, shownRows })),
+);
+
+function ColumnWidthUnitsOf(mapCase: MapCase): number[] {
+    return [SELECTION_COLUMN_WIDTH_UNITS, ...mapCase.columns.map((column) => column.widthUnits)];
+}
+
+function HeaderWidths(): string[] {
+    return screen.getAllByRole("columnheader").map((header) => getComputedStyle(header).width);
+}
+
+describe("SelectionTable fixed column widths", () => {
+    it.each(COLUMN_WIDTH_CASES)(
+        "$mapName with $shownRows rows lays out its declared column widths, never narrower",
+        (widthCase) => {
+            RenderTable({ ...widthCase, rowCount: widthCase.shownRows });
+            const widthUnits = ColumnWidthUnitsOf(widthCase);
+            const totalUnits = widthUnits.reduce((total, units) => total + units, 0);
+            expect(HeaderWidths()).toEqual(
+                widthUnits.map((units) => CARD_DEMO_THEME.spacing(units)),
+            );
+            expect(screen.getByRole("table")).toHaveStyle({
+                tableLayout: "fixed",
+                minWidth: CARD_DEMO_THEME.spacing(totalUnits),
+            });
+        },
     );
 });
