@@ -2,15 +2,7 @@
 // CVCUS01Y, CVCRD01Y, CSMSG02Y, CSUSR01Y, COCOM01Y, COTTL01Y, CSDAT01Y, CSMSG01Y
 "use client";
 
-import {
-    Grid,
-    Stack,
-    TextField,
-    Typography,
-    type SxProps,
-    type TextFieldProps,
-    type Theme,
-} from "@mui/material";
+import { Grid, Stack, TextField, Typography, type TextFieldProps } from "@mui/material";
 import axios from "axios";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -27,6 +19,7 @@ import {
     type SetStateAction,
 } from "react";
 
+import { CENTRE_ALIGNED_ROW_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import {
     ErrorMessageReference,
@@ -41,6 +34,7 @@ import {
     type CardDetailResponse,
 } from "@/lib/api/cards";
 import {
+    CutToFieldLength,
     IsCancelledRequest,
     LegacyErrorBody,
     SeverityForOutcome,
@@ -96,8 +90,6 @@ const KEY_REFUSAL_STATUSES: readonly number[] = [400, 404, 422];
 
 // Each key field takes half the row on wider viewports and a full row on narrow ones.
 const KEY_FIELD_SIZE = { xs: 12, md: 6 };
-// The month and year fields sit level with the separator between them.
-const EXPIRY_ROW_STYLE: SxProps<Theme> = { alignItems: "center" };
 // The detail rows lay out as on COCRDUP: Name on card takes the whole row at every width, and
 // Card Active and the Expiry Date group share the next row on wider viewports.
 const NAME_FIELD_SIZE = { xs: 12 };
@@ -602,12 +594,12 @@ function useKeyInputRefs(): KeyInputRefs {
     return useMemo(() => ({ [ACCT_ID_FIELD]: acctInputRef, [CARD_NUM_FIELD]: cardInputRef }), []);
 }
 
-// The query names the screen's entry; missing values are blank.
+// The query names the screen's entry, the account as ACCTSID holds it; missing values are blank.
 function useEntryKeys(): EntryKeys {
     const searchParams = useSearchParams();
     return {
         cardRef: searchParams.get(CARD_REF_PARAM) ?? "",
-        acctId: searchParams.get(ACCT_ID_PARAM) ?? "",
+        acctId: CutToFieldLength(searchParams.get(ACCT_ID_PARAM) ?? "", ACCOUNT_MAX_LENGTH),
     };
 }
 
@@ -740,13 +732,13 @@ function ExpiryFields({ detail }: CardDetailFieldsProps) {
 }
 
 // EXPMON, the "/" literal and EXPYEAR, announced together under the Expiry Date label; the
-// literal is only a visual separator.
+// literal is only a visual separator, and the month and year fields sit level with it.
 function ExpiryParts({ labelId, detail }: ExpiryPartsProps) {
     return (
         <Stack
             direction="row"
             spacing={2}
-            sx={EXPIRY_ROW_STYLE}
+            sx={CENTRE_ALIGNED_ROW_STYLE}
             role="group"
             aria-labelledby={labelId}
         >
@@ -797,7 +789,7 @@ function CardViewScreen() {
 }
 
 // Each arrival with another selection is a fresh COCRDSLC first entry, as every XCTL is, so the
-// screen state starts over and its pending read is abandoned when the query changes.
+// screen state starts over and its pending read is abandoned when the selection changes.
 function CardViewEntry() {
     const { cardRef, acctId } = useEntryKeys();
     return <CardViewScreen key={JSON.stringify([cardRef, acctId])} />;

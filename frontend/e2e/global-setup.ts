@@ -633,10 +633,10 @@ function BatchCliEnvironment(): NodeJS.ProcessEnv {
 // loads 0 rows, so transactions.transactions is left empty and the first online add of
 // day-in-the-life.spec.ts receives TRAN-ID 0000000000000001.
 function SeedSampleData(): void {
-    const seedArgs = ["seed-all"] as const;
-    const run = RunBatchCli(seedArgs);
+    const SEED_ARGS = ["seed-all"] as const;
+    const run = RunBatchCli(SEED_ARGS);
     if (run.status !== EXIT_SUCCESS) {
-        throw new Error(DescribeBatchRun(seedArgs, run));
+        throw new Error(DescribeBatchRun(SEED_ARGS, run));
     }
 }
 

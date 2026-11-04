@@ -3,7 +3,8 @@
 // URL. Each write runs through the real API_CLIENT pipeline (base URL, request transform and
 // response interceptor) to a capture adapter. It sends its method, path and JSON body unchanged,
 // with the session cookie and no AbortSignal; a raw path key travels as EncodePathKey defines;
-// the answer's data, or a legacy error, reaches the caller unchanged.
+// the answer's data, or a legacy error, reaches the caller unchanged. Logout alone resolves a 401,
+// which finds no session left to end, with the thank-you literal.
 import {
     AxiosError,
     AxiosHeaders,
@@ -12,7 +13,7 @@ import {
 } from "axios";
 
 import { UpdateAccount, type AccountUpdateRequest } from "@/lib/api/accounts";
-import { Login, Logout, type LoginRequest } from "@/lib/api/auth";
+import { Login, Logout, THANK_YOU_MESSAGE, type LoginRequest } from "@/lib/api/auth";
 import { PayBill, type BillPayRequest } from "@/lib/api/billpay";
 import {
     SelectCards,
@@ -57,6 +58,8 @@ const ANSWER_DATA = { answer: "write" };
 const EXPORT_PATH = "/reports/transactions/export";
 const HTTP_OK = 200;
 const HTTP_BAD_REQUEST = 400;
+const HTTP_UNAUTHORIZED = 401;
+const HTTP_INTERNAL_SERVER_ERROR = 500;
 
 // Generated per run, so no password value is typed into the code (MK_Modernization Rule).
 const generatedPassword = Math.random().toString(36).slice(2, 10);
@@ -462,6 +465,50 @@ it.each(WRITE_CASES)(
         expect(legacyError.response?.data).toStrictEqual(BuildLegacyErrorBody());
     },
 );
+
+// The axios error of a server answer with this status and body to the request config. The
+// interceptor reads the path from config, so a 401 to POST /auth/logout is not redirected.
+function BuildStatusError(
+    status: number,
+    data: object,
+    config: InternalAxiosRequestConfig,
+): AxiosError {
+    const response: AxiosResponse = { status, statusText: "", headers: {}, config, data };
+    const message = `Request failed with status code ${status}`;
+    return new AxiosError(message, AxiosError.ERR_BAD_RESPONSE, config, null, response);
+}
+
+const EMPTY_LEGACY_BODY = { message: "", info_message: "", field_errors: [], cursor_field: "" };
+
+it("Logout resolves THANK_YOU_MESSAGE when the server answers 401: no session", async () => {
+    transportAdapter.mockImplementation((config) =>
+        Promise.reject(BuildStatusError(HTTP_UNAUTHORIZED, EMPTY_LEGACY_BODY, config)),
+    );
+    await expect(Logout()).resolves.toStrictEqual({ message: THANK_YOU_MESSAGE });
+});
+
+const SERVER_ERROR_BODY = { detail: "Internal Server Error" };
+
+const LOGOUT_FAILURES = [
+    {
+        failure: "a 500 answer",
+        BuildFailure: () =>
+            BuildStatusError(HTTP_INTERNAL_SERVER_ERROR, SERVER_ERROR_BODY, {
+                headers: new AxiosHeaders(),
+            }),
+    },
+    {
+        failure: "a network error",
+        BuildFailure: () => new AxiosError("Network Error", AxiosError.ERR_NETWORK),
+    },
+    { failure: "a non-axios error", BuildFailure: () => new TypeError("defect") },
+];
+
+it.each(LOGOUT_FAILURES)("Logout rejects with $failure unchanged", async ({ BuildFailure }) => {
+    const failure = BuildFailure();
+    transportAdapter.mockRejectedValue(failure);
+    await expect(Logout()).rejects.toBe(failure);
+});
 
 it.each(PATH_KEY_CASES)(
     "$wrapper sends the raw key $quotedKey as the one path segment $segment",

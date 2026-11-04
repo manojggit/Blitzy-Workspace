@@ -7,9 +7,9 @@ valid UTF-8, or one nested too deeply to decode, with its own 400 ``{"detail"}``
 tests pin that app.core.errors.HandleHttpException answers such a body on every JSON write
 route with the sanitised 422 body of malformed JSON, sent with the session cookie of the role
 the route's guard passes, while every other HTTP error keeps FastAPI's default answer and an
-unexpected error stays FastAPI's 500. CORS is the outermost layer, so that 500 and the CORS
-preflight carry Access-Control-Allow-Origin for the allow-listed origin, while OriginGuard's 403
-to an unlisted origin carries none.
+unexpected error stays FastAPI's 500. CORS wraps Starlette's error middleware, so that 500 and
+the CORS preflight carry Access-Control-Allow-Origin for the allow-listed origin, while
+OriginGuard's 403 to an unlisted origin carries none.
 
 A missing, expired or invalid cookie gives 401, and a role refusal 403 (Section 0.7.1), even
 when the body cannot be parsed: app.api.v1.SessionFirstRoute runs the route's session guard

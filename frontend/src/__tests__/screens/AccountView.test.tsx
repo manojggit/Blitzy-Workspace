@@ -610,6 +610,40 @@ describe("COACTVWC acctId prefill on /accounts/view?acctId=", () => {
     });
 });
 
+interface OverlongAccountIdCase {
+    shape: string;
+    queryAcctId: string;
+    keptAcctId: string;
+}
+
+// acctId values longer than the 9(11) CDEMO-ACCT-ID and ACCTSID, and the 11 characters each
+// keeps; a character the cut would split in two is dropped whole.
+const SPLIT_CHARACTER_PREFIX = "0".repeat(10);
+const OVERLONG_ACCOUNT_ID_CASES: readonly OverlongAccountIdCase[] = [
+    { shape: "12 digits", queryAcctId: "000000000016", keptAcctId: "00000000001" },
+    { shape: "markup", queryAcctId: '"><svg onload=alert(2)>', keptAcctId: '"><svg onlo' },
+    {
+        shape: "10 digits and a two-unit character",
+        queryAcctId: `${SPLIT_CHARACTER_PREFIX}\u{1F600}`,
+        keptAcctId: SPLIT_CHARACTER_PREFIX,
+    },
+];
+
+describe("COACTVWC first entry with an over-long acctId on /accounts/view", () => {
+    it.each(OVERLONG_ACCOUNT_ID_CASES)(
+        "COACTVWC cuts an acctId of $shape to the ACCTSID LENGTH before it looks it up",
+        async ({ queryAcctId, keptAcctId }) => {
+            mockSearchParams = new URLSearchParams({ acctId: queryAcctId });
+            mockViewAccount.mockResolvedValue(BuildAccountView());
+            RenderScreen();
+            await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance_edited);
+            expect(mockViewAccount).toHaveBeenCalledTimes(1);
+            expect(mockViewAccount).toHaveBeenCalledWith(keptAcctId, READ_OPTIONS);
+            expect(AccountIdInput()).toHaveValue(keptAcctId);
+        },
+    );
+});
+
 // One arrival on the page: its description and the query it carries.
 interface EntryCase {
     entry: string;

@@ -20,6 +20,7 @@ import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
 import { ViewAccount, type AccountViewResponse } from "@/lib/api/accounts";
 import {
+    CutToFieldLength,
     IsCancelledRequest,
     SeverityForOutcome,
     TakePendingMessage,
@@ -346,8 +347,14 @@ function useCursorFocus(
     }, [inputRef, feedback]);
 }
 
+// The ?acctId= account number as ACCTSID holds it; a missing one is blank, as an empty one is.
+function useQueryAccountId(): string {
+    const queryValue = useSearchParams().get(ACCOUNT_ID_QUERY_KEY) ?? "";
+    return CutToFieldLength(queryValue, ACCOUNT_ID_MAX_LENGTH);
+}
+
 function useAccountViewScreen(): AccountViewScreenState {
-    const initialAcctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY) ?? "";
+    const initialAcctId = useQueryAccountId();
     const [acctText, setAcctText] = useState(initialAcctId);
     const [view, setView] = useState<ViewState>(() => InitialViewFor(initialAcctId));
     const inputRef = useRef<HTMLInputElement>(null);
@@ -516,11 +523,11 @@ function AccountViewScreen() {
     );
 }
 
-// Each arrival with another ?acctId= is a fresh COACTVWC first entry, as every XCTL is, so the
-// account number, the record shown and the lookup in flight start over together: the replaced
-// screen's unmount aborts its lookup. The screen treats an empty acctId as no acctId.
+// Each arrival with another ?acctId= account number is a fresh COACTVWC first entry, as every XCTL
+// is, so the account number, the record shown and the lookup in flight start over together: the
+// replaced screen's unmount aborts its lookup. The screen treats an empty acctId as no acctId.
 function AccountViewEntry() {
-    const acctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY) ?? "";
+    const acctId = useQueryAccountId();
     return <AccountViewScreen key={JSON.stringify([acctId])} />;
 }
 

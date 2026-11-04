@@ -44,7 +44,7 @@ const mockRouter = {
 };
 
 // A regular user (type U), whose own menu is this one. The ID is synthetic test data.
-const mockCurrentUser: CurrentUserResponse = {
+const MOCK_CURRENT_USER: CurrentUserResponse = {
     user_id: "TESTUSR1",
     user_type: "U",
     first_name: "Test",
@@ -53,7 +53,7 @@ const mockCurrentUser: CurrentUserResponse = {
 };
 const mockClearSession = jest.fn();
 const mockSession: SessionContextValue = {
-    currentUser: mockCurrentUser,
+    currentUser: MOCK_CURRENT_USER,
     isLoading: false,
     RefreshSession: jest.fn(),
     ClearSession: mockClearSession,

@@ -10,8 +10,9 @@ the Technical Specification's Sections 0.6.9 and 0.7.1 and success item 4 of Sec
   type exactly A to /admin and of every other type to /menu (lines 230-239);
 - the HttpOnly session cookie: its attributes, no token in any body, GET /auth/me, and 401 with
   an empty message for a missing, tampered, expired or foreign-signed cookie;
-- sign-off (PF3) with the CSMSG01Y thank-you literal, and the CSRF origin guard, from which only
-  POST /auth/login is exempt;
+- sign-off (PF3), which needs the session: the CSMSG01Y thank-you literal for a signed-on client,
+  401 with an empty message and no Set-Cookie for a missing, tampered, expired or foreign-signed
+  cookie, and the CSRF origin guard, from which only POST /auth/login is exempt;
 - the login throttle of security.login_attempts: the lockout, the reset on success and the
   expiry of the lock;
 - effective roles: only type A reaches the admin endpoints, every other type the regular ones.
@@ -148,7 +149,6 @@ class SetCookie:
     attributes: dict[str, str]
 
 
-# --- Response checks -----------------------------------------------------------------------------
 def AssertLegacyError(
     response: httpx.Response, status: int, message: str, cursorField: str = ""
 ) -> None:
@@ -214,7 +214,6 @@ def ReadFailureCount(syncEngine: Engine, userId: str) -> int | None:
         return result.scalar_one_or_none()
 
 
-# --- Requests ------------------------------------------------------------------------------------
 async def SignOn(client: httpx.AsyncClient, userId: str, password: str) -> httpx.Response:
     """Send ENTER on COSGN00: the USERID and PASSWD fields to POST /api/v1/auth/login."""
     return await client.post(LOGIN_URL, json={"user_id": userId, "password": password})
@@ -245,7 +244,6 @@ async def FailSignOns(
         AssertLegacyError(response, HTTP_UNAUTHORIZED, WRONG_CREDENTIAL_LITERAL, CREDENTIAL_CURSOR)
 
 
-# --- Generated inputs ----------------------------------------------------------------------------
 def NewCredential() -> str:
     """Return a generated 8-character password, printable in code page 037."""
     return secrets.token_urlsafe(GENERATED_CREDENTIAL_BYTES)
@@ -272,7 +270,6 @@ def NewUnknownUserId(syncEngine: Engine) -> str:
                 return candidateId
 
 
-# --- Session tokens built outside the app --------------------------------------------------------
 def BuildSessionToken(signingKey: str, userId: str, issuedAt: int, lifetimeSeconds: int) -> str:
     """Return an HS256 token with the sub, typ (U), iat and exp claims core.security requires."""
     claims = {
@@ -332,6 +329,8 @@ INVALID_COOKIE_BUILDERS = (
     pytest.param(ExpiredToken, id="expired"),
     pytest.param(ForeignKeyToken, id="foreign-key"),
 )
+# None sends no session cookie at all.
+REFUSED_SESSION_COOKIES = (pytest.param(None, id="missing"), *INVALID_COOKIE_BUILDERS)
 
 
 # --- Sign-on literals, first-failure order (COSGN00C lines 117-254) ------------------------------
@@ -368,7 +367,6 @@ async def test_unknown_user_id_returns_not_found_literal_and_401(
 async def test_wrong_password_returns_legacy_literal_and_401(
     apiClient: httpx.AsyncClient, createUser: CreateUser
 ) -> None:
-    """A password that does not match the stored one gives the wrong-password literal."""
     user = createUser(REGULAR_USER_TYPE)
     response = await SignOn(apiClient, user.userId, NewWrongCredential(user.password))
     AssertLegacyError(response, HTTP_UNAUTHORIZED, WRONG_CREDENTIAL_LITERAL, CREDENTIAL_CURSOR)
@@ -463,7 +461,6 @@ async def test_me_returns_the_signed_on_user_and_its_route(
 async def test_me_without_cookie_returns_401_with_empty_message(
     apiClient: httpx.AsyncClient,
 ) -> None:
-    """A request with no session cookie is refused with 401 and the empty legacy body."""
     response = await apiClient.get(ME_URL)
     AssertLegacyError(response, HTTP_UNAUTHORIZED, NO_MESSAGE)
 
@@ -491,7 +488,6 @@ async def test_me_refuses_an_invalid_session_cookie_with_401(
     testSettings: Settings,
     buildInvalidToken: InvalidTokenBuilder,
 ) -> None:
-    """A tampered, expired or foreign-signed cookie on a fresh client gives 401, empty message."""
     signedOn = await loginAs(REGULAR_USER_TYPE)
     invalidToken = buildInvalidToken(testSettings, signedOn)
     apiClient.cookies.set(testSettings.SESSION_COOKIE_NAME, invalidToken)
@@ -499,7 +495,6 @@ async def test_me_refuses_an_invalid_session_cookie_with_401(
     AssertLegacyError(response, HTTP_UNAUTHORIZED, NO_MESSAGE)
 
 
-# --- Logout and the CSRF origin guard ------------------------------------------------------------
 async def test_logout_returns_thank_you_and_expires_the_cookie(
     loginAs: LoginAs, testSettings: Settings
 ) -> None:
@@ -513,6 +508,22 @@ async def test_logout_returns_thank_you_and_expires_the_cookie(
     assert clearedCookie.attributes["path"] == "/"
     assert testSettings.SESSION_COOKIE_NAME not in signedOn.client.cookies
     AssertLegacyError(await signedOn.client.get(ME_URL), HTTP_UNAUTHORIZED, NO_MESSAGE)
+
+
+@pytest.mark.parametrize("buildInvalidToken", REFUSED_SESSION_COOKIES)
+async def test_logout_refuses_a_missing_or_invalid_session_cookie_with_401(
+    apiClient: httpx.AsyncClient,
+    loginAs: LoginAs,
+    testSettings: Settings,
+    buildInvalidToken: InvalidTokenBuilder | None,
+) -> None:
+    if buildInvalidToken is not None:
+        signedOn = await loginAs(REGULAR_USER_TYPE)
+        invalidToken = buildInvalidToken(testSettings, signedOn)
+        apiClient.cookies.set(testSettings.SESSION_COOKIE_NAME, invalidToken)
+    response = await apiClient.post(LOGOUT_URL)
+    AssertLegacyError(response, HTTP_UNAUTHORIZED, NO_MESSAGE)
+    assert SET_COOKIE_HEADER not in response.headers
 
 
 @pytest.mark.parametrize("origin", REFUSED_ORIGINS)
@@ -591,7 +602,6 @@ async def test_lock_expires_after_lockout_seconds(
     testSettings: Settings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Once the throttle clock passes LOGIN_LOCKOUT_SECONDS, the correct password signs on."""
     user = createUser(REGULAR_USER_TYPE)
     await FailSignOns(apiClient, user.userId, user.password, testSettings.LOGIN_MAX_ATTEMPTS)
     locked = await SignOn(apiClient, user.userId, user.password)

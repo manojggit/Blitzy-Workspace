@@ -10,8 +10,6 @@ import {
     Typography,
     type GridSize,
     type TextFieldProps,
-    type SxProps,
-    type Theme,
 } from "@mui/material";
 import axios from "axios";
 import { useRouter } from "next/navigation";
@@ -27,6 +25,7 @@ import {
     type SetStateAction,
 } from "react";
 
+import { CENTRE_ALIGNED_ROW_STYLE, CENTRED_TEXT_STYLE } from "@/app/theme";
 import { ConfirmField } from "@/components/ConfirmField";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
@@ -81,9 +80,6 @@ const OR_SEPARATOR_SIZE: FieldGridSize = { xs: 12, md: 2 };
 const THIRD_ROW_SIZE: FieldGridSize = { xs: 12, md: 4 };
 const HALF_ROW_SIZE: FieldGridSize = { xs: 12, md: 6 };
 const FULL_ROW_SIZE: FieldGridSize = { xs: 12 };
-
-const KEY_ROW_STYLE: SxProps<Theme> = { alignItems: "center" };
-const OR_SEPARATOR_STYLE: SxProps<Theme> = { textAlign: "center" };
 
 type AddFieldName = keyof TransactionAddFields;
 
@@ -667,10 +663,10 @@ function GridField({ definition, form }: AddTextFieldProps) {
 // Row 6: ACTIDIN, the "(or)" text and CARDNIN; either key identifies the account.
 function KeyFields({ form }: FieldGroupProps) {
     return (
-        <Grid container spacing={FIELD_SPACING} sx={KEY_ROW_STYLE}>
+        <Grid container spacing={FIELD_SPACING} sx={CENTRE_ALIGNED_ROW_STYLE}>
             <GridField definition={ACCOUNT_FIELD} form={form} />
             <Grid size={OR_SEPARATOR_SIZE}>
-                <Typography variant="bodyMedium" component="p" sx={OR_SEPARATOR_STYLE}>
+                <Typography variant="bodyMedium" component="p" sx={CENTRED_TEXT_STYLE}>
                     {OR_SEPARATOR_TEXT}
                 </Typography>
             </Grid>

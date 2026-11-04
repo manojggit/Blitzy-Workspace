@@ -59,6 +59,17 @@ export function EncodePathKey(value: string): string {
     return encodeURIComponent(sendableValue);
 }
 
+// The first half of a character, which a cut to a field's LENGTH leaves when it splits one.
+const TRAILING_HIGH_SURROGATE_PATTERN = /[\uD800-\uDBFF]$/;
+
+// A context key handed over in the URL (acctId, tranId) fills a COMMAREA field as long as its BMS
+// input, so a longer value keeps its first maxLength UTF-16 units, the units an input's maxLength
+// counts, as MOVE truncates on the right; a shorter one is neither trimmed nor padded. A character
+// the cut would split is dropped whole: half of one cannot be encoded into a request path.
+export function CutToFieldLength(text: string, maxLength: number): string {
+    return text.slice(0, maxLength).replace(TRAILING_HIGH_SURROGATE_PATTERN, "");
+}
+
 export const ABEND_MESSAGE = "UNEXPECTED ABEND OCCURRED.";
 export const SIGN_ON_ROUTE = "/signon";
 export const DEFAULT_HOME_ROUTE = "/menu";
@@ -97,8 +108,9 @@ export function MenuTreeHomeRoute(pathname: string): string | null {
     return isAdminPage ? ADMIN_HOME_ROUTE : DEFAULT_HOME_ROUTE;
 }
 
-// Their 401 bodies carry the sign-on literals (Wrong Password. Try again ...), which the sign-on
-// page shows instead of being redirected.
+// A login 401 body carries a sign-on literal (Wrong Password. Try again ...), which the sign-on
+// page shows instead of being redirected. A logout 401 means no session was left to end, which
+// lib/api/auth.ts Logout answers with the thank-you literal, so neither is redirected.
 const UNREDIRECTED_AUTH_PATHS = ["/auth/login", "/auth/logout"] as const;
 const CURRENT_USER_URL = API_V1_URL + "/auth/me";
 

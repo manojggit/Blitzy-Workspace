@@ -562,8 +562,8 @@ describe("COSGN00C sign-on failure literals on /signon", () => {
 
 describe("COSGN00C abend on /signon", () => {
     it("COSGN00C ENTER shows the abend text in red for a 500 without a legacy body", async () => {
-        const fastApiBody = { detail: "Internal Server Error" };
-        loginMock.mockRejectedValue(BuildAxiosError(HTTP_INTERNAL_SERVER_ERROR, fastApiBody));
+        const FASTAPI_BODY = { detail: "Internal Server Error" };
+        loginMock.mockRejectedValue(BuildAxiosError(HTTP_INTERNAL_SERVER_ERROR, FASTAPI_BODY));
         const { user } = await RenderScreen();
         await TypeCredentials(user, TYPED_CREDENTIALS);
         await user.click(SignOnButton());

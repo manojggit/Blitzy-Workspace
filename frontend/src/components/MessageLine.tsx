@@ -1,8 +1,9 @@
 // Replaces: BMS ERRMSG/INFOMSG fields; copybooks CSMSG01Y, CSMSG02Y
 "use client";
 
-import { Alert, Stack, type SxProps, type Theme } from "@mui/material";
+import { Alert, Stack } from "@mui/material";
 import { useEffect, useRef, type RefObject } from "react";
+import { MESSAGE_LINE_STYLE } from "@/app/theme";
 import type { MessageSeverity } from "@/lib/apiClient";
 
 // BMS ERRMSG is defined COLOR=RED, so a message the page passes without a severity renders red.
@@ -30,24 +31,6 @@ const MUI_HELPER_TEXT_ID_SUFFIX = "-helper-text";
 
 // The least scroll that shows the whole message line, and none while it is already in view.
 const REVEAL_SCROLL_OPTIONS: ScrollIntoViewOptions = { block: "nearest" };
-// The browser keeps whole-pixel scroll offsets, so a line revealed from above the viewport could
-// keep a sliver of its top edge outside it. A scroll margin of one theme spacing unit (4 dp) on
-// the top edge, which only scrolling reads, keeps the whole line inside. The bottom edge carries
-// none: a shown line whose place is below the fold is stuck flush to the viewport bottom, so a
-// bottom margin would scroll the page by its width on every reveal while the line stays stuck.
-const REVEAL_SCROLL_MARGIN_UNITS = 1;
-// A shown line sticks to the viewport bottom while its place in the layout is below the fold, so
-// the outcome of the key just pressed is in view however the page is scrolled, as the 3270 showed
-// the whole map after every key. It stacks above the fields' outlined labels and below menus and
-// dialogs. The paper background, the screen frame's own, keeps scrolled content from showing
-// through the Alerts' rounded corners and the gap between the two lines.
-const MESSAGE_LINE_STYLE: SxProps<Theme> = {
-    position: "sticky",
-    bottom: 0,
-    zIndex: "mobileStepper",
-    bgcolor: "background.paper",
-    scrollMarginTop: (theme) => theme.spacing(REVEAL_SCROLL_MARGIN_UNITS),
-};
 
 /** The input attribute that ties a field in error to the ERRMSG line. */
 export interface ErrorMessageReferenceAttributes {

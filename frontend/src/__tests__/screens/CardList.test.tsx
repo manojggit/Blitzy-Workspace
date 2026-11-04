@@ -49,7 +49,7 @@ const mockRouter = {
 let mockSearchParams = new URLSearchParams();
 
 // A regular user: COSGN00C sends every user type other than A to the main menu that owns CCLI.
-const mockCurrentUser: SignedInUser = {
+const MOCK_CURRENT_USER: SignedInUser = {
     user_id: "TESTU001",
     user_type: "U",
     first_name: "Test",
@@ -67,7 +67,7 @@ jest.mock("next/navigation", () => ({
 jest.mock("@/lib/session", () => ({
     SessionProvider: ({ children }: { children: ReactNode }) => children,
     useSession: () => ({
-        currentUser: mockCurrentUser,
+        currentUser: MOCK_CURRENT_USER,
         isLoading: false,
         RefreshSession: jest.fn(),
         ClearSession: jest.fn(),
@@ -438,8 +438,8 @@ async function PressKey(user: UserSession, key: ScreenKey): Promise<void> {
     await user.keyboard(`{${key}}`);
 }
 
-// ENTER from the keyboard needs the focus outside the Select fields, which act on Enter
-// themselves, so the keyboard path presses its key from the account filter.
+// The keyboard path presses its key with the focus on the account filter, a field this helper
+// chooses: Enter on a closed row Select is the screen's ENTER; in an open menu it picks an option.
 async function PressScreenKey(user: UserSession, key: ScreenKey, trigger: KeyTrigger) {
     if (trigger === "click") {
         await user.click(screen.getByRole("button", { name: KEY_BUTTON_NAMES[key] }));
@@ -1252,7 +1252,7 @@ describe("COCRDLIC first page under React Strict Mode on /cards", () => {
 });
 
 describe("COCRDLIC first page arriving after unmount on /cards", () => {
-    it("COCRDLIC a first page arriving after unmount applies nothing and raises nothing", async () => {
+    it("COCRDLIC a first page arriving after unmount applies and raises nothing", async () => {
         const consoleError = jest.spyOn(console, "error");
         const firstPage = Promise.withResolvers<CardListResponse>();
         mockListCards.mockReturnValueOnce(firstPage.promise);

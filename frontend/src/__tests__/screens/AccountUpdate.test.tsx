@@ -133,7 +133,7 @@ const mockRouter = {
 // Read by the mocked useSearchParams at render time: the ?acctId= entry, or none.
 let mockSearchParams = new URLSearchParams();
 // The signed-on regular user of the header; it carries an ID and names only.
-const mockCurrentUser: SessionContextValue["currentUser"] = {
+const MOCK_CURRENT_USER: SessionContextValue["currentUser"] = {
     user_id: "TESTUSR1",
     user_type: "U",
     first_name: "TEST",
@@ -150,7 +150,7 @@ jest.mock("next/navigation", () => ({
 jest.mock("@/lib/session", () => ({
     SessionProvider: ({ children }: { children: ReactNode }) => children,
     useSession: () => ({
-        currentUser: mockCurrentUser,
+        currentUser: MOCK_CURRENT_USER,
         isLoading: false,
         RefreshSession: jest.fn(),
         ClearSession: jest.fn(),
@@ -1976,6 +1976,40 @@ async function FetchesAccountOfEntryKey(): Promise<void> {
     expect(ShownAlerts()).toEqual([[INFO_PROMPT_FOR_CHANGES, "info"]]);
 }
 
+interface OverlongAccountIdCase {
+    shape: string;
+    queryAcctId: string;
+    keptAcctId: string;
+}
+
+// acctId values longer than the 9(11) CDEMO-ACCT-ID and ACCTSID, and the 11 characters each
+// keeps; a character the cut would split in two is dropped whole.
+const SPLIT_CHARACTER_PREFIX = "0".repeat(10);
+const OVERLONG_ACCOUNT_ID_CASES: readonly OverlongAccountIdCase[] = [
+    { shape: "12 digits", queryAcctId: "000000000016", keptAcctId: "00000000001" },
+    { shape: "markup", queryAcctId: '"><svg onload=alert(2)>', keptAcctId: '"><svg onlo' },
+    {
+        shape: "10 digits and a two-unit character",
+        queryAcctId: `${SPLIT_CHARACTER_PREFIX}\u{1F600}`,
+        keptAcctId: SPLIT_CHARACTER_PREFIX,
+    },
+];
+
+// The fetched screen shows the key the fetch was sent as ACCTSID, as the server's does.
+async function CutsOverlongEntryKey(overlongCase: OverlongAccountIdCase): Promise<void> {
+    mockFetchAccountForEdit.mockImplementation(async (acctId) =>
+        BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
+            fields: { ...TEST_FIELDS, acct_id: acctId },
+        }),
+    );
+    mockSearchParams = new URLSearchParams({ acctId: overlongCase.queryAcctId });
+    RenderScreen();
+    await WaitForIdle();
+    expect(mockFetchAccountForEdit).toHaveBeenCalledTimes(1);
+    expect(mockFetchAccountForEdit).toHaveBeenCalledWith(overlongCase.keptAcctId, READ_OPTIONS);
+    expect(InputOf("acct_id")).toHaveValue(overlongCase.keptAcctId);
+}
+
 async function SendsOnlyKeyBeforeFetch(): Promise<void> {
     const user = await RenderInState(UpdateScreenState.DETAILS_NOT_FETCHED);
     await user.type(InputOf("acct_id"), TEST_ACCOUNT_ID);
@@ -2436,6 +2470,13 @@ describe("COACTUPC /accounts/update field protection", () => {
     it.each(PENDING_ENTRY_CASES)(
         "COACTUPC entry $entry shows the pending refusal in red with $infoLine",
         ShowsPendingRefusalOnEntry,
+    );
+});
+
+describe("COACTUPC /accounts/update entry with an over-long acctId", () => {
+    it.each(OVERLONG_ACCOUNT_ID_CASES)(
+        "COACTUPC cuts an acctId of $shape to the ACCTSID LENGTH before it fetches",
+        CutsOverlongEntryKey,
     );
 });
 

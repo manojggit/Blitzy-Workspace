@@ -15,6 +15,7 @@ import {
     API_V1_PATH,
     API_V1_URL,
     ClearHomeRoute,
+    CutToFieldLength,
     DEFAULT_HOME_ROUTE,
     EncodePathKey,
     GetHomeRoute,
@@ -468,6 +469,28 @@ const DOT_SEGMENT_CASES: readonly { segment: string; pathname: string }[] = [
     { segment: "..", pathname: API_V1_PATH + "/" },
     { segment: "%2E%2E", pathname: API_V1_PATH + "/" },
 ];
+// A URL context key cut to an 11-character field: kept as given when it fits, else its first 11
+// UTF-16 units, less the first half of a character the cut splits.
+const ACCOUNT_FIELD_LENGTH = 11;
+const TEN_DIGITS = "0".repeat(10);
+const FITTING_TWO_UNIT_TEXT = "0".repeat(9) + "\u{1F600}";
+const FIELD_CUT_CASES: readonly { shape: string; text: string; keptText: string }[] = [
+    { shape: "empty text", text: "", keptText: "" },
+    { shape: "shorter text with blanks", text: " 000000001 ", keptText: " 000000001 " },
+    { shape: "text of the field's length", text: "00000000001", keptText: "00000000001" },
+    {
+        shape: "a two-unit character that fits",
+        text: FITTING_TWO_UNIT_TEXT,
+        keptText: FITTING_TWO_UNIT_TEXT,
+    },
+    { shape: "12 digits", text: "000000000016", keptText: "00000000001" },
+    { shape: "markup", text: '"><svg onload=alert(2)>', keptText: '"><svg onlo' },
+    {
+        shape: "a two-unit character the cut splits",
+        text: `${TEN_DIGITS}\u{1F600}`,
+        keptText: TEN_DIGITS,
+    },
+];
 
 let consoleErrorSpy: jest.SpyInstance;
 
@@ -776,8 +799,8 @@ it.each(LEGACY_ERROR_CASES)(
 );
 
 it("absent feedback keys get their empty values and a null cursor is kept", () => {
-    const sparseBody = { message: "Transaction ID NOT found..." };
-    expect(ToScreenFeedback(BuildAxiosError(404, sparseBody, "/transactions/1"))).toStrictEqual({
+    const SPARSE_BODY = { message: "Transaction ID NOT found..." };
+    expect(ToScreenFeedback(BuildAxiosError(404, SPARSE_BODY, "/transactions/1"))).toStrictEqual({
         message: "Transaction ID NOT found...",
         info_message: "",
         field_errors: [],
@@ -1127,5 +1150,15 @@ it.each(DOT_SEGMENT_CASES)(
     "an unpadded $segment segment would leave the detail route for $pathname",
     ({ segment, pathname }) => {
         expect(new URL(`${TRANSACTIONS_URL}/${segment}`, BACKEND_ORIGIN).pathname).toBe(pathname);
+    },
+);
+
+it.each(FIELD_CUT_CASES)(
+    "CutToFieldLength keeps what an 11-character field holds of $shape",
+    ({ text, keptText }) => {
+        const keptKey = CutToFieldLength(text, ACCOUNT_FIELD_LENGTH);
+        expect(keptKey).toBe(keptText);
+        expect(keptKey.length).toBeLessThanOrEqual(ACCOUNT_FIELD_LENGTH);
+        expect(() => EncodePathKey(keptKey)).not.toThrow();
     },
 );

@@ -18,7 +18,7 @@ import {
     type TransitionStartFunction,
 } from "react";
 
-import { VISUALLY_HIDDEN_STYLE } from "@/app/theme";
+import { CENTRE_ALIGNED_ROW_STYLE, VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
@@ -552,7 +552,7 @@ function PageStatus({ statusText }: PageStatusProps) {
 // zero padding PAGENUM got from CDEMO-CU00-PAGE-NUM 9(08), as the modernized layout shows it.
 function UserSearchBar({ page, pageStatus, ...searchFieldProps }: UserSearchBarProps) {
     return (
-        <Grid container spacing={4} sx={{ alignItems: "center" }}>
+        <Grid container spacing={4} sx={CENTRE_ALIGNED_ROW_STYLE}>
             <Grid size={{ xs: 12, md: 6 }}>
                 <SearchField {...searchFieldProps} />
             </Grid>

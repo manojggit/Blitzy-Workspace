@@ -891,7 +891,7 @@ const SHRUNK_ERROR_LABEL_MAX_WIDTH = "calc((100% - 16px - 52px) / 0.75)";
 // The TextField state of a filled, non-Select field in error, whose root holds the icon.
 const FILLED_ERROR_ICON_PROPS = { variant: "filled", error: true, select: false };
 
-// A field in error shows a non-colour cue: the trailing error icon (QAVIS2-F09, QAUX1-F14).
+// A field in error shows a non-colour cue: the trailing error icon.
 const FIELD_ERROR_ICON_RULES: readonly ThemeRuleExpectation[] = [
     {
         rule: "an outlined field in error shows the error icon centred 12 px in from its end",

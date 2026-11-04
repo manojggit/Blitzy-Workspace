@@ -42,7 +42,7 @@ let mockSearchParams = new URLSearchParams();
 const mockClearSession = jest.fn();
 const mockRefreshSession = jest.fn();
 // A fictitious admin: user type A is the one COSGN00C sends to COADM01C.
-const mockSessionUser: CurrentUserResponse = {
+const MOCK_SESSION_USER: CurrentUserResponse = {
     user_id: "TESTADM1",
     user_type: "A",
     first_name: "Test",
@@ -60,7 +60,7 @@ jest.mock("next/navigation", () => ({
 jest.mock("@/lib/session", () => ({
     SessionProvider: ({ children }: { children: ReactNode }) => children,
     useSession: () => ({
-        currentUser: mockSessionUser,
+        currentUser: MOCK_SESSION_USER,
         isLoading: false,
         RefreshSession: mockRefreshSession,
         ClearSession: mockClearSession,
@@ -838,7 +838,7 @@ function HoldNextPage(): (pageText: string) => Promise<void> {
 // The XCTL ends with the next screen: the menu stays locked after the selection answers, until
 // the routed page has rendered, so a second ENTER in that time sends no second selection.
 describe("COADM01C busy until the routed page renders", () => {
-    it("COADM01C option 3 then ENTER again before the page renders sends one selection", async () => {
+    it("COADM01C option 3, ENTER twice before the page renders, sends one selection", async () => {
         const loadNextPage = HoldNextPage();
         mockSelectAdminMenuOption.mockResolvedValue(BuildRouteResponse("/admin/users/update"));
         const user = RenderScreenBesideNextPage();

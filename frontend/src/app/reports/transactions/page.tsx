@@ -52,6 +52,7 @@ import {
 import DownloadIcon from "@mui/icons-material/Download";
 import axios, { type AxiosError } from "axios";
 
+import { REPORT_TITLE_SEGMENTS_STYLE, WRAPPING_ROW_STYLE } from "@/app/theme";
 import { ConfirmField } from "@/components/ConfirmField";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import {
@@ -189,8 +190,6 @@ const BLANK_LINE_CELL_STYLE: SxProps<Theme> = { borderBottom: "none" };
 const DASH_RULE_CELL_STYLE: SxProps<Theme> = { padding: 0, borderBottomColor: "m3.outline" };
 // TRANSACTION-HEADER-1 repeated in the body, in the M3 title-small role of column headings.
 const COLUMN_HEADING_CELL_STYLE: SxProps<Theme> = { typography: "titleSmall" };
-// The parts of a title line sit side by side and wrap on a narrow screen; theme spacing units.
-const TITLE_SEGMENTS_STYLE: SxProps<Theme> = { flexWrap: "wrap", columnGap: 8, rowGap: 1 };
 
 // CVTRA07Y REPORT-NAME-HEADER: 'Date Range: ' <start> ' to ' <end>.
 const DATE_RANGE_PREFIX = "Date Range: ";
@@ -659,7 +658,6 @@ function useReadController(): ReadController {
     return { startRead, abortRead };
 }
 
-// Shows the outcome of a failed call on the screen.
 type ErrorApplier = (error: AxiosError, setters: ScreenSetters) => void;
 
 // An abandoned read is discarded silently, before ToScreenFeedback would show it as the abend
@@ -1260,7 +1258,7 @@ function TitleLineRow({ segments }: TitleLineRowProps) {
     return (
         <TableRow>
             <TableCell colSpan={TABLE_HEADINGS.length}>
-                <Stack direction="row" sx={TITLE_SEGMENTS_STYLE}>
+                <Stack direction="row" sx={REPORT_TITLE_SEGMENTS_STYLE}>
                     {segments.map((segment, position) => (
                         <Typography key={position} variant="titleSmall" component="span">
                             {segment}
@@ -1534,7 +1532,7 @@ interface ReportDownloadButtonsProps {
 // the server names the file.
 function ReportDownloadButtons({ query, downloads }: ReportDownloadButtonsProps) {
     return (
-        <Stack direction="row" spacing={2} useFlexGap sx={{ flexWrap: "wrap" }}>
+        <Stack direction="row" spacing={2} useFlexGap sx={WRAPPING_ROW_STYLE}>
             {DOWNLOAD_OPTIONS.map((option) => (
                 <ReportDownloadButton
                     key={option.format}

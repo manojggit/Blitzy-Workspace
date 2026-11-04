@@ -649,6 +649,41 @@ describe("COCRDSLC entered from the COCRDLIC card list on /cards/view", () => {
     });
 });
 
+interface OverlongAccountIdCase {
+    shape: string;
+    queryAcctId: string;
+    keptAcctId: string;
+}
+
+// acctId values longer than the 9(11) CDEMO-ACCT-ID and ACCTSID, and the 11 characters each
+// keeps; a character the cut would split in two is dropped whole.
+const SPLIT_CHARACTER_PREFIX = "0".repeat(10);
+const OVERLONG_ACCOUNT_ID_CASES: readonly OverlongAccountIdCase[] = [
+    { shape: "12 digits", queryAcctId: "000000000016", keptAcctId: "00000000001" },
+    { shape: "markup", queryAcctId: '"><svg onload=alert(2)>', keptAcctId: '"><svg onlo' },
+    {
+        shape: "10 digits and a two-unit character",
+        queryAcctId: `${SPLIT_CHARACTER_PREFIX}\u{1F600}`,
+        keptAcctId: SPLIT_CHARACTER_PREFIX,
+    },
+];
+
+// ACCTSID shows the selection's account until the read answers with the account it read.
+describe("COCRDSLC a COCRDLIC selection with an over-long acctId on /cards/view", () => {
+    it.each(OVERLONG_ACCOUNT_ID_CASES)(
+        "COCRDSLC cuts an acctId of $shape to the ACCTSID LENGTH before it reads",
+        async ({ queryAcctId, keptAcctId }) => {
+            const releaseRead = HoldReads(mockViewSelectedCard);
+            mockSearchParams = new URLSearchParams({ cardRef: TEST_CARD_REF, acctId: queryAcctId });
+            RenderScreen();
+            expect(mockViewSelectedCard.mock.calls).toEqual([ReadCall(TEST_CARD_REF, keptAcctId)]);
+            expect(InputFor(ACCOUNT_LABEL)).toHaveValue(keptAcctId);
+            releaseRead(BuildCardDetail());
+            await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        },
+    );
+});
+
 // The read on arrival answers with its own information line, so no key prompt is set first.
 describe("COCRDSLC information line from the COCRDLIC card list on /cards/view", () => {
     it("COCRDSLC shows no key prompt while or after the selected card is read", async () => {
@@ -663,7 +698,7 @@ describe("COCRDSLC information line from the COCRDLIC card list on /cards/view",
 });
 
 describe("COCRDSLC entered from the COCRDLIC card list under StrictMode on /cards/view", () => {
-    it("COCRDSLC keeps one live read of the selected card under the double effect run", async () => {
+    it("COCRDSLC keeps one live read of the selected card in the double effect run", async () => {
         RenderFromCardList(true);
         await ExpectAlert(DETAILS_SHOWN_INFO, "info");
         expect(mockViewSelectedCard.mock.calls).toEqual([
@@ -948,8 +983,8 @@ describe("COCRDSLC WS-RETURN-MSG literals on /cards/view", () => {
 
 describe("COCRDSLC abend text on /cards/view", () => {
     it("COCRDSLC 500 shows the abend text and no information line", async () => {
-        const body = { detail: "Internal Server Error" };
-        mockViewCard.mockRejectedValue(BuildAxiosError(HTTP_INTERNAL_SERVER_ERROR, body));
+        const FASTAPI_BODY = { detail: "Internal Server Error" };
+        mockViewCard.mockRejectedValue(BuildAxiosError(HTTP_INTERNAL_SERVER_ERROR, FASTAPI_BODY));
         const user = RenderScreen();
         await ClickButton(user, SEARCH_BUTTON_NAME);
         await ExpectAlert(ABEND_MESSAGE, "error");
@@ -1056,7 +1091,7 @@ describe("COCRDSLC F3 during a pending read on /cards/view", () => {
 // ENTER cannot supersede a pending read, as the one-at-a-time guard refuses it; another card
 // list selection is the one lookup that replaces a read still in flight.
 describe("COCRDSLC a superseded read on /cards/view", () => {
-    it("COCRDSLC a new selection aborts the pending read and only its own answer shows", async () => {
+    it("COCRDSLC a new selection aborts the pending read; only its own answer shows", async () => {
         const staleRead = Promise.withResolvers<CardDetailResponse>();
         mockViewSelectedCard.mockReturnValueOnce(staleRead.promise);
         mockViewSelectedCard.mockResolvedValueOnce(BuildCardDetail());

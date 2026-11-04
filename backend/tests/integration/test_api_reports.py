@@ -16,7 +16,7 @@ tests/conftest.py, and restoreSeedState undoes every committed row. The cases co
 - the first-failure literals and cursors of the report type, the date parts, CSUTLDTC and the
   confirmation (lines 258-494), and the 200 confirmation prompt and cleared screen;
 - the CSV and PDF downloads, which carry the same lines, guard formula text and run the same
-  edits;
+  edits, and which, though streamed, carry the no-store, nosniff and no-framing headers;
 - the superseded TDQ job submission and its TRANREPT STEP01R backup: the screen and both
   downloads leave every TRANSACT row and column, and the batch catalog and ledger
   (batch.gdg_generations, job_runs, cycles, cycle_steps), unchanged, create no TRANSACT.BKUP
@@ -45,6 +45,7 @@ from sqlalchemy import Connection, Engine, Table, event, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncMappingResult
 
 from app.core.errors import FileIoError
+from app.core.middleware import RESPONSE_SECURITY_HEADERS
 from app.models import CYCLE_STEPS, CYCLES, GDG_GENERATIONS, JOB_RUNS, Transaction
 from app.repositories.transaction_repository import TransactionRepository
 from app.services.reports import corpt00c
@@ -885,6 +886,18 @@ async def test_pdf_export_draws_the_print_lines(regularClient: httpx.AsyncClient
     assert response.content.startswith(PDF_SIGNATURE)
     assert JULY_05_TRAN_ID.encode() in response.content
     assert REPORT_TITLE.encode() in response.content
+
+
+@pytest.mark.usefixtures("reportData")
+@pytest.mark.parametrize("exportFormat", EXPORT_FORMATS)
+async def test_streamed_export_forbids_caching_sniffing_and_framing(
+    regularClient: httpx.AsyncClient, exportFormat: str
+) -> None:
+    """A download carries no-store, so no private cache keeps the report after sign-off."""
+    response = await DownloadReport(regularClient, MONTHLY_CONFIRMED, exportFormat)
+    assert response.status_code == HTTP_OK, response.text
+    for headerName, headerValue in RESPONSE_SECURITY_HEADERS.items():
+        assert response.headers.get_list(headerName) == [headerValue], headerName
 
 
 @pytest.mark.parametrize("exportFormat", EXPORT_FORMATS)

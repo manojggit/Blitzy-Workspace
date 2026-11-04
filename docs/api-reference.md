@@ -76,10 +76,9 @@ the placeholders above. Where a sample shortens a list, the sentence that introd
 ## Session cookie
 
 `POST /api/v1/auth/login` is the only way to start a session. A successful sign-on sets an HttpOnly
-cookie, and the response body never carries a token. Every other `/api/v1` endpoint except
-`POST /api/v1/auth/logout` is protected: it reads the user from the cookie. Logout is public: it
-reads no identity and needs no session, so repeating it is harmless, but as a `POST` it still needs
-the `Origin` header that the [CSRF guard](#csrf-origin-guard-and-cors) requires.
+cookie, and the response body never carries a token. Every other `/api/v1` endpoint is protected:
+it reads the user from the cookie. `POST /api/v1/auth/logout` is one of them, and as a `POST` it
+also needs the `Origin` header that the [CSRF guard](#csrf-origin-guard-and-cors) requires.
 
 | Property | Value |
 |---|---|
@@ -141,6 +140,39 @@ CORS allows the `BACKEND_CORS_ORIGINS` origins with credentials, the methods `GE
 read it. The guard's 403 never does, because the guard refuses only an unlisted or missing
 `Origin`.
 
+## Response headers
+
+Every backend response carries four security headers: each `/api/v1` success and error, the CSRF
+guard's 403, an unexpected 500, the CORS preflight answers, the CR00 CSV and PDF downloads, the
+health probes and the [API documentation endpoints](#api-documentation-endpoints).
+
+| Header | Value | Purpose |
+|---|---|---|
+| `Cache-Control` | `no-store` | No cache keeps an SSN, other PII or a download after sign-off |
+| `X-Content-Type-Options` | `nosniff` | The browser never runs a download as another content type |
+| `X-Frame-Options` | `DENY` | No page may frame a response |
+| `Content-Security-Policy` | `frame-ancestors 'none'` | The same framing ban, in CSP form |
+
+These values replace any an endpoint sets, and the CORS headers stay as described above.
+`Strict-Transport-Security` is not sent, because the local base URL is plain HTTP.
+
+This command prints the response headers of the liveness probe:
+
+```bash
+curl -s -o /dev/null -D - http://127.0.0.1:8000/health
+```
+
+The response has status 200 with these headers:
+
+```http
+HTTP/1.1 200 OK
+cache-control: no-store
+x-content-type-options: nosniff
+x-frame-options: DENY
+content-security-policy: frame-ancestors 'none'
+# Other headers omitted.
+```
+
 ## Roles
 
 The role of a request comes only from the session cookie. No body field, query parameter or header
@@ -152,8 +184,8 @@ is read as a role.
 
 | Role | Endpoints |
 |---|---|
-| Public | `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`, `/health`, `/health/ready` |
-| Any signed-on user | `GET /api/v1/auth/me` |
+| Public | `POST /api/v1/auth/login`, `/health`, `/health/ready` |
+| Any signed-on user | `POST /api/v1/auth/logout`, `GET /api/v1/auth/me` |
 | Admin | CA00 and CU00–CU03: the `/api/v1/menu/admin` and `/api/v1/admin/users` paths |
 | Regular | CM00, CAVW, CAUP, CCLI, CCDL, CCUP, CT00, CT01, CT02, CR00 and CB00 |
 
@@ -346,7 +378,7 @@ CAUP, CCLI, CCUP, CT00 and CU00 instead reference an endpoint-specific model tha
 | — | [GET /health](#get-health) | Public |
 | — | [GET /health/ready](#get-healthready) | Public |
 | CC00 | [POST /api/v1/auth/login](#post-apiv1authlogin) | Public |
-| CC00 | [POST /api/v1/auth/logout](#post-apiv1authlogout) | Public |
+| CC00 | [POST /api/v1/auth/logout](#post-apiv1authlogout) | Any |
 | CC00 | [GET /api/v1/auth/me](#get-apiv1authme) | Any |
 | CM00 | [GET /api/v1/menu/main](#get-apiv1menumain) | Regular |
 | CM00 | [POST /api/v1/menu/main/selection](#post-apiv1menumainselection) | Regular |
@@ -477,9 +509,9 @@ No cookie accompanies an error.
 
 ### POST /api/v1/auth/logout
 
-Replaces CC00 / COSGN00C / COSGN00 (F3); role public. Clears the session cookie and returns the
-sign-off literal. It needs no session, so repeating it is harmless, but as a `POST` it needs the
-`Origin` header.
+Replaces CC00 / COSGN00C / COSGN00 (F3); role any signed-on user. Clears the session cookie and
+returns the sign-off literal. It needs the session cookie, and as a `POST` it needs the `Origin`
+header.
 
 This command signs off:
 
@@ -497,6 +529,7 @@ The response has status 200, clears the cookie and carries this `LogoutResponse`
 
 Other outcomes:
 
+- 401 with an empty `message`: the cookie is missing, expired or invalid; no cookie is cleared.
 - 403 with an empty `message`: the `Origin` header is missing or not allow-listed.
 
 Logout does not revoke the token: the token in the jar stays valid until it expires,
@@ -2532,4 +2565,3 @@ Other outcomes:
 - 400 `User ID can NOT be empty...` (`user_id`).
 - 404 `User ID NOT found...` (`user_id`): nothing is deleted.
 - 503 `Unable to Update User...`.
-

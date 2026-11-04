@@ -158,7 +158,7 @@ const mockRouter = {
 // Read by the mocked useSearchParams at render time: the card list's ?cardRef=&acctId=, or none.
 let mockSearchParams = new URLSearchParams();
 // The signed-on regular user (type U), as CCUP is a main-menu function; it holds no password.
-const mockCurrentUser: SessionContextValue["currentUser"] = {
+const MOCK_CURRENT_USER: SessionContextValue["currentUser"] = {
     user_id: "TESTUSR1",
     user_type: "U",
     first_name: "TEST",
@@ -175,7 +175,7 @@ jest.mock("next/navigation", () => ({
 jest.mock("@/lib/session", () => ({
     SessionProvider: ({ children }: { children: ReactNode }) => children,
     useSession: () => ({
-        currentUser: mockCurrentUser,
+        currentUser: MOCK_CURRENT_USER,
         isLoading: false,
         RefreshSession: jest.fn(),
         ClearSession: jest.fn(),
@@ -919,6 +919,38 @@ async function FetchesSelectedCard(): Promise<void> {
     expect(mockUpdateCard).not.toHaveBeenCalled();
 }
 
+interface OverlongAccountIdCase {
+    shape: string;
+    queryAcctId: string;
+    keptAcctId: string;
+}
+
+// acctId values longer than the 9(11) CDEMO-ACCT-ID and ACCTSID, and the 11 characters each
+// keeps; a character the cut would split in two is dropped whole.
+const SPLIT_CHARACTER_PREFIX = "0".repeat(10);
+const OVERLONG_ACCOUNT_ID_CASES: readonly OverlongAccountIdCase[] = [
+    { shape: "12 digits", queryAcctId: "000000000016", keptAcctId: "00000000001" },
+    { shape: "markup", queryAcctId: '"><svg onload=alert(2)>', keptAcctId: '"><svg onlo' },
+    {
+        shape: "10 digits and a two-unit character",
+        queryAcctId: `${SPLIT_CHARACTER_PREFIX}\u{1F600}`,
+        keptAcctId: SPLIT_CHARACTER_PREFIX,
+    },
+];
+
+// ACCTSID shows the selection's account from the first render, before the fetch answers.
+async function CutsOverlongEntryKey(overlongCase: OverlongAccountIdCase): Promise<void> {
+    const { queryAcctId, keptAcctId } = overlongCase;
+    const heldFetch = Promise.withResolvers<CardScreen>();
+    mockFetchCardForEdit.mockReturnValueOnce(heldFetch.promise);
+    mockSearchParams = new URLSearchParams({ cardRef: TEST_CARD_REF, acctId: queryAcctId });
+    RenderScreen();
+    expect(mockFetchCardForEdit.mock.calls).toEqual([[TEST_CARD_REF, keptAcctId, READ_OPTIONS]]);
+    expect(InputOf("acct_id")).toHaveValue(keptAcctId);
+    await act(async () => heldFetch.resolve(BuildCardScreen(UpdateScreenState.SHOW_DETAILS)));
+    await WaitForIdle();
+}
+
 // The card_ref path segment, the held screen_token, and the four detail inputs for ENTER and F5.
 async function SendsHeldToken(actionKeyCase: ActionKeyCase): Promise<void> {
     const user = await RenderFromList(UpdateScreenState.SHOW_DETAILS);
@@ -1397,6 +1429,13 @@ describe("COCRDUPC BMS COCRDUP content on /cards/update", () => {
 describe("COCRDUPC entry from a COCRDLIC selection on /cards/update", () => {
     it("COCRDUPC fetches the selected card once by its card_ref and the list's account", () =>
         FetchesSelectedCard());
+});
+
+describe("COCRDUPC entry from a COCRDLIC selection, over-long acctId, on /cards/update", () => {
+    it.each(OVERLONG_ACCOUNT_ID_CASES)(
+        "COCRDUPC cuts an acctId of $shape to the ACCTSID LENGTH before it fetches",
+        CutsOverlongEntryKey,
+    );
 });
 
 describe("COCRDUPC 3300-SETUP-SCREEN-ATTRS field protection on /cards/update", () => {

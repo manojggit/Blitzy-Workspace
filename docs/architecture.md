@@ -102,8 +102,10 @@ How each legacy mechanism is replaced:
     2. The FastAPI app, with `/docs`, `/redoc` and `/openapi.json` only when the docs are enabled
         ([Health probes and API documentation](#health-probes-and-api-documentation)).
     3. The settings, the lazily connecting async engine and its session factory on `app.state`.
-    4. `OriginGuard`, then CORS as the outermost layer, around Starlette's error middleware, so
-        CORS answers preflight requests and decorates the guard's 403 and an unexpected 500.
+    4. `OriginGuard`, then CORS around Starlette's error middleware, so CORS answers preflight
+        requests and decorates the guard's 403 and an unexpected 500. `ResponseSecurityHeaders`
+        wraps CORS as the outermost layer, so every response, those included, carries the
+        [response security headers](#response-security-headers).
     5. The `LegacyMessageError`, request-validation and HTTP-exception handlers, and no other.
     6. The health router at the root and the `/api/v1` router.
 - **Routers.** `backend/app/api/v1/router.py` aggregates the eight cluster routers under
@@ -117,8 +119,8 @@ How each legacy mechanism is replaced:
     ([Screen input](#screen-input)).
 - **Core.** `backend/app/core/` holds the settings (`config.py`), the engine, request session and
     write units (`database.py`), the identity and role dependencies (`dependencies.py`), the
-    origin guard (`middleware.py`), the error contract (`errors.py`), the shared literals
-    (`messages.py`), security, locks, paths and logging.
+    origin guard and the response security headers (`middleware.py`), the error contract
+    (`errors.py`), the shared literals (`messages.py`), security, locks, paths and logging.
 
 ### Services
 
@@ -226,7 +228,7 @@ flowchart LR
         apiClient["lib/apiClient.ts"]
     end
     subgraph backendLayer ["FastAPI backend"]
-        guard["CORS and OriginGuard"]
+        guard["Security headers,<br/>CORS and OriginGuard"]
         healthRoutes["/health probes"]
         routers["/api/v1 routers"]
         services["Services"]
@@ -299,14 +301,15 @@ backend and frontend never read them.
 - **Identity.** Each route belongs to one of three classes
     ([Identity and trust](#identity-and-trust)):
     - **Public.** `POST /auth/login` reads no cookie, and is the only exemption from
-        `core/middleware.OriginGuard`. `POST /auth/logout` reads no identity and needs no
-        session, but like every `POST`, `PUT` and `DELETE` it needs an allow-listed `Origin`
-        ([CSRF and CORS](#csrf-and-cors)). The health probes and, when enabled, the API
+        `core/middleware.OriginGuard`. The health probes and, when enabled, the API
         documentation are public too
         ([Health probes and API documentation](#health-probes-and-api-documentation)).
-    - **Signed on, any role.** `GET /auth/me` resolves the caller from the session cookie
-        through `core/dependencies.GetAuthenticatedContext`, which runs `GetCurrentUser` and no
-        role guard: a missing, expired or invalid cookie gives 401, and every user type passes.
+    - **Signed on, any role.** `GET /auth/me` and `POST /auth/logout` resolve the caller from
+        the session cookie through `core/dependencies.GetCurrentUser` and no role guard:
+        `GET /auth/me` through `GetAuthenticatedContext`, and logout directly, without a
+        database read. A missing, expired or invalid cookie gives 401, and every user type
+        passes. Like every `POST`, `PUT` and `DELETE`, logout also needs an allow-listed
+        `Origin` ([CSRF and CORS](#csrf-and-cors)).
     - **Role-guarded.** Every other `/api/v1` route resolves the caller the same way, with the
         same 401, and its `RequireAdmin` or `RequireRegular` guard then admits the caller or
         refuses it with 403 ([Effective role](#effective-role)).
@@ -462,7 +465,7 @@ Who is identified, and what each caller may supply:
     choose the menu and fill the header.
 - **Backend.** The token's claims `sub` (the user ID) and `typ` (the user type) are read from
     `security.users` at login, and verified by `core/dependencies.GetCurrentUser` on every request
-    that needs a user: `GET /auth/me` and every role-guarded route
+    that needs a user: `GET /auth/me`, `POST /auth/logout` and every role-guarded route
     ([Request flow](#request-flow)). No other request body, query parameter or header field is
     read as identity or role.
 - **Batch.** There is no application user. Batch connects with the `SYNC_DATABASE_URL`
@@ -483,8 +486,9 @@ Who is identified, and what each caller may supply:
     - The browser sends it on every API call (`withCredentials`) and on the CSV and PDF export
         downloads, which are same-site because both origins use the host `127.0.0.1`.
 - **Logout.** `POST /auth/logout` clears the cookie and returns
-    `Thank you for using CardDemo application...`. It needs no session, so repeating it is
-    harmless, but it needs an allow-listed `Origin` ([CSRF and CORS](#csrf-and-cors)).
+    `Thank you for using CardDemo application...`. It needs a signed-on session: a missing,
+    expired or invalid cookie gives 401 and is left as it is. It also needs an allow-listed
+    `Origin` ([CSRF and CORS](#csrf-and-cors)).
 - **Fail closed.** `core/config.Settings` refuses to start when `SECRET_KEY` is blank or shorter
     than 32 characters.
 - **Claims and expiry.** The claims are `sub`, `typ`, `iat` and `exp`. On a request that needs a
@@ -553,6 +557,25 @@ change (`cbl/COUSR02C.cbl` lines 166–170, 198–240). A bcrypt hash supplies n
     is missing or not in `BACKEND_CORS_ORIGINS`, with 403. Only `POST /auth/login` is exempt.
 - CORS allows the `BACKEND_CORS_ORIGINS` origins, with credentials. `Settings` refuses a wildcard
     or a malformed entry at startup, because credentials are allowed.
+
+### Response security headers
+
+`core/middleware.ResponseSecurityHeaders`, the outermost layer, sets these headers on every
+backend response: successes and errors, the guard's 403, an unexpected 500, CORS preflight
+answers, the streamed CR00 exports, the health probes and the API docs.
+
+| Header | Value | Reason |
+|---|---|---|
+| `Cache-Control` | `no-store` | No private cache keeps SSNs, other PII or exports after sign-off |
+| `X-Content-Type-Options` | `nosniff` | A browser never runs a download as another content type |
+| `X-Frame-Options` | `DENY` | No page may frame a response |
+| `Content-Security-Policy` | `frame-ancestors 'none'` | The same framing ban, in CSP form |
+
+- The policy is uniform: the backend serves no cacheable asset, a probe must report live state,
+    and the docs are a development aid.
+- It replaces any value a route sets and leaves the CORS headers unchanged.
+- It edits only the start of each response, so a streamed body is never buffered.
+- `Strict-Transport-Security` is not sent, because the local run target is plain HTTP.
 
 ### Encrypted navigation tokens
 

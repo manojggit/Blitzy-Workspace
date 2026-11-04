@@ -7,11 +7,13 @@ carries a token. ENTER on COSGN00 is ``POST /login``, PF3 is ``POST /logout``, a
 reads ``GET /me`` to choose the user's menu and fill the screen header.
 
 Only ``POST /login`` reads a caller's identity, from its ``user_id`` and ``password`` fields.
-``GET /me`` takes the user from the verified cookie. ``POST /logout`` reads no identity and
-needs no session, so repeating it is harmless. ``core.middleware.OriginGuard``
-exempts only ``POST /api/v1/auth/login``, so ``POST /logout`` without an allow-listed Origin is
-refused with 403 before it reaches its handler. The COSGN00C service owns every literal and
-every edit; its ``LegacyMessageError`` outcomes are serialised by ``app.core.errors``.
+``GET /me`` and ``POST /logout`` need a signed-on session: ``core.dependencies.GetCurrentUser``
+verifies the cookie and admits every user type, and refuses a missing, expired or invalid cookie
+with 401 and the empty legacy body before the handler runs, so a refused logout leaves the cookie
+as it is. ``core.middleware.OriginGuard`` exempts only ``POST /api/v1/auth/login``, so
+``POST /logout`` without an allow-listed Origin is refused with 403 before the session is
+checked. The COSGN00C service owns every literal and every edit; its ``LegacyMessageError``
+outcomes are serialised by ``app.core.errors``.
 """
 
 from typing import Annotated
@@ -23,6 +25,7 @@ from app.core.config import Settings
 from app.core.dependencies import (
     GetAppSettings,
     GetAuthenticatedContext,
+    GetCurrentUser,
     GetOnlineContext,
     OnlineContext,
 )
@@ -42,8 +45,10 @@ LOGIN_DESCRIPTION = (
     " returns the user and the next route: /admin for user type A, /menu for any other type."
 )
 LOGOUT_DESCRIPTION = (
-    "Replaces PF3 on COSGN00: clears the session cookie and returns the CSMSG01Y thank-you"
-    " message. No session is required, so repeating the call is harmless."
+    "Replaces PF3 on COSGN00: ends the signed-on session by clearing the session cookie, and"
+    " returns the CSMSG01Y thank-you message. Any signed-on user type may call it. A missing,"
+    " expired or invalid session cookie is refused with 401 and an empty message, and the"
+    " cookie is left as it is. A missing or unlisted Origin header is refused with 403 first."
 )
 CURRENT_USER_DESCRIPTION = (
     "Returns the signed-on user from the session cookie, with the names from the user record"
@@ -96,7 +101,8 @@ async def Login(
     response_model=LogoutResponse,
     summary="CC00 / COSGN00C: sign off (F3)",
     description=LOGOUT_DESCRIPTION,
-    responses=LegacyErrorResponses(403),
+    responses=LegacyErrorResponses(401, 403),
+    dependencies=[Depends(GetCurrentUser)],
 )
 async def Logout(
     response: Response, settings: Annotated[Settings, Depends(GetAppSettings)]

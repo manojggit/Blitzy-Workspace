@@ -182,7 +182,7 @@ Rule.
     - Service: `backend/app/services/auth/cosgn00c.py`, with the lockout in
         `backend/app/services/auth/login_throttle.py`
     - Router: `backend/app/api/v1/auth.py`
-    - Endpoints: `POST /auth/login` (public), `POST /auth/logout` (no session needed),
+    - Endpoints: `POST /auth/login` (public), `POST /auth/logout` (any signed-in user),
         `GET /auth/me` (any signed-in user)
     - Page: `frontend/src/app/signon/page.tsx`
 - **CM00** (COMEN01C)

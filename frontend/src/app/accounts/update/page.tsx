@@ -42,6 +42,7 @@ import {
     type AccountUpdateRequest,
 } from "@/lib/api/accounts";
 import {
+    CutToFieldLength,
     IsCancelledRequest,
     LegacyErrorBody,
     SeverityForOutcome,
@@ -88,9 +89,10 @@ interface SectionDefinitions {
 
 type ThreePartNames = readonly [AccountFieldName, AccountFieldName, AccountFieldName];
 
-// What the COMMAREA kept between two CAUP tasks: the ACUP-CHANGE-ACTION state, the encrypted
-// screen_token the server sends back unchanged, the map fields as keyed, and the map fields as
-// the server last sent them.
+// What the COMMAREA kept between two CAUP tasks: the ACUP-CHANGE-ACTION state, the latest
+// encrypted screen_token the server issued, the map fields as keyed, and the map fields as the
+// server last sent them. The page echoes the token unchanged with the next request, never
+// decoding or editing it, and replaces it from each response that carries one.
 interface ScreenModel {
     state: UpdateScreenState;
     screenToken: string | null;
@@ -231,6 +233,8 @@ const YES_NO_HELPER_TEXT = "Y/N";
 const FIELD_ID_PREFIX = "account-update-";
 
 const ACCOUNT_ID_FIELD: AccountFieldName = "acct_id";
+// The ACCTSID LENGTH.
+const ACCOUNT_ID_MAX_LENGTH = 11;
 
 const ENTRY_GRID_SIZE = { xs: 12, md: 6 } as const;
 // Until lg, half a row is narrower than the SSN and phone part labels at full size, which a blank
@@ -335,7 +339,7 @@ function PhoneGroup(
 // The COACTUP DFHMDF labels (INITIAL trimmed at both ends) and LENGTHs, by screen section.
 const FIELD_DEFINITIONS: Readonly<SectionDefinitions> = Object.freeze<SectionDefinitions>({
     accountFields: [
-        { name: "acct_id", label: "Account Number :", maxLength: 11 },
+        { name: "acct_id", label: "Account Number :", maxLength: ACCOUNT_ID_MAX_LENGTH },
         {
             name: "active_status",
             label: "Active Y/N:",
@@ -788,8 +792,14 @@ function useFieldView(store: ScreenStore, registry: InputRegistry): FieldView {
     );
 }
 
+// The ?acctId= account number as ACCTSID holds it, or null when the query carries none.
+function useQueryAccountId(): string | null {
+    const queryValue = useSearchParams().get(ACCOUNT_ID_QUERY_KEY);
+    return queryValue === null ? null : CutToFieldLength(queryValue, ACCOUNT_ID_MAX_LENGTH);
+}
+
 function useAccountUpdateScreen(): AccountUpdateScreenModel {
-    const acctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY);
+    const acctId = useQueryAccountId();
     const store = useScreenStore(acctId);
     const runRequest = useRequestRunner(store.setters);
     const registry = useInputRegistry();
@@ -1026,13 +1036,13 @@ function AccountUpdateScreen() {
     );
 }
 
-// Each arrival with another ?acctId=, or with none, is a fresh COACTUPC first entry, as every
-// XCTL is, so the fields, state and screen_token start over together with their own request
-// runner. The replaced screen's unmount aborts its entry fetch; a PUT it already sent runs to its
-// answer, which reaches only that screen. A missing acctId stays distinct from an empty one,
-// because only the latter is fetched.
+// Each arrival with another ?acctId= account number, or with none, is a fresh COACTUPC first
+// entry, as every XCTL is, so the fields, state and screen_token start over together with their
+// own request runner. The replaced screen's unmount aborts its entry fetch; a PUT it already sent
+// runs to its answer, which reaches only that screen. A missing acctId stays distinct from an
+// empty one, because only the latter is fetched.
 function AccountUpdateEntry() {
-    const acctId = useSearchParams().get(ACCOUNT_ID_QUERY_KEY);
+    const acctId = useQueryAccountId();
     return <AccountUpdateScreen key={JSON.stringify([acctId])} />;
 }
 

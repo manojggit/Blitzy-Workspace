@@ -42,7 +42,7 @@ from app.core.errors import (
     LegacyMessageError,
 )
 from app.core.logging import ConfigureLogging
-from app.core.middleware import OriginGuard
+from app.core.middleware import OriginGuard, ResponseSecurityHeaders
 from app.schemas.common import LegacyValidationErrorResponse
 
 API_TITLE = "CardDemo API"
@@ -129,14 +129,13 @@ def BuildFastApi(settings: Settings) -> FastAPI:
 
 
 def AttachState(application: FastAPI, settings: Settings) -> None:
-    """Keep the settings, the lazily connecting engine and its session factory on app.state."""
     application.state.settings = settings
     application.state.engine = BuildEngine(settings)
     application.state.sessionFactory = BuildSessionFactory(application.state.engine)
 
 
 def AddMiddleware(application: FastAPI, settings: Settings) -> None:
-    """Add the CSRF origin guard, then make CORS the outermost layer of the whole stack.
+    """Add the CSRF origin guard, wrap the whole stack in CORS, then in the security headers.
 
     CORS wraps the guard and Starlette's ServerErrorMiddleware, which sends the 500 of an
     unhandled error. It therefore answers the preflight OPTIONS before the guard sees it, adds
@@ -144,10 +143,13 @@ def AddMiddleware(application: FastAPI, settings: Settings) -> None:
     that abend. Access-Control-Allow-Origin goes only to an allow-listed origin, which the guard
     never refuses. Credentials are allowed, so the origins are always the explicit
     BACKEND_CORS_ORIGINS list: Settings refuses a wildcard or a malformed entry at startup.
+    ResponseSecurityHeaders is the outermost layer, so every response, those three included,
+    carries its no-store, nosniff and no-framing headers, and CORS is left unchanged.
     """
     allowedOrigins = settings.CorsOrigins()
     application.add_middleware(OriginGuard, allowedOrigins=allowedOrigins)
     WrapStackInCors(application, allowedOrigins)
+    WrapStackInSecurityHeaders(application)
 
 
 def WrapStackInCors(application: FastAPI, allowedOrigins: Sequence[str]) -> None:
@@ -161,7 +163,6 @@ def WrapStackInCors(application: FastAPI, allowedOrigins: Sequence[str]) -> None
     buildFastApiStack = application.build_middleware_stack
 
     def BuildCorsWrappedStack() -> ASGIApp:
-        """Return FastAPI's middleware stack wrapped in CORSMiddleware for ``allowedOrigins``."""
         return CORSMiddleware(
             buildFastApiStack(),
             allow_origins=list(allowedOrigins),
@@ -175,6 +176,22 @@ def WrapStackInCors(application: FastAPI, allowedOrigins: Sequence[str]) -> None
     # lower-case: a framework-mandated exception to the MK_Modernization Rule's PascalCase
     # method naming.
     application.build_middleware_stack = BuildCorsWrappedStack
+
+
+def WrapStackInSecurityHeaders(application: FastAPI) -> None:
+    """Make ``application`` build its middleware stack inside ResponseSecurityHeaders.
+
+    Called after WrapStackInCors, it wraps the CORS-wrapped stack, so the headers also reach
+    the preflight answers and the 500 that CORS decorates.
+    """
+    buildInnerStack = application.build_middleware_stack
+
+    def BuildSecurityHeadersWrappedStack() -> ASGIApp:
+        return ResponseSecurityHeaders(buildInnerStack())
+
+    # Starlette calls this exact attribute name, so it stays lower-case: a framework-mandated
+    # exception to the MK_Modernization Rule's PascalCase method naming.
+    application.build_middleware_stack = BuildSecurityHeadersWrappedStack
 
 
 def AddExceptionHandlers(application: FastAPI) -> None:

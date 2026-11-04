@@ -5,7 +5,7 @@ import nextJest from "next/jest.js";
 
 const createJestConfig = nextJest({ dir: "./" });
 
-const jestConfig = {
+const JEST_CONFIG = {
     testEnvironment: "jsdom",
     setupFilesAfterEnv: ["<rootDir>/jest.setup.ts"],
     // The "@/*" -> "src/*" alias of tsconfig.json.
@@ -25,4 +25,4 @@ const jestConfig = {
     moduleFileExtensions: ["ts", "tsx", "js", "mjs", "json"],
 };
 
-export default createJestConfig(jestConfig);
+export default createJestConfig(JEST_CONFIG);

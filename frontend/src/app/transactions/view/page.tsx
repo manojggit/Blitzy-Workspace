@@ -27,6 +27,7 @@ import {
 import { ScreenShell } from "@/components/ScreenShell";
 import { ViewTransaction, type TransactionDetailResponse } from "@/lib/api/transactions";
 import {
+    CutToFieldLength,
     IsCancelledRequest,
     SIGN_ON_ROUTE,
     SeverityForOutcome,
@@ -52,8 +53,6 @@ const TRAN_ID_LABEL = "Enter Tran ID:";
 const TRAN_ID_FIELD = "tran_id";
 // The CDEMO-CT01-TRN-SELECTED key that a CT00 S selection hands over.
 const TRAN_ID_QUERY_KEY = "tranId";
-// The first half of a character that a cut to TRAN_ID_MAX_LENGTH split in two.
-const TRAILING_HIGH_SURROGATE_PATTERN = /[\uD800-\uDBFF]$/;
 // A blank TRNIDINI still reaches COTRN01C, which answers with its empty-key literal.
 const BLANK_TRAN_ID = " ";
 // COBOL SPACES: only blanks make a key empty, so the text itself is never trimmed.
@@ -296,7 +295,7 @@ function IsBlank(text: string): boolean {
 // first 16 characters, as MOVE truncates on the right. A character the cut would split is dropped
 // whole: half of one cannot be encoded into the request path.
 function SelectedTranId(queryValue: string): string {
-    return queryValue.slice(0, TRAN_ID_MAX_LENGTH).replace(TRAILING_HIGH_SURROGATE_PATTERN, "");
+    return CutToFieldLength(queryValue, TRAN_ID_MAX_LENGTH);
 }
 
 // Each value shows as the server sends it: the masked card number, the amount and the stored

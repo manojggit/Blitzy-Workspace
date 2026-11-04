@@ -676,15 +676,15 @@ it("COUSR00C keeps a code at its row across F8, sent beside the user shown there
     await ExpectKeysReady();
     expect(BodyRowTexts()).toEqual(RowTextsOf(OTHER_PAGE_ROWS));
     expect(ShownSelectionCodes()).toEqual(["", "", "U"]);
-    const route = "/admin/users/update?userId=TESTUSRC";
-    mockSelectUsers.mockResolvedValueOnce({ route });
+    const UPDATE_USER_ROUTE = "/admin/users/update?userId=TESTUSRC";
+    mockSelectUsers.mockResolvedValueOnce({ route: UPDATE_USER_ROUTE });
     await TriggerKey(user, "ENTER", "button");
     const expectedRequest: UserSelectionRequest = {
         selections: ExpectedSelections(OTHER_PAGE_ROWS, { rowNumber: KEPT_CODE_ROW, code: "U" }),
         search_user_id: "",
     };
     expect(mockSelectUsers).toHaveBeenCalledWith(expectedRequest);
-    expect(mockRouterPush).toHaveBeenCalledWith(route);
+    expect(mockRouterPush).toHaveBeenCalledWith(UPDATE_USER_ROUTE);
 });
 
 // A refusal or a file error re-sends the screen with every SELnnnn field as it was typed.

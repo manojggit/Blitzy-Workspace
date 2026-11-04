@@ -88,8 +88,8 @@ interface MenuLoadResult {
 // A route replaces the XCTL to the option's program; anything else stays on the menu.
 type SelectionOutcome = { route: string } | { screenMessage: ScreenMessage };
 
-// The thank-you literal once the server has cleared the session cookie; otherwise the failure's
-// message, shown while the session stays signed on.
+// The thank-you literal once Logout resolves, the session cookie cleared or no session left to
+// end; otherwise the failure's message, shown while the session stays signed on.
 type SignOffOutcome = { thankYouMessage: string } | { screenMessage: ScreenMessage };
 
 interface BusyTracker {
@@ -244,7 +244,7 @@ async function HandleSelectOption(actions: MenuActions, optionText: string): Pro
 }
 
 // PF3: XCTL to COSGN00C, which the sign-on page replaces by showing the thank-you literal. The
-// identity is cleared only after the server confirms the sign-off; a failure stays on the menu
+// identity is cleared only after Logout confirms the sign-off; a failure stays on the menu
 // with its message, signed on, so F3 can be pressed again.
 async function HandleSignOff(actions: MenuActions): Promise<void> {
     actions.ShowMessage(NO_MESSAGE);

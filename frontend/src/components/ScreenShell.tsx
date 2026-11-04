@@ -16,6 +16,13 @@ import {
 } from "@mui/material";
 import { createContext, useContext, useSyncExternalStore, type ReactNode } from "react";
 
+import {
+    BUSY_BAR_STYLE,
+    BUSY_SLOT_STYLE,
+    SCREEN_HEADER_DATE_TIME_STYLE,
+    SCREEN_HEADER_ROW_STYLE,
+    SCREEN_HEADER_TITLES_STYLE,
+} from "@/app/theme";
 import { useSession } from "@/lib/session";
 
 // COTTL01Y CCDA-TITLE01 and CCDA-TITLE02 without their X(40) centring blanks: the header layout
@@ -31,36 +38,8 @@ const MILLISECONDS_PER_SECOND = 1000;
 const DATE_PLACEHOLDER = "mm/dd/yy";
 const TIME_PLACEHOLDER = "hh:mm:ss";
 
-// The three header groups (Tran/Prog, titles, Date/Time) share one row and wrap onto further
-// rows on narrow viewports.
-const HEADER_ROW_STYLE: SxProps<Theme> = {
-    width: 1,
-    flexWrap: "wrap",
-    justifyContent: "space-between",
-    alignItems: "center",
-};
-
 // Keeps wrapped header rows off the app bar's top and bottom edges.
 const HEADER_TOOLBAR_STYLE: SxProps<Theme> = { py: 2 };
-
-// The titles take the row space the side groups leave, so they stay centred there, and on a
-// row of their own once the header wraps.
-const APP_TITLE_STYLE: SxProps<Theme> = { flexGrow: 1, alignItems: "center", textAlign: "center" };
-
-// Keeps the Date/Time group, and its lines, at the right edge of whichever row it wraps onto.
-const DATE_TIME_META_STYLE: SxProps<Theme> = { marginLeft: "auto", textAlign: "end" };
-
-// A zero-height slot below the header that sticks to the viewport top: the busy bar overlays the
-// page instead of pushing it down, and stays in view on a scrolled page.
-const BUSY_SLOT_STYLE: SxProps<Theme> = {
-    position: "sticky",
-    top: 0,
-    height: 0,
-    zIndex: "appBar",
-};
-
-// Out of flow inside the slot, across its full width, so showing it never moves the page.
-const BUSY_BAR_STYLE: SxProps<Theme> = { position: "absolute", top: 0, left: 0, right: 0 };
 
 // The 3270 keyboard locked from send to response: while a call runs, every input keeps the
 // cursor but refuses keystrokes. The fields under the shell read the lock through useScreenBusy.
@@ -199,7 +178,7 @@ function SignedInUser() {
 
 function AppTitle() {
     return (
-        <Stack sx={APP_TITLE_STYLE}>
+        <Stack sx={SCREEN_HEADER_TITLES_STYLE}>
             <Typography variant="titleLarge" component="p">
                 {APP_TITLE_LINE_1}
             </Typography>
@@ -216,14 +195,14 @@ function ShellHeader({ transactionId, programName }: ShellHeaderProps) {
     return (
         <AppBar position="static" color="primary">
             <Toolbar sx={HEADER_TOOLBAR_STYLE}>
-                <Stack direction="row" spacing={4} useFlexGap sx={HEADER_ROW_STYLE}>
+                <Stack direction="row" spacing={4} useFlexGap sx={SCREEN_HEADER_ROW_STYLE}>
                     <HeaderMeta lines={[`Tran: ${transactionId}`, `Prog: ${programName}`]}>
                         <SignedInUser />
                     </HeaderMeta>
                     <AppTitle />
                     <HeaderMeta
                         lines={[`Date: ${dateText}`, `Time: ${timeText}`]}
-                        sx={DATE_TIME_META_STYLE}
+                        sx={SCREEN_HEADER_DATE_TIME_STYLE}
                     />
                 </Stack>
             </Toolbar>

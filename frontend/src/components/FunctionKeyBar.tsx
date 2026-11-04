@@ -5,6 +5,7 @@ import { Button, Stack, type ButtonProps } from "@mui/material";
 import ChevronLeft from "@mui/icons-material/ChevronLeft";
 import ChevronRight from "@mui/icons-material/ChevronRight";
 import type { MouseEvent } from "react";
+import { WRAPPING_ROW_STYLE } from "@/app/theme";
 import type { FunctionKeyDefinition, PfKey } from "@/lib/useFunctionKeys";
 
 export interface FunctionKeyBarProps {
@@ -90,7 +91,7 @@ export function FunctionKeyBar(props: FunctionKeyBarProps) {
             direction="row"
             spacing={2}
             useFlexGap
-            sx={{ flexWrap: "wrap" }}
+            sx={WRAPPING_ROW_STYLE}
             role="group"
             aria-label="Function keys"
         >

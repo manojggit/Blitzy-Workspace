@@ -70,7 +70,7 @@ const mockRouter = {
 };
 // COBIL00C reads no query parameter, so the search parameters stay empty.
 const mockSearchParams = new URLSearchParams();
-const mockPathname = "/billpay";
+const MOCK_PATHNAME = "/billpay";
 
 // The session user carries an ID and names only; type U is a regular user (COMEN01C tree).
 const mockSessionValue: SessionContextValue = {
@@ -88,7 +88,7 @@ const mockSessionValue: SessionContextValue = {
 
 jest.mock("next/navigation", () => ({
     useRouter: () => mockRouter,
-    usePathname: () => mockPathname,
+    usePathname: () => MOCK_PATHNAME,
     useSearchParams: () => mockSearchParams,
 }));
 
@@ -643,7 +643,7 @@ it("COBIL00C keyboard lock: nothing is keyed while PayBill runs", async () => {
 
 // F4 cannot clear while the call runs, so a late answer never repaints a cleared screen; the
 // cursor goes to the field the error names once the keyboard unlocks.
-it("COBIL00C PF4 is locked while PayBill runs, so its answer applies to the screen sent", async () => {
+it("COBIL00C PF4 is locked during PayBill, so its answer applies to the screen sent", async () => {
     const user = RenderScreen();
     await ShowConfirmPrompt(user);
     const pendingPayBill = DeferPayBill();
@@ -720,8 +720,8 @@ it.each(["N", "n"])(
     async (answer) => {
         const user = RenderScreen();
         await ShowConfirmPrompt(user);
-        const cleared = { current_balance: null, message: "", cursor_field: "acct_id" };
-        mockPayBill.mockResolvedValue(BuildBillPayResponse(cleared));
+        const CLEARED_RESPONSE = { current_balance: null, message: "", cursor_field: "acct_id" };
+        mockPayBill.mockResolvedValue(BuildBillPayResponse(CLEARED_RESPONSE));
         await KeyInto(user, "confirm", answer);
         await UseMapKey(user, "ENTER", "button");
         await waitFor(() => {

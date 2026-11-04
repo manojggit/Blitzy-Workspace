@@ -87,8 +87,8 @@ function AttachmentOf(fileName: string): string {
 }
 
 function LegacyAnswer(status: number, feedback: CompleteScreenFeedback): ExportAnswer {
-    const headers = { "content-type": "application/json" };
-    return { status, headers, body: JSON.stringify(feedback) };
+    const JSON_CONTENT_HEADERS = { "content-type": "application/json" };
+    return { status, headers: JSON_CONTENT_HEADERS, body: JSON.stringify(feedback) };
 }
 
 // The body bytes as a browser receives them: UTF-8, in this realm's own ArrayBuffer.

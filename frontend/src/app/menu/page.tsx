@@ -379,7 +379,7 @@ async function SubmitOption(context: MenuActionContext, optionText: string): Pro
     });
 }
 
-// PF3: XCTL to COSGN00C. The sign-on page shows the thank-you literal the server answers with.
+// PF3: XCTL to COSGN00C. The sign-on page shows the thank-you literal Logout resolves with.
 async function SignOff(context: MenuActionContext): Promise<void> {
     await RunScreenCall(context.callContext, async () => {
         const response = await Logout();

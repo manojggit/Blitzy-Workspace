@@ -261,7 +261,7 @@ describe("SelectionTable keyboard", () => {
         PressOnClosedField,
     );
 
-    it("COCRDLI CRDSEL1 Enter in the open menu picks the highlighted code and closes it", async () => {
+    it("COCRDLI CRDSEL1 Enter in the menu picks the highlighted code and closes it", async () => {
         const user = userEvent.setup();
         const onSelectionChange = RenderTable(COCRDLI_CASE);
         await TabToFirstSelectionField(user, COCRDLI_CASE);

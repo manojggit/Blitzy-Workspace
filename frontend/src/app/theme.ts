@@ -14,8 +14,9 @@ import {
 import type { M3ShapeScale } from "@/theme/m3";
 
 /**
- * Material Design 3 baseline colour roles. They replace the 3270 COLOR attributes of the BMS
- * maps and are the only colour values in the frontend.
+ * Material Design 3 baseline colour roles: the application theme's colour source, replacing the
+ * 3270 COLOR attributes of the BMS maps. The static public/favicon.svg repeats primary and
+ * onPrimary because an asset cannot import them.
  */
 export const M3_COLOR_TOKENS = {
     primary: "#6750A4",
@@ -741,9 +742,9 @@ function ErrorIconRoomStyle(theme: StyleTheme): CSSObject {
  * field swaps its trailing icon for the error icon, so the Select keeps its width.
  */
 function OutlinedErrorIconStyle(theme: StyleTheme): CSSObject {
-    const centred = { top: "50%", transform: "translateY(-50%)" };
+    const CENTRED_ICON_POSITION = { top: "50%", transform: "translateY(-50%)" };
     return {
-        "&::after": ErrorIconStyle(theme, centred),
+        "&::after": ErrorIconStyle(theme, CENTRED_ICON_POSITION),
         "&.Mui-disabled::after": DisabledErrorIconColourStyle(theme),
         "&.MuiSelect-root::after": { right: theme.spacing(SELECT_ICON_INSET_UNITS) },
         "&.MuiSelect-root .MuiSelect-icon": { display: "none" },
@@ -1258,3 +1259,106 @@ export function FixedLayoutTableStyle(minWidthUnits: number): SxProps<Theme> {
         [TABLE_CELL_SELECTOR]: { overflowWrap: "anywhere" },
     };
 }
+
+/**
+ * The screen header's one row of three groups (Tran/Prog, the titles, Date/Time), as an sx style:
+ * the groups spread across the toolbar's full width, centred on one another, and wrap onto further
+ * rows on narrow viewports.
+ */
+export const SCREEN_HEADER_ROW_STYLE: SxProps<Theme> = {
+    width: 1,
+    flexWrap: "wrap",
+    justifyContent: "space-between",
+    alignItems: "center",
+};
+
+/**
+ * The screen header's titles, as an sx style: they take the row space the side groups leave, so
+ * they stay centred there, and on a row of their own once the header wraps.
+ */
+export const SCREEN_HEADER_TITLES_STYLE: SxProps<Theme> = {
+    flexGrow: 1,
+    alignItems: "center",
+    textAlign: "center",
+};
+
+/**
+ * The screen header's Date/Time group, as an sx style: the group and its lines keep to the right
+ * edge of whichever row it wraps onto.
+ */
+export const SCREEN_HEADER_DATE_TIME_STYLE: SxProps<Theme> = {
+    marginLeft: "auto",
+    textAlign: "end",
+};
+
+/**
+ * The zero-height slot below the screen header, as an sx style: it sticks to the viewport top above
+ * the page, so the busy bar inside it overlays the page instead of pushing it down, and stays in
+ * view on a scrolled page.
+ */
+export const BUSY_SLOT_STYLE: SxProps<Theme> = {
+    position: "sticky",
+    top: 0,
+    height: 0,
+    zIndex: "appBar",
+};
+
+/**
+ * The busy bar, as an sx style: out of flow inside its slot, across the slot's full width, so
+ * showing it never moves the page.
+ */
+export const BUSY_BAR_STYLE: SxProps<Theme> = { position: "absolute", top: 0, left: 0, right: 0 };
+
+// The browser keeps whole-pixel scroll offsets, so a line revealed from above the viewport could
+// keep a sliver of its top edge outside it. A scroll margin of one theme spacing unit (4 dp) on
+// the top edge, which only scrolling reads, keeps the whole line inside. The bottom edge carries
+// none: a shown line whose place is below the fold is stuck flush to the viewport bottom, so a
+// bottom margin would scroll the page by its width on every reveal while the line stays stuck.
+const REVEAL_SCROLL_MARGIN_UNITS = 1;
+
+/**
+ * The message line, as an sx style. A shown line sticks to the viewport bottom while its place in
+ * the layout is below the fold, so the outcome of the key just pressed is in view however the page
+ * is scrolled, as the 3270 showed the whole map after every key. It stacks above the fields'
+ * outlined labels and below menus and dialogs. The paper background, the screen frame's own, keeps
+ * scrolled content from showing through the Alerts' rounded corners and the gap between the two
+ * lines. Its top edge carries the reveal scroll margin.
+ */
+export const MESSAGE_LINE_STYLE: SxProps<Theme> = {
+    position: "sticky",
+    bottom: 0,
+    zIndex: "mobileStepper",
+    bgcolor: "background.paper",
+    scrollMarginTop: (theme) => theme.spacing(REVEAL_SCROLL_MARGIN_UNITS),
+};
+
+/**
+ * A flex row whose items wrap onto further rows where the viewport is too narrow to hold them side
+ * by side, as an sx style.
+ */
+export const WRAPPING_ROW_STYLE: SxProps<Theme> = { flexWrap: "wrap" };
+
+/**
+ * A flex or grid row whose items are centred on one another across the row, as an sx style: a
+ * field sits level with the text, separator or field beside it.
+ */
+export const CENTRE_ALIGNED_ROW_STYLE: SxProps<Theme> = { alignItems: "center" };
+
+/**
+ * A column whose items keep their intrinsic width at its start edge rather than stretch across the
+ * screen, as an sx style.
+ */
+export const START_ALIGNED_COLUMN_STYLE: SxProps<Theme> = { alignItems: "flex-start" };
+
+/** Text centred in its box, as an sx style. */
+export const CENTRED_TEXT_STYLE: SxProps<Theme> = { textAlign: "center" };
+
+/**
+ * The parts of a report title line, as an sx style: side by side, 8 theme spacing units (32 px)
+ * apart, and wrapping on a narrow screen with 1 unit (4 px) between the rows.
+ */
+export const REPORT_TITLE_SEGMENTS_STYLE: SxProps<Theme> = {
+    flexWrap: "wrap",
+    columnGap: 8,
+    rowGap: 1,
+};

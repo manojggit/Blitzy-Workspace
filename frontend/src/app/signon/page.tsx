@@ -26,6 +26,7 @@ import {
     type SetStateAction,
 } from "react";
 
+import { START_ALIGNED_COLUMN_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
@@ -205,8 +206,9 @@ function FeedbackFromError(error: unknown): SignOnFeedback {
 }
 
 // Logs out the session a refused login opened; neither its thank-you literal nor its failure is
-// shown. True once the server has confirmed the logout. An axios failure gives false: the cookie
-// the server never cleared may still be valid. Anything else is a defect and propagates.
+// shown. True once Logout resolves: the server cleared the cookie, or found no session left to
+// end. An axios failure gives false: the cookie the server never cleared may still be valid.
+// Anything else is a defect and propagates.
 async function EndRefusedSession(): Promise<boolean> {
     try {
         await Logout();
@@ -267,8 +269,8 @@ async function SubmitSignOn(context: SignOnContext): Promise<void> {
     }
 }
 
-// F3 sign-off. The server's CSMSG01Y thank-you literal replaces SEND-PLAIN-TEXT, and the session
-// context forgets the signed-off user.
+// F3 sign-off. The CSMSG01Y thank-you literal Logout resolves with replaces SEND-PLAIN-TEXT, and
+// the session context forgets the signed-off user.
 async function SubmitExit(context: SignOnContext): Promise<void> {
     const { form } = context;
     form.SetThankYouText("");
@@ -433,7 +435,7 @@ function CredentialField(props: CredentialFieldProps) {
 // The fields keep their intrinsic width rather than stretching across the screen.
 function CredentialFields({ form }: SignOnFormProps) {
     return (
-        <Stack spacing={4} sx={{ alignItems: "flex-start" }}>
+        <Stack spacing={4} sx={START_ALIGNED_COLUMN_STYLE}>
             {FIELD_DEFINITIONS.map((definition) => (
                 <CredentialField
                     key={definition.name}

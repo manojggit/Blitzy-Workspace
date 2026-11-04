@@ -2,7 +2,7 @@
 // COCOM01Y, COTTL01Y, CSDAT01Y, CSMSG01Y
 "use client";
 
-import { Box, Grid, TextField, Typography, type SxProps, type Theme } from "@mui/material";
+import { Box, Grid, TextField, Typography } from "@mui/material";
 import axios from "axios";
 import { useRouter } from "next/navigation";
 import {
@@ -17,7 +17,7 @@ import {
     type SetStateAction,
 } from "react";
 
-import { VISUALLY_HIDDEN_STYLE } from "@/app/theme";
+import { CENTRE_ALIGNED_ROW_STYLE, VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
@@ -105,9 +105,6 @@ const RESULT_STATUS_ROWS = "transactions";
 const RESULT_STATUS_NO_ROWS = "no transactions";
 const RESULT_STATUS_RANGE_SEPARATOR = " to ";
 const NO_RESULT_STATUS = "";
-
-// The search field and the page number share one row, centred on each other.
-const SEARCH_ROW_STYLE: SxProps<Theme> = { alignItems: "center" };
 
 type SelectionCodes = Readonly<Record<string, string>>;
 
@@ -702,9 +699,10 @@ function ResultStatus({ view }: ListViewProps) {
     );
 }
 
+// The search field and the page number share one row, centred on each other.
 function SearchBar({ view }: ListViewProps) {
     return (
-        <Grid container spacing={4} sx={SEARCH_ROW_STYLE}>
+        <Grid container spacing={4} sx={CENTRE_ALIGNED_ROW_STYLE}>
             <Grid size={{ xs: 12, md: 6 }}>
                 <SearchField view={view} />
             </Grid>

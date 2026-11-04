@@ -36,7 +36,7 @@ jest.mock("next/navigation", () => ({
 }));
 
 // CU01 is reached from the admin menu (COADM01C), so the session user has type A.
-const mockCurrentUser: CurrentUserResponse = {
+const MOCK_CURRENT_USER: CurrentUserResponse = {
     user_id: "TESTADM1",
     user_type: "A",
     first_name: "Test",
@@ -48,7 +48,7 @@ const mockCurrentUser: CurrentUserResponse = {
 jest.mock("@/lib/session", () => ({
     SessionProvider: ({ children }: { children: ReactNode }) => children,
     useSession: () => ({
-        currentUser: mockCurrentUser,
+        currentUser: MOCK_CURRENT_USER,
         isLoading: false,
         RefreshSession: jest.fn(),
         ClearSession: jest.fn(),
@@ -446,7 +446,7 @@ function ExpectFieldsReadOnly(isReadOnly: boolean): void {
 // The 3270 keyboard locked from send to response: the cursor stays in USRTYPE, where it was
 // keyed, and no field takes keystrokes until the add answers.
 describe("COUSR01C fields while the write is in flight on /admin/users/add", () => {
-    it("COUSR01C Add User by pointer keeps the cursor in USRTYPE and locks every field", async () => {
+    it("COUSR01C Add User by pointer keeps the cursor in USRTYPE, locks every field", async () => {
         const settleAdd = DeferAddUser();
         const user = RenderScreen();
         await FillUser(user, KEYED_USER);

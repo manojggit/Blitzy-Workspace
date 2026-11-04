@@ -8,9 +8,7 @@ import {
     TextField,
     Typography,
     type GridProps,
-    type SxProps,
     type TextFieldProps,
-    type Theme,
 } from "@mui/material";
 import axios from "axios";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -28,6 +26,7 @@ import {
     type SetStateAction,
 } from "react";
 
+import { CENTRE_ALIGNED_ROW_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
@@ -41,6 +40,7 @@ import {
     type CardUpdateRequest,
 } from "@/lib/api/cards";
 import {
+    CutToFieldLength,
     IsCancelledRequest,
     LegacyErrorBody,
     SeverityForOutcome,
@@ -84,8 +84,6 @@ const EXPIRY_LABEL_SPACING = 2;
 const EXPIRY_PART_SPACING = 2;
 const EDITABLE_FIELD_KEY = "editable";
 const PROTECTED_FIELD_KEY = "protected";
-// The month and year fields sit level with the separator between them.
-const EXPIRY_ROW_STYLE: SxProps<Theme> = { alignItems: "center" };
 // Every CR and LF, which an <input type="text"> strips from its value.
 const LINE_BREAK_PATTERN = /[\r\n]/g;
 // A multiline field is one native textarea row, which wraps a value wider than the field.
@@ -113,11 +111,13 @@ interface CardFieldDefinition {
 
 const ACCT_ID_FIELD: CardFieldName = "acct_id";
 const CARD_NUM_FIELD: CardFieldName = "card_num";
+// The ACCTSID LENGTH.
+const ACCT_ID_MAX_LENGTH = 11;
 
 // The COCRDUP DFHMDF labels (INITIAL, trailing blank dropped) and LENGTHs. EXPMON and EXPYEAR
 // have no INITIAL of their own: under the Expiry Date label they are Month and Year, as on COCRDSL.
 const CARD_UPDATE_FIELDS: Readonly<Record<RenderedFieldName, CardFieldDefinition>> = Object.freeze({
-    acct_id: { name: "acct_id", label: "Account Number    :", maxLength: 11 },
+    acct_id: { name: "acct_id", label: "Account Number    :", maxLength: ACCT_ID_MAX_LENGTH },
     card_num: { name: "card_num", label: "Card Number       :", maxLength: 16 },
     embossed_name: {
         name: "embossed_name",
@@ -179,9 +179,11 @@ const EDITABLE_FIELDS_BY_STATE: Readonly<Record<UpdateScreenState, readonly Card
         [UpdateScreenState.CHANGES_FAILED]: KEY_FIELD_NAMES,
     });
 
-// What the COMMAREA kept between two CCUP tasks: the CCUP-CHANGE-ACTION state, the encrypted
-// screen_token and card_ref the server sends back unchanged, and the map fields as last shown
-// or keyed. It lives in React state only; neither token is ever stored, decoded or logged.
+// What the COMMAREA kept between two CCUP tasks: the CCUP-CHANGE-ACTION state, the latest
+// encrypted screen_token and card_ref the server issued (no card_ref while no card is held), and
+// the map fields as last shown or keyed. It lives in React state only; neither token is ever
+// stored, decoded or logged. The page echoes each token unchanged on the next request that uses
+// it and replaces it from each response that carries one.
 interface CardUpdateModel {
     state: UpdateScreenState;
     screenToken: string;
@@ -566,7 +568,7 @@ function FocusCursorField(inputs: InputRefMap, cursorField: string): void {
 function useEntryKeys(): EntryKeys {
     const searchParams = useSearchParams();
     const cardRef = searchParams.get(CARD_REF_QUERY_KEY) || null;
-    const acctId = searchParams.get(ACCT_ID_QUERY_KEY) ?? "";
+    const acctId = CutToFieldLength(searchParams.get(ACCT_ID_QUERY_KEY) ?? "", ACCT_ID_MAX_LENGTH);
     return useMemo(() => ({ cardRef, acctId }), [cardRef, acctId]);
 }
 
@@ -822,13 +824,13 @@ function ExpiryDateGroup({ view }: FieldSectionProps) {
 }
 
 // EXPMON, the "/" literal and EXPYEAR, announced together under the Expiry Date label; the
-// literal is only a visual separator.
+// literal is only a visual separator, and the month and year fields sit level with it.
 function ExpiryParts({ labelId, view }: ExpiryPartsProps) {
     return (
         <Stack
             direction="row"
             spacing={EXPIRY_PART_SPACING}
-            sx={EXPIRY_ROW_STYLE}
+            sx={CENTRE_ALIGNED_ROW_STYLE}
             role="group"
             aria-labelledby={labelId}
         >
@@ -877,7 +879,7 @@ function CardUpdateScreen() {
 }
 
 // Each arrival with another selection is a fresh COCRDUPC first entry, as every XCTL is, so the
-// model and screen_token start over and the pending entry fetch is abandoned when the query
+// model and screen_token start over and the pending entry fetch is abandoned when the selection
 // changes; a write already sent still ends, and its answer reaches no later screen.
 function CardUpdateEntry() {
     const { cardRef, acctId } = useEntryKeys();

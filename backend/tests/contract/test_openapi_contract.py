@@ -53,6 +53,9 @@ LEGACY_ERROR_KEYS = frozenset({"message", "info_message", "field_errors", "curso
 JSON_MEDIA_TYPE = "application/json"
 HTTP_METHODS = frozenset({"get", "put", "post", "delete", "patch"})
 HTTP_OK = 200
+# The one public /api/v1 operation: every other one needs the session cookie and declares its 401.
+SIGN_ON_OPERATION = ("POST", API_V1_PREFIX + "/auth/login")
+SESSION_REFUSAL_STATUS = "401"
 # The function-scoped fixtures are shared by every example of the run, the database calls make a
 # per-example deadline meaningless, and no example database is written into the source tree.
 CONTRACT_SETTINGS = settings(
@@ -235,6 +238,16 @@ def LegacyErrorViolations(document: dict[str, Any]) -> list[str]:
     return violations
 
 
+def OperationsWithoutSessionRefusal(document: dict[str, Any]) -> list[str]:
+    """Return "<METHOD> <path>" for each /api/v1 operation but sign-on that declares no 401."""
+    return [
+        f"{methodName} {path}"
+        for methodName, path, operation in ApiOperations(document)
+        if (methodName, path) != SIGN_ON_OPERATION
+        and SESSION_REFUSAL_STATUS not in operation.get("responses", {})
+    ]
+
+
 async def FetchDocument(client: httpx.AsyncClient) -> dict[str, Any]:
     """Return the served OpenAPI document; /openapi.json must answer 200 under APP_ENV=test."""
     response = await client.get(OPENAPI_PATH)
@@ -266,3 +279,10 @@ async def test_openapi_document_lists_every_transaction_operation(
 async def test_legacy_error_statuses_use_legacy_error_model(apiClient: httpx.AsyncClient) -> None:
     document = await FetchDocument(apiClient)
     assert LegacyErrorViolations(document) == []
+
+
+async def test_every_operation_but_sign_on_declares_the_session_refusal(
+    apiClient: httpx.AsyncClient,
+) -> None:
+    document = await FetchDocument(apiClient)
+    assert OperationsWithoutSessionRefusal(document) == []
