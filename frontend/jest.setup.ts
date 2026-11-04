@@ -12,6 +12,11 @@ if (typeof globalThis.TextDecoder === "undefined") {
     });
 }
 
+// Suites that select the node environment with a @jest-environment docblock (for example
+// sourceReferences.test.ts, which reads files only) have no window or Element, so the DOM
+// stubs below are installed only where those globals exist.
+const HAS_DOM = typeof window !== "undefined" && typeof Element !== "undefined";
+
 // jsdom implements no window.matchMedia, yet MUI useMediaQuery and the responsive layout
 // components call it on render. The stub reports that no media query matches.
 function CreateMediaQueryListStub(query: string): MediaQueryList {
@@ -27,7 +32,7 @@ function CreateMediaQueryListStub(query: string): MediaQueryList {
     };
 }
 
-if (typeof window.matchMedia === "undefined") {
+if (HAS_DOM && typeof window.matchMedia === "undefined") {
     Object.defineProperty(window, "matchMedia", {
         writable: true,
         value: CreateMediaQueryListStub,
@@ -36,7 +41,7 @@ if (typeof window.matchMedia === "undefined") {
 
 // jsdom implements no Element.scrollIntoView, which MessageLine calls to bring each new outcome
 // into view. jsdom lays nothing out, so the stub scrolls nothing; suites can spy on it.
-if (typeof Element.prototype.scrollIntoView === "undefined") {
+if (HAS_DOM && typeof Element.prototype.scrollIntoView === "undefined") {
     Object.defineProperty(Element.prototype, "scrollIntoView", {
         writable: true,
         value: () => undefined,
