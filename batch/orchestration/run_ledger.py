@@ -11,8 +11,11 @@ Commit points (Section 0.7.2):
 
 - StartRun commits the RUNNING row in its own transaction before the step starts.
 - FinishRun writes the final run status and the step state on the caller's connection, so both
-  commit together: inside the step's own transaction for atomic steps (FinishAtomicRun), and
-  after the step's last write for per-write and files-only steps (FinishIfRunning).
+  commit together. Atomic steps finish with FinishAtomicRun inside their own transaction. The
+  per-write producers POSTTRAN and INTCALC finish with FinishAtomicRun in their final
+  transaction, after their last posting write and before the generation's COMMITTED row, so
+  that row stays the step's final database write. The files-only CREASTMT finishes with
+  FinishIfRunning, in its own transaction, once its files are in place.
 - RecordFailure commits FAILED in its own transaction after the failure, for a run still RUNNING
   and its step together. A run already COMPLETED, or otherwise no longer RUNNING, keeps its
   status and its step its state, so a committed completion is never overwritten FAILED.
@@ -378,8 +381,10 @@ def FinishAtomicRun(connection: Connection, context: JobContext, result: JobResu
 def FinishIfRunning(context: JobContext, result: JobResult) -> bool:
     """Finish the run in its own transaction if it is still RUNNING; return whether it did.
 
-    Called after the last write of a per-write step, after a files-only step, and for an atomic
-    runner that committed without FinishAtomicRun.
+    The files-only CREASTMT calls it once its files are in place, and it also finishes the run
+    of a runner that committed without FinishAtomicRun. batch_chain calls it after every runner;
+    for a run its runner already finished, as atomic steps and the per-write producers do with
+    FinishAtomicRun and CREASTMT with this call, it changes nothing.
     """
     if not context.IsLedgered():
         return False

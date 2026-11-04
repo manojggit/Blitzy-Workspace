@@ -215,7 +215,6 @@ class TransactionRepository:
             raise FileIoError(TRANSACTION_FILE_NAME) from exc
 
     async def _FetchRecords(self, statement: Executable) -> list[dict[str, Any]]:
-        """Run a read on the request session and return every row as a record dictionary."""
         result = await self._Execute(self.context.session, statement)
         return [dict(row) for row in result.mappings().all()]
 

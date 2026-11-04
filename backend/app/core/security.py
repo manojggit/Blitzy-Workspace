@@ -14,8 +14,8 @@ COMMAREA screen state. Specified in the Technical Specification, Section 0.7.1.
   before-image and validated new values that the CAUP and CCUP COMMAREA held between screens.
 - Masking: PAN as twelve asterisks plus the last four, SSN as ***-**- plus the last four.
 
-Every function is pure: importing this module reads no setting and no environment variable,
-and callers pass the Settings (or the bcrypt rounds) in. Batch loaders, the sample seed and
+Importing this module reads no setting and no environment variable: callers pass the Settings
+(or the bcrypt rounds) to each function that uses them. Batch loaders, the sample seed and
 Alembic revision 0002 therefore call HashPassword with no SECRET_KEY configured.
 """
 

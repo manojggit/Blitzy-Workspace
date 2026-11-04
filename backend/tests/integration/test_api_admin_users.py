@@ -42,7 +42,6 @@ from app.services.users.cousr00c import PAGE_SIZE
 # the MK_Modernization upper-case constant form.
 pytestmark = pytest.mark.usefixtures("restoreSeedState")
 
-# --- Endpoints -----------------------------------------------------------------------------------
 USERS_URL = "/api/v1/admin/users"
 SELECTION_URL = USERS_URL + "/selection"
 LOGIN_URL = "/api/v1/auth/login"
@@ -63,7 +62,6 @@ LEGACY_ERROR_KEYS = frozenset({"message", "info_message", "field_errors", "curso
 # The JSON key fragments no CU02 response may carry.
 SECRET_KEY_FRAGMENTS = ("password", "hash")
 
-# --- Users ---------------------------------------------------------------------------------------
 # A seeded regular user of data/EBCDIC/AWS.M2.CARDDEMO.USRSEC.PS, used as a key only.
 SEED_REGULAR_USER_ID = "USER0001"
 SEED_ADMIN_USER_ID = "ADMIN001"
@@ -84,7 +82,6 @@ GUARDED_NAME = "Guarded"
 # The user types COUSR01C accepts although only A signs on as an admin.
 UNRESTRICTED_USER_TYPES = ("Z", "u")
 
-# --- CU00 (COUSR00C) -----------------------------------------------------------------------------
 EBCDIC_CODEC = "cp037"
 FORWARD_DIRECTION = "forward"
 BACKWARD_DIRECTION = "backward"
@@ -144,7 +141,6 @@ CONTROL_BASE_URL = "http://cu00-control.invalid"
 CONTROL_STORED_USER_COUNT = 25
 CONTROL_KEY_TEMPLATE = "K{rowNumber:07d}"
 
-# --- CU01 (COUSR01C) -----------------------------------------------------------------------------
 # cbl/COUSR01C.cbl lines 120-144, in source order: (request field and cursor, literal).
 REQUIRED_ADD_MESSAGES = (
     ("first_name", "First Name can NOT be empty..."),
@@ -159,7 +155,6 @@ USER_ADDED_TEMPLATE = "User {userId} has been added ..."
 USER_ID_EXISTS_MESSAGE = "User ID already exist..."
 CREDENTIAL_EMPTY_MESSAGE = "Password can NOT be empty..."
 
-# --- CU02 (COUSR02C) -----------------------------------------------------------------------------
 # cbl/COUSR02C.cbl lines 182-206 without the password check (lines 198-203), which hashing
 # makes unreachable: (blanked field and cursor, literal), in source order.
 REQUIRED_UPDATE_MESSAGES = (
@@ -175,12 +170,10 @@ PRESS_PF5_TO_SAVE_MESSAGE = "Press PF5 key to save your updates ..."
 USER_ID_NOT_FOUND_MESSAGE = "User ID NOT found..."
 USER_UPDATED_TEMPLATE = "User {userId} has been updated ..."
 
-# --- CU03 (COUSR03C) -----------------------------------------------------------------------------
 # cbl/COUSR03C.cbl lines 283 and 318-320.
 PRESS_PF5_TO_DELETE_MESSAGE = "Press PF5 key to delete this user ..."
 USER_DELETED_TEMPLATE = "User {userId} has been deleted ..."
 
-# --- Sign-on (COSGN00C) and guards ---------------------------------------------------------------
 # cbl/COSGN00C.cbl sign-on literals, with the field each puts the cursor on.
 SIGN_ON_USER_NOT_FOUND_MESSAGE = "User not found. Try again ..."
 WRONG_CREDENTIAL_MESSAGE = "Wrong Password. Try again ..."
@@ -197,7 +190,6 @@ FOREIGN_ORIGIN = "http://localhost:3000"
 MISSING_ORIGIN = None
 ORIGIN_HEADER = "Origin"
 
-# --- SQL: values are always bound ----------------------------------------------------------------
 SELECT_USER_IDS_SQL = text("SELECT user_id FROM security.users")
 SELECT_USER_SQL = text(
     "SELECT user_id, first_name, last_name, password_hash, user_type"
@@ -209,7 +201,6 @@ SELECT_ALL_USERS_SQL = text(
 )
 
 
-# --- Value objects -------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class NewUser:
     """A COUSR01 add-screen entry, each field as keyed; repr hides the password."""
@@ -315,7 +306,6 @@ SEARCHED_INVALID_SELECTION_CASES = (
 )
 
 
-# --- Generated values ----------------------------------------------------------------------------
 def NewUserId() -> str:
     """Return a generated 7-character upper-case user ID that no seed or fixture user has."""
     return GENERATED_USER_ID_PREFIX + secrets.token_hex(USER_ID_HEX_BYTES).upper()
@@ -361,7 +351,6 @@ def UserIdsFrom(orderedIds: Iterable[str], searchUserId: str) -> list[str]:
     return [userId for userId in orderedIds if userId.encode(EBCDIC_CODEC) >= searchKey]
 
 
-# --- Database reads (security.users, through the test database's psycopg2 engine) ---------------
 def ReadStoredUserIds(syncEngine: Engine) -> list[str]:
     """Return every user ID in security.users, in no particular order."""
     with syncEngine.connect() as connection:
@@ -381,7 +370,6 @@ def ReadAllStoredUsers(syncEngine: Engine) -> list[tuple[Any, ...]]:
         return [tuple(storedRow) for storedRow in connection.execute(SELECT_ALL_USERS_SQL)]
 
 
-# --- Assertions ----------------------------------------------------------------------------------
 def AssertLegacyError(
     response: httpx.Response, status: int, message: str, cursorField: str = ""
 ) -> None:
@@ -442,7 +430,6 @@ def AssertSearchedPage(
     assert [row["user_id"] for row in body["rows"]] == pageIds
 
 
-# --- Requests ------------------------------------------------------------------------------------
 async def AddUser(client: httpx.AsyncClient, request: NewUser) -> httpx.Response:
     """Send ``request`` to CU01's ENTER, POST /admin/users."""
     return await client.post(USERS_URL, json=request.RequestBody())
@@ -575,7 +562,6 @@ async def ReadAllPages(client: httpx.AsyncClient, storedUserCount: int) -> list[
     return pages
 
 
-# --- Page-walk controls: a scripted CU00 over httpx.MockTransport, with no database ----------
 @dataclass
 class ScriptedUserList:
     """A MockTransport handler answering request n with ``answer(n)``, counting the requests."""
@@ -684,7 +670,6 @@ async def SendWithOrigin(
     return await client.send(request)
 
 
-# --- Fixtures ------------------------------------------------------------------------------------
 @pytest.fixture(name="harness")
 def HarnessFixture(
     adminClient: httpx.AsyncClient,
@@ -701,7 +686,6 @@ def HarnessFixture(
     )
 
 
-# --- CU00: COUSR00C user list --------------------------------------------------------------------
 async def test_cu00_pages_list_every_user_in_ebcdic_key_order(
     adminClient: httpx.AsyncClient, syncEngine: Engine
 ) -> None:
@@ -848,7 +832,6 @@ async def test_cu00_invalid_selection_with_a_search_browses_from_the_search_key(
     AssertSearchedPage(response.json(), case, keyedIds[:PAGE_SIZE])
 
 
-# --- CU01: COUSR01C add user ---------------------------------------------------------------------
 @pytest.mark.parametrize(("blankField", "expectedMessage"), REQUIRED_ADD_MESSAGES)
 async def test_cu01_first_blank_field_in_source_order_ends_validation(
     adminClient: httpx.AsyncClient, syncEngine: Engine, blankField: str, expectedMessage: str
@@ -894,7 +877,6 @@ async def test_cu01_lower_case_password_is_hashed_as_entered_and_never_signs_on(
 
 
 async def test_cu01_upper_case_password_signs_on(harness: UserAdminHarness) -> None:
-    """A user added with an upper-case password signs on with it."""
     entry = NewUserEntry(NewUserId())
     AssertAdded(await AddUser(harness.adminClient, entry), entry.userId)
     signOnResponse = await SignOn(harness.anonymousClient, entry.userId, entry.password)
@@ -922,7 +904,6 @@ async def test_cu01_user_id_beyond_bms_length_is_malformed(
     assert ReadStoredUser(syncEngine, overlongUserId) is None
 
 
-# --- CU02: COUSR02C update user ------------------------------------------------------------------
 async def test_cu02_fetch_shows_the_user_with_the_save_prompt(harness: UserAdminHarness) -> None:
     """ENTER on COUSR02 shows the stored fields and the PF5 prompt, never a password or hash."""
     user = harness.createUser(REGULAR_USER_TYPE)
@@ -1001,7 +982,6 @@ async def test_cu02_new_password_replaces_the_hash(harness: UserAdminHarness) ->
 
 
 async def test_cu02_responses_never_expose_passwords_or_hashes(harness: UserAdminHarness) -> None:
-    """No fetch, update or no-change response carries either password or either hash."""
     user = harness.createUser(REGULAR_USER_TYPE)
     storedBefore = ReadStoredUser(harness.syncEngine, user.userId)
     newPassword = NewPassword()
@@ -1052,7 +1032,6 @@ async def test_cu02_update_refuses_blank_and_unknown_user_ids(
     assert ReadAllStoredUsers(syncEngine) == usersBefore
 
 
-# --- CU03: COUSR03C delete user ------------------------------------------------------------------
 async def test_cu03_fetch_shows_the_user_with_the_delete_prompt(harness: UserAdminHarness) -> None:
     """ENTER on COUSR03 shows the stored fields and the PF5 delete prompt, nothing deleted."""
     user = harness.createUser(REGULAR_USER_TYPE)
@@ -1096,7 +1075,6 @@ async def test_cu03_deleted_user_session_holds_for_its_lifetime(
     )
 
 
-# --- Guards: admin role, session cookie and CSRF origin ------------------------------------------
 @pytest.mark.parametrize("endpoint", ALL_ENDPOINTS)
 async def test_regular_user_is_refused_every_endpoint(
     regularClient: httpx.AsyncClient, syncEngine: Engine, endpoint: Endpoint

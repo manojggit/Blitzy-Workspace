@@ -4,7 +4,9 @@ Replaces: VSAM ACCTDAT (AWS.M2.CARDDEMO.ACCTDATA.VSAM.KSDS, key ACCT-ID 9(11)); 
 CVACT01Y; used by COACTVWC (CAVW), COACTUPC (CAUP), COBIL00C (CB00); a batch-window file
 (CLOSEFIL).
 
-The CSD defines ACCTDAT with KEYS(11 0) and no alternate index, so the only access path is the
+The CSD binds CICS file ACCTDAT to that cluster. The IDCAMS DEFINE CLUSTER in jcl/ACCTFILE.jcl
+gives it KEYS(11 0) (line 40), the catalog (catlg/LISTCAT.txt) records KEYLEN 11 and RKP 0, and
+neither names an alternate index for it, so the only access path is the
 11-character ``acct_id`` primary key of ``accounts.accounts``. Records are returned as plain
 dictionaries keyed by column name, with the money columns as exact ``Decimal`` values.
 

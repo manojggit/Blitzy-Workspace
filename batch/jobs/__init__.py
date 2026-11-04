@@ -1,5 +1,8 @@
 """Processing jobs of the CardDemo batch chain, one module per legacy processing job.
 
+Replaces: TRANBKP, POSTTRAN (program CBTRN02C), INTCALC (program CBACT04C), COMBTRAN,
+CREASTMT (programs CBSTM03A and CBSTM03B) and TRANIDX.
+
 Modules, with the JCL job and COBOL programs each replaces and its step in the chain:
     tranbkp: TRANBKP, steps 6 and 15.
     posttran: POSTTRAN, program CBTRN02C, step 13.

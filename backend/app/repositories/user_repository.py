@@ -84,7 +84,6 @@ def WritableValues(values: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def KeyedSelect(userId: str) -> Select[Any]:
-    """Return the SELECT of the one record whose SEC-USR-ID is ``userId``."""
     return select(USERS_TABLE).where(USERS_TABLE.c.user_id == TrimmedKey(userId))
 
 
@@ -139,12 +138,10 @@ def KeyedUpdate(values: Mapping[str, Any]) -> Update:
 
 
 def KeyedDelete(userId: str) -> Delete:
-    """Return the DELETE of the one record whose SEC-USR-ID is ``userId``."""
     return delete(USERS_TABLE).where(USERS_TABLE.c.user_id == TrimmedKey(userId))
 
 
 def RecordInsert(values: Mapping[str, Any]) -> Insert:
-    """Return the WRITE of one new record from ``values``."""
     return insert(USERS_TABLE).values(WritableValues(values))
 
 
@@ -177,14 +174,12 @@ class UserRepository:
             raise FileIoError(USER_FILE_NAME) from exc
 
     async def _FetchAll(self, statement: Select[Any]) -> list[dict[str, Any]]:
-        """Run a SELECT on the request session and return every record it reads."""
         result = await self._Execute(self.context.session, statement)
         return [dict(row) for row in result.mappings().all()]
 
     async def _FetchFirst(
         self, executor: AsyncConnection | AsyncSession, statement: Select[Any]
     ) -> dict[str, Any] | None:
-        """Run a SELECT and return its first record, or None when it reads none."""
         result = await self._Execute(executor, statement)
         row = result.mappings().first()
         return dict(row) if row is not None else None

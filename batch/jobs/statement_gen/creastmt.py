@@ -34,8 +34,6 @@ from batch.jobs.statement_gen import cbstm03a, cbstm03b
 from batch.orchestration import run_ledger
 from batch.orchestration.job_context import EXIT_ABEND, EXIT_OK, JobContext, JobFailure, JobResult
 
-# The CLI job name and the JCL name it accepts as an alias, as batch_chain's JobDefinition names
-# chain step 17.
 JOB_NAME = "statement-gen"
 JCL_NAME = "CREASTMT"
 PROGRAM_NAME = "CBSTM03A"
@@ -43,9 +41,12 @@ STEP_NAME = "STEP040"
 
 STATEMENT_FILE_NAME = "STATEMNT.PS"
 HTML_FILE_NAME = "STATEMNT.HTML"
-# Every cp037 character has a Latin-1 form, so strict Latin-1 writes one byte per column and
-# refuses any other text with UnicodeEncodeError. The fixtures use the same encoding.
-OUTPUT_ENCODING = "latin-1"
+# STATEMNT.PS is strict Latin-1, one byte per column. STATEMNT.HTML is UTF-8, as its HTML-L04 meta
+# charset line declares (cbl/CBSTM03A.CBL:153), so its records are 100 characters. Both files
+# carry the same field text and STATEMNT.PS is written first, so text Latin-1 refuses never
+# reaches STATEMNT.HTML.
+STATEMENT_FILE_ENCODING = "latin-1"
+HTML_FILE_ENCODING = "utf-8"
 LINE_TERMINATOR = "\n"
 TEMPORARY_SUFFIX = ".part"
 # The publication work files: each previous statement file's hard-linked backup, and the
@@ -231,9 +232,11 @@ def WriteStatementFiles(
     counts = StatementCounts()
     with ExitStack() as openFiles:
         statementFile = openFiles.enter_context(
-            OpenTemporaryFile(statementsDir, STATEMENT_FILE_NAME)
+            OpenTemporaryFile(statementsDir, STATEMENT_FILE_NAME, STATEMENT_FILE_ENCODING)
         )
-        htmlFile = openFiles.enter_context(OpenTemporaryFile(statementsDir, HTML_FILE_NAME))
+        htmlFile = openFiles.enter_context(
+            OpenTemporaryFile(statementsDir, HTML_FILE_NAME, HTML_FILE_ENCODING)
+        )
         for records in statementRecords:
             WriteRecords(statementFile, records.psLines)
             WriteRecords(htmlFile, records.htmlLines)
@@ -302,15 +305,16 @@ def RemoveWorkFiles(statementsDir: Path, pathOf: Callable[[Path, str], Path]) ->
 
 
 @contextmanager
-def OpenTemporaryFile(statementsDir: Path, fileName: str) -> Iterator[IO[str]]:
-    """Create fileName's .part file for writing, and delete it unless it has been renamed.
+def OpenTemporaryFile(statementsDir: Path, fileName: str, encoding: str) -> Iterator[IO[str]]:
+    """Create fileName's .part file to write in encoding, and delete it unless it was renamed.
 
     This stands in for DISP=(NEW,CATLG,DELETE): the file is cataloged under its final name only
     by PublishFiles, and deleted when the step ends any other way. Exclusive creation refuses a
-    path that already exists, a symbolic link included, with FileExistsError.
+    path that already exists, a symbolic link included, with FileExistsError. A record with no
+    form in encoding raises UnicodeEncodeError when it is written.
     """
     temporaryPath = TemporaryPath(statementsDir, fileName)
-    temporaryFile = temporaryPath.open("x", encoding=OUTPUT_ENCODING, newline=LINE_TERMINATOR)
+    temporaryFile = temporaryPath.open("x", encoding=encoding, newline=LINE_TERMINATOR)
     try:
         with temporaryFile:
             yield temporaryFile

@@ -55,7 +55,6 @@ from batch.orchestration.job_context import EXIT_ABEND, EXIT_OK, JobContext, Job
 
 LOGGER = logging.getLogger(__name__)
 
-# The canonical CLI name and the legacy JCL name of batch_chain.JOB_DEFINITIONS["interest-calc"].
 JOB_NAME = "interest-calc"
 JCL_NAME = "INTCALC"
 PROGRAM_NAME = "CBACT04C"
@@ -125,7 +124,6 @@ ABEND_FILE_TEMPLATE = "FILE ERROR {errorClass} ERRNO {errnoName}"
 ABEND_RECORD_TEMPLATE = "RECORD ENCODING ERROR {errorClass}"
 ABEND_UNKNOWN_CODE = "UNKNOWN"
 
-# The batch.job_runs.counts keys.
 RECORDS_COUNT_KEY = "records"
 INTEREST_TRANSACTIONS_COUNT_KEY = "interest_transactions"
 ACCOUNTS_REWRITTEN_COUNT_KEY = "accounts_rewritten"

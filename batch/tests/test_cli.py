@@ -27,13 +27,12 @@ The database tests start from the restored seed state of the batchEnvironment fi
 the Alembic seed cycle is OPEN with steps 1-5 and 7-12 COMPLETED.
 """
 
+import os
 import re
-import secrets
 import shlex
-import shutil
 import subprocess
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,7 +58,6 @@ from batch.tests.conftest import (
 )
 from batch.tests.reconciliation import compare
 
-# --- The documented command surface (Technical Specification 0.6.8) ------------------------------
 CLI_COMMANDS = ("run-all", "seed-all", "job", "load")
 JOB_NAMES = (
     "post-tran",
@@ -159,7 +157,6 @@ EPILOG_PAGE_CASES = (
 )
 EPILOG_PAGE_IDS = ["-".join(arguments) or "top-level" for arguments in EPILOG_PAGE_CASES]
 
-# --- Click help and usage-error output -----------------------------------------------------------
 COMMANDS_HEADING = "Commands:"
 # Click separates help sections with a blank line; the epilog follows the commands section.
 SECTION_BREAK = "\n\n"
@@ -173,7 +170,7 @@ INVALID_VALUE_TEMPLATE = "Invalid value for '{optionName}'"
 # the form the log masking gives it: twelve asterisks and the last four digits.
 TYPED_CARD_NUMBER = "4000" + "1234" * 3
 MASKED_CARD_NUMBER = "*" * 12 + TYPED_CARD_NUMBER[-4:]
-# A 16-digit operand that starts with 0, as every sample card number does: int() would drop the
+# A 16-digit operand that starts with 0, as some sample card numbers do: int() would drop the
 # zero, leaving a 15-digit run that the 16-digit masking does not recognise.
 ZERO_LED_CARD_NUMBER = "0" + TYPED_CARD_NUMBER[:-1]
 UNMASKED_CARD_NUMBER_PATTERN = re.compile(r"(?<![0-9])[0-9]{16}(?![0-9])")
@@ -233,7 +230,6 @@ CARD_NUMBER_USAGE_CASES = (
     ),
 )
 
-# --- Chain steps, run history and generations ----------------------------------------------------
 ACCOUNTS_STEP = 1
 TRAN_BACKUP_FIRST_STEP = 6
 TRAN_TYPES_STEP = 7
@@ -244,7 +240,6 @@ TRANSACT_BKUP_BASE = "TRANSACT.BKUP"
 SYSTRAN_BASE = "SYSTRAN"
 GDG_DIRECTORY = "gdg"
 
-# --- Option values -------------------------------------------------------------------------------
 # A PARM-DATE other than the INTCALC JCL's 2022071800, so its TRAN-ID prefix proves it was used.
 ALTERNATE_RUN_DATE = "2022071900"
 SHORT_RUN_DATE = "202207180"
@@ -255,17 +250,13 @@ MICROSECOND_AS_OF_TEXT = "2022-07-18T00:00:00.123456"
 # Clock.Now() keeps hundredths of a second, as FUNCTION CURRENT-DATE does.
 TRUNCATED_AS_OF = datetime(2022, 7, 18, 0, 0, 0, 120000)
 
-# --- Working directories and relative paths ------------------------------------------------------
 FRONTEND_DIR = REPO_ROOT / "frontend"
 EBCDIC_DIR_VARIABLE = "CARDDEMO_EBCDIC_DIR"
 RELATIVE_EBCDIC_DIR = "data/EBCDIC"
-VAR_DIRECTORY = "var"
-RELATIVE_OUTPUT_PREFIX = "batch-test-"
-OUTPUT_TOKEN_BYTES = 4
+RELATIVE_OUTPUT_SUBDIRECTORY = "relative-output"
 # Written over a loaded text column, so only a reload brings back the fixture's values.
 DISTURBED_TEXT = "DISTURBED"
 
-# --- Database errors outside the steps -----------------------------------------------------------
 CLASSIFY_INTERRUPTED_RUNS_NAME = "ClassifyInterruptedRuns"
 # No migration creates this relation, so PostgreSQL rejects the query as an unmigrated database
 # rejects the prelude's first query of batch.job_runs.
@@ -326,7 +317,6 @@ LOAD_ALIAS_CASES = (
 )
 
 
-# --- Helpers -------------------------------------------------------------------------------------
 def ListedCommands(helpOutput: str) -> list[str]:
     """Return the command names a Click help page lists under "Commands:", in listed order.
 
@@ -400,21 +390,6 @@ def PostedProcTimestamps(engine: Engine) -> set[datetime]:
         return set(connection.execute(select(procTs).distinct()).scalars())
 
 
-def RemoveTreeIfPresent(path: Path) -> None:
-    """Delete a directory tree a test created; nothing when it does not exist."""
-    if path.is_dir():
-        shutil.rmtree(path)
-
-
-def RemoveDirectoryIfEmpty(path: Path) -> None:
-    """Delete a directory a test caused to exist, only while it holds no entry.
-
-    A directory that is absent, or that holds any file or subdirectory, is left as it is.
-    """
-    if path.is_dir() and not any(path.iterdir()):
-        path.rmdir()
-
-
 def QueryMissingRelation(context: JobContext) -> int:
     """Stand in for ClassifyInterruptedRuns, failing as it does on an unmigrated database.
 
@@ -427,30 +402,26 @@ def QueryMissingRelation(context: JobContext) -> int:
 
 @pytest.fixture(name="relativeOutputDir")
 def RelativeOutputDir(
-    batchEnvironment: BatchEnvironment, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[Path]:
-    """Point CARDDEMO_OUTPUT_DIR at a new relative var/batch-test-<token>; delete it afterwards.
+    batchEnvironment: BatchEnvironment, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Point CARDDEMO_OUTPUT_DIR at a new tmp_path subtree, spelled relative to REPO_ROOT.
 
-    Requested after batchEnvironment, so this value overrides that fixture's absolute one. The
-    copy under backend/ exists only if the CLI resolved against its working directory.
-
-    A var/ under the root or backend/ that was absent before the test is also deleted when it
-    is left empty, so the run leaves nothing in the checkout. A var/ that existed before the
-    test, or that holds anything else (such as var/batch-output), is kept.
+    Returns that spelling, os.path.relpath from REPO_ROOT, which names the subtree only when
+    resolved against REPO_ROOT. Requested after batchEnvironment, so this value overrides that
+    fixture's absolute one. The spelling must resolve, symlinks followed, to the subtree inside
+    tmp_path; pytest owns tmp_path, so this fixture removes nothing itself.
     """
-    directoryName = RELATIVE_OUTPUT_PREFIX + secrets.token_hex(OUTPUT_TOKEN_BYTES)
-    relativeDir = Path(VAR_DIRECTORY, directoryName)
-    varDirs = (REPO_ROOT / VAR_DIRECTORY, BACKEND_DIR / VAR_DIRECTORY)
-    absentVarDirs = [varDir for varDir in varDirs if not varDir.exists()]
-    monkeypatch.setenv(OUTPUT_DIR_VARIABLE, relativeDir.as_posix())
-    yield relativeDir
-    RemoveTreeIfPresent(REPO_ROOT / relativeDir)
-    RemoveTreeIfPresent(BACKEND_DIR / relativeDir)
-    for varDir in absentVarDirs:
-        RemoveDirectoryIfEmpty(varDir)
+    outputRoot = tmp_path / RELATIVE_OUTPUT_SUBDIRECTORY
+    outputRoot.mkdir()
+    relativeSpelling = Path(os.path.relpath(outputRoot, REPO_ROOT))
+    resolvedRoot = outputRoot.resolve(strict=True)
+    assert not relativeSpelling.is_absolute()
+    assert (REPO_ROOT / relativeSpelling).resolve(strict=True) == resolvedRoot
+    assert resolvedRoot.is_relative_to(tmp_path.resolve(strict=True))
+    monkeypatch.setenv(OUTPUT_DIR_VARIABLE, relativeSpelling.as_posix())
+    return relativeSpelling
 
 
-# --- Phase 1: help and naming --------------------------------------------------------------------
 def test_help_lists_run_all_seed_all_job_and_load() -> None:
     """The console script's --help lists exactly the four command groups (Section 0.9.4)."""
     outcome = RunCli([HELP_OPTION])
@@ -527,7 +498,6 @@ def test_every_help_page_shows_environment_exit_statuses_and_examples(
     assert len(invocations) == len(exampleLines)
 
 
-# --- Phase 2: legacy JCL aliases -----------------------------------------------------------------
 @pytest.mark.parametrize(("group", "canonicalName", "jclName"), ALIAS_CASES, ids=ALIAS_CASE_IDS)
 def test_every_legacy_jcl_name_is_an_alias_of_its_command(
     group: str, canonicalName: str, jclName: str
@@ -589,7 +559,6 @@ def test_unknown_job_name_is_rejected_without_ledger_rows(
     assert CountJobRuns(engine) == runsBefore
 
 
-# --- Phase 3: option validation ------------------------------------------------------------------
 @pytest.mark.parametrize("runDate", [SHORT_RUN_DATE, LONG_RUN_DATE])
 def test_run_date_must_be_ten_characters(batchEnvironment: BatchEnvironment, runDate: str) -> None:
     """A --run-date other than the 10-character PARM-DATE is refused before any run starts."""
@@ -659,7 +628,6 @@ def test_usage_error_never_shows_a_typed_card_number(
     assert shownText in outcome.output
 
 
-# --- Phase 4: working-directory independence (Section 0.7.3) -------------------------------------
 @pytest.mark.parametrize("workingDir", [FRONTEND_DIR, BACKEND_DIR], ids=["frontend", "backend"])
 def test_load_tran_types_subprocess_from_frontend_and_backend_dirs(
     batchEnvironment: BatchEnvironment, monkeypatch: pytest.MonkeyPatch, workingDir: Path
@@ -680,27 +648,29 @@ def test_load_tran_types_subprocess_from_frontend_and_backend_dirs(
 
 
 def test_relative_output_dir_resolves_against_repo_root(
-    batchEnvironment: BatchEnvironment, relativeOutputDir: Path
+    batchEnvironment: BatchEnvironment, relativeOutputDir: Path, tmp_path: Path
 ) -> None:
-    """A relative CARDDEMO_OUTPUT_DIR puts the TRANSACT.BKUP generation under REPO_ROOT.
+    """A relative CARDDEMO_OUTPUT_DIR resolves against REPO_ROOT, not the working directory.
 
-    The command starts in backend/, so a working-directory resolution would write there.
+    The command starts in backend/, and the variable's spelling names the tmp_path subtree only
+    from the repository root, so the TRANSACT.BKUP generation resolves inside that subtree's
+    gdg/ only through REPO_ROOT. Where the spelling leads from backend/ is checked, never
+    created.
     """
     arguments = ["job", "tran-backup", "--occurrence", "1"]
     outcome = RunCli(arguments, workingDir=BACKEND_DIR)
     assert outcome.exitCode == EXIT_OK, outcome.output
-    expectedOutputRoot = REPO_ROOT / relativeOutputDir
+    outputRoot = (tmp_path / RELATIVE_OUTPUT_SUBDIRECTORY).resolve(strict=True)
     with batchEnvironment.engine.connect() as connection:
         generationPath = compare.LatestPublishedGeneration(
-            connection, TRANSACT_BKUP_BASE, expectedOutputRoot
+            connection, TRANSACT_BKUP_BASE, outputRoot
         )
     assert generationPath is not None and generationPath.is_file()
-    assert generationPath.is_relative_to(expectedOutputRoot / GDG_DIRECTORY)
+    assert generationPath.resolve(strict=True).is_relative_to(outputRoot / GDG_DIRECTORY)
     assert not (BACKEND_DIR / relativeOutputDir).exists()
     assert LatestStepRun(batchEnvironment.engine, TRAN_BACKUP_FIRST_STEP)["job_name"] == "TRANBKP"
 
 
-# --- Phase 5: database errors outside the steps (Section 0.6.8) ----------------------------------
 def test_prelude_database_error_exits_12_naming_classes_and_sqlstate(
     batchEnvironment: BatchEnvironment, monkeypatch: pytest.MonkeyPatch
 ) -> None:

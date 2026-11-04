@@ -5,13 +5,14 @@ Replaces the BMS symbolic maps COUSR00-COUSR03 (``cpy-bms/COUSR00.CPY`` to
 COUSR02C (CU02, update user) and COUSR03C (CU03, delete user), and the USRSEC record of
 copybook CSUSR01Y.
 
-The four programs end validation at the first failing edit, so their responses carry
-``message`` and ``cursor_field`` only. Screen fields are raw ``ScreenText`` limited to their
+The four programs end validation at the first failing edit, so an error names at most that
+one field. Its body still carries the four legacy keys ``message``, ``info_message``,
+``field_errors`` and ``cursor_field``. Screen fields are raw ``ScreenText`` limited to their
 BMS LENGTH; every presence check and its literal belongs to the services.
 
 No response model carries a password or a password hash. Plaintext arrives only in
 ``UserCreateRequest`` and ``UserUpdateRequest``, and the services hash it as entered. The
-CU03 delete confirmation uses ``app.schemas.common.MessageResponse``.
+CU03 delete confirmation uses ``UserMessageResponse``, as the CU01 and CU02 successes do.
 """
 
 from enum import StrEnum
@@ -271,12 +272,15 @@ class UserUpdateRequest(BaseModel):
 
 
 class UserMessageResponse(BaseModel):
-    """The success body of COUSR01C (CU01) and COUSR02C (CU02): the ERRMSG line and cursor."""
+    """The success body of COUSR01C (CU01), COUSR02C (CU02) and COUSR03C (CU03).
+
+    It holds the ERRMSG line and the cursor.
+    """
 
     message: str = Field(
         description=(
             "The program's literal, verbatim, for example 'User <id> has been added ...', "
-            "'User <id> has been updated ...' or 'Please modify to update ...'."
+            "'User <id> has been updated ...' or 'User <id> has been deleted ...'."
         ),
     )
     cursor_field: str | None = Field(

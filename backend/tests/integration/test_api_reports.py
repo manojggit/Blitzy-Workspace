@@ -105,7 +105,6 @@ UNABLE_TO_WRITE_TDQ_MESSAGE = "Unable to Write TDQ (JOBS)..."
 CURSOR_REPORT_TYPE = "reportType"
 CURSOR_CONFIRM = "confirm"
 
-# --- Requests ------------------------------------------------------------------------------------
 MONTHLY_CONFIRMED = {"reportType": "monthly", "confirm": "Y"}
 YEARLY_CONFIRMED = {"reportType": "yearly", "confirm": "Y"}
 CUSTOM_DATE_PARTS = {
@@ -120,7 +119,6 @@ CUSTOM_DATE_PARTS = {
 BLANK_PART = " "
 EXPORT_FORMATS = ("csv", "pdf")
 
-# --- Report transactions -------------------------------------------------------------------------
 # The seeded card of account 00000000004 (the CARDDATA and CARDXREF images), type 01 Purchase
 # and category 0001 Regular Sales Draft, all on file in TRANTYPE and TRANCATG.
 REPORT_CARD_NUM = "2988091353094312"
@@ -177,7 +175,6 @@ FORMULA_TRANSACTION = ReportTransaction(
     FORMULA_TRAN_ID, datetime(2022, 7, 10, 8, 0), Decimal("-1.00"), FORMULA_SOURCE
 )
 
-# --- Expected CBTRN03C lines ---------------------------------------------------------------------
 REPORT_NAME = "DALYREPT"
 REPORT_TITLE = "Daily Transaction Report"
 DATE_RANGE_TEMPLATE = "Date Range: {startDate} to {endDate}"
@@ -222,7 +219,6 @@ FORMULA_MONTHLY_LINE_KINDS = [
 ]
 FORMULA_MONTHLY_TRAN_IDS = [JULY_05_TRAN_ID, FORMULA_TRAN_ID, JULY_18_TRAN_ID]
 
-# --- Expected downloads --------------------------------------------------------------------------
 CSV_HEADER = "line_kind,tran_id,acct_id,type_cd,type_desc,cat_cd,cat_desc,source,amount"
 CSV_COLUMN_NAMES = CSV_HEADER.split(",")
 CSV_LINE_KIND_COLUMN = "line_kind"
@@ -251,7 +247,6 @@ FORMULA_MONTHLY_SOURCE_CELLS = [DEFAULT_SOURCE, GUARDED_FORMULA_SOURCE, DEFAULT_
 AMOUNT_LINE_KINDS = (DETAIL_KIND, PAGE_TOTAL_KIND, GRAND_TOTAL_KIND)
 FORMULA_MONTHLY_AMOUNT_CELLS = ["10.00", "-1.00", "20.50", "50.00", "50.00"]
 
-# --- SQL: values are always bound ----------------------------------------------------------------
 INSERT_TRANSACTION_SQL = text(
     "INSERT INTO transactions.transactions (tran_id, tran_type_cd, tran_cat_cd, tran_source,"
     " tran_desc, tran_amt, merchant_id, merchant_name, merchant_city, merchant_zip, card_num,"
@@ -267,7 +262,6 @@ CATEGORY_DESCRIPTION_SQL = text(
     " WHERE tran_type_cd = :typeCd AND tran_cat_cd = :catCd"
 )
 
-# --- The superseded backup -----------------------------------------------------------------------
 # TRANREPT STEP01R unloaded TRANSACT to AWS.M2.CARDDEMO.TRANSACT.BKUP(+1) (proc/TRANREPT.prc): a
 # backup would add a TRANSACT.BKUP generation to the batch catalog, a job run to its ledger and
 # an archive under the base's directory of the batch output root.
@@ -312,7 +306,6 @@ class YearCase(NamedTuple):
     tranIds: tuple[str, ...]
 
 
-# --- Request and data helpers --------------------------------------------------------------------
 def CustomQuery(overrides: dict[str, str]) -> dict[str, str]:
     """Return a confirmed Custom request over 06/30/2022 to 07/05/2022 with ``overrides``."""
     return {"reportType": "custom", **CUSTOM_DATE_PARTS, "confirm": "Y", **overrides}
@@ -508,7 +501,6 @@ def DetailTranIds(body: dict[str, Any]) -> list[str]:
     return [line["tran_id"] for line in LinesOfKind(body, DETAIL_KIND)]
 
 
-# --- Assertions ----------------------------------------------------------------------------------
 def AssertLegacyError(
     response: httpx.Response, status: int, message: str, cursorField: str = ""
 ) -> None:
@@ -585,7 +577,6 @@ async def ReadFormulaMonthlyScreen(client: httpx.AsyncClient, syncEngine: Engine
     return body
 
 
-# --- Fixtures ------------------------------------------------------------------------------------
 @pytest.fixture(name="reportData")
 def ReportDataFixture(
     syncEngine: Engine, monkeypatch: pytest.MonkeyPatch, restoreSeedState: None
@@ -606,7 +597,6 @@ def BackupDirectoryFixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     return LoadBatchSettings().GdgDir() / TRANSACT_BACKUP_BASE
 
 
-# --- Cases ---------------------------------------------------------------------------------------
 RANGE_CASES = [
     pytest.param(
         RangeCase(
@@ -695,13 +685,11 @@ UNCONFIRMED_EXPORT_CASES = [
 ]
 
 
-# --- Ranges and success --------------------------------------------------------------------------
 @pytest.mark.usefixtures("reportData")
 @pytest.mark.parametrize("rangeCase", RANGE_CASES)
 async def test_blank_confirmation_prompts_without_lines(
     regularClient: httpx.AsyncClient, rangeCase: RangeCase
 ) -> None:
-    """A blank CONFIRM answers 200 with the prompt, the range, no lines and the confirm cursor."""
     response = await RunReport(regularClient, {**rangeCase.query, "confirm": ""})
     assert response.status_code == HTTP_OK, response.text
     assert response.json() == {
@@ -754,7 +742,6 @@ async def test_monthly_report_follows_the_cbtrn03c_line_sequence(
 async def test_confirmed_range_without_transactions_has_no_lines(
     regularClient: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A confirmed month holding no transaction answers the success literal and no lines."""
     FreezeToday(monkeypatch, EMPTY_MONTH_TODAY)
     response = await RunReport(regularClient, MONTHLY_CONFIRMED)
     AssertSubmitted(
@@ -784,7 +771,6 @@ async def test_report_and_exports_leave_transact_unchanged(
     assert WriteStatements(issuedStatements) == []
 
 
-# --- First-failure literals ----------------------------------------------------------------------
 @pytest.mark.parametrize("query", MISSING_REPORT_TYPE_QUERIES)
 async def test_missing_report_type_is_refused(
     regularClient: httpx.AsyncClient, query: dict[str, str]
@@ -830,7 +816,6 @@ async def test_impossible_calendar_date_is_refused_by_csutldtc(
 async def test_non_numeric_year_is_normalised_never_refused(
     regularClient: httpx.AsyncClient, yearCase: YearCase
 ) -> None:
-    """A year keyed ABCD becomes 0000, which CSUTLDTC accepts (2513), and the report runs."""
     response = await RunReport(regularClient, CustomQuery({yearCase.fieldName: "ABCD"}))
     rangeCase = RangeCase({}, "Custom", yearCase.startDate, yearCase.endDate, yearCase.tranIds)
     AssertSubmitted(response, rangeCase)
@@ -839,7 +824,7 @@ async def test_non_numeric_year_is_normalised_never_refused(
 
 
 async def test_invalid_confirmation_value_is_refused(regularClient: httpx.AsyncClient) -> None:
-    """A CONFIRM other than Y, N or blank is quoted in the literal, with the confirm cursor."""
+    """A CONFIRM other than Y, y, N, n or blank is quoted in the literal, cursor on CONFIRM."""
     query = {"reportType": "monthly", "confirm": INVALID_CONFIRM_VALUE}
     response = await RunReport(regularClient, query)
     AssertLegacyError(response, HTTP_EDIT_FAILURE, INVALID_CONFIRM_MESSAGE, CURSOR_CONFIRM)
@@ -862,7 +847,6 @@ async def test_confirmation_n_clears_the_screen(
     }
 
 
-# --- Exports -------------------------------------------------------------------------------------
 @pytest.mark.usefixtures("reportData")
 async def test_csv_export_writes_one_row_per_report_line(
     regularClient: httpx.AsyncClient, syncEngine: Engine
@@ -944,12 +928,10 @@ async def test_a_failed_report_read_answers_the_tdq_literal_before_the_body_star
     AssertLegacyError(response, HTTP_FILE_ERROR, UNABLE_TO_WRITE_TDQ_MESSAGE, CURSOR_REPORT_TYPE)
 
 
-# --- Session and role ----------------------------------------------------------------------------
 @pytest.mark.parametrize("refusalTarget", REFUSAL_TARGETS)
 async def test_request_without_session_is_refused(
     apiClient: httpx.AsyncClient, refusalTarget: tuple[str, dict[str, str]]
 ) -> None:
-    """A client holding no session cookie gets 401 with no message, before any edit runs."""
     url, extraParams = refusalTarget
     response = await apiClient.get(url, params={**MONTHLY_CONFIRMED, **extraParams})
     AssertLegacyError(response, HTTP_SIGN_ON_FAILURE, NO_MESSAGE)

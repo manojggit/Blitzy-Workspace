@@ -160,7 +160,6 @@ class CommonSettings(BaseSettings):
     BCRYPT_ROUNDS: int = Field(default=12, ge=4, le=31)
 
     def IsProduction(self) -> bool:
-        """Return True when APP_ENV is production."""
         return self.APP_ENV == "production"
 
     def EbcdicDir(self) -> Path:

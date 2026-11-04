@@ -137,7 +137,6 @@ ORIGIN_HEADER_CASES = ({}, {"Origin": NOT_ALLOW_LISTED_ORIGIN})
 type LoginAs = Callable[[str], Awaitable[Any]]
 
 
-# --- Helpers -------------------------------------------------------------------------------------
 def MenuPath(menu: str) -> str:
     """Return the option-list path of ``menu``, ``main`` (CM00) or ``admin`` (CA00)."""
     return f"{API_V1}/menu/{menu}"
@@ -218,7 +217,6 @@ def CopySessionClient(
     )
 
 
-# --- Menu content --------------------------------------------------------------------------------
 async def test_main_menu_lists_the_comen02y_options(regularClient: httpx.AsyncClient) -> None:
     """CM00 lists COMEN02Y's 11 options, 8 being the active ``Transaction Add`` entry."""
     response = await regularClient.get(MenuPath(MAIN_MENU))
@@ -231,7 +229,6 @@ async def test_admin_menu_lists_the_coadm02y_options(adminClient: httpx.AsyncCli
     AssertMenuOptions(response, ADMIN_MENU_LABELS, ADMIN_MENU_OPTION_COUNT)
 
 
-# --- Selections ----------------------------------------------------------------------------------
 @pytest.mark.parametrize(("optionNumber", "route"), MAIN_MENU_ROUTES.items())
 async def test_main_menu_option_routes_to_its_page(
     regularClient: httpx.AsyncClient, optionNumber: int, route: str
@@ -296,7 +293,6 @@ async def test_option_longer_than_the_bms_field_is_malformed(
     assert response.json()["detail"]
 
 
-# --- Role guards ---------------------------------------------------------------------------------
 @pytest.mark.parametrize("method", MENU_METHODS)
 @pytest.mark.parametrize("userType", NON_ADMIN_USER_TYPES)
 async def test_non_admin_user_is_refused_the_admin_menu(

@@ -18,8 +18,10 @@ services under test:
   superseded by the session identity (AAP 0.6.12, 0.7.1). An admin is refused with 403 and an
   empty message and stays an admin; every other stored type lists cards as itself.
 
-No response may carry a full 16-digit card number or a CVV key. Card rows are changed only
-through ``syncEngine``; ``restoreSeedState`` restores the seed after every test.
+No response may carry a full 16-digit card number or a CVV key. Test setup commits card rows
+through ``syncEngine`` (MakeCardEditable), each successful CCUP save (PUT /cards/{cardNum})
+commits its rewrite through the app's own write unit, and ``restoreSeedState`` restores the seed
+after every test, undoing both.
 """
 
 import re
@@ -41,11 +43,10 @@ from sqlalchemy import Engine, text
 from app.core.security import SECONDS_PER_MINUTE
 
 # pytest reads this module variable by its own lower-case name, so it keeps that name rather than
-# the upper-case constant form of MK_Modernization Rule clause 1. Every CCUP test commits card
-# changes through syncEngine, which the restore undoes.
+# the upper-case constant form of MK_Modernization Rule clause 1. The restore undoes both the card
+# rows test setup commits through syncEngine and the rewrites that successful CCUP saves commit.
 pytestmark = pytest.mark.usefixtures("restoreSeedState")
 
-# --- Paths ---------------------------------------------------------------------------------------
 API_V1 = "/api/v1"
 CARDS_URL = API_V1 + "/cards"
 SELECTION_URL = CARDS_URL + "/selection"
@@ -140,7 +141,6 @@ ENTER = "enter"
 SAVE = "save"
 CANCEL = "cancel"
 
-# --- COCRDUP screen fields, as CardScreenFields names them ---------------------------------------
 ACCT_ID_FIELD = "acct_id"
 CARD_NUM_FIELD = "card_num"
 NAME_FIELD = "embossed_name"
@@ -181,12 +181,10 @@ SAVED_COLUMNS = {
 IGNORED_SAVE_FIELDS = {NAME_FIELD: "Ignored Holder", STATUS_FIELD: "N", YEAR_FIELD: "2040"}
 IMPOSSIBLE_DATE_CHANGES = {MONTH_FIELD: "02"}
 
-# --- Roles and origins ---------------------------------------------------------------------------
 ADMIN_USER_TYPE = "A"
 OTHER_USER_TYPES = ("X", "u")
 FOREIGN_ORIGIN = "http://127.0.0.1:9"
 
-# --- SQL: constant text, values always bound -----------------------------------------------------
 CARD_ORDER_SQL = text(
     "SELECT card_num, acct_id, active_status FROM cards.cards ORDER BY card_num_sort"
 )
@@ -200,7 +198,6 @@ MAKE_EDITABLE_SQL = text(
 )
 
 
-# --- Value types ---------------------------------------------------------------------------------
 class FilterCase(NamedTuple):
     """CCLI filter text and the first literal and failing fields 2210/2220 give it."""
 
@@ -447,7 +444,6 @@ WRITE_ENDPOINTS = [
 ]
 
 
-# --- Response assertions -------------------------------------------------------------------------
 def AssertLegacyError(
     response: httpx.Response, status: int, message: str, cursorField: str = ""
 ) -> dict[str, Any]:
@@ -526,7 +522,6 @@ def AssertDetailShowsCard(detail: Mapping[str, Any], card: Mapping[str, Any]) ->
     assert detail["card_ref"]
 
 
-# --- Database access through syncEngine ----------------------------------------------------------
 def ReadCardOrder(syncEngine: Engine) -> list[dict[str, Any]]:
     """Return every card's number, account and status in EBCDIC card-number order."""
     with syncEngine.connect() as connection:
@@ -554,7 +549,6 @@ def MakeCardEditable(syncEngine: Engine, cardNum: str) -> str:
         return connection.execute(MAKE_EDITABLE_SQL, values).scalar_one()
 
 
-# --- Requests ------------------------------------------------------------------------------------
 def CardUrl(cardKey: str) -> str:
     """Return the CCDL and CCUP path of a typed card number or a card_ref."""
     return f"{CARDS_URL}/{cardKey}"
@@ -701,7 +695,6 @@ async def CardUpdateFixture(
 async def test_first_page_lists_seven_masked_cards_in_key_order(
     regularClient: httpx.AsyncClient, syncEngine: Engine
 ) -> None:
-    """A fresh entry lists the 7 lowest card numbers on page 1, masked, with no CVV."""
     body = ExpectOk(await ListCards(regularClient, {}))
     assert body["page"] == 1
     assert RowIdentities(body["rows"]) == ExpectedIdentities(
@@ -866,7 +859,6 @@ async def test_selection_errors_redisplay_the_list(
 
 
 async def test_no_selection_transfers_nowhere(regularClient: httpx.AsyncClient) -> None:
-    """ENTER with every row blank returns no action and no card_ref."""
     listBody = ExpectOk(await ListCards(regularClient, {}))
     body = ExpectOk(await PostSelection(regularClient, listBody, {}))
     assert body["action"] is None
@@ -983,7 +975,6 @@ async def test_detail_edit_outcomes(
 async def test_valid_change_awaits_confirmation_without_writing(
     cardUpdate: CardUpdateSession,
 ) -> None:
-    """Valid changes give CHANGES_OK_NOT_CONFIRMED with the new values; nothing is written."""
     confirm = await cardUpdate.Validate(RENAME_CHANGES)
     assert confirm["fields"][NAME_FIELD] == RENAMED_NAME
     assert confirm["message"] == ""
@@ -1033,7 +1024,6 @@ async def test_enter_after_validation_runs_no_edit(cardUpdate: CardUpdateSession
 
 @pytest.mark.parametrize("validateFirst", [False, True], ids=["show-details", "not-confirmed"])
 async def test_cancel_rereads_the_card(cardUpdate: CardUpdateSession, validateFirst: bool) -> None:
-    """F12 discards the keyed or validated changes and shows the committed card again."""
     screen = cardUpdate.screen
     if validateFirst:
         screen = await cardUpdate.Validate(RENAME_CHANGES)
@@ -1062,7 +1052,6 @@ async def test_any_key_before_fetch_is_enter(
 async def test_any_key_after_done_shows_the_empty_key_screen(
     cardUpdate: CardUpdateSession, action: str
 ) -> None:
-    """After CHANGES_DONE the input is discarded and the empty key screen is sent."""
     confirm = await cardUpdate.Validate(RENAME_CHANGES)
     done = ExpectOk(await cardUpdate.Put(confirm, SAVE, {}))
     body = ExpectOk(await cardUpdate.Put(done, action, DISCARDED_CHANGES))
@@ -1141,7 +1130,6 @@ async def test_every_other_user_type_lists_cards_as_itself(
 async def test_anonymous_requests_are_refused(
     apiClient: httpx.AsyncClient, call: EndpointCall
 ) -> None:
-    """Every card endpoint answers 401 with an empty message without a session cookie."""
     response = await apiClient.send(BuildRequest(apiClient, call))
     AssertLegacyError(response, HTTP_SIGN_ON_FAILURE, "")
 

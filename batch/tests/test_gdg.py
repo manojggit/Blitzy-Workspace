@@ -48,7 +48,12 @@ from batch.tests.conftest import (
     InvokeCli,
     StepRow,
 )
-from batch.tests.reconciliation.compare import CompareFixedWidthFiles, LatestPublishedGeneration
+from batch.tests.reconciliation.compare import (
+    GDG_DIRECTORY_NAME,
+    CompareFixedWidthFiles,
+    LatestPublishedGeneration,
+    ResolveCatalogFilePath,
+)
 
 # The final file name of a generation, G followed by four digits and V00.
 GENERATION_FILE_PATTERN = re.compile(r"G\d{4}V00\.dat")
@@ -78,6 +83,27 @@ OLDEST_RETAINED_RELATIVE = -(LEGACY_GDG_LIMIT - 1)
 ROLLED_OFF_RELATIVE = -LEGACY_GDG_LIMIT
 SCRATCH_BASES = [gdg.DALYREJS, gdg.SYSTRAN, gdg.TRANSACT_COMBINED]
 SCRATCH_BASE_IDS = [base.name for base in SCRATCH_BASES]
+CATALOG_OUTPUT_DIRECTORY_NAME = "catalog-output"
+OUTSIDE_DIRECTORY_NAME = "outside-gdg-root"
+LINKED_DIRECTORY_NAME = "LINKED.BASE"
+SAMPLE_FILE_NAME = GENERATION_FILE_TEMPLATE.format(generation=OLDEST_GENERATION)
+SAMPLE_FILE_PATH = f"{gdg.SYSTRAN.name}/{SAMPLE_FILE_NAME}"
+LINKED_FILE_NAME = GENERATION_FILE_TEMPLATE.format(generation=SIXTH_GENERATION)
+# Catalog file_path values resolving outside outputDir/gdg, or to it. "{outsideDir}" stands for
+# the directory beside the output root that BuildCatalogRoots links LINKED.BASE and
+# SYSTRAN/LINKED_FILE_NAME to.
+ESCAPING_CATALOG_PATHS = {
+    "absolute-outside-root": "{outsideDir}/" + SAMPLE_FILE_PATH,
+    "dot-dot-escape": "../" + SAMPLE_FILE_PATH,
+    "symlinked-parent-directory": f"{LINKED_DIRECTORY_NAME}/{SAMPLE_FILE_NAME}",
+    "symlinked-file": f"{gdg.SYSTRAN.name}/{LINKED_FILE_NAME}",
+    "gdg-root-itself": ".",
+}
+# Catalog file_path values inside the GDG root; "{gdgRoot}" stands for outputDir/gdg.
+INSIDE_CATALOG_PATHS = {
+    "relative-base-path": SAMPLE_FILE_PATH,
+    "absolute-path-inside-root": "{gdgRoot}/" + SAMPLE_FILE_PATH,
+}
 
 POSTTRAN_STEP = 13
 INTCALC_STEP = 14
@@ -107,7 +133,6 @@ class InjectedProducerError(Exception):
     """Stands for any failure of a job while it writes a new generation."""
 
 
-# --- Helpers -------------------------------------------------------------------------------------
 def LedgeredContext(jobContext: JobContext) -> JobContext:
     """Start a RUNNING test run in the OPEN cycle and return the context bound to it.
 
@@ -224,12 +249,34 @@ def InsertCommittedRow(context: JobContext, base: gdg.GdgBase, generation: int) 
 
 
 def LoseLatestGeneration(context: JobContext, row: dict) -> None:
-    """Leave a generation COMMITTED with neither its final nor its .part file, a lost archive."""
+    """Leave a generation COMMITTED with neither its final nor its .part file, a lost archive.
+
+    The row's file_path is confined to this test's GDG root first, so a path resolving outside
+    it raises ValueError before the catalog or any file changes.
+    """
+    finalPath = ResolveCatalogFilePath(context.settings.OutputDir(), row["file_path"])
     baseName, generation = row["base_name"], row["generation"]
     SetGenerationState(context.engine, baseName, generation, run_ledger.GDG_COMMITTED)
-    finalPath = context.settings.GdgDir() / row["file_path"]
     finalPath.unlink(missing_ok=True)
     PartPath(finalPath).unlink(missing_ok=True)
+
+
+def BuildCatalogRoots(tempRoot: Path) -> tuple[Path, Path]:
+    """Create an output root whose GDG root holds symlinks to a directory beside the root.
+
+    Returns (outputDir, outsideDir), both under tempRoot: outputDir/gdg/LINKED.BASE links to
+    outsideDir, and outputDir/gdg/SYSTRAN/LINKED_FILE_NAME links to a file in outsideDir.
+    """
+    outputDir = tempRoot / CATALOG_OUTPUT_DIRECTORY_NAME
+    outsideDir = tempRoot / OUTSIDE_DIRECTORY_NAME
+    gdgRoot = outputDir / GDG_DIRECTORY_NAME
+    (gdgRoot / gdg.SYSTRAN.name).mkdir(parents=True)
+    outsideDir.mkdir()
+    outsideFile = outsideDir / LINKED_FILE_NAME
+    outsideFile.write_bytes(CORRUPT_FILE_BYTES)
+    (gdgRoot / LINKED_DIRECTORY_NAME).symlink_to(outsideDir, target_is_directory=True)
+    (gdgRoot / gdg.SYSTRAN.name / LINKED_FILE_NAME).symlink_to(outsideFile)
+    return outputDir, outsideDir
 
 
 def LostGenerationText(engine: Engine, baseName: str, generation: int) -> str:
@@ -339,7 +386,6 @@ def AssertOldestRolledOff(context: JobContext, base: gdg.GdgBase) -> None:
         gdg.ResolveGeneration(context, base, ROLLED_OFF_RELATIVE)
 
 
-# --- Publication and recovery --------------------------------------------------------------------
 def test_new_generation_publishes_file_with_sha256_catalog_row(jobContext: JobContext) -> None:
     """Two SYSTRAN records give G0001V00.dat, no .part, and a PUBLISHED row with its SHA-256."""
     context = LedgeredContext(jobContext)
@@ -525,7 +571,41 @@ def test_rolled_back_caller_transaction_leaves_orphan_part_for_reconcile(
     assert BaseFileNames(context, base) == set()
 
 
-# --- LOST blocking -------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "filePathTemplate", list(ESCAPING_CATALOG_PATHS.values()), ids=list(ESCAPING_CATALOG_PATHS)
+)
+def test_catalog_file_path_resolving_outside_gdg_root_is_refused(
+    tmp_path: Path, filePathTemplate: str
+) -> None:
+    """A catalog file_path resolving outside outputDir/gdg, or to it, raises ValueError naming it.
+
+    An absolute path outside the root, a "../" escape, an in-root symlink to a directory or file
+    outside, and the root itself are refused alike, the check LatestPublishedGeneration's readers
+    and LoseLatestGeneration's deletions rely on.
+    """
+    outputDir, outsideDir = BuildCatalogRoots(tmp_path)
+    filePath = filePathTemplate.format(outsideDir=outsideDir)
+
+    with pytest.raises(ValueError, match=re.escape(repr(filePath))):
+        ResolveCatalogFilePath(outputDir, filePath)
+
+
+@pytest.mark.parametrize(
+    "filePathTemplate", list(INSIDE_CATALOG_PATHS.values()), ids=list(INSIDE_CATALOG_PATHS)
+)
+def test_catalog_file_path_inside_gdg_root_resolves_there(
+    tmp_path: Path, filePathTemplate: str
+) -> None:
+    """The batch's relative "<BASE>/G####V00.dat" and an in-root absolute path name one file."""
+    outputDir, _outsideDir = BuildCatalogRoots(tmp_path)
+    gdgRoot = outputDir / GDG_DIRECTORY_NAME
+    filePath = filePathTemplate.format(gdgRoot=gdgRoot)
+
+    resolvedPath = ResolveCatalogFilePath(outputDir, filePath)
+
+    assert resolvedPath == gdgRoot.resolve() / SAMPLE_FILE_PATH
+
+
 def test_lost_generation_blocks_cycle_until_new_cycle(
     jobContext: JobContext, outputDir: Path
 ) -> None:
@@ -572,7 +652,6 @@ def test_resolve_generation_refuses_base_with_lost_row_in_open_cycle(
         gdg.ResolveGeneration(context, gdg.DALYREJS, 0)
 
 
-# --- Retention and abnormal disposition of a producing job --------------------------------------
 @pytest.mark.parametrize("base", SCRATCH_BASES, ids=SCRATCH_BASE_IDS)
 def test_sixth_scratch_generation_rolls_off_oldest_and_deletes_file(
     jobContext: JobContext, base: gdg.GdgBase

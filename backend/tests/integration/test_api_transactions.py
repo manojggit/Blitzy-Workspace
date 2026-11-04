@@ -4,8 +4,10 @@ Replaces: CT00 / COTRN00C (Transaction List, BMS COTRN00), CT01 / COTRN01C (Tran
 BMS COTRN01) and CT02 / COTRN02C (Transaction Add, BMS COTRN02), with copybook CVTRA05Y and the
 CSUTLDTC date check COTRN02C calls.
 
-The seed leaves transactions.transactions empty, so every test commits its own rows through
-syncEngine, and restoreSeedState empties the table again at teardown. The cases cover:
+The seed leaves transactions.transactions empty. Tests that need existing rows commit them through
+syncEngine (InsertTransactions: the paging fixture and the view, next TRAN-ID and copy_last
+cases), confirmed CT02 adds write theirs through POST /transactions, and restoreSeedState empties
+the table again at teardown, undoing both. The cases cover:
 
 - CT00 paging: 10 rows per page in key order, F8 and F7, and the five paging literals of
   cbl/COTRN00C.cbl (lines 248 and 270, the STARTBR NOTFND of line 608, the READNEXT and
@@ -70,7 +72,6 @@ UNKNOWN_ACCOUNT_ID = "99999999999"
 UNKNOWN_CARD_NUMBER = "9999999999999999"
 UNKNOWN_TRAN_ID = "0000000000000999"
 
-# --- CT00 / COTRN00C ----------------------------------------------------------------------------
 PAGE_SIZE = 10
 # 25 TRAN-IDs from 0000000000000010 to 0000000000000250, a step of 10: three pages.
 PAGED_TRAN_IDS = tuple(f"{tranNumber:016d}" for tranNumber in range(10, 260, 10))
@@ -86,7 +87,6 @@ REACHED_TOP_TEXT = "You have reached the top of the page..."
 INVALID_SELECTION_TEXT = "Invalid selection. Valid value is S"
 TRAN_ID_NOT_NUMERIC_TEXT = "Tran ID must be Numeric ..."
 
-# --- CT01 / COTRN01C ----------------------------------------------------------------------------
 VIEW_CURSOR_FIELD = "tran_id"
 TRAN_ID_EMPTY_TEXT = "Tran ID can NOT be empty..."
 TRAN_ID_NOT_FOUND_TEXT = "Transaction ID NOT found..."
@@ -110,7 +110,6 @@ LIST_DESCRIPTION_LENGTH = 26
 SEED_DESCRIPTION = "INTEGRATION TEST PURCHASE WITH A LONG DESCRIPTION"
 SEED_AMOUNT = Decimal("12.34")
 
-# --- CT02 / COTRN02C ----------------------------------------------------------------------------
 ACCOUNT_OR_CARD_REQUIRED_TEXT = "Account or Card Number must be entered..."
 ACCOUNT_NOT_NUMERIC_TEXT = "Account ID must be Numeric..."
 CARD_NOT_NUMERIC_TEXT = "Card Number must be Numeric..."
@@ -268,7 +267,6 @@ class EditCase(NamedTuple):
     cursorField: str
 
 
-# --- Seed and read helpers (sync engine, bound parameters only) ---------------------------------
 def ParseTimestamp(timestampText: str, timestampFormat: str) -> datetime:
     """Return the TIMESTAMP(6) value of a 26-character timestamp text of the given form."""
     return datetime.strptime(timestampText.rstrip(" "), TIMESTAMP_PATTERNS[timestampFormat])
@@ -319,7 +317,6 @@ def StoredValues(record: Mapping[str, Any], expected: Mapping[str, Any]) -> dict
     return {column: record[column] for column in expected}
 
 
-# --- Request and assertion helpers --------------------------------------------------------------
 def AssertLegacyError(
     response: httpx.Response, status: int, message: str, cursorField: str = ""
 ) -> dict[str, Any]:
@@ -413,7 +410,6 @@ def PagedTransactionsFixture(syncEngine: Engine) -> tuple[str, ...]:
     return PAGED_TRAN_IDS
 
 
-# --- CT00 / COTRN00C: list and paging -----------------------------------------------------------
 async def test_first_page_lists_ten_rows_in_key_order(
     regularClient: httpx.AsyncClient, pagedTransactions: tuple[str, ...]
 ) -> None:
@@ -496,7 +492,6 @@ def test_paging_literal_is_the_shared_constant(legacyText: str, sharedConstant: 
     assert sharedConstant == legacyText
 
 
-# --- CT00 / COTRN00C: search and selection ------------------------------------------------------
 @pytest.mark.parametrize(
     ("searchTranId", "expectedFirstId"),
     [
@@ -579,7 +574,6 @@ async def test_invalid_selection_continues_with_the_search(
     assert refusal["page"] == 1
 
 
-# --- CT01 / COTRN01C: view ----------------------------------------------------------------------
 def ExpectedDetail(seed: SeedTransaction) -> dict[str, Any]:
     """Return the COTRN01 map of ``seed`` without its amount: masked card, stored texts."""
     return {
@@ -640,7 +634,6 @@ async def test_view_of_an_unknown_id_is_not_found(
     AssertLegacyError(response, HTTP_NOT_FOUND, TRAN_ID_NOT_FOUND_TEXT, VIEW_CURSOR_FIELD)
 
 
-# --- CT02 / COTRN02C: add in first-failure mode -------------------------------------------------
 KEY_EDIT_CASES = [
     pytest.param(
         EditCase({"acct_id": ""}, HTTP_EDIT_FAILURE, ACCOUNT_OR_CARD_REQUIRED_TEXT, "acct_id"),
@@ -825,7 +818,6 @@ async def test_copy_last_on_an_empty_file_copies_the_initial_record(
     assert ReadTransactions(syncEngine) == []
 
 
-# --- Session, role and Origin guards ------------------------------------------------------------
 GUARDED_REQUESTS = [
     pytest.param("GET", TRANSACTIONS_URL, None, id="ct00-list"),
     pytest.param("POST", SELECTION_URL, {"selections": []}, id="ct00-selection"),

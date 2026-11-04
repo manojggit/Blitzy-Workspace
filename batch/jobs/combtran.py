@@ -13,9 +13,10 @@ archived and emptied transactions.transactions.
 - STEP10 REPRO INFILE(TRANSACT) OUTFILE(TRANVSAM) adds every combined record to the TRANSACT
   KSDS; the port inserts each one into transactions.transactions in file order.
 
-The sort streams, so memory never grows with the generations. Each input is checked for TRAN-ID
-order by a first read; one in order streams from its file, and one out of order (a SYSTRAN whose
-six-digit INTCALC suffix wrapped at 999999, or any other) is sorted stably in bounded memory with
+The sort streams, so the records held in memory never grow with the generations; only the list
+of spilled run paths grows, with the run count. Each input is checked for TRAN-ID order by a
+first read; one in order streams from its file, and one out of order (a SYSTRAN whose six-digit
+INTCALC suffix wrapped at 999999, or any other) is sorted stably with bounded record buffers and
 spilled runs, as DFSORT uses work files. The runs go to a work directory in the
 TRANSACT.COMBINED base directory, beside the generation's .part file, which the job removes
 whatever happens and gdg.ReconcileCatalog removes after a killed run. The two ordered streams
@@ -26,9 +27,12 @@ Both steps run in one transaction with the run's completion and then the generat
 catalog row, the transaction's final write, so the step is atomic. This module never publishes:
 batch_chain publishes the generation once the transaction has committed, outside its
 runner-failure handling, so a publication error cannot turn the committed load into a failed,
-retryable step. A duplicate key, or any other database, file or record failure, rolls everything
-back: the table is left as it was, no generation is cataloged and the .part file is deleted.
-This replaces the REPRO failure path (Technical Specification 0.6.12, "Utility steps").
+retryable step. A duplicate key, or any other database, file or record failure, rolls the
+transaction back: the table is left as it was and no generation is cataloged or published. A
+failure inside the generation block also deletes the .part file; a failure of the final commit
+leaves it uncataloged until gdg.ReconcileCatalog, which batch_chain runs once the failure is
+recorded and every command runs at its start, deletes it. This replaces the REPRO failure path
+(Technical Specification 0.6.12, "Utility steps").
 
 Exit statuses: EXIT_OK; or JobFailure with EXIT_FAILURE when an input generation is missing or
 LOST, on a duplicate key or another constraint violation, and on a database, file or record
@@ -66,7 +70,6 @@ from batch.orchestration.job_context import (
 
 LOGGER = logging.getLogger(__name__)
 
-# The canonical CLI name and the legacy JCL name of batch_chain.JOB_DEFINITIONS["comb-tran"].
 JOB_NAME = "comb-tran"
 JCL_NAME = "COMBTRAN"
 
@@ -78,8 +81,9 @@ INSERT_BATCH_SIZE = 500
 # The external sort an input out of TRAN-ID order goes through, as DFSORT sorts with work
 # files: runs of at most SORT_RUN_RECORD_COUNT records are sorted in memory and spilled to a
 # work directory (SPILL_DIRECTORY_PREFIX, gdg.WORK_DIRECTORY_SUFFIX) in the TRANSACT.COMBINED
-# base directory, and at most MERGE_FAN_IN runs are open in any merge, so neither memory nor
-# open files grow with the generation.
+# base directory, and at most MERGE_FAN_IN runs are open in any merge, so the records held in
+# memory and the run files open per merge stay bounded; only the list of run paths grows with
+# the number of runs.
 SORT_RUN_RECORD_COUNT = 10_000
 MERGE_FAN_IN = 64
 SPILL_DIRECTORY_PREFIX = "carddemo-combtran-"
@@ -230,13 +234,14 @@ def SpillSortedRuns(records: Iterable[str], spillDirectory: Path) -> list[Path]:
 def ExternalSort(
     generation: gdg.Generation, cleanup: contextlib.ExitStack, spillRoot: Path
 ) -> Iterator[str]:
-    """Return a generation's records in stable TRAN-ID order, sorted in bounded memory.
+    """Return a generation's records in stable TRAN-ID order, sorted with bounded record buffers.
 
     Stably sorted runs are spilled to a new work directory under spillRoot, which cleanup
     removes, then merged MERGE_FAN_IN consecutive runs at a time until one merge of at most
-    MERGE_FAN_IN remains. Each merge puts earlier runs first on equal keys, so the input order of
-    equal keys is kept. The directory's gdg.WORK_DIRECTORY_SUFFIX lets gdg.ReconcileCatalog
-    delete it when a killed process never ran cleanup.
+    MERGE_FAN_IN remains. Only the list of run paths grows, with the number of spilled runs.
+    Each merge puts earlier runs first on equal keys, so the input order of equal keys is kept.
+    The directory's gdg.WORK_DIRECTORY_SUFFIX lets gdg.ReconcileCatalog delete it when a killed
+    process never ran cleanup.
     """
     spillName = cleanup.enter_context(
         tempfile.TemporaryDirectory(
@@ -447,7 +452,8 @@ def RunJob(context: JobContext) -> JobResult:
     Returns EXIT_OK with the records, backup_records and interest_records counts once the
     transaction has committed, leaving the generation COMMITTED for batch_chain to publish.
     Raises JobFailure with EXIT_FAILURE on a missing or LOST input, a duplicate key or another
-    failure, after which the table, the catalog and the archive directory are as they were.
+    failure, after which the table and the catalog are as they were and no generation is
+    published; a .part file a failed commit leaves is deleted by gdg.ReconcileCatalog.
     """
     try:
         result, writer = CombineAndReload(context)

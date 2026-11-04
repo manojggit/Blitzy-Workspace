@@ -5,8 +5,9 @@ READ-USER-SEC-FILE (lines 209-257) reads USRSEC and compares the password. The t
 guards it has no legacy source (AAP 0.7.1): each failure counts against the upper-cased user
 ID, LOGIN_MAX_ATTEMPTS failures lock it for LOGIN_LOCKOUT_SECONDS, a locked ID answers 429 with
 ``Too many failed attempts. Try again later ...`` on the user ID, and a success resets the
-count. The failures counted since the last reset plus the password checks in flight never
-exceed LOGIN_MAX_ATTEMPTS, and an attempt over the limit waits for the checks in flight, so:
+count. An attempt is admitted only while the failures counted since the last reset plus the
+password checks in flight stay below LOGIN_MAX_ATTEMPTS, a finishing failure counting twice
+until its check is released, and an attempt over the limit waits for the checks in flight, so:
 - concurrent correct sign-ons of one user ID all sign on, never more than LOGIN_MAX_ATTEMPTS
     of them checking at once, and leave no row;
 - a concurrent burst of wrong passwords checks exactly LOGIN_MAX_ATTEMPTS of them (401
@@ -24,7 +25,7 @@ exceed LOGIN_MAX_ATTEMPTS, and an attempt over the limit waits for the checks in
     many are sent it is never counted, never refused with 429 and never checks a password;
 - an attempt still waiting at the throttle's wait limit answers 503
     ``Unable to verify the User ...``, uncounted and unchecked;
-- an admitted attempt whose USRSEC read or reset fails answers that 503 and counts one failure;
+- an admitted attempt whose USRSEC read or reset fails answers that 503 and counts nothing;
 - a failed admission or failure write answers that 503, and no check marker outlives its
     attempt, even when releasing it fails.
 
@@ -91,7 +92,7 @@ NO_FIELD = ""
 # A blank map field: empty, or spaces only. A blank user ID is never throttled: no row is keyed.
 BLANK_FIELD = ""
 SPACES_FIELD = "        "
-# The no-failure row an admission inserts, left by an attempt whose failure write failed.
+# The no-failure row an admission inserts, left by an attempt that answers 503 uncounted.
 NO_FAILURE_COUNT = 0
 UNLOCK_FAILED_LOG_TEXT = "Sign-on check-slot unlock failed"
 
@@ -645,14 +646,14 @@ async def test_failed_admission_answers_503_counting_and_checking_nothing(
 
 
 @pytest.mark.parametrize("failedOperation", FAILED_OPERATION_CASES, ids=FAILED_OPERATION_IDS)
-async def test_503_of_an_admitted_attempt_counts_one_failure(throttle, syncEngine, failedOperation):
-    """A USRSEC read or a reset that fails answers 503, which counts as the attempt's failure."""
+async def test_503_of_an_admitted_attempt_counts_no_failure(throttle, syncEngine, failedOperation):
+    """A USRSEC read or a reset that fails answers 503 and leaves the admission's row uncounted."""
     failingCall = RaisingIoError(failedOperation.fileName)
     throttle.monkeypatch.setattr(failedOperation.owner, failedOperation.attributeName, failingCall)
     outcome = await throttle.Attempt(CorrectPasswordAttempt(throttle))
     assert outcome == UNABLE_TO_VERIFY_OUTCOME
-    storedRow = StoredAttemptRow(syncEngine, throttle.user.userId)
-    assert (storedRow.failureCount, storedRow.lockedUntil) == (1, None)
+    noFailureRow = AttemptRow(failureCount=NO_FAILURE_COUNT, lockedUntil=None, lastFailureAt=None)
+    assert StoredAttemptRow(syncEngine, throttle.user.userId) == noFailureRow
     assert throttle.checkSpy.await_count == failedOperation.passwordChecks
     assert CheckMarkersOf(syncEngine, throttle.user.userId) == 0
 

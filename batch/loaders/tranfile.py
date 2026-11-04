@@ -15,7 +15,6 @@ from app.utils.record_layouts import TRANSACTION_LAYOUT
 from batch.loaders import replace_loader
 from batch.orchestration.job_context import JobContext, JobResult
 
-# The `carddemo-batch load` command name, and the legacy JCL member it is also accepted as.
 JOB_NAME = "transactions"
 JCL_NAME = "TRANFILE"
 

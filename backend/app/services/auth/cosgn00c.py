@@ -8,13 +8,18 @@ opens /menu (XCTL COMEN01C). The login throttle is the one added control, keyed 
 upper-cased user ID. A blank user ID reads no USRSEC record and names no key, so its edit
 answers before the throttle: it is never counted or refused with 429. Every other attempt then
 waits for a check slot of the upper-cased ID before the password edit: a locked user ID answers
-429, and the failures counted since the last reset plus the checks in flight never exceed
-LOGIN_MAX_ATTEMPTS, so an attempt over the limit waits for the outcomes in flight instead of
-answering 429. Every admitted attempt that does not sign on, the blank-password edit and the
-503 included, counts one failure before it answers; a successful one clears the count. The
-blank-field edits, NOTFND and the wrong password answer 401; the WHEN OTHER literal
-``Unable to verify the User ...`` answers 503. The router issues and clears the
-session cookie, so nothing here creates, returns or logs a token. PF3 of MAIN-PARA is SignOff.
+429, and an attempt is admitted only while the failures counted since the last reset plus the
+checks in flight stay below LOGIN_MAX_ATTEMPTS, so an attempt over the limit waits for the
+outcomes in flight instead of answering 429. A finishing failure commits before its check is
+released, so it counts twice until the release, which only makes admission more conservative:
+a concurrent burst of wrong passwords checks at most LOGIN_MAX_ATTEMPTS of them before the
+lock. The blank-field edits, NOTFND and the wrong password answer 401, and each admitted 401,
+the blank-password edit included, counts one failure before it answers; a successful sign-on
+clears the count. The WHEN OTHER literal ``Unable to verify the User ...`` answers 503 and
+counts nothing: a USRSEC read that fails, the batch window's NOTOPEN included, checks no
+password, and a reset that fails follows a password that verified, so sign-ons the batch window
+refuses never lock the user ID. The router issues and clears the session cookie, so nothing
+here creates, returns or logs a token. PF3 of MAIN-PARA is SignOff.
 MAIN-PARA's invalid-key branch has no path: the sign-on request carries no AID key, and the
 COSGN00 legend offers only ENTER and F3.
 """
@@ -102,7 +107,6 @@ def IsBlank(text: str) -> bool:
 
 
 def WithoutPadding(value: Any) -> str:
-    """Return a stored field value as text without its trailing space padding."""
     return str(value).rstrip(FIELD_PADDING)
 
 
@@ -171,10 +175,12 @@ def BuildLoginResponse(userRow: Mapping[str, Any]) -> LoginResponse:
 async def AcquireSignOnSlot(context: OnlineContext, upperUserId: str) -> login_throttle.CheckSlot:
     """Wait for a check slot of the upper-cased user ID once the user ID edit has passed.
 
-    The failures counted since the last reset plus the checks in flight never exceed
-    LOGIN_MAX_ATTEMPTS, so concurrent attempts of one ID never check more passwords than that
-    before the lock, and an attempt over the limit waits for the outcomes in flight instead of
-    answering 429. A locked user ID answers the throttle's 429 and is not counted. A throttle
+    The attempt is admitted only while the failures counted since the last reset plus the
+    checks in flight stay below LOGIN_MAX_ATTEMPTS; an attempt over the limit waits for the
+    outcomes in flight instead of answering 429. A finishing failure commits before its check
+    is released, so it counts twice until the release, which only makes admission more
+    conservative: concurrent wrong passwords of one ID check at most LOGIN_MAX_ATTEMPTS of them
+    before the lock. A locked user ID answers the throttle's 429 and is not counted. A throttle
     that cannot admit the attempt, or admits none within its wait limit, answers the 503 WHEN
     OTHER literal and counts nothing, so the control never fails open.
     """
@@ -202,8 +208,8 @@ async def CountFailure(context: OnlineContext, upperUserId: str) -> None:
 async def ClearFailures(context: OnlineContext, upperUserId: str) -> None:
     """Delete the user ID's failure count after a successful sign-on.
 
-    A throttle that cannot reset answers the 503 WHEN OTHER literal instead of signing on, and
-    SignOn counts that 503 as the attempt's failure, so the control fails closed.
+    A throttle that cannot reset answers the 503 WHEN OTHER literal instead of signing on, so the
+    control fails closed. The 503 counts nothing, because the password verified.
     """
     try:
         await login_throttle.ResetAttempts(context, upperUserId)
@@ -216,7 +222,7 @@ async def LookUpUser(context: OnlineContext, upperUserId: str) -> dict[str, Any]
     """Port the CICS READ of USRSEC (lines 211-219): the record, or None for NOTFND (RESP 13).
 
     Any other condition, the batch window's NOTOPEN included, is the WHEN OTHER branch
-    (lines 252-256): it answers the 503 literal, which SignOn counts as the attempt's failure.
+    (lines 252-256): it answers the 503 literal, which checks no password and counts nothing.
     """
     try:
         return await UserRepository(context).GetUser(upperUserId)
@@ -258,17 +264,19 @@ async def CheckSignOn(
 ) -> LoginResponse:
     """Run the password edit, the USRSEC read and compare, and the reset of one admitted attempt.
 
-    The user ID edit has already passed. Every failure here, the blank password and the 503 of
-    USRSEC or of the reset included, counts once against the upper-cased user ID before it is
-    raised again: a 503 is not a sign-on.
+    The user ID edit has already passed. Each 401 here, the blank password included, counts
+    once against the upper-cased user ID before it is raised again. The 503 of USRSEC, the
+    batch window's NOTOPEN included, or of the reset counts nothing, so sign-ons the batch
+    window refuses never lock the user ID.
     """
     try:
         EditCredentialPresent(request)
         userRow = await VerifyUser(context, upperUserId, upperCredential)
-        await ClearFailures(context, upperUserId)
-    except LegacyMessageError:
-        await CountFailure(context, upperUserId)
+    except LegacyMessageError as failure:
+        if failure.httpStatus == SIGNON_FAILURE_STATUS:
+            await CountFailure(context, upperUserId)
         raise
+    await ClearFailures(context, upperUserId)
     return BuildLoginResponse(userRow)
 
 
@@ -277,18 +285,19 @@ async def SignOn(context: OnlineContext, request: LoginRequest) -> LoginResponse
 
     The user ID edit runs first, before the throttle: a blank user ID names no key, so it holds
     no check slot and counts nothing. Any other attempt then waits for a check slot of the
-    upper-cased ID, so the failures counted since the last reset plus the checks in flight never
-    exceed LOGIN_MAX_ATTEMPTS. The admitted attempt then runs the password edit and the check; a
-    failure counts once and a successful sign-on clears the count. The slot is released only
-    after that outcome has committed.
+    upper-cased ID, admitted only while the failures counted since the last reset plus the
+    checks in flight stay below LOGIN_MAX_ATTEMPTS. The admitted attempt then runs the password
+    edit and the check; a 401 counts once, a 503 counts nothing and a successful sign-on clears
+    the count. The slot is released only after that outcome has committed, so a finishing
+    failure counts twice until the release, which only makes admission more conservative.
 
     Raises:
         LegacyMessageError: 401 ``Please enter User ID ...`` for a blank user ID, answered
             before the throttle, counting nothing and never refused with 429; 429 with the
             lockout literal while the user ID is locked, counting nothing; 503 with
             ``Unable to verify the User ...`` when USRSEC or the throttle fails, the batch
-            window and the throttle's wait limit included; 401 with the COSGN00C literal and
-            its cursor field for every other sign-on failure.
+            window and the throttle's wait limit included, counting nothing; 401 with the
+            COSGN00C literal and its cursor field for every other sign-on failure, counted once.
     """
     EditUserIdPresent(request)
     upperUserId = NormaliseSignOnInput(request.user_id)

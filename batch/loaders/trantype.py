@@ -19,7 +19,6 @@ from app.utils.record_layouts import TRANSACTION_TYPE_LAYOUT
 from batch.loaders import replace_loader
 from batch.orchestration.job_context import JobContext, JobResult
 
-# The canonical CLI name (`load tran-types`) and the legacy JCL name accepted as its alias.
 JOB_NAME = "tran-types"
 JCL_NAME = "TRANTYPE"
 

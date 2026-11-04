@@ -26,14 +26,15 @@ when all 22 are staged is each renamed into place with ``os.replace``. A reader 
 a whole fixture, old or new, never a partial one, and a target that is a symlink is replaced
 rather than written through.
 
-A missing or malformed image, an oracle abend, a target that exists but is not a regular file,
-or a failure while staging leaves every existing fixture untouched. The builder then prints one
-line, ``build_expected: <reason>``, to stderr; an image error reads
+A missing or malformed image, an oracle abend, a target that exists and is neither a regular
+file nor a symlink, or a failure while staging leaves every existing fixture untouched. The
+builder then prints one line, ``build_expected: <reason>``, to stderr; an image error reads
 ``<image path>: record <n>: <reason>``. It exits with the oracle's status when the chain stops
 (16 for an abend) and 12 for any other failure. A failure during the final renames, or a hard
-kill, can leave some fixtures new and some old, and only a hard kill can leave a ``.tmp`` file
-behind. Rerunning the command restores the complete fixture set, and a leftover ``.tmp`` file
-is safe to delete.
+kill, can leave some fixtures new and some old. Whether publication succeeds or fails, the
+builder attempts to delete every staged file it created; a hard kill or a failed cleanup can
+leave a ``.tmp`` file behind. Rerunning the command restores the complete fixture set, and a
+leftover ``.tmp`` file is safe to delete.
 
 To delete leftover staged files, run the following command from the repository root:
 
@@ -63,6 +64,8 @@ EBCDIC_RELATIVE_DIR = Path("data/EBCDIC")
 LINE_TERMINATOR = "\n"
 CSV_ENCODING = "utf-8"
 RECORD_ENCODING = "latin-1"
+# STATEMNT.HTML is UTF-8, the charset its HTML-L04 meta line declares (cbl/CBSTM03A.CBL:153).
+HTML_ENCODING = "utf-8"
 REPORT_ENCODING = "utf-8"
 CSV_COUNT_UNIT = "rows"
 RECORD_COUNT_UNIT = "records"
@@ -247,7 +250,7 @@ def RenderCreastmtFixtures(
             expectedDir / "creastmt_STATEMNT.PS", statements.psLines, RECORD_ENCODING
         ),
         RenderRecordFixture(
-            expectedDir / "creastmt_STATEMNT.HTML", statements.htmlLines, RECORD_ENCODING
+            expectedDir / "creastmt_STATEMNT.HTML", statements.htmlLines, HTML_ENCODING
         ),
     ]
 
@@ -261,7 +264,6 @@ def RenderTranreptFixtures(
     ]
 
 
-# The job fixture renderers in output order, after the loader_rows CSVs.
 JOB_FIXTURE_RENDERERS: tuple[
     Callable[[Path, legacy_oracle.ChainOutcome], list[RenderedFixture]], ...
 ] = (
@@ -320,7 +322,7 @@ def IsReplaceableTarget(path: Path) -> bool:
 
 
 def RequireReplaceableTargets(fixtures: Iterable[RenderedFixture]) -> None:
-    """Refuse, before anything is staged, a target that exists and is not a regular file.
+    """Refuse, before staging, a target that exists and is neither a regular file nor a symlink.
 
     Raises:
         FileExistsError: A target is a directory, a FIFO, a socket or a device; it names the path.
@@ -363,11 +365,14 @@ def PublishFixtures(fixtures: Sequence[RenderedFixture]) -> None:
 
     No target changes until every fixture is staged, so a failure up to then leaves every
     existing fixture untouched. Each os.replace is atomic: a reader sees the old file or the new
-    one, never a partial one. A staged file still present when this returns or raises is deleted.
+    one, never a partial one. Before returning or raising, it attempts to delete every staged file
+    still present; a hard kill or a failed cleanup can leave a staged file behind.
 
     Raises:
-        FileExistsError: A target exists and is not a regular file; nothing is staged.
-        OSError: A directory or a staged file cannot be created or written, or a rename fails.
+        FileExistsError: A target exists and is neither a regular file nor a symlink; nothing is
+            staged.
+        OSError: A directory or a staged file cannot be created, written or deleted, or a rename
+            fails.
     """
     RequireReplaceableTargets(fixtures)
     fileMode = NewFileMode()
@@ -394,7 +399,8 @@ def BuildAllFixtures(repoRoot: Path) -> list[RenderedFixture]:
             record, and no fixture is written.
         legacy_oracle.OracleAbend: The chain abended, so no fixture is written.
         ValueError: A fixture cannot be rendered, so no fixture is written.
-        OSError: A target is not a regular file, or staging or a rename failed.
+        OSError: A target exists and is neither a regular file nor a symlink, or staging, a
+            rename or the cleanup of a staged file failed.
     """
     chain = legacy_oracle.RunSampleChain(
         repoRoot / EBCDIC_RELATIVE_DIR, legacy_oracle.DB2_CLOCK_TEXT

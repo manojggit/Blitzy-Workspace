@@ -1,7 +1,7 @@
 """CREASTMT statement generation: the CBSTM03A builder and the CBSTM03B reads.
 
 Pins cbl/CBSTM03A.CBL (STATEMENT-LINES and HTML-LINES, lines 86-223; WS-TRNX-TABLE, lines
-226-233; 8100-TRNXFILE-OPEN to 8599-EXIT, lines 758-850) and jcl/CREASTMT.JCL, as ported to
+225-233; 8100-TRNXFILE-OPEN to 8599-EXIT, lines 730-853) and jcl/CREASTMT.JCL, as ported to
 STATEMNT.PS records of 80 columns and STATEMNT.HTML records of exactly 100 columns, with the
 51-card by 10-transaction table bound (Technical Specification, Sections 0.6.11 and 0.6.12).
 
@@ -59,6 +59,10 @@ CUST_ID = "000000001"
 ACCT_ID = "00000000001"
 PS_LINE_WIDTH = 80
 HTML_LINE_WIDTH = 100
+# The file encodings, written out rather than read from creastmt, so a changed module encoding
+# fails here: STATEMNT.PS one Latin-1 byte per column, STATEMNT.HTML the UTF-8 it declares.
+PS_ENCODING = "latin-1"
+HTML_ENCODING = "utf-8"
 # 19 STATEMNT.PS and 64 STATEMNT.HTML records per statement, plus 1 and 11 per transaction.
 PS_FIXED_LINE_COUNT = 19
 HTML_FIXED_LINE_COUNT = 64
@@ -499,7 +503,11 @@ def AbendEncodingError(values: AbendSyntheticValues) -> Exception:
     unencodableText = f"{values.holderName}\u0100"
     position = len(values.holderName)
     return UnicodeEncodeError(
-        creastmt.OUTPUT_ENCODING, unencodableText, position, position + 1, AbendRowText(values)
+        creastmt.STATEMENT_FILE_ENCODING,
+        unencodableText,
+        position,
+        position + 1,
+        AbendRowText(values),
     )
 
 
@@ -645,7 +653,7 @@ def test_run_job_abend_keeps_the_cbstm03a_display_text(
 PUBLICATION_DIRECTORY_NAME = "statements"
 PUBLICATION_PS_NAME = "STATEMNT.PS"
 PUBLICATION_HTML_NAME = "STATEMNT.HTML"
-PUBLICATION_ENCODING = "latin-1"
+PUBLICATION_NON_ASCII_LABEL = "CAFÉ ÑANDÚ ¢50"
 PUBLICATION_STATEMENT_COUNT = 2
 PUBLICATION_INJECTED_TEXT = "injected rename failure"
 PUBLICATION_LEDGER_STATEMENT = "UPDATE batch.job_runs SET status = %(status)s"
@@ -674,8 +682,8 @@ def PublicationContents(records: list[cbstm03a.StatementRecords]) -> dict[str, b
     psText = "".join(line + "\n" for statement in records for line in statement.psLines)
     htmlText = "".join(line + "\n" for statement in records for line in statement.htmlLines)
     return {
-        PUBLICATION_PS_NAME: psText.encode(PUBLICATION_ENCODING),
-        PUBLICATION_HTML_NAME: htmlText.encode(PUBLICATION_ENCODING),
+        PUBLICATION_PS_NAME: psText.encode(PS_ENCODING),
+        PUBLICATION_HTML_NAME: htmlText.encode(HTML_ENCODING),
     }
 
 
@@ -772,15 +780,19 @@ def PublicationRunJob(statementsDir: Path, transactionRows: list[dict[str, objec
     return raised.value
 
 
+@pytest.mark.parametrize(
+    "label", ["NEW", PUBLICATION_NON_ASCII_LABEL], ids=["ascii-records", "non-ascii-records"]
+)
 @pytest.mark.parametrize("hasPrevious", [True, False], ids=["previous-pair", "first-run"])
 def test_publication_replaces_both_files_and_leaves_no_work_file(
-    tmp_path: Path, hasPrevious: bool
+    tmp_path: Path, hasPrevious: bool, label: str
 ) -> None:
-    """A complete run leaves exactly the new pair: no .part file, backup or marker."""
+    """A complete run leaves exactly the new pair, STATEMNT.PS in Latin-1 and STATEMNT.HTML in
+    UTF-8: no .part file, backup or marker."""
     statementsDir = tmp_path / PUBLICATION_DIRECTORY_NAME
     if hasPrevious:
         PublicationWritePair(statementsDir, "PREVIOUS")
-    records = PublicationRecords("NEW")
+    records = PublicationRecords(label)
     counts = creastmt.WriteStatementFiles(statementsDir, records)
     assert PublicationFiles(statementsDir) == PublicationContents(records)
     assert counts.AsLedgerCounts() == {"statements": 2, "transactions": 3}
@@ -923,7 +935,6 @@ def test_read_abend_after_recovery_leaves_the_previous_statements(
     assert PublicationFiles(statementsDir) == previous
 
 
-# --- CREASTMT through the CLI on the seeded test database ----------------------------------------
 # Chain steps 6 and 13-16 as standalone jobs, with the status each ends with on the sample data:
 # POSTTRAN rejects records, the legacy RC 4. TRANSACT then holds the COMBTRAN records.
 CHAIN_SET_UP_JOBS = (
@@ -957,9 +968,38 @@ APOSTROPHE_ENTITIES = ("&#39;", "&#x27;")
 PS_NAME_LINE_INDEX = 1
 MULTI_WORD_NAMES = {"first_name": "MARY ANN", "middle_name": "JO BETH", "last_name": "VAN DYKE"}
 EXPECTED_STATEMENT_NAME = "MARY JO VAN "
-MARKUP_ADDRESS = "O'NEIL & <SONS>"
-MARKUP_DESCRIPTION = "CAFE 'A' & <B>"
-ESCAPED_MARKUP_VALUES = ("O'NEIL &amp; &lt;SONS&gt;", "CAFE 'A' &amp; &lt;B&gt;")
+
+
+class StatementTextCase(NamedTuple):
+    """Text set in a customer's address line 1 and a transaction's description, with the values
+    STATEMNT.PS must hold raw, as Latin-1 bytes, and STATEMNT.HTML escaped."""
+
+    address: str
+    description: str
+    psBytes: tuple[bytes, ...]
+    escapedValues: tuple[str, ...]
+
+
+# ASCII markup, and code page 037 text outside ASCII. An HTML field value ends at its first '*'
+# (DELIMITED BY '*'); STATEMNT.PS keeps ST-TRANDT X(49) whole.
+MARKUP_TEXT_CASE = StatementTextCase(
+    address="O'NEIL & <SONS>",
+    description="CAFE 'A' & <B>",
+    psBytes=(b"O'NEIL & <SONS>", b"CAFE 'A' & <B>"),
+    escapedValues=("O'NEIL &amp; &lt;SONS&gt;", "CAFE 'A' &amp; &lt;B&gt;"),
+)
+NON_ASCII_TEXT_CASE = StatementTextCase(
+    address="CAFÉ <B>ÑANDÚ</B> & ¢50",
+    description='Café <b>Ñandú</b> & ¢50 "q" O\'Brien *star after',
+    psBytes=(
+        b"CAF\xc9 <B>\xd1AND\xda</B> & \xa250",
+        b'Caf\xe9 <b>\xd1and\xfa</b> & \xa250 "q" O\'Brien *star after',
+    ),
+    escapedValues=(
+        "<p>CAFÉ &lt;B&gt;ÑANDÚ&lt;/B&gt; &amp; ¢50  </p>",
+        '<p>Café &lt;b&gt;Ñandú&lt;/b&gt; &amp; ¢50 "q" O\'Brien </p>',
+    ),
+)
 
 
 def StatementPaths(outputDir: Path) -> tuple[Path, Path]:
@@ -988,6 +1028,13 @@ def RunStatementJob(expectedExitCode: int, force: bool = False) -> CliOutcome:
 def ReadLines(path: Path) -> list[str]:
     """Return a statement file's records, each without its LF terminator."""
     return compare.ReadFixedWidthRecords(path)
+
+
+def DecodedRecords(path: Path, encoding: str) -> list[str]:
+    """Return a statement file's records decoded strictly from encoding, each without its LF."""
+    records = path.read_bytes().decode(encoding).split(compare.RECORD_TERMINATOR)
+    assert records.pop() == ""
+    return records
 
 
 def FileDigests(paths: tuple[Path, ...]) -> list[str]:
@@ -1021,16 +1068,22 @@ def RunOracleStatements(engine: Engine) -> legacy_oracle.StatementOutcome:
 def WriteOracleStatements(engine: Engine, oracleDir: Path) -> tuple[Path, Path]:
     """Write the two files of RunOracleStatements(engine), after asserting the oracle succeeded.
 
-    The lines are written as the fixtures are: Latin-1, one LF after every record. Returns the
-    paths, as StatementPaths(oracleDir).
+    The lines are written as the fixtures are: STATEMNT.PS in Latin-1 and STATEMNT.HTML in
+    UTF-8, one LF after every record. Returns the paths, as StatementPaths(oracleDir).
     """
     outcome = RunOracleStatements(engine)
     assert outcome.exitCode == legacy_oracle.EXIT_OK
     oraclePaths = StatementPaths(oracleDir)
     oraclePaths[0].parent.mkdir(parents=True)
-    for oraclePath, lines in zip(oraclePaths, (outcome.psLines, outcome.htmlLines), strict=True):
+    oracleFiles = zip(
+        oraclePaths,
+        (outcome.psLines, outcome.htmlLines),
+        (PS_ENCODING, HTML_ENCODING),
+        strict=True,
+    )
+    for oraclePath, lines, encoding in oracleFiles:
         recordText = "".join(line + compare.RECORD_TERMINATOR for line in lines)
-        oraclePath.write_bytes(recordText.encode(compare.FILE_ENCODING))
+        oraclePath.write_bytes(recordText.encode(encoding))
     return oraclePaths
 
 
@@ -1101,7 +1154,7 @@ def test_statement_files_equal_expected_fixtures_byte_for_byte(
     RunStatementJob(EXIT_OK)
     actualPaths = StatementPaths(batchEnvironment.outputDir)
     assert StatementDifferences(actualPaths, EXPECTED_STATEMENT_PATHS) == []
-    htmlText = actualPaths[1].read_text(encoding=compare.FILE_ENCODING)
+    htmlText = actualPaths[1].read_text(encoding=HTML_ENCODING)
     assert "'" in htmlText
     assert [entity for entity in APOSTROPHE_ENTITIES if entity in htmlText] == []
     statementStep = StepRow(batchEnvironment.engine, STATEMENT_STEP_NO)
@@ -1109,12 +1162,13 @@ def test_statement_files_equal_expected_fixtures_byte_for_byte(
 
 
 def test_statement_lines_have_legacy_widths(batchEnvironment: BatchEnvironment) -> None:
-    """Every STATEMNT.PS record is LRECL 80 and every STATEMNT.HTML record LRECL 100."""
+    """Every STATEMNT.PS record is LRECL 80 and every STATEMNT.HTML record LRECL 100, counted in
+    the characters of each file's encoding."""
     RunChainThroughCombtran(batchEnvironment)
     RunStatementJob(EXIT_OK)
     psPath, htmlPath = StatementPaths(batchEnvironment.outputDir)
-    assert {len(line) for line in ReadLines(psPath)} == {PS_LINE_WIDTH}
-    assert {len(line) for line in ReadLines(htmlPath)} == {HTML_LINE_WIDTH}
+    assert {len(line) for line in DecodedRecords(psPath, PS_ENCODING)} == {PS_LINE_WIDTH}
+    assert {len(line) for line in DecodedRecords(htmlPath, HTML_ENCODING)} == {HTML_LINE_WIDTH}
 
 
 def test_statement_rerun_overwrites_files_with_identical_content(
@@ -1149,22 +1203,36 @@ def test_statement_name_keeps_only_first_word_of_each_name_part(
     assert StatementDifferences(actualPaths, oraclePaths) == []
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(MARKUP_TEXT_CASE, id="ascii-markup"),
+        pytest.param(NON_ASCII_TEXT_CASE, id="non-ascii-cp037-text"),
+    ],
+)
 def test_html_escapes_only_ampersand_and_angle_brackets_and_keeps_apostrophes(
-    batchEnvironment: BatchEnvironment, tmp_path: Path
+    batchEnvironment: BatchEnvironment, tmp_path: Path, case: StatementTextCase
 ) -> None:
     """User text reaches STATEMNT.HTML with &, < and > escaped and nothing else changed, and
-    STATEMNT.PS raw: the input-cleaning pin of the statement template."""
+    STATEMNT.PS raw: the input-cleaning pin of the statement template. STATEMNT.HTML records are
+    100 UTF-8 characters and STATEMNT.PS records 80 Latin-1 bytes."""
     engine = batchEnvironment.engine
     xref = FirstStatementXref(engine)
-    SetCustomerColumns(engine, xref["cust_id"], {"addr_line_1": MARKUP_ADDRESS})
+    SetCustomerColumns(engine, xref["cust_id"], {"addr_line_1": case.address})
     InsertCardTransactions(engine, [xref["card_num"]], SYNTHETIC_TRANSACTIONS_PER_CARD)
-    SetFirstTransactionDescription(engine, xref["card_num"], MARKUP_DESCRIPTION)
+    SetFirstTransactionDescription(engine, xref["card_num"], case.description)
     RunStatementJob(EXIT_OK)
     actualPaths = StatementPaths(batchEnvironment.outputDir)
-    psText, htmlText = (path.read_text(encoding=compare.FILE_ENCODING) for path in actualPaths)
-    assert [value for value in ESCAPED_MARKUP_VALUES if value not in htmlText] == []
+    psRecords = DecodedRecords(actualPaths[0], PS_ENCODING)
+    htmlRecords = DecodedRecords(actualPaths[1], HTML_ENCODING)
+    assert {len(record) for record in psRecords} == {PS_LINE_WIDTH}
+    assert {len(record) for record in htmlRecords} == {HTML_LINE_WIDTH}
+    psText, htmlText = "\n".join(psRecords), "\n".join(htmlRecords)
+    assert [value for value in case.escapedValues if value not in htmlText] == []
     assert [entity for entity in APOSTROPHE_ENTITIES if entity in htmlText] == []
-    assert [value for value in (MARKUP_ADDRESS, MARKUP_DESCRIPTION) if value not in psText] == []
+    assert [value for value in (case.address, case.description) if value not in psText] == []
+    psBytes = actualPaths[0].read_bytes()
+    assert [value for value in case.psBytes if value not in psBytes] == []
     oraclePaths = WriteOracleStatements(engine, tmp_path / ORACLE_DIRECTORY_NAME)
     assert StatementDifferences(actualPaths, oraclePaths) == []
 
@@ -1188,8 +1256,6 @@ def test_capacity_of_51_cards_by_10_transactions_is_processed_exactly(
     assert len(ReadLines(actualPaths[0])) == STATEMENT_CAPACITY_CARDS * fullTableLines
 
 
-# The 52nd-card and 11th-transaction refusals differ only in their input, and the fresh and
-# previous output directories only in what must survive, so one parameterized test covers all.
 # The expected outcome is legacy_oracle.RunCreastmt's, run in-test on the arranged tables.
 @pytest.mark.parametrize(
     "fillOverCapacity",

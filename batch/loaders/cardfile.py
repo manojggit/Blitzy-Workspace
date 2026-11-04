@@ -23,7 +23,6 @@ from app.utils.record_layouts import CARD_LAYOUT
 from batch.loaders import replace_loader
 from batch.orchestration.job_context import JobContext, JobResult
 
-# The CLI load name and the legacy JCL alias, as batch_chain registers chain step 2.
 JOB_NAME = "cards"
 JCL_NAME = "CARDFILE"
 

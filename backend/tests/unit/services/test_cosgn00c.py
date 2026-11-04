@@ -89,6 +89,8 @@ UNKNOWN_USER_ID_HEX_BYTES = 4
 # The failure_count a blank-field edit leaves against the keyed user ID; None for no row.
 ONE_FAILURE = 1
 NO_ATTEMPT_ROW = None
+# The failure_count of the row an admission inserts, which an uncounted 503 leaves.
+NO_FAILURE = 0
 # The key a blank USERID would have once right-trimmed, which the throttle never stores.
 BLANK_USER_ID_KEY = ""
 LOWER_CASE_USER_FIRST_NAME = "Lower"
@@ -396,7 +398,6 @@ def ThrottleCleanupFixture(syncEngine: Engine) -> Iterator[list[str]]:
             connection.execute(DELETE_ATTEMPT_ROW_STATEMENT, {"userId": throttledUserId})
 
 
-# --- First-failure literals ------------------------------------------------------------------
 @pytest.mark.parametrize(("transcribedValue", "serviceValue"), TRANSCRIBED_LITERAL_CASES)
 def test_service_literals_equal_the_cobol_transcription(transcribedValue, serviceValue):
     assert serviceValue == transcribedValue
@@ -456,16 +457,15 @@ async def test_usrsec_file_condition_gives_unable_to_verify_on_the_user_id(
     signOnScenario, syncEngine, monkeypatch, errorType
 ):
     # The WHEN OTHER branch answers 503, the file-error status of AAP 0.6.5, not the 401 of a
-    # sign-on refusal; it still counts as the attempt's failure.
+    # sign-on refusal. It checks no password, so it leaves the admission's row uncounted.
     monkeypatch.setattr(UserRepository, "GetUser", FailingGetUser(errorType))
     user = signOnScenario.user
     await AssertSignOnFails(signOnScenario.context, CorrectPasswordRequest(user), UNABLE_TO_VERIFY)
     attemptRow = ReadAttemptRow(syncEngine, user.userId)
     assert attemptRow is not None
-    assert attemptRow.failure_count == 1
+    assert (attemptRow.failure_count, attemptRow.locked_until) == (NO_FAILURE, None)
 
 
-# --- Success and routing ---------------------------------------------------------------------
 @pytest.mark.parametrize("seedSignOnCase", SEED_SIGN_ON_CASES)
 async def test_seed_user_signs_on_with_its_image_password_to_its_menu(
     makeOnlineContext, seedUsers, syncEngine, seedSignOnCase
@@ -523,7 +523,6 @@ async def test_successful_sign_on_leaves_no_attempt_row_and_keeps_the_hash(
     assert ReadStoredUser(syncEngine, user.userId).password_hash == storedHash
 
 
-# --- Throttle, sign-off and current user -----------------------------------------------------
 async def test_limit_of_wrong_passwords_locks_the_user_id_against_the_right_one(
     signOnScenario, syncEngine, throttleCleanup
 ):

@@ -41,7 +41,6 @@ from batch.orchestration.job_context import (
 
 LOGGER = logging.getLogger(__name__)
 
-# The canonical CLI name and the legacy JCL name of batch_chain.JOB_DEFINITIONS["tran-index"].
 JOB_NAME = "tran-index"
 JCL_NAME = "TRANIDX"
 

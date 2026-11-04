@@ -358,10 +358,12 @@ def PublishStepGenerations(stepContext: JobContext, step: ChainStep) -> int:
 def FinishStep(stepContext: JobContext, step: ChainStep, result: JobResult) -> int:
     """Complete a run whose runner returned, publish its generations and return its status.
 
-    FinishIfRunning finishes per-write and files-only runs and is a no-op for an atomic runner
-    that already finished inside its own transaction. Publication then runs once, after that
-    commit: a generation it does not publish makes the status EXIT_FAILURE, while the run and
-    its step stay COMPLETED. The run's ENDED line is logged last.
+    FinishIfRunning finishes a run its runner committed without finishing. It is a no-op for
+    atomic and per-write runners, which finish with FinishAtomicRun in their own final
+    transaction, and for the files-only CREASTMT, which calls FinishIfRunning itself once its
+    files are in place. Publication then runs once, after that commit: a generation it does not
+    publish makes the status EXIT_FAILURE, while the run and its step stay COMPLETED. The run's
+    ENDED line is logged last.
     """
     if result.exitCode >= CHAIN_STOP_THRESHOLD:
         message = RETURNED_FAILURE_TEMPLATE.format(
@@ -377,7 +379,10 @@ def FinishStep(stepContext: JobContext, step: ChainStep, result: JobResult) -> i
 def IoFailureExitCode(step: ChainStep) -> int:
     """Return the status of an unmapped I/O error: abend 999 for a per-write step.
 
-    An atomic or files-only step has rolled back completely, so its failure is recoverable.
+    An atomic step's transaction has rolled back completely. A files-only step (CREASTMT) has
+    committed no table write and, even when it failed after publishing its files, its retry
+    overwrites them. Either failure is therefore recoverable (EXIT_FAILURE), unlike a per-write
+    step's abend, which keeps the writes it committed.
     """
     if step.durability == DURABILITY_PER_WRITE:
         return EXIT_ABEND

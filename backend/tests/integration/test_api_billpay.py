@@ -122,7 +122,6 @@ INSERT_TRANSACTION_SQL = text(
 )
 
 
-# --- Helpers -------------------------------------------------------------------------------------
 def AssertLegacyError(
     response: httpx.Response, status: int, message: str, cursorField: str = ""
 ) -> None:
@@ -281,7 +280,6 @@ async def test_balance_not_above_zero_has_nothing_to_pay(
     AssertNothingWritten(syncEngine, balance)
 
 
-# --- The payment ---------------------------------------------------------------------------------
 @pytest.mark.usefixtures("frozenPaymentClock")
 @pytest.mark.parametrize("confirm", [CONFIRM_YES, "y"])
 async def test_payment_writes_the_bill_payment_record(
@@ -308,7 +306,6 @@ async def test_payment_writes_the_bill_payment_record(
 async def test_second_payment_has_nothing_to_pay(
     regularClient: httpx.AsyncClient, syncEngine: Engine
 ) -> None:
-    """After a payment the balance is zero, so paying again is refused and writes nothing."""
     firstResponse = await PayBill(regularClient, SAMPLE_ACCOUNT_ID, CONFIRM_YES)
     assert firstResponse.status_code == HTTP_OK, firstResponse.text
     secondResponse = await PayBill(regularClient, SAMPLE_ACCOUNT_ID, CONFIRM_YES)
@@ -331,7 +328,6 @@ async def test_next_tran_id_follows_the_highest_existing_one(
     assert storedTranIds == [EXISTING_TRAN_ID, FOLLOWING_TRAN_ID]
 
 
-# --- Session, role and Origin guards -------------------------------------------------------------
 async def test_admin_is_refused_the_regular_transaction(
     adminClient: httpx.AsyncClient, syncEngine: Engine
 ) -> None:

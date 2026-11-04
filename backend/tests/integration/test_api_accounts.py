@@ -291,7 +291,6 @@ class AccountAction:
         }
 
 
-# --- Test data, committed through syncEngine and undone by restoreSeedState ---------------------
 def MakeAccountEditable(syncEngine: Engine, acctId: str) -> str:
     """Commit account and customer values passing every COACTUPC edit; return ``acctId``."""
     with syncEngine.begin() as connection:
@@ -317,7 +316,6 @@ def ReadAccountRow(syncEngine: Engine, acctId: str) -> dict[str, Any]:
     return dict(rowMapping)
 
 
-# --- Expected screen values ----------------------------------------------------------------------
 def StoredText(value: object) -> str:
     """Return a stored column as display text: ISO for a date, "" for NULL, no trailing pad."""
     if value is None:
@@ -355,7 +353,6 @@ def MaskedSsn(ssn: str) -> str:
     return MASKED_SSN_PREFIX + ssn[-SSN_VISIBLE_DIGITS:]
 
 
-# --- Requests and assertions ---------------------------------------------------------------------
 def AssertLegacyError(
     response: httpx.Response, status: int, message: str, cursorField: str = ""
 ) -> dict[str, Any]:
@@ -503,7 +500,6 @@ async def test_view_shows_account_and_customer_as_stored(
 async def test_view_masks_ssn_and_never_returns_it(
     regularClient: httpx.AsyncClient, syncEngine: Engine
 ) -> None:
-    """CAVW shows the SSN as ***-**- plus its last four digits, and nowhere in full."""
     storedSsn = ReadAccountRow(syncEngine, SAMPLE_ACCOUNT_ID)["ssn"]
     response = await regularClient.get(f"{ACCOUNTS_URL}/{SAMPLE_ACCOUNT_ID}")
     assert response.status_code == HTTP_OK, response.text
@@ -685,7 +681,6 @@ async def test_all_field_mode_keeps_first_message_and_every_failing_field(
 async def test_valid_change_is_validated_without_writing(
     regularClient: httpx.AsyncClient, syncEngine: Engine
 ) -> None:
-    """A change passing every edit gives CHANGES_OK_NOT_CONFIRMED; ENTER never writes."""
     acctId = MakeAccountEditable(syncEngine, SAMPLE_ACCOUNT_ID)
     storedRow = ReadAccountRow(syncEngine, acctId)
     overrides = {CREDIT_LIMIT_FIELD: CURRENCY_CREDIT_LIMIT}
@@ -757,7 +752,6 @@ async def test_save_without_validation_only_validates(
 async def test_cancel_rereads_record_and_discards_edits(
     regularClient: httpx.AsyncClient, syncEngine: Engine, validateFirst: bool
 ) -> None:
-    """F12 once details are fetched re-reads the record: SHOW_DETAILS with the stored values."""
     acctId = MakeAccountEditable(syncEngine, SAMPLE_ACCOUNT_ID)
     storedRow = ReadAccountRow(syncEngine, acctId)
     overrides = {CREDIT_LIMIT_FIELD: CURRENCY_CREDIT_LIMIT}
@@ -777,7 +771,6 @@ async def test_cancel_rereads_record_and_discards_edits(
 async def test_request_after_changes_done_returns_empty_key_screen(
     regularClient: httpx.AsyncClient, syncEngine: Engine, action: UpdateAction
 ) -> None:
-    """After CHANGES_DONE any key re-initialises: the empty key screen, the input discarded."""
     acctId = MakeAccountEditable(syncEngine, SAMPLE_ACCOUNT_ID)
     doneScreen = await SaveChange(
         regularClient, acctId, {CREDIT_LIMIT_FIELD: CURRENCY_CREDIT_LIMIT}
@@ -869,7 +862,6 @@ async def test_edit_endpoints_refuse_admin_with_empty_message(
 async def test_edit_endpoints_require_session(
     apiClient: httpx.AsyncClient, useFetchEndpoint: bool
 ) -> None:
-    """Without a session cookie both CAUP endpoints answer 401."""
     response = await SendEditRequest(apiClient, SAMPLE_KEY_CASE, useFetchEndpoint)
     assert response.status_code == HTTP_UNAUTHENTICATED, response.text
 

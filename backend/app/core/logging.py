@@ -28,17 +28,19 @@ Uvicorn logs a request target's query exactly as the client sent it, for every r
 status, so a mistaken or hostile request can carry a password, an SSN, a CVV, the session
 token or a connection string under any parameter name, or in the value of a declared one. A
 request target, a query whose decoded path holds a / or is the * of OPTIONS *, therefore
-keeps only what its route declares. ROUTE_QUERY_SHAPES matches the end of the decoded path
-to a GET route, and gives the wire names that route reads, each with the shape of its value:
-acctId is up to 11 digits, direction is forward or backward, and so on. A pair whose name the
-route does not declare is replaced whole by [REDACTED], its name included; auth, menu,
-accounts, billpay, health and every unknown path declare none. A declared value without its
-shape is replaced by [REDACTED] after the name. One with its shape is written as sent unless
-it holds a card number, which is masked. cardNum and the card-list startKey keep the card
-handling above. Names and values are judged decoded, as Starlette decodes them, so
-%70assword=... or pass+word=... is redacted like password=..., and repeated pairs are judged
-one by one. The text after a ? elsewhere, such as "what?x" in a message, has each parameter
-judged by its decoded value alone.
+keeps only what its route declares. ROUTE_QUERY_SHAPES holds each route's declaration, a
+safe-logging allow-list rather than the route's parameter list. It matches the end of the
+decoded path to a GET route, and gives the wire names that route's log keeps readable, each
+with the shape of its value: acctId is up to 11 digits, direction is forward or backward, and
+so on. A pair whose name the route does not declare, even one the route reads, is replaced
+whole by [REDACTED], its name included; every path no entry matches, such as auth, menu,
+accounts, billpay and health, declares none. A declared value without its shape is replaced
+by [REDACTED] after the name. One with its shape is written as sent unless it holds a card
+number, which is masked. cardNum and the card-list startKey keep the card handling above.
+Names and values are judged decoded, as Starlette decodes them, so %70assword=... or
+pass+word=... is redacted like password=..., and repeated pairs are judged one by one. The
+text after a ? elsewhere, such as "what?x" in a message, has each parameter judged by its
+decoded value alone.
 
 Uvicorn's TRACE log writes each ASGI scope, whose query_string and raw_path bytes do not take
 the path?query form. Before a record is rendered, each scope among its args is replaced by a
@@ -186,8 +188,10 @@ CARD_LIST_QUERY_SHAPES = types.MappingProxyType(
         "selections": SELECTION_CODE_SHAPE,
     }
 )
-# GET /cards/{cardNum} and its /edit form read acctId only. cardNum is masked there as on the
-# card list, so a raw-PAN request line logs its path and query card numbers alike.
+# GET /cards/{cardNum} and its /edit form log acctId by its shape. Any other name, the isCardRef
+# flag these routes read included, is redacted whole. cardNum, which they do not read as a query
+# parameter, is admitted only so that a card number sent as its value is masked as on the card
+# list, and a raw-PAN request line logs its path and query card numbers alike.
 CARD_KEY_QUERY_SHAPES = types.MappingProxyType(
     {"acctId": ACCOUNT_ID_SHAPE, CARD_NUMBER_QUERY_NAME: CARD_PARAMETER_SHAPE}
 )
@@ -312,7 +316,6 @@ def RedactCardSlotValue(slotValue: str) -> str:
 
 
 def RedactCardSlot(slotMatch: re.Match[str]) -> str:
-    """Return a card path or query slot with its value passed through RedactCardSlotValue."""
     return slotMatch.group(1) + RedactCardSlotValue(slotMatch.group(2))
 
 
@@ -551,7 +554,6 @@ def ProjectScopeMapping(scope: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def ProjectScope(argument: object) -> object:
-    """Return a log argument projected by ProjectScopeMapping when it is a mapping."""
     if isinstance(argument, Mapping):
         return ProjectScopeMapping(argument)
     return argument
@@ -660,7 +662,6 @@ class CurrentStdoutHandler(logging.StreamHandler):
 
     @property
     def stream(self) -> TextIO:
-        """Return the current sys.stdout."""
         return sys.stdout
 
 

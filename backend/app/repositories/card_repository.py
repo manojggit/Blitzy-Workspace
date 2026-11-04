@@ -249,7 +249,6 @@ class CardRepository:
         return await self._ReadRecords(statement)
 
     async def _ReadRecords(self, statement: Executable) -> list[dict[str, Any]]:
-        """Run an unlocked read on the request session and return its rows as records."""
         result = await self._Execute(self.context.session, statement)
         return [dict(row) for row in result.mappings().all()]
 

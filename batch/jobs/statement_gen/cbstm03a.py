@@ -591,9 +591,10 @@ def MarkFieldValue(value: object) -> str:
 def BuildTemplateEnvironment() -> Environment:
     """Return the Jinja2 environment for templates/statement.html.j2, built on first use."""
     # autoescape stays off because HTML autoescaping also rewrites the apostrophes in the
-    # sample customer and transaction text, which breaks byte parity with CBSTM03A. The
-    # finalize hook MarkFieldValue cleans each field value with EscapeFieldValue instead
-    # (MK_Modernization Rule clause 4) and marks it, so FitHtmlRecord can fit the record.
+    # sample customer and transaction text, which breaks byte parity with CBSTM03A's raw field
+    # writes (cbl/CBSTM03A.CBL:560-592,686-716). The finalize hook MarkFieldValue cleans each
+    # field value with EscapeFieldValue instead (MK_Modernization Rule clause 4) and marks it,
+    # so FitHtmlRecord can fit the record.
     # auto_reload is off so a cached template is never re-checked on disk.
     return Environment(
         loader=FileSystemLoader(TEMPLATE_DIRECTORY),

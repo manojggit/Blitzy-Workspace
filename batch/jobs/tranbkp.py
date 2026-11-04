@@ -12,7 +12,10 @@ net effect in one transaction: every row of transactions.transactions, in tran_i
 CVTRA05Y record of the new generation, streamed from a server-side cursor in bounded batches as
 REPRO streams the unload, and the rows are then deleted. The run's completion and then the
 generation's COMMITTED catalog row, the transaction's final write, commit together with the
-delete, so a failure leaves the table, the catalog and the archive directory as they were.
+delete, so a failure commits nothing: the table and the catalog are left as they were and no
+generation is published. A failure inside the generation block also deletes the .part file; a
+failure of the final commit leaves it uncataloged until gdg.ReconcileCatalog, which batch_chain
+runs once the failure is recorded and every command runs at its start, deletes it.
 This module never publishes: batch_chain publishes the generation once the transaction has
 committed, outside its runner-failure handling, so a publication error cannot turn the committed
 backup into a failed, retryable step. TRANSACT.BKUP retention (LIMIT 5, NOSCRATCH) belongs to
@@ -50,7 +53,6 @@ from batch.orchestration.job_context import (
 
 LOGGER = logging.getLogger(__name__)
 
-# The canonical CLI name and the legacy JCL name of batch_chain.JOB_DEFINITIONS["tran-backup"].
 JOB_NAME = "tran-backup"
 JCL_NAME = "TRANBKP"
 
@@ -177,7 +179,8 @@ def RunJob(context: JobContext) -> JobResult:
 
     Returns EXIT_OK with the records_archived count once the transaction has committed, leaving
     the generation COMMITTED for batch_chain to publish. Raises JobFailure with EXIT_FAILURE on a
-    database, file or record error, after which nothing is archived, cataloged or deleted.
+    database, file or record error, after which nothing is cataloged or deleted and no generation
+    is published; a .part file a failed commit leaves is deleted by gdg.ReconcileCatalog.
     """
     try:
         with context.engine.begin() as connection:

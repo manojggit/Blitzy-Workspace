@@ -6,7 +6,11 @@
 // to an option's program is a page navigation here, and each option of an excluded module answers
 // with its menu's legacy "not installed" literal. The spec only reads data, so it does not depend
 // on day-in-the-life.spec.ts, and each test runs in a fresh browser context with its own session
-// cookie. Credentials come from frontend/.env.e2e through AdminUser() and RegularUser() only.
+// cookie. Real credentials come from the environment through AdminUser() and RegularUser() only;
+// the credential-entry case uses throwaway markers generated at run time, and its entry fails
+// before anything is submitted, so it sends no sign-on request.
+import { randomBytes } from "node:crypto";
+
 import { expect, test, type Page, type Response } from "@playwright/test";
 
 import {
@@ -416,6 +420,76 @@ async function MainMenuNavigation({ page }: PageFixtures): Promise<void> {
     });
 }
 
+// Random markers that no page, fixture or log holds, so a marker found in a failure's text can
+// only have come from the entry. USERID is BMS LENGTH=8, so its marker is 8 hex digits.
+const USER_ID_MARKER_BYTES = 4;
+const PASSWORD_MARKER_BYTES = 8;
+
+// The COSGN00 USERID field by its verbatim BMS label, and every password input of the page.
+const SIGN_ON_USER_ID_NAME = "User ID     :";
+const PASSWORD_INPUT_SELECTOR = 'input[type="password"]';
+
+// A read-only field fails the entry after this long instead of at the test timeout.
+const LOCKED_ENTRY_TIMEOUT_MS = 5_000;
+
+function MarkerCredentials(): Credentials {
+    return {
+        userId: randomBytes(USER_ID_MARKER_BYTES).toString("hex"),
+        password: randomBytes(PASSWORD_MARKER_BYTES).toString("hex"),
+    };
+}
+
+// Runs in the page before its own scripts. Each password input is made read-only when it
+// appears, and again if the page lifts the attribute; setting it only on an editable input
+// keeps the observer's own change from triggering it without end.
+function LockPasswordInputs(selector: string): void {
+    const lockAll = (): void => {
+        for (const input of document.querySelectorAll<HTMLInputElement>(selector)) {
+            if (!input.readOnly) {
+                input.readOnly = true;
+            }
+        }
+    };
+    new MutationObserver(lockAll).observe(document, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["readonly"],
+    });
+}
+
+// What a reporter prints for a failure: the message and stack of the error and of each Error in
+// its cause chain. A chain that loops back on itself is read once.
+function ErrorChainText(error: unknown): string {
+    const chainParts: string[] = [];
+    const seenErrors = new Set<Error>();
+    let current = error;
+    while (current instanceof Error && !seenErrors.has(current)) {
+        seenErrors.add(current);
+        chainParts.push(current.message, current.stack ?? "");
+        current = current.cause;
+    }
+    return chainParts.join("\n");
+}
+
+// SignOn must fail at the password, with the user ID already entered, and the text of that
+// failure must hold neither marker.
+async function LockedPasswordEntry({ page }: PageFixtures): Promise<void> {
+    const markers = MarkerCredentials();
+    await page.addInitScript(LockPasswordInputs, PASSWORD_INPUT_SELECTOR);
+    page.setDefaultTimeout(LOCKED_ENTRY_TIMEOUT_MS);
+    const entryError = await SignOn(page, markers).then(
+        () => undefined,
+        (error: unknown) => error,
+    );
+    expect(entryError, "sign-on with a read-only password field").toBeInstanceOf(Error);
+    const userIdField = page.getByRole("textbox", { name: SIGN_ON_USER_ID_NAME, exact: true });
+    await expect(userIdField, "user ID entered before the failure").toHaveValue(markers.userId);
+    const failureText = ErrorChainText(entryError);
+    expect(failureText, "failure text holds no user ID").not.toContain(markers.userId);
+    expect(failureText, "failure text holds no password").not.toContain(markers.password);
+}
+
 test.describe("admin user (type A) on the CA00 admin menu", () => {
     test(
         "admin menu opens options 1–4, reports 5–6 not installed, and F3 signs out",
@@ -427,5 +501,12 @@ test.describe("regular user on the CM00 main menu", () => {
     test(
         "main menu opens options 1–10, reports 11 not installed, and refuses /admin/users",
         MainMenuNavigation,
+    );
+});
+
+test.describe("sign-on credential entry", () => {
+    test(
+        "a failed password entry leaves no credential in the error, its call log or causes",
+        LockedPasswordEntry,
     );
 });

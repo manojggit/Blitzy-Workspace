@@ -20,7 +20,6 @@ from app.utils.record_layouts import ACCOUNT_LAYOUT
 from batch.loaders import replace_loader
 from batch.orchestration.job_context import JobContext, JobResult
 
-# The canonical CLI name and the legacy JCL name of batch_chain.JOB_DEFINITIONS["accounts"].
 JOB_NAME = "accounts"
 JCL_NAME = "ACCTFILE"
 

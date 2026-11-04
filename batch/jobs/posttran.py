@@ -15,13 +15,14 @@ DALYTRAN DD) are read in record_seq order, never updated or deleted, and each on
 
 docs/batch.md ("Step 13: POSTTRAN", "POSTTRAN: posting") transcribes this contract.
 
-Durability: every CardDemo file is RECOVERY(NONE), so each write commits as it is made and an
-abend leaves the earlier records posted. The category-balance write commits with the validation
-reads that lock its account; the account rewrite and the transaction insert follow in units of
-their own. The run's completion and then the DALYREJS generation's COMMITTED catalog row, the
-job's final database write, share one final transaction, committed after the last posting
-write; the chain (batch_chain) publishes the generation once that has committed. An abend
-deletes the .part file and catalogs nothing, as DISP=(NEW,CATLG,DELETE) does.
+Durability: every CardDemo file is RECOVERY(NONE) (csd/CARDDEMO.CSD lines 9 and 84 for ACCTDAT and
+TRANSACT), so each write commits as it is made and an abend (9999-ABEND-PROGRAM, cbl/CBTRN02C.cbl
+lines 707-711) leaves the earlier records posted. The category-balance write commits with the
+validation reads that lock its account; the account rewrite and the transaction insert follow in
+units of their own. The run's completion and then the DALYREJS generation's COMMITTED catalog row,
+the job's final database write, share one final transaction, committed after the last posting write;
+the chain (batch_chain) publishes the generation once that has committed. An abend deletes the .part
+file and catalogs nothing, as DISP=(NEW,CATLG,DELETE) does.
 
 Exit statuses: EXIT_OK; REJECTS_RETURN_CODE (4) when the stored reject count is above zero; or
 JobFailure with EXIT_ABEND (9999-ABEND-PROGRAM, CEE3ABD 999) on a duplicate key or any database,
@@ -63,7 +64,6 @@ from batch.orchestration.job_context import EXIT_ABEND, EXIT_OK, JobContext, Job
 
 LOGGER = logging.getLogger(__name__)
 
-# The canonical CLI name and the legacy JCL name of batch_chain.JOB_DEFINITIONS["post-tran"].
 JOB_NAME = "post-tran"
 JCL_NAME = "POSTTRAN"
 PROGRAM_NAME = "CBTRN02C"
@@ -126,7 +126,6 @@ ABEND_FILE_TEMPLATE = "FILE ERROR {errorClass} ERRNO {errnoName}"
 ABEND_RECORD_TEMPLATE = "RECORD ENCODING ERROR {errorClass}"
 ABEND_UNKNOWN_CODE = "UNKNOWN"
 
-# The batch.job_runs.counts keys.
 PROCESSED_COUNT_KEY = "processed"
 REJECTED_COUNT_KEY = "rejected"
 POSTED_COUNT_KEY = "posted"
@@ -155,9 +154,9 @@ class PostingCounts:
 def RunJob(context: JobContext) -> JobResult:
     """Run POSTTRAN: post the staged daily transactions and write DALYREJS(+1) (step 13).
 
-    Returns EXIT_OK, or REJECTS_RETURN_CODE when any record was rejected, with the processed,
-    rejected and posted counts, once the final transaction has recorded the run COMPLETED and
-    cataloged the generation COMMITTED. Raises JobFailure with EXIT_ABEND on any abend: the
+    Returns EXIT_OK, or REJECTS_RETURN_CODE when the stored reject count is positive, with the
+    processed, rejected and posted counts, once the final transaction has recorded the run COMPLETED
+    and cataloged the generation COMMITTED. Raises JobFailure with EXIT_ABEND on any abend: the
     postings committed before it stay, and no DALYREJS generation is cataloged.
     """
     LOGGER.info(START_LOG, PROGRAM_NAME)

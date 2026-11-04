@@ -6,7 +6,9 @@ symbolic maps cpy-bms/COTRN00.CPY, cpy-bms/COTRN01.CPY and cpy-bms/COTRN02.CPY, 
 transaction record copybook cpy/CVTRA05Y.cpy.
 
 The three programs validate in first-failure mode: the first failing edit ends validation, so
-their responses carry ``message`` and ``cursor_field`` rather than a list of failing fields.
+failures never accumulate. An error body still carries the four legacy keys ``message``,
+``info_message``, ``field_errors`` and ``cursor_field``; ``field_errors`` names the one field
+the error flags, or is empty when it flags none.
 Screen inputs are raw ``ScreenText`` limited to their BMS LENGTH, so every edit literal of the
 programs (for example ``Tran ID must be Numeric ...`` or
 ``Amount should be in format -99999999.99``) stays reachable in the services.

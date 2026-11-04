@@ -29,7 +29,6 @@ from datetime import date, datetime
 from decimal import ROUND_DOWN, Context, Decimal, InvalidOperation
 from pathlib import Path
 
-# Field kinds. Each FieldSpec names one; ParseRecord and FormatRecord dispatch on it.
 KIND_TEXT = "X"
 KIND_DIGITS = "9"
 KIND_CODE = "N"
@@ -193,7 +192,6 @@ STATEMENT_PS_WIDTH = 80
 STATEMENT_HTML_WIDTH = 100
 REPORT_LINE_WIDTH = 133
 
-# Layout name -> (fields, record length). The statement files are line-only layouts.
 LAYOUTS: dict[str, tuple[tuple[FieldSpec, ...], int]] = {
     "ACCOUNT": (ACCOUNT_FIELDS, ACCOUNT_LRECL),
     "CUSTOMER": (CUSTOMER_FIELDS, CUSTOMER_LRECL),
@@ -2286,9 +2284,12 @@ def BuildAllStatements(
 def RunCreastmt(state: OracleState) -> StatementOutcome:
     """Transcribes CREASTMT (jcl/CREASTMT.JCL STEP010-STEP040) and CBSTM03A with CBSTM03B.
 
-    The TIOT walk and the ALTER / GO TO dispatch of cbl/CBSTM03A.CBL (lines 262-314) only open the
-    files and have no output. Any abend, including the capacity refusal, gives exit 16 and no
-    lines.
+    The TIOT walk and the ALTER / GO TO dispatch of cbl/CBSTM03A.CBL (lines 262-314) write no
+    STATEMNT.PS or STATEMNT.HTML record, so nothing here models them: the dispatch routes to the
+    file opens and to the table load LoadStatementTable replays. The walk's DISPLAY lines
+    (270-290: the job and step name, then each DD name with its UCB state) are console
+    diagnostics, which the port replaces with one log line listing the configured inputs. Any
+    abend, including the capacity refusal, gives exit 16 and no lines.
     """
     try:
         cardTable = LoadStatementTable(state.transactions)

@@ -470,7 +470,8 @@ Other outcomes, each with `field_errors` and `cursor_field` naming the field sho
     `LOGIN_LOCKOUT_SECONDS` (default 900). A successful sign-on resets the count. A blank user ID
     is never counted or refused with 429.
 - 503 `Unable to verify the User ...` (`user_id`): the user file cannot be read, as while the
-    batch window is held.
+    batch window is held. A 503 is never counted against the throttle, so these refusals never
+    lock the user ID.
 
 No cookie accompanies an error.
 

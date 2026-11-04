@@ -1,13 +1,13 @@
 """Replaces: no legacy artefact (new control, AAP 0.7.1). Guards: COSGN00C (CC00) sign-on,
 key SEC-USR-ID X(08) of copybook CSUSR01Y.
 
-Only failed sign-ons are counted in security.login_attempts, against the upper-cased user ID
-cosgn00c passes, as COSGN00C reads USRSEC, whether or not the user exists. cosgn00c answers a
-blank user ID with its edit before any admission, as COSGN00C reads no USRSEC record for it, so
-the blank ID is never a key. The invariant: the failures counted since the last reset plus the
-password checks in flight never exceed LOGIN_MAX_ATTEMPTS. A concurrent burst of wrong
-passwords therefore checks at most LOGIN_MAX_ATTEMPTS of them before the lock, and concurrent
-correct sign-ons are never refused:
+Only the sign-on failures cosgn00c answers with 401 are counted in security.login_attempts,
+against the upper-cased user ID it passes, as COSGN00C reads USRSEC, whether or not the user
+exists. cosgn00c answers a blank user ID with its edit before any admission, as COSGN00C reads
+no USRSEC record for it, so the blank ID is never a key. An attempt is admitted only while the
+failures counted since the last reset plus the password checks in flight stay below
+LOGIN_MAX_ATTEMPTS. A concurrent burst of wrong passwords therefore checks at most
+LOGIN_MAX_ATTEMPTS of them before the lock, and concurrent correct sign-ons are never refused:
 
 - AcquireCheckSlot admits an attempt to its password edit and check. One write unit locks
   the ID's row, inserting it with no failures when absent, so the admissions of one ID, and its
@@ -23,7 +23,8 @@ correct sign-ons are never refused:
   failure_count never overflows, and the first failure after a lock has expired starts the
   count again at one. ResetAttempts deletes the row after a successful sign-on.
 - ReleaseCheckSlot ends the check only after its outcome has committed, so no admission ever
-  counts fewer failures plus checks than there are.
+  counts fewer failures plus checks than there are: a finishing failure counts twice until the
+  release, which only makes admission more conservative.
 
 A check in flight is a session-level shared advisory lock in PostgreSQL's two-int4 key space,
 (CHECK_SLOT_LOCK_SPACE, hashtext(user ID)), held on a pooled connection of the attempt's own;
@@ -35,7 +36,7 @@ other's checks. A connection that drops releases its marker with its session.
 A sign-on holds at most four pooled connections at once, core.database.REQUEST_CONNECTION_LIMIT:
 the check-slot connection, the batch-window connection, the request session and one write unit.
 The table is not a batch-window file, so the throttle keeps working while the batch window is
-closed.
+closed; a sign-on the window refuses answers 503 and counts nothing, so it never locks the ID.
 """
 
 import logging
@@ -77,8 +78,6 @@ USER_ID_FIELD = "user_id"
 # The first key of every check marker in PostgreSQL's two-int4 advisory-lock space, spelling
 # the ASCII bytes "CDLC" and fitting a signed int4; the second key is hashtext(user ID).
 CHECK_SLOT_LOCK_SPACE = 0x43444C43
-# How long an attempt over the limit sleeps before it decides again, and how long it waits for
-# admission in all before it gives up.
 CHECK_SLOT_POLL_SECONDS = 0.05
 CHECK_SLOT_WAIT_SECONDS = 30.0
 
@@ -124,7 +123,6 @@ class CheckSlot:
     state: str = SLOT_IDLE
 
     def MarkerKey(self) -> dict[str, object]:
-        """Return the bound parameters of the attempt's check marker."""
         return {"lockSpace": CHECK_SLOT_LOCK_SPACE, "userId": self.userId}
 
 
@@ -258,7 +256,6 @@ async def AcquireCheckSlot(context: OnlineContext, userId: str) -> CheckSlot:
 
 
 async def UnlockCheckSlot(slot: CheckSlot) -> None:
-    """Release the attempt's check marker on its connection and end the transaction."""
     await slot.connection.execute(RELEASE_CHECK_SLOT_STATEMENT, slot.MarkerKey())
     await slot.connection.commit()
 
@@ -339,7 +336,6 @@ def BuildFailureUpsert(userId: str, now: datetime, maxAttempts: int) -> Insert:
 
 
 async def ApplyLockout(unit: AsyncConnection, userId: str, lockedUntil: datetime) -> None:
-    """Lock the user ID until ``lockedUntil``, inside the unit that counted the failure."""
     statement = (
         update(LOGIN_ATTEMPTS)
         .where(LOGIN_ATTEMPTS.c.user_id == userId)

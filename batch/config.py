@@ -69,7 +69,6 @@ class BatchSettings(BaseSettings):
     CARDDEMO_OUTPUT_DIR: str = "var/batch-output"
 
     def IsProduction(self) -> bool:
-        """Return True when APP_ENV is production."""
         return self.APP_ENV == "production"
 
     def EbcdicDir(self) -> Path:

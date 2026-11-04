@@ -101,7 +101,6 @@ SETTINGS_INVALID_LOG = SETTINGS_INVALID_MESSAGE + ": %d error(s) in %s"
 SETTINGS_INVALID_DETAIL_LOG = SETTINGS_INVALID_MESSAGE + ": %s"
 SETTING_NAME_SEPARATOR = ", "
 
-# The canonical names of the processing jobs, as batch_chain.JOB_DEFINITIONS keys them.
 POST_TRAN_JOB = "post-tran"
 INTEREST_CALC_JOB = "interest-calc"
 TRAN_BACKUP_JOB = "tran-backup"
@@ -259,7 +258,6 @@ APP.add_typer(
     epilog=HelpEpilog(LOAD_GROUP_EXAMPLES),
 )
 
-# The help of every command; each names the legacy job it replaces.
 COMMAND_HELP = {
     "run-all": "Run or resume the 18-step chain in legacy order (CA-7 and Control-M chains).",
     "seed-all": "Abandon any OPEN cycle and run loader steps 1-5 and 7-12 in a new cycle.",

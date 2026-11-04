@@ -35,13 +35,17 @@ from . import legacy_oracle
 TABLE_SPECS = legacy_oracle.TABLE_SPECS
 GDG_BASE_NAMES = ("TRANSACT.BKUP", "DALYREJS", "SYSTRAN", "TRANSACT.COMBINED")
 PUBLISHED_STATE = "PUBLISHED"
-# GDG and statement files hold one byte per character, each line ended by "\n".
+# GDG files and STATEMNT.PS hold one byte per character, each line ended by "\n". Latin-1 maps
+# every byte to one character, so a UTF-8 STATEMNT.HTML is still compared byte for byte.
 FILE_ENCODING = "latin-1"
 RECORD_TERMINATOR = "\n"
 CSV_ENCODING = "utf-8"
 # batch.gdg_generations.file_path is relative to BatchSettings.GdgDir(), which is
 # <CARDDEMO_OUTPUT_DIR>/gdg, so a relative path resolves under outputDir / "gdg" (AAP 0.6.8).
 GDG_DIRECTORY_NAME = "gdg"
+CATALOG_PATH_OUTSIDE_ROOT_TEMPLATE = (
+    "catalog file_path {filePath!r} resolves to {resolvedPath}, not inside the GDG root {gdgRoot}"
+)
 MAX_REPORTED_DIFFERENCES = 50
 # Pseudo field kind of the CHAR(1) <timestamp>_format columns, beside the oracle's KIND_* codes.
 FORMAT_CODE_KIND = "F"
@@ -120,6 +124,35 @@ def ReadTableRows(connection: Connection, spec: legacy_oracle.TableSpec) -> list
     return [dict(row) for row in connection.execute(statement).mappings()]
 
 
+def ResolveCatalogFilePath(outputDir: Path, filePath: str) -> Path:
+    """Resolve a batch.gdg_generations file_path to its archive file, confined to outputDir/gdg.
+
+    A relative file_path, the "<BASE>/G####V00.dat" the batch catalogs, is joined to the GDG
+    root; an absolute one is taken as given. Both are canonicalised with ``Path.resolve``, which
+    follows symlinks, a symlinked parent directory or final component included, so the
+    containment check applies to the file a reader or a deletion would actually reach.
+
+    Args:
+        outputDir: The run's CARDDEMO_OUTPUT_DIR, whose gdg/ is the GDG root.
+        filePath: The catalog file_path, for example "SYSTRAN/G0001V00.dat".
+
+    Returns:
+        The canonical path, strictly inside the canonical GDG root.
+
+    Raises:
+        ValueError: The path resolves to the GDG root itself or outside it, or holds a NUL.
+    """
+    gdgRoot = (outputDir / GDG_DIRECTORY_NAME).resolve()
+    resolvedPath = (gdgRoot / filePath).resolve()
+    if resolvedPath == gdgRoot or not resolvedPath.is_relative_to(gdgRoot):
+        raise ValueError(
+            CATALOG_PATH_OUTSIDE_ROOT_TEMPLATE.format(
+                filePath=filePath, resolvedPath=resolvedPath, gdgRoot=gdgRoot
+            )
+        )
+    return resolvedPath
+
+
 def LatestPublishedGeneration(
     connection: Connection, baseName: str, outputDir: Path, relative: int = 0
 ) -> Path | None:
@@ -137,10 +170,12 @@ def LatestPublishedGeneration(
         relative: 0 for the newest generation, -1 for the one before it, and so on.
 
     Returns:
-        The archive path, or None when no PUBLISHED generation matches.
+        The archive path, canonical and inside outputDir/gdg (``ResolveCatalogFilePath``), or
+        None when no PUBLISHED generation matches.
 
     Raises:
-        ValueError: relative is greater than 0.
+        ValueError: relative is greater than 0, or the catalog file_path resolves outside
+            outputDir/gdg.
     """
     if relative > 0:
         raise ValueError(f"relative generation must be 0 or negative, got {relative!r}")
@@ -148,10 +183,7 @@ def LatestPublishedGeneration(
     filePath = connection.execute(LATEST_PUBLISHED_GENERATION_SQL, parameters).scalar_one_or_none()
     if filePath is None:
         return None
-    generationPath = Path(filePath)
-    if generationPath.is_absolute():
-        return generationPath
-    return outputDir / GDG_DIRECTORY_NAME / generationPath
+    return ResolveCatalogFilePath(outputDir, filePath)
 
 
 def FieldColumnKinds(fields: Iterable[legacy_oracle.FieldSpec]) -> dict[str, str]:
@@ -298,7 +330,7 @@ def CompareIndexedRows(
     expectedRows: Mapping[tuple[str, ...], dict[str, str]],
     actualRows: Mapping[tuple[str, ...], dict[str, str]],
 ) -> list[str]:
-    """Compare two keyed row sets: missing keys, then field differences, then unexpected keys."""
+    """Compare expected keys in input order, then report unexpected keys in sorted order."""
     differences = []
     for key, expectedRow in expectedRows.items():
         actualRow = actualRows.get(key)

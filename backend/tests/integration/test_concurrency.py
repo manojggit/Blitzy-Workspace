@@ -15,6 +15,7 @@ proves the concurrency contract of the Technical Specification, Section 0.6.10:
   batch/orchestration/batch_window.BatchWindow does, CC00 and CB00 answer their WHEN OTHER
   literals (cbl/COSGN00C.cbl line 254, cbl/COBIL00C.cbl line 368) with HTTP 503, CCLI still
   lists cards because CARDDAT stays open, and both work again once the window is released;
+  more CC00 refusals than LOGIN_MAX_ATTEMPTS count no failure, so none locks the user ID;
 - TRANBKP against CT02, with the batch CLI run as a subprocess: a backup holding the window
   refuses the add (cbl/COTRN02C.cbl line 600), and a backup started during an add waits for it
   and archives its row, so every transaction ends in the archive or in the table;
@@ -30,19 +31,22 @@ UPDATE on a separate connection holds TRANBKP after its archive read, at its DEL
 online request is a repository call patched to stop at a Gate. Waits on another session are
 observed in pg_locks and pg_stat_activity of this test database only, because sibling test
 databases on the same server use the same lock keys. Every subprocess is waited for or killed,
-every paused request released and reaped and every sync connection closed, in finally.
-restoreSeedState restores every table, the batch schema the CLI writes included, so the
-TRANBKP cases need no ledger cleanup of their own. Clients, generated users and the test
+every paused request released and its reap attempted and every sync connection closed, in
+finally. restoreSeedState restores every table, the batch schema the CLI writes included, so
+the TRANBKP cases need no ledger cleanup of their own. Clients, generated users and the test
 database are fixtures of tests/conftest.py, so no password appears here.
 
-PausedRequest reaps its request on every exit, a failure of the gate wait or of its block and a
-cancellation of its caller included: the request is released, given time to end, cancelled if
-it has not, and awaited, and how it ended is retrieved, before the failure or the cancellation
-propagates. Its own cases check this: a request ending before the gate, answered or raised,
-fails with that outcome; an add hanging short of the gate is cancelled and reaped; a failure
-raised in the block comes out unchanged, with the request's exception retrieved; and one
-cancellation of the helper, while it awaits the gate or while it reaps, propagates only once
-the add has ended and released its locks.
+PausedRequest reaps its request within bounded waits on every exit, a failure of the gate wait
+or of its block and a cancellation of its caller included: the request is released, given time
+to end, cancelled if it has not, and awaited a while more. If it has ended by then, how it
+ended is retrieved before the failure or the cancellation propagates. A request still running
+is left pending, with no promise that its locks are released: after a block that ended
+normally it fails the test, and otherwise the failure or the cancellation propagates
+unchanged. Its own cases check this for requests that end: a request ending before the gate,
+answered or raised, fails with that outcome; an add hanging short of the gate is cancelled and
+reaped; a failure raised in the block comes out unchanged, with the request's exception
+retrieved; and one cancellation of the helper, while it awaits the gate or while it reaps,
+propagates only once the add has ended and released its locks.
 """
 
 import asyncio
@@ -74,6 +78,7 @@ import pytest
 from sqlalchemy import BigInteger, Engine, TextClause, bindparam, text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from app.core.config import Settings
 from app.core.locks import BATCH_WINDOW_LOCK
 from app.repositories.account_repository import AccountRepository
 from app.repositories.transaction_repository import TransactionRepository
@@ -82,7 +87,6 @@ from app.repositories.transaction_repository import TransactionRepository
 # first and torn down last, so the app engine is disposed of before the seed restore runs.
 pytestmark = pytest.mark.usefixtures("restoreSeedState")
 
-# --- HTTP ----------------------------------------------------------------------------------------
 API_V1 = "/api/v1"
 LOGIN_URL = API_V1 + "/auth/login"
 BILLPAY_URL = API_V1 + "/billpay"
@@ -107,7 +111,6 @@ REGULAR_USER_TYPE = "U"
 # COCRDLIC shows 7 cards per page (cbl/COCRDLIC.cbl lines 177-178).
 CARD_LIST_PAGE_ROWS = 7
 
-# --- Literals, verbatim from the COBOL sources ---------------------------------------------------
 UNABLE_TO_VERIFY_TEXT = "Unable to verify the User ..."
 ACCOUNT_LOOKUP_FAILED_TEXT = "Unable to lookup Account..."
 CONFIRM_PAYMENT_TEXT = "Confirm to make a bill payment..."
@@ -121,7 +124,6 @@ RECORD_CHANGED_TEXT = "Record changed by some one else. Please review"
 CHANGES_FAILED_INFO = "Changes unsuccessful. Please try again"
 CHANGES_COMMITTED_INFO = "Changes committed to database"
 
-# --- CAUP and CCUP keys, screen states and fields ------------------------------------------------
 ENTER_ACTION = "enter"
 SAVE_ACTION = "save"
 SHOW_DETAILS_STATE = "SHOW_DETAILS"
@@ -136,7 +138,6 @@ NO_CHANGES: Mapping[str, str] = MappingProxyType({})
 FIRST_CREDIT_LIMIT = Decimal("2345.00")
 SECOND_CREDIT_LIMIT = Decimal("6789.00")
 
-# --- Waits and timeouts --------------------------------------------------------------------------
 PROCESS_TIMEOUT_SECONDS = 120
 WAIT_TIMEOUT_SECONDS = 60
 GATE_TIMEOUT_SECONDS = 30
@@ -153,7 +154,6 @@ SHORT_GATE_TIMEOUT_SECONDS = 5.0
 SLOW_RELEASE_SECONDS = 1.0
 POLL_INTERVAL_SECONDS = 0.05
 
-# --- Failure messages ----------------------------------------------------------------------------
 BATCH_PACKAGE_NAME = "batch"
 BATCH_PACKAGE_MISSING_MESSAGE = (
     "The batch package is not installed, and the TRANBKP cases run its CLI: install it with"
@@ -174,7 +174,6 @@ LOCKS_NOT_HELD_MESSAGE = "The paused add held no advisory lock, so their release
 # asyncio's report of a task dropped with an exception nobody retrieved.
 UNRETRIEVED_TASK_EXCEPTION_MESSAGE = "Task exception was never retrieved"
 
-# --- How a request task ended, as AwaitGate reports it -------------------------------------------
 REQUEST_CANCELLED_OUTCOME = "was cancelled"
 REQUEST_RAISED_OUTCOME = "raised {error!r}"
 REQUEST_ANSWERED_OUTCOME = "answered {status} {body}"
@@ -212,7 +211,6 @@ CONFIRMED_PAYMENT_BODY: Mapping[str, str] = MappingProxyType(
 )
 PARALLEL_ADD_COUNT = 3
 
-# --- TRAN-IDs ------------------------------------------------------------------------------------
 TRAN_ID_LENGTH = 16
 HIGHEST_TRAN_ID = "9999999999999999"
 WRAPPED_TRAN_ID = "0000000000000000"
@@ -301,7 +299,6 @@ EDITABLE_CARD_VALUES: Mapping[str, object] = MappingProxyType(
 VALIDATED_CARD_NAME = "Validated Card Holder"
 CONCURRENT_CARD_NAME = "Concurrent Card Holder"
 
-# --- SQL: constant text, values always bound -----------------------------------------------------
 INSERT_TRANSACTION_SQL = text(
     "INSERT INTO transactions.transactions (tran_id, tran_type_cd, tran_cat_cd, tran_source,"
     " tran_desc, tran_amt, merchant_id, merchant_name, merchant_city, merchant_zip, card_num,"
@@ -344,6 +341,11 @@ TRANSACTION_ROW_LOCK_SQL = text(
     "SELECT 1 FROM transactions.transactions WHERE tran_id = :tranId FOR UPDATE"
 )
 CARD_ROW_LOCK_SQL = text("SELECT 1 FROM cards.cards WHERE card_num = :cardNum FOR UPDATE")
+LOGIN_ATTEMPT_SQL = text(
+    "SELECT failure_count, locked_until FROM security.login_attempts WHERE user_id = :userId"
+)
+# The row the sign-on throttle's admission inserts: no failure counted and no lock.
+UNCOUNTED_LOGIN_ATTEMPT = (0, None)
 # The batch window as BatchWindow takes it: the single BIGINT key, session-level and exclusive.
 ACQUIRE_WINDOW_SQL = text("SELECT pg_advisory_lock(:lockKey)").bindparams(
     bindparam("lockKey", type_=BigInteger)
@@ -374,7 +376,6 @@ RECORD_TERMINATOR = "\n"
 TRANSACTION_RECORD_LENGTH = 350
 
 
-# --- Value objects -------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Probe:
     """A count query on the server's lock or activity view, what it detects and its parameters."""
@@ -485,7 +486,6 @@ ADVISORY_LOCKS_HELD = Probe(
 )
 
 
-# --- Test data, committed through syncEngine and undone by restoreSeedState ---------------------
 def InsertTransactions(syncEngine: Engine, rows: Sequence[SeedTransaction]) -> None:
     """Commit ``rows`` to transactions.transactions in one transaction."""
     parameters = [
@@ -549,12 +549,18 @@ def ReadCardName(syncEngine: Engine, cardNum: str) -> str:
         return connection.execute(CARD_NAME_SQL, {"cardNum": cardNum}).scalar_one()
 
 
+def ReadLoginAttempt(syncEngine: Engine, userId: str) -> tuple[int, datetime | None]:
+    """Return the committed failure_count and locked_until of ``userId``'s throttle row."""
+    with syncEngine.connect() as connection:
+        failureCount, lockedUntil = connection.execute(LOGIN_ATTEMPT_SQL, {"userId": userId}).one()
+    return failureCount, lockedUntil
+
+
 def ValidAddBody() -> dict[str, str]:
     """Return a fresh CT02 ENTER body that every COTRN02C edit accepts, confirmed with Y."""
     return dict(VALID_ADD_FIELDS)
 
 
-# --- Locks held by the test, each on a sync connection of its own -------------------------------
 @contextlib.contextmanager
 def HoldBatchWindow(syncEngine: Engine) -> Iterator[None]:
     """Close the batch window to online access, as CLOSEFIL did, until the block ends (OPENFIL).
@@ -600,7 +606,6 @@ async def WaitUntil(syncEngine: Engine, probe: Probe, timeoutSeconds: float) -> 
     pytest.fail(WAIT_FAILED_MESSAGE.format(seconds=timeoutSeconds, description=probe.description))
 
 
-# --- TRANBKP, the batch CLI as a subprocess ------------------------------------------------------
 def RequireBatchPackage() -> None:
     """Fail, never skip, when the batch package whose CLI the TRANBKP cases run is missing."""
     if importlib.util.find_spec(BATCH_PACKAGE_NAME) is None:
@@ -665,7 +670,6 @@ def BackupOutputDirFixture(request: pytest.FixtureRequest) -> Path:
     return request.getfixturevalue("tmp_path")
 
 
-# --- Paused repository calls ---------------------------------------------------------------------
 def PausedCall(original: RepositoryWrite, gate: Gate) -> RepositoryWrite:
     """Return ``original`` wrapped to stop at ``gate``, before or after it runs as the gate says.
 
@@ -811,11 +815,13 @@ async def PausedRequest(
     """Send ``request`` as a task and yield it once its patched call has stopped at ``gate``.
 
     On every exit, a failure of the gate wait or of the block and a cancellation of the caller
-    included, the gate is released and the request reaped (ReapTask): given
-    GATE_TIMEOUT_SECONDS to end, then cancelled and awaited. How it ended is retrieved, and a
-    cancellation of the caller propagates only after the reap. A failure of the gate wait or
-    of the block propagates unchanged; after a block that ends normally, a request still
-    running fails the test.
+    included, the gate is released and the request reaped within bounds (ReapTask): given
+    GATE_TIMEOUT_SECONDS to end, then cancelled and awaited for up to REAP_TIMEOUT_SECONDS.
+    If the request ended, how it ended is retrieved. A request still running then is left
+    pending, its locks possibly still held. A cancellation of the caller propagates only after
+    the reap, in place of any failure of the gate wait or of the block; such a failure
+    otherwise propagates unchanged, the request pending or not. After a block that ends
+    normally, a request still running fails the test.
     """
     requestTask = asyncio.create_task(request)
     try:
@@ -827,7 +833,6 @@ async def PausedRequest(
     AssertTaskEnded(requestTask)
 
 
-# --- Requests and assertions ---------------------------------------------------------------------
 def ExpectOk(response: httpx.Response) -> dict[str, Any]:
     """Assert HTTP 200 and return the JSON body."""
     assert response.status_code == HTTP_OK, response.text
@@ -894,7 +899,6 @@ async def PressSave(
     return await client.put(editScreen.updateUrl, json=saveBody)
 
 
-# --- PausedRequest's own cases: stand-in requests and checks -------------------------------------
 async def RefusedRequest() -> httpx.Response:
     """Stand in for a request whose connection is refused before the app is reached."""
     raise httpx.ConnectError(CONNECTION_REFUSED_TEXT)
@@ -971,18 +975,26 @@ ENDED_REQUESTS = [
 ]
 
 
-# --- The batch window (CLOSEFIL / OPENFIL) -------------------------------------------------------
-async def test_window_refuses_sign_on_until_released(
+async def test_window_refuses_sign_on_uncounted_until_released(
     apiClient: httpx.AsyncClient,
     createUser: Callable[[str], Any],
     syncEngine: Engine,
+    testSettings: Settings,
 ) -> None:
-    """CC00 reads USRSEC first: NOTOPEN is the WHEN OTHER literal (COSGN00C line 254), then 200."""
+    """CC00 reads USRSEC first: NOTOPEN is the WHEN OTHER literal (COSGN00C line 254), then 200.
+
+    The refusals check no password, so more of them than LOGIN_MAX_ATTEMPTS never lock the ID.
+    """
     user = createUser(REGULAR_USER_TYPE)
     credentials = {"user_id": user.userId, "password": user.password}
+    refusedAttempts = testSettings.LOGIN_MAX_ATTEMPTS + 1
     with HoldBatchWindow(syncEngine):
-        refused = await apiClient.post(LOGIN_URL, json=credentials)
-    AssertLegacyError(refused, HTTP_FILE_ERROR, UNABLE_TO_VERIFY_TEXT)
+        refusals = [
+            await apiClient.post(LOGIN_URL, json=credentials) for _ in range(refusedAttempts)
+        ]
+    for refused in refusals:
+        AssertLegacyError(refused, HTTP_FILE_ERROR, UNABLE_TO_VERIFY_TEXT)
+    assert ReadLoginAttempt(syncEngine, user.userId) == UNCOUNTED_LOGIN_ATTEMPT
     signedOn = await apiClient.post(LOGIN_URL, json=credentials)
     assert signedOn.status_code == HTTP_OK, signedOn.text
 
@@ -1007,7 +1019,6 @@ async def test_window_leaves_card_list_open(
     assert len(listed["rows"]) == CARD_LIST_PAGE_ROWS
 
 
-# --- TRANBKP against CT02 ------------------------------------------------------------------------
 async def test_backup_holding_window_refuses_transaction_add(
     regularClient: httpx.AsyncClient, syncEngine: Engine, backupOutputDir: Path
 ) -> None:
@@ -1056,7 +1067,6 @@ async def test_backup_waits_for_transaction_add_in_flight(
     assert ReadTranIds(syncEngine) == []
 
 
-# --- READ UPDATE record locks and before-image compares ------------------------------------------
 async def test_concurrent_account_saves_lock_out_the_second(
     regularClient: httpx.AsyncClient, syncEngine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1181,7 +1191,6 @@ async def test_next_id_after_combtran_follows_interest_ids(
     assert added["tran_id"] == NEXT_AFTER_INTEREST_ID
 
 
-# --- PausedRequest itself: requests that never pause at the gate ---------------------------------
 @pytest.mark.parametrize(("requestOf", "expectedOutcome"), ENDED_REQUESTS)
 async def test_paused_request_reports_a_request_ending_before_the_gate(
     regularClient: httpx.AsyncClient,
@@ -1227,9 +1236,7 @@ async def test_paused_request_cancels_and_reaps_an_add_hanging_short_of_the_gate
     assert CountRows(syncEngine, ADVISORY_LOCKS_HELD) == 0
 
 
-# --- PausedRequest itself: a failure of its block, and its own cancellation ---------------------
 async def test_loop_error_recorder_reports_an_unretrieved_task_exception() -> None:
-    """RecordedLoopErrors, which the block-failure case relies on, reports such a dropped task."""
     with RecordedLoopErrors() as loopErrors:
         await asyncio.wait({asyncio.create_task(RefusedRequest())})
     assert [report["message"] for report in loopErrors] == [UNRETRIEVED_TASK_EXCEPTION_MESSAGE]

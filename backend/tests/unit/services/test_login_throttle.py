@@ -149,7 +149,6 @@ async def AssertCheckLocked(context: OnlineContext, userId: str) -> None:
 
 
 def test_expectations_match_the_configured_throttle(testSettings: Settings) -> None:
-    """The limits and literal these tests expect are the settings and message the app uses."""
     assert testSettings.LOGIN_MAX_ATTEMPTS == MAX_ATTEMPTS
     assert testSettings.LOGIN_LOCKOUT_SECONDS == LOCKOUT_SECONDS
     assert messages.LOGIN_LOCKED_MESSAGE == LOCKED_MESSAGE
@@ -196,7 +195,6 @@ async def test_lock_lasts_until_locked_until(
     throttleKey: str,
     lockProbe: LockProbe,
 ) -> None:
-    """The lock holds while locked_until is later than now, and ends at locked_until."""
     context = await makeOnlineContext()
     await RecordFailures(context, throttleKey, MAX_ATTEMPTS, throttleClock)
     throttleClock.Advance(lockProbe.secondsAfterLock)
@@ -212,7 +210,6 @@ async def test_failure_while_locked_is_not_counted(
     throttleKey: str,
     syncEngine: Engine,
 ) -> None:
-    """A failure recorded before the lock expires leaves the count and the lock unchanged."""
     context = await makeOnlineContext()
     await RecordFailures(context, throttleKey, MAX_ATTEMPTS, throttleClock)
     lockedRow = ReadAttempts(syncEngine, throttleKey)

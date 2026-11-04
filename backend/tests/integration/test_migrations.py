@@ -48,7 +48,6 @@ from app.core.paths import REPO_ROOT
 from app.core.security import VerifyPassword
 from app.models import ALL_SCHEMAS, CYCLE_STEPS, CYCLES, JOB_RUNS, Base
 
-# --- Alembic -------------------------------------------------------------------------------------
 BACKEND_DIRECTORY = REPO_ROOT / "backend"
 ALEMBIC_INI_PATH = BACKEND_DIRECTORY / "alembic.ini"
 ALEMBIC_TIMEOUT_SECONDS = 120
@@ -142,7 +141,6 @@ INDEX_DEFINITIONS: dict[str, IndexDefinition] = {
 }
 EXPECTED_INDEXES = frozenset(INDEX_DEFINITIONS)
 
-# --- Constraints ---------------------------------------------------------------------------------
 PRIMARY_KEY_TYPE = "p"
 FOREIGN_KEY_TYPE = "f"
 CHECK_TYPE = "c"
@@ -347,8 +345,6 @@ INDEX_CHANGES: tuple[DefinitionChange, ...] = (
         "partial_predicate", "ix_transactions_proc_ts", "isPartial", True, "isPartial"
     ),
 )
-
-# --- Columns -------------------------------------------------------------------------------------
 
 
 class SortColumn(NamedTuple):
@@ -557,7 +553,6 @@ TRIGGERS_SQL = text(
 )
 
 
-# --- Value objects -------------------------------------------------------------------------------
 class ConstraintRow(NamedTuple):
     """One reflected constraint: its table, name, pg_constraint type, deferral and key columns.
 
@@ -598,7 +593,6 @@ class SeedUserRecord(Protocol):
     userType: str
 
 
-# --- Helpers -------------------------------------------------------------------------------------
 def SchemaParameters() -> dict[str, list[str]]:
     """Return the :schemas binding that limits every catalog query to ALL_SCHEMAS."""
     return {"schemas": list(ALL_SCHEMAS)}
@@ -798,7 +792,6 @@ def ReadCycleRuns(engine: Engine, cycleId: int) -> list[Row]:
         return list(connection.execute(statement))
 
 
-# --- Fixtures ------------------------------------------------------------------------------------
 @pytest.fixture(name="migratedEngine", scope="module")
 def MigratedEngine(syncEngine: Engine, migratedDatabase: object) -> Engine:
     """Return the psycopg2 engine of the test database once it has been migrated to head."""
@@ -837,7 +830,6 @@ def SeedCycleId(migratedEngine: Engine) -> int:
         return connection.execute(statement).scalar_one()
 
 
-# --- Alembic head and subprocess runs ------------------------------------------------------------
 def test_revision_chain_is_linear_from_0001_to_head_0009():
     scriptDirectory = ScriptDirectory.from_config(Config(str(ALEMBIC_INI_PATH)))
     assert scriptDirectory.get_heads() == [HEAD_REVISION]
@@ -863,7 +855,6 @@ def test_alembic_upgrade_head_runs_from_backend_directory(migratedEngine):
     assert HEAD_MARKER in currentResult.stdout, currentResult.stdout
 
 
-# --- Schemas, tables and primary keys ------------------------------------------------------------
 def test_dataset_group_schemas_exist(migratedEngine):
     assert set(ALL_SCHEMAS) == EXPECTED_SCHEMAS
     assert FetchNames(migratedEngine, SCHEMAS_SQL, SchemaParameters()) == EXPECTED_SCHEMAS
@@ -900,7 +891,6 @@ def test_composite_primary_key_has_the_vsam_key_columns_in_order(
     assert reflectedColumns == [keyColumns]
 
 
-# --- Indexes -------------------------------------------------------------------------------------
 @pytest.mark.parametrize("indexName", sorted(EXPECTED_INDEXES))
 def test_alternate_index_replacement_is_valid_and_not_unique(indexRows, indexName):
     indexRow = indexRows[indexName]
@@ -931,7 +921,6 @@ def test_secondary_indexes_match_the_models(indexRows):
     assert EXPECTED_INDEXES <= secondaryIndexes
 
 
-# --- Foreign keys and checks ---------------------------------------------------------------------
 def test_foreign_keys_are_exactly_the_planned_relationships(constraintRows):
     foreignKeys = ConstraintsOfType(constraintRows, FOREIGN_KEY_TYPE)
     assert {row.constraintName for row in foreignKeys} == EXPECTED_FOREIGN_KEYS
@@ -1005,7 +994,6 @@ def test_column_carries_no_constraint_of_the_excluded_kind(constraintRows, uncon
     assert unconstrained.columnName not in constrainedColumns
 
 
-# --- Generated sort columns and the EBCDIC sort key ----------------------------------------------
 @pytest.mark.parametrize("sortColumn", SORT_COLUMNS, ids=[item.columnName for item in SORT_COLUMNS])
 def test_sort_column_is_generated_always_stored_with_c_collation(migratedEngine, sortColumn):
     parameters = sortColumn._asdict()
@@ -1034,7 +1022,6 @@ def test_ebcdic_sort_key_orders_lower_before_upper_before_digits(migratedEngine,
     assert tuple(row.key_text for row in orderedRows) == sortCase.ebcdicOrder
 
 
-# --- Column types --------------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "columnType",
     COLUMN_TYPES,
@@ -1050,7 +1037,6 @@ def test_no_column_is_floating_point(migratedEngine):
     assert FetchNames(migratedEngine, FLOATING_POINT_COLUMNS_SQL, parameters) == set()
 
 
-# --- FILLER comments -----------------------------------------------------------------------------
 @pytest.mark.parametrize(
     ("tableName", "fillerComment"), list(FILLER_COMMENTS.items()), ids=list(FILLER_COMMENTS)
 )
@@ -1060,7 +1046,6 @@ def test_table_comment_records_the_dropped_filler(migratedEngine, tableName, fil
     assert Base.metadata.tables[tableName].comment == fillerComment
 
 
-# --- Audit trigger -------------------------------------------------------------------------------
 def test_users_audit_trigger_runs_before_each_row_update(migratedEngine):
     parameters = {"tableName": USERS_TABLE_NAME}
     triggerRows = FetchRows(migratedEngine, TRIGGERS_SQL, parameters)
@@ -1079,7 +1064,6 @@ def test_users_update_trigger_advances_updated_at(migratedEngine, seedUsers, res
     assert afterUpdate.updated_at > beforeUpdate.updated_at
 
 
-# --- Sample seed ---------------------------------------------------------------------------------
 @pytest.mark.parametrize(
     ("tableName", "expectedCount"),
     list(EXPECTED_SEED_COUNTS.items()),
@@ -1110,7 +1094,6 @@ def test_daily_staging_runs_in_record_order_with_spaced_orig_ts_and_blank_proc_t
     )
 
 
-# --- Seed cycle ----------------------------------------------------------------------------------
 # restoreSeedState restores every Base.metadata table, batch.* included, so the ledger read here
 # is the one migration left, whatever earlier tests of the session ran.
 def test_seed_is_recorded_as_the_only_cycle_open_and_opened_by_seed(migratedEngine):

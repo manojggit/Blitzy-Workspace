@@ -88,7 +88,6 @@ async def UnreachableClientFixture(testSettings: Settings) -> AsyncIterator[http
 
 
 async def test_health_returns_ok_without_session(testApp: FastAPI) -> None:
-    """GET /health answers 200 ok to a client that sends no session cookie and no Origin."""
     async with BuildAnonymousClient(testApp) as anonymousClient:
         healthResponse = await RequestWithinLimit(anonymousClient, HEALTH_URL)
     assert "cookie" not in healthResponse.request.headers
@@ -98,7 +97,6 @@ async def test_health_returns_ok_without_session(testApp: FastAPI) -> None:
 
 
 async def test_ready_returns_ready_when_database_reachable(apiClient: httpx.AsyncClient) -> None:
-    """GET /health/ready answers 200 ready while the test database runs SELECT 1."""
     readyResponse = await RequestWithinLimit(apiClient, READY_URL)
     assert readyResponse.status_code == HTTP_OK
     assert readyResponse.json() == READY_BODY
@@ -124,6 +122,5 @@ async def test_ready_returns_503_when_database_unreachable(
 async def test_probes_are_not_under_api_prefix(
     probePath: str, apiClient: httpx.AsyncClient
 ) -> None:
-    """The probes are served at the root only: under /api/v1 their paths answer 404."""
     prefixedResponse = await RequestWithinLimit(apiClient, API_V1_PREFIX + probePath)
     assert prefixedResponse.status_code == HTTP_NOT_FOUND

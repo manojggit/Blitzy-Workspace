@@ -20,7 +20,6 @@ from app.utils.record_layouts import TRANSACTION_CATEGORY_LAYOUT
 from batch.loaders import replace_loader
 from batch.orchestration.job_context import JobContext, JobResult
 
-# The canonical CLI name (load tran-categories) and the legacy JCL name accepted as its alias.
 JOB_NAME = "tran-categories"
 JCL_NAME = "TRANCATG"
 

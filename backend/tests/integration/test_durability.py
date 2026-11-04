@@ -22,8 +22,11 @@ the same app still serves a request. The control cases send the same requests un
 commit both writes, which shows the patches cause those outcomes. Clients, the test database
 and the seed restore are the fixtures of tests/conftest.py.
 
-CancelAtGate cancels and reaps the request task on every exit, so the request's units and its
-batch-window lock are released before the test goes on or fails. Two cases check this where
+CancelAtGate cancels the request task on every exit and waits a bounded time for it to end. A
+request task that has ended has released its units and its batch-window lock, and how it ended
+is retrieved, before the test goes on or fails. A task still running when the wait gives up
+fails the test, or, when a failure or a cancellation is already propagating, leaves that one to
+propagate; nothing is promised about its units or its lock. Two cases check that release where
 arranging the experiment fails: a save hanging short of the gate with both rows locked, and a
 request ending before the gate. A third cancels CancelAtGate itself once, while it awaits the
 gate or while it reaps, and checks the same before that cancellation propagates.
@@ -52,7 +55,6 @@ from app.repositories.customer_repository import CustomerRepository
 
 pytestmark = pytest.mark.usefixtures("restoreSeedState")
 
-# --- HTTP ----------------------------------------------------------------------------------------
 API_V1 = "/api/v1"
 ACCOUNTS_PATH = API_V1 + "/accounts"
 BILLPAY_PATH = API_V1 + "/billpay"
@@ -110,7 +112,6 @@ PAID_BALANCE = Decimal("0.00")
 # TRAN-TYPE-CD, TRAN-DESC, TRAN-AMT (the whole balance) and TRAN-CARD-NUM of lines 219-225.
 EXPECTED_PAYMENT_ROW = ("02", "BILL PAYMENT - ONLINE", SEED_BALANCE, SAMPLE_CARD_NUM)
 
-# --- SQL: literal statements with bound values only ----------------------------------------------
 CUSTOMER_OF_ACCOUNT_SQL = "SELECT cust_id FROM xref.card_xref WHERE acct_id = :acctId"
 MAKE_ACCOUNT_EDITABLE_SQL = (
     "UPDATE accounts.accounts SET active_status = :active_status, open_date = :open_date,"
@@ -171,13 +172,11 @@ ADVISORY_LOCK_COUNT_SQL = (
     " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
 )
 
-# --- How a request task ended, as CancelAtGate reports it ----------------------------------------
 REQUEST_CANCELLED_OUTCOME = "was cancelled"
 REQUEST_RAISED_OUTCOME = "raised {error!r}"
 REQUEST_ANSWERED_OUTCOME = "answered {status}: {text}"
 CONNECTION_REFUSED_TEXT = "the test transport refused the connection"
 
-# --- Failure messages ----------------------------------------------------------------------------
 GATE_NOT_REACHED_MESSAGE = "the request never reached the patched second write"
 GATE_NOT_REACHED_OUTCOME_MESSAGE = GATE_NOT_REACHED_MESSAGE + "; the request {outcome}"
 REQUEST_NOT_CANCELLED_MESSAGE = "the request reached the gate but was not cancelled; it {outcome}"
@@ -194,7 +193,6 @@ type RepositoryCall = Callable[[Any, AsyncConnection, Mapping[str, Any]], Awaita
 type RequestCall = Callable[[], Awaitable[httpx.Response]]
 
 
-# --- Value objects -------------------------------------------------------------------------------
 @dataclass
 class Gate:
     """What the patched second write tells the test: that it ran, and the backend it ended."""
@@ -216,7 +214,6 @@ class Interruption:
     driveRequest: Callable[[RequestCall, Gate], Awaitable[httpx.Response | None]]
 
 
-# --- Paths and database helpers (sync, psycopg2) -------------------------------------------------
 def AccountPath(acctId: str) -> str:
     """Return the CAUP update path of ``acctId``, ``PUT /api/v1/accounts/{acctId}``."""
     return f"{ACCOUNTS_PATH}/{acctId}"
@@ -306,7 +303,6 @@ async def WaitUntilRowUnlocked(syncEngine: Engine, table: str, key: str) -> None
         await asyncio.sleep(UNLOCK_POLL_SECONDS)
 
 
-# --- Interruptions of the second write -----------------------------------------------------------
 def TerminatingCall(original: RepositoryCall, syncEngine: Engine, gate: Gate) -> RepositoryCall:
     """Return a write method that ends its unit's server process, then runs ``original``.
 
@@ -422,12 +418,15 @@ async def CancelAtGate(requestCall: RequestCall, gate: Gate) -> None:
 
     The wait gives up after GATE_TIMEOUT_SECONDS, or as soon as the request ends without
     reaching the gate. On every exit, a cancellation of this call included, the request task
-    and the gate waiter are both cancelled and awaited until they have ended, before this
-    returns, fails or propagates the cancellation. A cancellation of this call that arrives
-    during that reap does not cut it short: it is re-raised only once both tasks have ended,
-    or once the reap has given up after REAP_TIMEOUT_SECONDS. So the request's write units
-    have rolled back and its batch-window lock is released by then, and how the request ended
-    has been retrieved. A request that never reached the gate fails the test with that outcome.
+    and the gate waiter are both cancelled and awaited for up to REAP_TIMEOUT_SECONDS, before
+    this returns, fails or propagates the cancellation. A cancellation of this call that
+    arrives during that reap does not cut it short: it is re-raised only once both tasks have
+    ended, or once the reap has given up. A request task that has ended by then has rolled
+    back its write units and released its batch-window lock, and how it ended has been
+    retrieved. Tasks still running when the reap gives up are named in a test failure, unless
+    an exception, such as a cancellation of this call, is already propagating; that one
+    propagates instead. Nothing is promised about the units or the lock of a request still
+    running. A request that never reached the gate fails the test with that outcome.
     """
     requestTask = asyncio.create_task(requestCall())
     reachedWaiter = asyncio.create_task(gate.reached.wait())
@@ -456,7 +455,6 @@ INTERRUPTIONS = [
 ]
 
 
-# --- Request helpers and assertions --------------------------------------------------------------
 @pytest_asyncio.fixture(name="interruptibleClient")
 async def InterruptibleClientFixture(
     testApp: FastAPI, regularClient: httpx.AsyncClient
@@ -613,7 +611,6 @@ async def test_cb00_payment_transaction_survives_interrupted_account_rewrite(
     await AssertSameAppStillServes(interruptibleClient)
 
 
-# --- CancelAtGate itself: a request that never reaches the gate ----------------------------------
 async def test_cancel_at_gate_reaps_a_save_hanging_short_of_the_gate(
     interruptibleClient, syncEngine, monkeypatch
 ):
@@ -655,7 +652,6 @@ async def test_cancel_at_gate_reports_a_request_ending_short_of_the_gate(
     AssertNoTaskLeft(tasksBefore)
 
 
-# --- CancelAtGate itself: one cancellation of the helper, at the gate wait or during the reap ----
 @pytest.mark.parametrize("cancelWhileReaping", [False, True], ids=["awaiting-gate", "reaping"])
 async def test_cancel_at_gate_reaps_the_save_before_its_own_cancellation_propagates(
     interruptibleClient, syncEngine, monkeypatch, cancelWhileReaping
@@ -689,7 +685,6 @@ async def test_cancel_at_gate_reaps_the_save_before_its_own_cancellation_propaga
     await AssertRequestReaped(syncEngine, interruptibleClient, tasksBefore, custId)
 
 
-# --- Controls: the same requests with no interruption commit both writes ------------------------
 async def test_caup_save_without_interruption_commits_both_writes(interruptibleClient, syncEngine):
     """Unpatched, the save rewrites the account and then the customer."""
     custId = MakeAccountEditable(syncEngine, SAMPLE_ACCOUNT_ID)

@@ -9,18 +9,18 @@
 // Playwright runs the default export as globalSetup, and the function it returns as the global
 // teardown that publishes failure evidence. Both specs import the named helpers, so importing
 // this module performs no I/O: its top level only defines constants and functions.
-// Every e2e setting comes from frontend/.env.e2e, which playwright.config.ts loads; user IDs and
-// passwords are read from the environment only and never appear in messages. APP_ENV and
-// SYNC_DATABASE_URL are read as the batch CLI reads them, from the environment or else from
-// plain unquoted backend/.env lines, and the URL as SQLAlchemy parses it. Every carddemo-batch
-// command that global setup or a spec runs is given the checked values, and no message repeats
-// them.
+// The e2e variables are read from the process environment, which playwright.config.ts fills from
+// frontend/.env.e2e without overriding a value already set; user IDs and passwords are read from
+// the environment only and never appear in messages. APP_ENV and SYNC_DATABASE_URL are read as
+// the batch CLI reads them, from the environment or else from plain unquoted backend/.env lines,
+// and the URL as SQLAlchemy parses it. Every carddemo-batch command that global setup or a spec
+// runs is given the checked values, and no message repeats them.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { parseEnv } from "node:util";
 
-import { expect, type FullConfig, type Page } from "@playwright/test";
+import { expect, type FullConfig, type Locator, type Page } from "@playwright/test";
 
 /** The repository root: frontend/e2e -> frontend -> root. Relative settings resolve here. */
 export const REPO_ROOT = path.resolve(__dirname, "..", "..");
@@ -100,8 +100,8 @@ function DescribeMissingVariables(names: readonly RequiredVariable[]): string {
 }
 
 /**
- * The value of one .env.e2e variable. A missing or blank value fails with the variable's name
- * only: the values include passwords.
+ * The environment's value of one .env.e2e variable. A missing or blank value fails with the
+ * variable's name only: the values include passwords.
  */
 export function RequireEnv(name: RequiredVariable): string {
     const value = ReadEnv(name);
@@ -178,19 +178,31 @@ export async function WaitForPath(page: Page, pathname: string): Promise<void> {
     await page.waitForURL((url) => url.pathname === pathname);
 }
 
+// Enters a credential with the steps locator.fill runs for a text or password input, minus the
+// one that logs the value: fill(value) writes it into its call log, which a failed action's
+// error message carries to the reporter and error-context.md. clear() waits for the field to be
+// visible, enabled and editable, then selects, focuses and empties it, logging only fill("");
+// insertText types into the focused field and logs nothing.
+async function EnterCredential(field: Locator, value: string): Promise<void> {
+    await field.clear();
+    await expect(field).toBeFocused();
+    await field.page().keyboard.insertText(value);
+}
+
 /**
  * Signs on through the COSGN00 screen. Typing waits until the fresh screen has put the cursor
  * on USERID, as the map's IC attribute did: the page sets that focus once it is interactive, so
- * no keystroke or click reaches a page that has not hydrated yet. The landing route is the
- * caller's to assert: COSGN00C sends type A to the admin menu and every other type to the main
- * menu.
+ * no keystroke or click reaches a page that has not hydrated yet. Both credentials are entered
+ * by clearing the field and inserting the text, so no failure message, call log or error cause
+ * carries a user ID or password. The landing route is the caller's to assert: COSGN00C sends
+ * type A to the admin menu and every other type to the main menu.
  */
 export async function SignOn(page: Page, credentials: Credentials): Promise<void> {
     await page.goto(SIGN_ON_ROUTE);
     const userIdField = page.getByLabel(USER_ID_LABEL);
     await expect(userIdField).toBeFocused({ timeout: MESSAGE_TIMEOUT_MS });
-    await userIdField.fill(credentials.userId);
-    await page.getByLabel(PASSWORD_LABEL).fill(credentials.password);
+    await EnterCredential(userIdField, credentials.userId);
+    await EnterCredential(page.getByLabel(PASSWORD_LABEL), credentials.password);
     await page.getByRole("button", { name: SIGN_ON_BUTTON_NAME }).click();
 }
 

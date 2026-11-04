@@ -42,10 +42,12 @@ def BuildHashedUserRows(
     """Return a lazy iterator of USRSEC insert rows, SEC-USR-PWD replaced by its bcrypt hash.
 
     Each row holds user_id, first_name, last_name, user_type and password_hash, hashed at the
-    run's BCRYPT_ROUNDS by sample_seed.BuildUserRows, so this loader and the Alembic seed build
-    identical rows. The generated user_id_sort and the audit timestamps are left to the
-    database. records is replace_loader's lazy image stream, not a list, so rows are built one
-    insert batch at a time, as its RowBuilder contract requires.
+    run's BCRYPT_ROUNDS by sample_seed.BuildUserRows, so this loader and the Alembic seed decode
+    the same fields and apply the same hashing policy. bcrypt salts every hash afresh, so
+    password_hash differs on every load and is verified with VerifyPassword, never compared. The
+    generated user_id_sort and the audit timestamps are left to the database. records is
+    replace_loader's lazy image stream, not a list, so rows are built one insert batch at a time,
+    as its RowBuilder contract requires.
     """
     return BuildUserRows(records, context.settings.BCRYPT_ROUNDS)
 

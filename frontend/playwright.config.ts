@@ -1,9 +1,12 @@
 // Playwright configuration for the CardDemo end-to-end flows (day in the life, role navigation).
 //
 // The suite runs against services that are already up (docs/README.md): PostgreSQL, the backend
-// and the built frontend, so no webServer block starts anything here. Every setting, URLs and
-// sign-on credentials included, comes from the uncommitted frontend/.env.e2e (a copy of
-// .env.e2e.example); this file holds no URL, user ID or password and never prints a value.
+// and the built frontend, so no webServer block starts anything here. The e2e variables (target
+// URLs, sign-on credentials and batch paths) come from the process environment or from the
+// optional, uncommitted frontend/.env.e2e (a copy of .env.e2e.example), and a value already set
+// in the process environment takes precedence over the file. The browser project, timeouts,
+// workers, retries, reporter and artifact policy are fixed here. This file holds no URL, user ID
+// or password and never prints a value.
 import fs from "node:fs";
 import path from "node:path";
 
@@ -42,8 +45,8 @@ export default defineConfig({
     retries: 0,
     timeout: TEST_TIMEOUT_MS,
     expect: { timeout: EXPECT_TIMEOUT_MS },
-    // No HTML report: it stores every step title, and Playwright titles a fill with the typed
-    // value, so it would hold the sign-on passwords of every test, passing ones included.
+    // No HTML report: it stores every step title, and Playwright titles each typing step with the
+    // text typed, so it would hold the sign-on passwords of every test, passing ones included.
     reporter: [["list"]],
     // Playwright's working files. Global setup's teardown copies each failed test's screenshot
     // and video from here to blitzy/screenshots and blitzy/screen_recordings.
@@ -52,7 +55,7 @@ export default defineConfig({
         // Must use host 127.0.0.1 and the API origin's scheme, or the SameSite=Lax session cookie
         // is not sent; global setup refuses any other pair.
         baseURL: process.env.CARDDEMO_E2E_BASE_URL,
-        // Tracing stays off: a trace records the sign-on request body and every fill value, so
+        // Tracing stays off: a trace records the sign-on request body and every typed value, so
         // it would store the passwords. The screenshot and video show the password field masked.
         trace: "off",
         screenshot: "only-on-failure",

@@ -45,7 +45,6 @@ from sqlalchemy import create_engine
 
 from . import compare
 
-# --- Paths and the command under test ------------------------------------------------------------
 EXPECTED_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "expected"
 LOADER_ROWS_DIR = EXPECTED_DIR / "loader_rows"
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -59,13 +58,11 @@ CHAIN_TIMEOUT_SECONDS = 1800
 OUTPUT_TAIL_LINES = 40
 MAX_SHOWN_DIFFERENCES = 20
 
-# --- Environment of the subprocess ---------------------------------------------------------------
 SYNC_URL_VARIABLE = "SYNC_DATABASE_URL"
 OUTPUT_DIR_VARIABLE = "CARDDEMO_OUTPUT_DIR"
 APP_ENV_VARIABLE = "APP_ENV"
 TEST_APP_ENV = "test"
 
-# --- Compared outputs ----------------------------------------------------------------------------
 # (qualified table, loader-row CSV): the loaded tables no later chain step writes, so their
 # post-chain rows are the IDCAMS REPRO loads of jcl/CARDFILE.jcl ... jcl/DUSRSECJ.jcl and the
 # DALYTRAN staging load, unchanged.
@@ -113,7 +110,6 @@ SORT_KEY_FIXTURES = (
     ),
 )
 
-# --- Messages ------------------------------------------------------------------------------------
 CLI_MISSING_MESSAGE = (
     "carddemo-batch is not installed at {path}; install the editable packages with"
     " pip install -e backend -e batch"
@@ -133,7 +129,6 @@ NO_GENERATION_MESSAGE = (
 )
 
 
-# --- The chain run -------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ChainRunResult:
     """One run-all of the sample chain: its exit status, output and the database and directory.
@@ -232,7 +227,6 @@ def ReconciledChain(
     return RunSampleChain(testDatabaseUrl, outputDir)
 
 
-# --- Comparison helpers --------------------------------------------------------------------------
 @contextmanager
 def OpenConnection(databaseUrl: str) -> Iterator[Any]:
     """Yield a SQLAlchemy connection to the database the chain ran on; dispose of it afterwards.
@@ -327,7 +321,6 @@ def ExpectedSortKeyTexts(
     return [row[sortSpec.keyColumn] for row in rows], messages
 
 
-# --- Tests ---------------------------------------------------------------------------------------
 def test_run_all_new_cycle_exits_with_posttran_reject_status(
     reconciledChain: ChainRunResult,
 ) -> None:

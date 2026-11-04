@@ -33,7 +33,6 @@ from app.utils.record_layouts import DAILY_TRANSACTION_LAYOUT
 from batch.loaders import replace_loader
 from batch.orchestration.job_context import JobContext, JobResult
 
-# The canonical CLI name and the legacy name of batch_chain.JOB_DEFINITIONS["daily-transactions"].
 JOB_NAME = "daily-transactions"
 JCL_NAME = "DALYTRAN"
 
