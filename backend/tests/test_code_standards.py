@@ -11,7 +11,8 @@ included), import none of them, and need no database and no fixture:
   fields, dataclass fields and enum members keep their fixed names.
 - Size (clause 3): a function body, its docstring excluded, spans at most 20 lines, and a
   function takes at most four parameters, counted as ruff's PLR0913 counts them (receiver,
-  *args and **kwargs excluded).
+  *args and **kwargs excluded). Only a signature a framework fixes is exempt from the parameter
+  limit, so pytest test functions and constructors are counted.
 - Source references (clause 5, Section 0.11.3): every ported module under backend/app/services,
   batch/jobs and batch/loaders opens with a "Replaces:" docstring naming a legacy artefact.
 - Traceability (Section 0.11.3): the program-to-module map in docs/traceability.md lists each
@@ -141,6 +142,8 @@ FRAMEWORK_METHOD_NAMES = frozenset(
     }
 )
 RECEIVER_NAMES = frozenset({"self", "cls", "mcs"})
+# Python fixes only the name of these dunders; the class author writes their parameters.
+AUTHOR_SIGNATURE_DUNDERS = frozenset({"__init__", "__new__", "__call__"})
 # pytest built-in fixtures, injected by parameter name.
 PYTEST_BUILTIN_FIXTURE_PARAMETERS = frozenset(
     {
@@ -311,12 +314,16 @@ def IsFrameworkMandated(function: FunctionNode, parentIsClass: bool, module: Sou
 
 
 def IsSignatureDictated(function: FunctionNode, parentIsClass: bool, module: SourceModule) -> bool:
-    """Whether the framework also fixes the parameter names.
+    """Whether the framework also fixes the parameters, both their names and their count.
 
-    pytest's test_* functions are the exception: their parameters are fixture names the suites
-    choose, declared camelCase through pytest.fixture(name=...), so they are still checked.
+    Two kinds of framework-named function are still checked, because their authors choose the
+    parameters: pytest's test_* functions, whose parameters are the fixture names the suite
+    author selects, declared camelCase through pytest.fixture(name=...); and the constructors
+    and __call__ in AUTHOR_SIGNATURE_DUNDERS, whose parameters the class author writes.
     """
     if IsInTestTree(module) and TEST_FUNCTION_PATTERN.match(function.name):
+        return False
+    if function.name in AUTHOR_SIGNATURE_DUNDERS:
         return False
     return IsFrameworkMandated(function, parentIsClass, module)
 
@@ -562,7 +569,7 @@ def CheckParameterCount(module: SourceModule) -> list[Violation]:
     violations: list[Violation] = []
     for function, parentIsClass in IterFunctions(module.tree):
         count = CountParameters(function)
-        if count > MAX_PARAMETERS and not IsFrameworkMandated(function, parentIsClass, module):
+        if count > MAX_PARAMETERS and not IsSignatureDictated(function, parentIsClass, module):
             message = (
                 f"function {function.name!r} takes {count} parameters (limit {MAX_PARAMETERS})"
             )
@@ -732,12 +739,20 @@ VIOLATING_SOURCE = textwrap.dedent(
         return first
 
 
+    class FiveParameterRecord:
+        def __init__(self, record_id, second, third, fourth, fifth):
+            self.recordId = record_id
+
+
     """
 ) + NumberedFunctionSource("LongFunction", MAX_FUNCTION_BODY_LINES + 1)
 VIOLATING_TEST_PATH = "backend/tests/unit/test_violations.py"
 VIOLATING_SOURCES = {
     VIOLATING_PATH: VIOLATING_SOURCE,
-    VIOLATING_TEST_PATH: "def test_x(account_id):\n    return account_id\n",
+    VIOLATING_TEST_PATH: (
+        "def test_x(account_id):\n    return account_id\n\n\n"
+        "def test_five(one, two, three, four, five):\n    return one\n"
+    ),
 }
 
 EXEMPT_SOURCES = (
@@ -794,6 +809,26 @@ EXEMPT_SOURCES = (
         """,
         "backend/app/core/demo.py",
         id="logging-filter-property-typevar-dunder",
+    ),
+    pytest.param(
+        """
+        from pydantic_settings import BaseSettings
+
+
+        class DemoSettings(BaseSettings):
+            @classmethod
+            def settings_customise_sources(
+                cls,
+                settings_cls,
+                init_settings,
+                env_settings,
+                dotenv_settings,
+                file_secret_settings,
+            ):
+                return (init_settings,)
+        """,
+        "backend/app/core/demo_settings.py",
+        id="pydantic-settings-fixed-signature",
     ),
 )
 
@@ -860,8 +895,11 @@ def test_traceability_program_map_matches_ported_modules() -> None:
         (VIOLATING_PATH, "module name 'lowerConstant' is not an UPPER_CASE constant"),
         (VIOLATING_PATH, "function 'LongFunction' body spans 21 lines"),
         (VIOLATING_PATH, "function 'FiveParameters' takes 5 parameters"),
+        (VIOLATING_PATH, "function '__init__' takes 5 parameters"),
+        (VIOLATING_PATH, "parameter 'record_id' of '__init__' is not camelCase"),
         (VIOLATING_PATH, "lacks a 'Replaces:' header"),
         (VIOLATING_TEST_PATH, "parameter 'account_id' of 'test_x' is not camelCase"),
+        (VIOLATING_TEST_PATH, "function 'test_five' takes 5 parameters"),
     ],
 )
 def test_checkers_flag_synthetic_violations(relativePath: str, expectedFragment: str) -> None:
