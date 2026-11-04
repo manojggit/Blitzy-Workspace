@@ -157,9 +157,9 @@ TERMINATION_UNCONFIRMED_MESSAGE = "server process {backendPid} did not exit with
 ROW_STILL_LOCKED_MESSAGE = "{table} row {key!r} is still locked after the request ended"
 
 # A repository write method as the services call it: (repository, unit, values).
-RepositoryCall = Callable[[Any, AsyncConnection, Mapping[str, Any]], Awaitable[None]]
+type RepositoryCall = Callable[[Any, AsyncConnection, Mapping[str, Any]], Awaitable[None]]
 # One HTTP request, sent when awaited.
-RequestCall = Callable[[], Awaitable[httpx.Response]]
+type RequestCall = Callable[[], Awaitable[httpx.Response]]
 
 
 # --- Value objects -------------------------------------------------------------------------------

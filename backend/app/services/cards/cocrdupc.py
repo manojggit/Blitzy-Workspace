@@ -331,7 +331,9 @@ class ScreenReply:
     shownKeys: tuple[str, str] | None = None
 
 
-ScreenHandler = Callable[[OnlineContext, CardUpdateState, CardScreenFields], Awaitable[CardScreen]]
+type ScreenHandler = Callable[
+    [OnlineContext, CardUpdateState, CardScreenFields], Awaitable[CardScreen]
+]
 
 
 async def FetchCardForEdit(context: OnlineContext, cardKey: str, acctId: str) -> CardScreen:

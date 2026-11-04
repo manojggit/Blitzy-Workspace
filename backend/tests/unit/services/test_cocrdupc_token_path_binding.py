@@ -229,7 +229,7 @@ def GarbledCardKey(settings: "Settings") -> str:
     return GARBLED_CARD_KEY
 
 
-PathBuilder = Callable[["Settings"], str]
+type PathBuilder = Callable[["Settings"], str]
 # Each path: its test id and the builder of the {cardNum} value the request is sent on.
 OTHER_CARD_PATHS = [("other-card-typed", OtherCardTyped), ("other-card-ref", OtherCardRef)]
 INVALID_CARD_REF_PATHS = [

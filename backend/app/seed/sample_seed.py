@@ -78,8 +78,8 @@ FIELD_PADDING = " "
 DEFER_CONSTRAINTS_SQL = "SET CONSTRAINTS ALL DEFERRED"
 RESTORE_CONSTRAINTS_SQL = "SET CONSTRAINTS ALL IMMEDIATE"
 
-DecodedRecords = Iterable[Mapping[str, object]]
-RowBuilder = Callable[[DecodedRecords, int], Iterator[dict[str, object]]]
+type DecodedRecords = Iterable[Mapping[str, object]]
+type RowBuilder = Callable[[DecodedRecords, int], Iterator[dict[str, object]]]
 
 
 @dataclass(frozen=True)

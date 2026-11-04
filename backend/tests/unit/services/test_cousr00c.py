@@ -139,7 +139,7 @@ CORE_PAGING_MESSAGE_IDS = [
     "reached-top",
 ]
 
-ContextFactory = Callable[..., Awaitable[object]]
+type ContextFactory = Callable[..., Awaitable[object]]
 
 
 def EbcdicKey(userId: str) -> bytes:

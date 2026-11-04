@@ -32,7 +32,7 @@ from app.core.dependencies import OnlineContext
 from app.core.errors import LegacyMessageError
 from app.services.auth import login_throttle
 
-ContextFactory = Callable[..., Awaitable[OnlineContext]]
+type ContextFactory = Callable[..., Awaitable[OnlineContext]]
 
 # The lockout of AAP 0.7.1: its literal, status and cursor field, and its default limits.
 LOCKED_MESSAGE = "Too many failed attempts. Try again later ..."

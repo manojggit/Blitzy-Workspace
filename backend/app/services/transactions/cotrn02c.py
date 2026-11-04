@@ -250,7 +250,7 @@ DATE_FIELDS = (
     DateField("procDate", PROC_DATE_FORMAT_MESSAGE, PROC_DATE_INVALID_MESSAGE),
 )
 
-XrefLookup = Callable[[CardXrefRepository, str], Awaitable[dict[str, Any] | None]]
+type XrefLookup = Callable[[CardXrefRepository, str], Awaitable[dict[str, Any] | None]]
 
 
 class KeyPath(NamedTuple):
