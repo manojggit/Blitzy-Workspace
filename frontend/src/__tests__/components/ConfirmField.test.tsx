@@ -1,5 +1,6 @@
 // Tests ConfirmField, which replaces the one-byte CONFIRM field of COTRN02, COBIL00 and CORPT00
 // (bms/*.bms, cpy-bms/*.CPY).
+import { inputBaseClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -107,6 +108,14 @@ describe("ConfirmField field shape", () => {
         expect(input).toHaveAttribute("maxlength", "1");
         expect(input).toHaveAccessibleDescription("Y/N");
         expect(screen.getByText("Y/N")).toBeInTheDocument();
+    });
+
+    // MUI's default medium field is the field height on every map, so CONFIRM matches the rest.
+    it("COBIL00 CONFIRM is MUI's default medium size, not size small", () => {
+        const input = RenderConfirm();
+        expect(input.closest(`.${inputBaseClasses.root}`)).not.toHaveClass(
+            inputBaseClasses.sizeSmall,
+        );
     });
 
     it.each(CONFIRM_PROMPTS)("$mapName CONFIRM is labelled with the map prompt", ({ prompt }) => {

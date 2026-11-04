@@ -355,7 +355,6 @@ function AccountIdField(props: KeyedInputProps) {
             error={isInvalid}
             disabled={isKeyboardLocked}
             variant="outlined"
-            size="small"
             inputRef={inputRef}
             slotProps={{ htmlInput: { maxLength, ...ErrorMessageReference(isInvalid) } }}
         />
@@ -370,7 +369,6 @@ function CurrentBalanceDisplay({ currentBalance }: CurrentBalanceDisplayProps) {
             label={label}
             value={currentBalance ?? ""}
             variant="filled"
-            size="small"
             slotProps={{ input: { readOnly: true }, htmlInput: { maxLength } }}
         />
     );

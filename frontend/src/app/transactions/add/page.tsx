@@ -601,7 +601,6 @@ function StaticFieldProps(definition: AddFieldDefinition): TextFieldProps {
         label: definition.label,
         helperText: definition.helperText,
         variant: "outlined",
-        size: "small",
         autoComplete: "off",
         fullWidth: true,
     };

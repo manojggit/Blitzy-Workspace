@@ -3,7 +3,7 @@
 // backend/app/services/transactions/cotrn02c.py; labels, hints and input lengths from
 // bms/COTRN02.bms. The in-flight lock, the ERRMSG description tie and the restored focus outline
 // have their own TransactionAdd*.test.tsx suites.
-import { alertClasses } from "@mui/material";
+import { alertClasses, inputBaseClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
@@ -519,8 +519,10 @@ function MockOutcome(literalCase: LiteralCase): void {
     mockAddTransaction.mockRejectedValue(FailureOf(literalCase));
 }
 
+// delay null keys each character back to back: FillForm types over 100 characters, and a timer
+// between keystrokes pushed the typing tests past jest's 5 s default timeout on a loaded host.
 function RenderScreen(): UserEvent {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(
         <ThemeProvider theme={CARD_DEMO_THEME}>
             <TransactionAddPage />
@@ -648,6 +650,18 @@ it.each(FIELD_CASES)(
         expect(input).toHaveAccessibleDescription(hint ?? "");
     },
 );
+
+// MUI's default medium field is the field height of every other map; no input is size small.
+it("COTRN02 shows every input, CONFIRM included, at MUI's default medium size", () => {
+    RenderScreen();
+    const inputs = FIELD_NAMES.map(InputOf);
+    expect(screen.getAllByRole("textbox")).toHaveLength(inputs.length);
+    for (const input of inputs) {
+        expect(input.closest(`.${inputBaseClasses.root}`)).not.toHaveClass(
+            inputBaseClasses.sizeSmall,
+        );
+    }
+});
 
 it("COTRN02 legend ENTER/F3/F4/F5, (or) between the keys, cursor on ACTIDIN (IC)", () => {
     RenderScreen();

@@ -62,6 +62,12 @@ interface PendingReadCase {
     routes: readonly string[];
 }
 
+interface OverlongQueryCase {
+    shape: string;
+    queryTranId: string;
+    selectedKey: string;
+}
+
 interface ScreenStatus {
     detailStatus: HTMLElement;
     messageText: string;
@@ -288,6 +294,23 @@ const BACK_CASES: readonly BackCase[] = PRESS_MODES.flatMap((mode) => [
     { mode, origin: "the main menu", tranId: "", route: MAIN_MENU_ROUTE },
 ]);
 
+// tranId values longer than the X(16) CDEMO-CT01-TRN-SELECTED field, and the 16 characters it
+// keeps of each; a character the cut would split in two is dropped whole.
+const SPLIT_CHARACTER_PREFIX = "0".repeat(15);
+const OVERLONG_QUERY_CASES: readonly OverlongQueryCase[] = [
+    { shape: "20 digits", queryTranId: `${TEST_TRAN_ID}0042`, selectedKey: TEST_TRAN_ID },
+    {
+        shape: "28 characters of markup",
+        queryTranId: "<img src=x onerror=alert(1)>",
+        selectedKey: "<img src=x onerr",
+    },
+    {
+        shape: "15 digits and a two-unit character",
+        queryTranId: `${SPLIT_CHARACTER_PREFIX}\u{1F600}`,
+        selectedKey: SPLIT_CHARACTER_PREFIX,
+    },
+];
+
 // The mocked router does not navigate, so cleanup() stands in for the unmount.
 const PENDING_READ_CASES: readonly PendingReadCase[] = [
     {
@@ -513,14 +536,31 @@ describe("COTRN01C BMS COTRN01 fields", () => {
         expect(mockViewTransaction).not.toHaveBeenCalled();
     });
 
-    // A multi-line text box wraps a value wider than the field instead of clipping it.
+    // A one-row text box wraps a value wider than the field onto further rows instead of clipping
+    // it.
     it.each(DETAIL_FIELD_CASES)("$label is a protected field of LENGTH $maxLength", (field) => {
         RenderScreen();
         const input = DetailInput(field.label);
         expect(input).toBeInstanceOf(HTMLTextAreaElement);
         expect(input).toHaveAttribute("maxlength", String(field.maxLength));
         expect(input).toHaveAttribute("readonly");
+        expect(input).toHaveAttribute("rows", "1");
         expect(input).toHaveValue("");
+    });
+});
+
+// The browser sizes each native textarea to its value, so no hidden measuring copy of a field is
+// rendered, and every textarea on the screen is a labelled field with its own id and no input type.
+describe("COTRN01C BMS COTRN01 display-field elements", () => {
+    it("COTRN01C renders one identified textarea per protected field and no hidden copy", () => {
+        RenderScreen();
+        const detailInputs = DETAIL_FIELD_CASES.map((field) => DetailInput(field.label));
+        expect(Array.from(document.querySelectorAll("textarea"))).toEqual(detailInputs);
+        expect(document.querySelectorAll("textarea[aria-hidden]")).toHaveLength(0);
+        expect(detailInputs.filter((input) => input.hasAttribute("type"))).toEqual([]);
+        const ids = detailInputs.map((input) => input.id);
+        expect(ids).not.toContain("");
+        expect(new Set(ids).size).toBe(DETAIL_FIELD_CASES.length);
     });
 });
 
@@ -537,6 +577,21 @@ describe("COTRN01C first entry from a CT00 selection (/transactions/view?tranId)
         await RenderFrom(TEST_TRAN_ID);
         expect(DetailInput(field.label)).toHaveValue(field.shownValue);
     });
+});
+
+describe("COTRN01C first entry with an over-long tranId", () => {
+    it.each(OVERLONG_QUERY_CASES)(
+        "COTRN01C cuts a tranId of $shape to the TRNIDIN LENGTH before it reads",
+        async (queryCase) => {
+            await RenderFrom(queryCase.queryTranId);
+            expect(mockViewTransaction).toHaveBeenCalledTimes(1);
+            expect(mockViewTransaction).toHaveBeenCalledWith(
+                queryCase.selectedKey,
+                READ_SIGNAL_OPTIONS,
+            );
+            expect(TranIdInput()).toHaveValue(queryCase.selectedKey);
+        },
+    );
 });
 
 describe("COTRN01C masked card number and stored timestamp text", () => {

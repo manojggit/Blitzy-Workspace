@@ -994,7 +994,6 @@ function DatePartInput(props: DatePartInputProps) {
             error={isFlagged}
             disabled={disabled}
             variant="outlined"
-            size="small"
             fullWidth
             inputRef={inputRef}
             slotProps={DatePartSlotProps(part, isFlagged, props.hintId)}

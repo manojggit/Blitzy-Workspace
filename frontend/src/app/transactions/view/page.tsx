@@ -48,6 +48,8 @@ const TRAN_ID_LABEL = "Enter Tran ID:";
 const TRAN_ID_FIELD = "tran_id";
 // The CDEMO-CT01-TRN-SELECTED key that a CT00 S selection hands over.
 const TRAN_ID_QUERY_KEY = "tranId";
+// The first half of a character that a cut to TRAN_ID_MAX_LENGTH split in two.
+const TRAILING_HIGH_SURROGATE_PATTERN = /[\uD800-\uDBFF]$/;
 // A blank TRNIDINI still reaches COTRN01C, which answers with its empty-key literal.
 const BLANK_TRAN_ID = " ";
 // COBOL SPACES: only blanks make a key empty, so the text itself is never trimmed.
@@ -71,6 +73,10 @@ const HTTP_UNAUTHORIZED = 401;
 const PAIR_SIZE: GridProps["size"] = { xs: 12, md: 6 };
 const TRIPLE_SIZE: GridProps["size"] = { xs: 12, md: 4 };
 const FULL_SIZE: GridProps["size"] = { xs: 12 };
+
+// Each display field is one native textarea row, which wraps a value wider than the field.
+const DETAIL_FIELD_ELEMENT = "textarea";
+const DETAIL_FIELD_ROWS = 1;
 
 type DetailKey = Exclude<keyof TransactionDetailResponse, "message">;
 
@@ -279,6 +285,13 @@ interface TransactionViewScreenProps {
 
 function IsBlank(text: string): boolean {
     return BLANK_TEXT_PATTERN.test(text);
+}
+
+// CDEMO-CT01-TRN-SELECTED is X(16), the TRNIDIN LENGTH, so a longer tranId query value keeps its
+// first 16 characters, as MOVE truncates on the right. A character the cut would split is dropped
+// whole: half of one cannot be encoded into the request path.
+function SelectedTranId(queryValue: string): string {
+    return queryValue.slice(0, TRAN_ID_MAX_LENGTH).replace(TRAILING_HIGH_SURROGATE_PATTERN, "");
 }
 
 // Each value shows as the server sends it: the masked card number, the amount and the stored
@@ -523,8 +536,10 @@ function KeyField(props: KeyFieldProps) {
 }
 
 // A protected (ASKIP) field: read-only yet focusable, so keyboard and screen-reader users reach
-// every value. It keeps one row while the value fits, and at narrow widths the value wraps onto
-// further rows instead of being cut off. maxLength only exposes the BMS LENGTH; it never cuts a
+// every value. It is a native textarea, which the theme sizes to its content: it keeps one row
+// while the value fits, and at narrow widths the value wraps onto further rows instead of being
+// cut off, with no hidden copy of the field rendered to measure it. A textarea takes no type, so
+// the input type MUI passes is dropped. maxLength only exposes the BMS LENGTH; it never cuts a
 // displayed value.
 function DetailField({ field, detail }: DetailFieldProps) {
     return (
@@ -534,10 +549,11 @@ function DetailField({ field, detail }: DetailFieldProps) {
             variant="filled"
             fullWidth
             multiline
+            rows={DETAIL_FIELD_ROWS}
             value={DisplayValue(detail, field.responseKey)}
             slotProps={{
-                input: { readOnly: true },
-                htmlInput: { maxLength: field.maxLength },
+                input: { readOnly: true, inputComponent: DETAIL_FIELD_ELEMENT },
+                htmlInput: { maxLength: field.maxLength, type: undefined },
             }}
         />
     );
@@ -616,9 +632,9 @@ function TransactionViewScreen({ initialTranId }: TransactionViewScreenProps) {
 }
 
 // Each arrival with another selection is a fresh COTRN01C first entry, as every XCTL is, so the
-// screen state starts over whenever the tranId query parameter changes.
+// screen state starts over whenever the selection that tranId carries changes.
 function TransactionViewEntry() {
-    const initialTranId = useSearchParams().get(TRAN_ID_QUERY_KEY) ?? "";
+    const initialTranId = SelectedTranId(useSearchParams().get(TRAN_ID_QUERY_KEY) ?? "");
     return <TransactionViewScreen key={initialTranId} initialTranId={initialTranId} />;
 }
 

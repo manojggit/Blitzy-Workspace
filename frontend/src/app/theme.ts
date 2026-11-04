@@ -152,19 +152,42 @@ const BUTTON_TOUCH_TARGET_STYLE: CSSObject = {
 // The width of the border MUI draws around an outlined button.
 const OUTLINED_BORDER_WIDTH_PX = 1;
 
-// The field input styles skip a multiline field's textarea, which keeps MUI's own sizing.
+// The field input styles skip a multiline field's textarea: MUI pads a multiline field from its
+// root, around the textarea, so the theme sets that field's padding on the root instead.
 const SINGLE_LINE_INPUT_SELECTOR = "&:not(textarea)";
 
-// A filled field's input padding in grid units around its 24 px line box. The floating label sits
-// in the top padding, so the field keeps MUI's 56 px, or 48 px when small; a field with a hidden
-// label centres the line box instead, keeping MUI's 56 px, or 40 px when small. As in MUI, a later
-// row wins where several match.
+// A filled field's padding in grid units around its 24 px line box, on a single-line input or on
+// a multiline field's root. The floating label sits in the top padding, so the field keeps MUI's
+// 56 px, or 48 px when small; a field with a hidden label centres the line box instead, keeping
+// MUI's 56 px, or 40 px when small. As in MUI, a later row wins where several match.
 const FILLED_INPUT_PADDING_UNITS = { top: 6, bottom: 2 };
 const FILLED_INPUT_PADDING_VARIANTS = [
     { props: { size: "small" }, units: { top: 5, bottom: 1 } },
     { props: { hiddenLabel: true }, units: { top: 4, bottom: 4 } },
     { props: { hiddenLabel: true, size: "small" }, units: { top: 2, bottom: 2 } },
 ] as const;
+
+// A multiline field's root padding in grid units around its 24 px line box: a filled field takes
+// its single-line input's, and an outlined field keeps MUI's 56 px, or 40 px when small, as a
+// single-line outlined field does.
+const FILLED_MULTILINE_PADDING: FieldPadding = {
+    units: FILLED_INPUT_PADDING_UNITS,
+    variants: FILLED_INPUT_PADDING_VARIANTS,
+};
+const OUTLINED_MULTILINE_PADDING: FieldPadding = {
+    units: { top: 4, bottom: 4 },
+    variants: [{ props: { size: "small" }, units: { top: 2, bottom: 2 } }],
+};
+const MULTILINE_FIELD_PROPS = { multiline: true } as const;
+// On a multiline field's root the 16 dp inset applies to each side that holds no adornment; an
+// adorned side keeps MUI's own spacing, as on a single-line input.
+const UNADORNED_START_FIELD_SELECTOR = "&:not(.MuiInputBase-adornedStart)";
+const UNADORNED_END_FIELD_SELECTOR = "&:not(.MuiInputBase-adornedEnd)";
+
+// A multiline field rendered as a native textarea, in place of MUI's TextareaAutosize, grows to its
+// wrapped value through CSS field sizing, with no hidden copy of the field to measure it.
+const NATIVE_TEXTAREA_PROPS = { multiline: true, inputComponent: "textarea" } as const;
+const CONTENT_FIELD_SIZING = "content";
 
 // The M3 text field's 16 dp inset: the input text, the floating label and the helper text share
 // one column 16 px in from either side of an outlined or filled field.
@@ -252,6 +275,12 @@ const AUTOFILL_DETECTION_INPUT_STYLE: CSSObject = {
         animationDuration: "5000s",
         animationName: MUI_AUTO_FILL_ANIMATION,
     },
+};
+
+/** Every InputBase input: MUI's autofill detection, and a native multiline textarea's sizing. */
+const INPUT_BASE_INPUT_STYLE: CSSObject = {
+    ...AUTOFILL_DETECTION_INPUT_STYLE,
+    variants: [{ props: NATIVE_TEXTAREA_PROPS, style: { fieldSizing: CONTENT_FIELD_SIZING } }],
 };
 
 /**
@@ -380,6 +409,13 @@ type AlertSeverityRoles = Record<"error" | "info", AlertColourRoles>;
 interface VerticalPaddingUnits {
     top: number;
     bottom: number;
+}
+
+// A field's padding at rest, and in each state that changes it; a later state wins where several
+// match.
+interface FieldPadding {
+    units: VerticalPaddingUnits;
+    variants: readonly { props: object; units: VerticalPaddingUnits }[];
 }
 
 /** A forced-colours boundary: 1 px in the given CSS system colour. */
@@ -549,6 +585,26 @@ function TextFieldInsetStyle(theme: StyleTheme): CSSObject {
 }
 
 /**
+ * A multiline field's root on the 4 dp grid: the 24 px bodyLarge line box that its textarea
+ * inherits, the padding a single-line input of the variant has, and the 16 dp inset. A one-row
+ * multiline field is then as tall as a single-line one, and its text starts under its label.
+ */
+function MultilineFieldVariants(theme: StyleTheme, padding: FieldPadding): CSSObject[] {
+    const inset = theme.spacing(TEXT_FIELD_INSET_UNITS);
+    const fieldStyle = {
+        lineHeight: M3_TYPE_SCALE.bodyLarge.lineHeight,
+        ...VerticalPadding(theme, padding.units),
+        [UNADORNED_START_FIELD_SELECTOR]: { paddingLeft: inset },
+        [UNADORNED_END_FIELD_SELECTOR]: { paddingRight: inset },
+    };
+    const stateVariants = padding.variants.map(({ props, units }) => ({
+        props: { ...props, ...MULTILINE_FIELD_PROPS },
+        style: VerticalPadding(theme, units),
+    }));
+    return [{ props: MULTILINE_FIELD_PROPS, style: fieldStyle }, ...stateVariants];
+}
+
+/**
  * A floating label on the 16 dp inset at one of MUI's heights. It spans the field between the two
  * insets, so a shrunk label's unscaled width is that span over its scale.
  */
@@ -587,7 +643,7 @@ function NotchPaddingStyle(theme: StyleTheme, outlineWidthPx: number): CSSObject
 
 /**
  * Keeps the outline role on a resting outlined field while a touch device holds a tap's hover,
- * and keeps the notch edge in place while focus widens the outline.
+ * keeps the notch edge in place while focus widens the outline, and pads a multiline field.
  */
 function BuildOutlinedFieldStyle({ theme }: ThemedStyleProps): CSSObject {
     const focusedNotchStyle = NotchPaddingStyle(theme, FIELD_OUTLINE_WIDTH_PX.focused);
@@ -596,6 +652,7 @@ function BuildOutlinedFieldStyle({ theme }: ThemedStyleProps): CSSObject {
             [TOUCH_HOVER_RESTING_OUTLINE_SELECTOR]: { borderColor: theme.palette.m3.outline },
         },
         [FOCUSED_NOTCHED_OUTLINE_SELECTOR]: focusedNotchStyle,
+        variants: MultilineFieldVariants(theme, OUTLINED_MULTILINE_PADDING),
     };
 }
 
@@ -707,6 +764,7 @@ function BuildOutlinedButtonStyle({ theme }: ThemedStyleProps): CSSObject {
 /**
  * The M3 filled text field: the highest surface container with an on-surface-variant active
  * indicator. MUI's hover, focus and error rules keep the on-surface, primary and error indicator.
+ * A multiline field is padded as a single-line filled input is.
  */
 function BuildFilledFieldStyle({ theme }: ThemedStyleProps): CSSObject {
     const containerColor = theme.palette.m3.surfaceContainerHighest;
@@ -724,6 +782,7 @@ function BuildFilledFieldStyle({ theme }: ThemedStyleProps): CSSObject {
         },
         "&::before": { borderBottomColor: theme.palette.text.secondary },
         [FORCED_COLORS_QUERY]: { border: ForcedBoundary(SYSTEM_COLORS.canvasText) },
+        variants: MultilineFieldVariants(theme, FILLED_MULTILINE_PADDING),
     };
 }
 
@@ -901,7 +960,7 @@ export const CARD_DEMO_THEME = createTheme({
         },
         MuiInputBase: {
             defaultProps: { disableInjectingGlobalStyles: true },
-            styleOverrides: { input: AUTOFILL_DETECTION_INPUT_STYLE },
+            styleOverrides: { input: INPUT_BASE_INPUT_STYLE },
         },
         MuiTextField: { defaultProps: { variant: "outlined" } },
         MuiOutlinedInput: {

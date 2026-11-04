@@ -691,6 +691,13 @@ const FOCUSED_NOTCHED_OUTLINE_SELECTOR = "&.Mui-focused .MuiOutlinedInput-notche
 // A label spans the field between the two insets; shrunk, its unscaled width is that over 0.75.
 const RESTING_LABEL_MAX_WIDTH = "calc((100% - 2 * 16px) / 1)";
 const SHRUNK_LABEL_MAX_WIDTH = "calc((100% - 2 * 16px) / 0.75)";
+// A multiline field pads its textarea from its root: the 24 px line box the textarea inherits,
+// and the 16 px inset on each side that holds no adornment, so an adorned side keeps MUI's spacing.
+const MULTILINE_FIELD_STYLE = {
+    lineHeight: "24px",
+    "&:not(.MuiInputBase-adornedStart)": { paddingLeft: TEXT_FIELD_INSET },
+    "&:not(.MuiInputBase-adornedEnd)": { paddingRight: TEXT_FIELD_INSET },
+};
 
 // Text-field horizontal geometry on the 4 dp grid, in place of MUI's 14 px, 12 px and 5 px values.
 const TEXT_FIELD_INSET_RULES: readonly ThemeRuleExpectation[] = [
@@ -856,6 +863,55 @@ const SLOT_VARIANT_EXPECTATIONS: readonly SlotVariantExpectation[] = [
         expectedStyle: {
             [SINGLE_LINE_INPUT_SELECTOR]: { paddingTop: "8px", paddingBottom: "8px" },
         },
+    },
+    {
+        rule: "a multiline filled field pads a 24 px line box as a filled input, 16 px in",
+        component: "MuiFilledInput",
+        slot: "root",
+        variantProps: { multiline: true },
+        expectedStyle: { ...MULTILINE_FIELD_STYLE, paddingTop: "24px", paddingBottom: "8px" },
+    },
+    {
+        rule: "a small multiline filled field sits 20 px below the top and 4 px above the bottom",
+        component: "MuiFilledInput",
+        slot: "root",
+        variantProps: { multiline: true, size: "small" },
+        expectedStyle: { paddingTop: "20px", paddingBottom: "4px" },
+    },
+    {
+        rule: "a multiline filled field with a hidden label centres its text 16 px from each edge",
+        component: "MuiFilledInput",
+        slot: "root",
+        variantProps: { multiline: true, hiddenLabel: true },
+        expectedStyle: { paddingTop: "16px", paddingBottom: "16px" },
+    },
+    {
+        rule: "a small multiline filled field with a hidden label centres its text 8 px in",
+        component: "MuiFilledInput",
+        slot: "root",
+        variantProps: { multiline: true, hiddenLabel: true, size: "small" },
+        expectedStyle: { paddingTop: "8px", paddingBottom: "8px" },
+    },
+    {
+        rule: "a multiline outlined field pads a 24 px line box as an outlined input, 16 px in",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        variantProps: { multiline: true },
+        expectedStyle: { ...MULTILINE_FIELD_STYLE, paddingTop: "16px", paddingBottom: "16px" },
+    },
+    {
+        rule: "a small multiline outlined field pads its 24 px line box 8 px above and below",
+        component: "MuiOutlinedInput",
+        slot: "root",
+        variantProps: { multiline: true, size: "small" },
+        expectedStyle: { paddingTop: "8px", paddingBottom: "8px" },
+    },
+    {
+        rule: "a native multiline textarea grows to its wrapped value",
+        component: "MuiInputBase",
+        slot: "input",
+        variantProps: { multiline: true, inputComponent: "textarea" },
+        expectedStyle: { fieldSizing: "content" },
     },
     {
         rule: "a dense menu item keeps MUI's 4 px above and below its label",

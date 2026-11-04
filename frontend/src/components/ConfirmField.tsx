@@ -54,7 +54,6 @@ function ConfirmTextField(props: ConfirmTextFieldProps) {
             disabled={disabled ?? false}
             helperText={CONFIRM_HELPER_TEXT}
             variant="outlined"
-            size="small"
             inputRef={inputRef}
             slotProps={{ htmlInput: ConfirmInputProps(fieldId, error) }}
         />

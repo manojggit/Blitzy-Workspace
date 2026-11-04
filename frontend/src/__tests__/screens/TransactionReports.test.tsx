@@ -1193,6 +1193,18 @@ it.each(DATE_PARTS)(
     },
 );
 
+// MUI's default medium field is the field height of every other map; no input is size small.
+it("CORPT00 shows every date part and CONFIRM at MUI's default medium size", async () => {
+    await RenderScreen();
+    const inputs = [...DATE_PARTS.map(DatePartInput), ConfirmInput()];
+    expect(screen.getAllByRole("textbox")).toHaveLength(inputs.length);
+    for (const input of inputs) {
+        expect(input.closest(`.${inputBaseClasses.root}`)).not.toHaveClass(
+            inputBaseClasses.sizeSmall,
+        );
+    }
+});
+
 // WCAG 2.5.3 label in name: the accessible name of each part holds the label it shows.
 it.each(DATE_PARTS)("CORPT00 $name contains the visible label of its part", async (part) => {
     await RenderScreen();

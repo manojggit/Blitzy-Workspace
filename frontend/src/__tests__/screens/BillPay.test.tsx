@@ -523,6 +523,18 @@ it("COBIL00 ACTIDIN (11), CURBAL (14, ASKIP) and CONFIRM (1, Y/N) keep BMS attri
     expect(BalanceField()).toHaveValue("");
 });
 
+// MUI's default medium field is the field height of every other map; no input is size small.
+it("COBIL00 shows ACTIDIN, CURBAL and CONFIRM at MUI's default medium size", () => {
+    RenderScreen();
+    const inputs = [InputOf("acct_id"), BalanceField(), InputOf("confirm")];
+    expect(screen.getAllByRole("textbox")).toHaveLength(inputs.length);
+    for (const input of inputs) {
+        expect(input.closest(`.${inputBaseClasses.root}`)).not.toHaveClass(
+            inputBaseClasses.sizeSmall,
+        );
+    }
+});
+
 it("COBIL00 legend ENTER=Continue F3=Back F4=Clear, cursor on ACTIDIN (IC)", () => {
     RenderScreen();
     const legend = screen.getByRole("group", { name: "Function keys" });
