@@ -57,6 +57,7 @@ from app.utils.lookup_codes import VALID_NANP_AREA_CODES
 EDIT_ACCOUNT_ID = "00000000016"
 EDIT_CUSTOMER_ID = "000000016"
 LOW_FICO_ACCOUNT_ID = "00000000001"
+LOW_FICO_CUSTOMER_ID = "000000001"
 UNKNOWN_ACCOUNT_ID = "00000000099"
 REGULAR_USER_TYPE = "U"
 # LIT-ACCTFILENAME and LIT-CUSTFILENAME.
@@ -67,6 +68,10 @@ XREF_ACCOUNT_PATH = "CXACAIX"
 # The AccountScreenFields attributes the cursor and field_errors name most often.
 ACCOUNT_ID_FIELD = "acct_id"
 STATUS_FIELD = "active_status"
+# FLG-ACCTFILTER-NOT-OK colours ACCTSID red (lines 3175-3177). An outcome that sets no NOT-OK
+# flag colours no field: field_errors is empty while 3300 still positions the cursor.
+KEY_FLAGGED = (ACCOUNT_ID_FIELD,)
+NOTHING_FLAGGED: tuple[str, ...] = ()
 BIRTH_DATE_FIELDS = ("dob_year", "dob_month", "dob_day")
 DATE_PARTS = ("year", "month", "day")
 PHONE_PARTS = ("area", "prefix", "line")
@@ -327,6 +332,12 @@ FIXED_TODAY = date(2024, 2, 29)
 # --- Plain SQL on the psycopg2 engine; values are always bound -----------------------------------
 SELECT_ACCOUNT_SQL = text("SELECT * FROM accounts.accounts WHERE acct_id = :acctId")
 SELECT_CUSTOMER_SQL = text("SELECT * FROM customers.customers WHERE cust_id = :custId")
+# xmin changes with every row version, so an equal xmin means the row was never rewritten.
+ROW_VERSIONS_SQL = text(
+    "SELECT account.xmin::text AS account_version, customer.xmin::text AS customer_version"
+    " FROM accounts.accounts AS account CROSS JOIN customers.customers AS customer"
+    " WHERE account.acct_id = :acctId AND customer.cust_id = :custId"
+)
 UPDATE_BALANCE_SQL = text(
     "UPDATE accounts.accounts SET curr_balance = :balance WHERE acct_id = :acctId"
 )
@@ -386,9 +397,10 @@ class KeyCase(NamedTuple):
 
 
 class NoChangeCase(NamedTuple):
-    """An account and fields that 1205-COMPARE-OLD-NEW finds equal to the before-image."""
+    """An account, its customer and fields 1205-COMPARE-OLD-NEW finds equal to the before-image."""
 
     acctId: str
+    custId: str
     changes: Mapping[str, str]
 
 
@@ -399,6 +411,16 @@ class AmountCase(NamedTuple):
     storedAmount: Decimal
 
 
+class StoredRows(NamedTuple):
+    """An account's and its customer's committed rows, with the xmin row version of each."""
+
+    acctId: str
+    custId: str
+    accountRow: Mapping[str, Any]
+    customerRow: Mapping[str, Any]
+    rowVersions: tuple[str, str]
+
+
 @dataclass(frozen=True)
 class UpdateScenario:
     """A regular user's online context, the test engine, account 16 fetched, and its rows."""
@@ -406,8 +428,7 @@ class UpdateScenario:
     context: Any
     syncEngine: Engine
     screen: AccountScreen
-    accountRow: Mapping[str, Any]
-    customerRow: Mapping[str, Any]
+    storedRows: StoredRows
 
 
 # --- Case builders -------------------------------------------------------------------------------
@@ -486,13 +507,18 @@ def EditFailure(message: str, fieldErrors: tuple[str, ...]) -> ExpectedScreen:
     )
 
 
-def KeyFailure(httpStatus: int, message: str) -> ExpectedScreen:
-    """The DETAILS_NOT_FETCHED screen of a failed key edit or read, the key flagged."""
+def KeyFailure(
+    httpStatus: int, message: str, fieldErrors: tuple[str, ...] = KEY_FLAGGED
+) -> ExpectedScreen:
+    """The DETAILS_NOT_FETCHED screen of a failed key edit or read, the cursor on the key.
+
+    The key is flagged unless only CUSTDAT failed, which sets FLG-CUSTFILTER-NOT-OK alone.
+    """
     return ExpectedScreen(
         httpStatus,
         message,
         INFO_PROMPT_FOR_SEARCH_KEYS,
-        (ACCOUNT_ID_FIELD,),
+        fieldErrors,
         ACCOUNT_ID_FIELD,
         DETAILS_NOT_FETCHED,
     )
@@ -504,19 +530,19 @@ def UnreadAccountFailure(httpStatus: int, message: str) -> ExpectedScreen:
         httpStatus,
         message,
         INFO_PROMPT_FOR_CHANGES,
-        (ACCOUNT_ID_FIELD,),
+        KEY_FLAGGED,
         ACCOUNT_ID_FIELD,
         SHOW_DETAILS,
     )
 
 
 def SaveFailure(httpStatus: int, message: str) -> ExpectedScreen:
-    """A failed F5: CHANGES_FAILED and INFORM-FAILURE; no field failed, so the key is the cursor."""
+    """A failed F5: CHANGES_FAILED and INFORM-FAILURE; no field failed, the cursor on the key."""
     return ExpectedScreen(
         httpStatus,
         message,
         INFO_INFORM_FAILURE,
-        (ACCOUNT_ID_FIELD,),
+        NOTHING_FLAGGED,
         ACCOUNT_ID_FIELD,
         CHANGES_FAILED,
     )
@@ -637,16 +663,17 @@ KEY_CASES = [
 ]
 KEY_CASE_IDS = ["blank", "asterisk", "non-numeric", "all-zeros", "ten-digits", "not-in-xref"]
 NO_CHANGE_CASES = [
-    NoChangeCase(EDIT_ACCOUNT_ID, MappingProxyType({})),
+    NoChangeCase(EDIT_ACCOUNT_ID, EDIT_CUSTOMER_ID, MappingProxyType({})),
     # 1205-COMPARE-OLD-NEW compares the status, names and city upper-cased (lines 1685-1735).
     NoChangeCase(
         EDIT_ACCOUNT_ID,
+        EDIT_CUSTOMER_ID,
         MappingProxyType(
             {STATUS_FIELD: "y", "first_name": "CARROLL", "addr_line_3": "concepcionland"}
         ),
     ),
     # Account 1 as fetched holds values every edit rejects; the compare runs before any edit.
-    NoChangeCase(LOW_FICO_ACCOUNT_ID, MappingProxyType({})),
+    NoChangeCase(LOW_FICO_ACCOUNT_ID, LOW_FICO_CUSTOMER_ID, MappingProxyType({})),
 ]
 NO_CHANGE_IDS = ["as-fetched", "case-only", "invalid-values-as-fetched"]
 # NO-CHANGES-DETECTED puts the cursor on ACSTTUS (lines 3010-3012); no field failed.
@@ -654,7 +681,7 @@ NO_CHANGE_SCREEN = ExpectedScreen(
     HTTP_EDIT_FAILURE,
     MSG_NO_CHANGES,
     INFO_PROMPT_FOR_CHANGES,
-    (STATUS_FIELD,),
+    NOTHING_FLAGGED,
     STATUS_FIELD,
     SHOW_DETAILS,
 )
@@ -730,10 +757,31 @@ def RewrittenAccount(accountRow: Mapping[str, Any], creditLimit: Decimal) -> dic
     return {**accountRow, "credit_limit": creditLimit, "addr_zip": "", "group_id": ""}
 
 
-def AssertRowsUnchanged(scenario: UpdateScenario) -> None:
-    """Assert that account 16 and customer 16 still hold the rows read before the test."""
-    assert ReadAccountRow(scenario.syncEngine, EDIT_ACCOUNT_ID) == scenario.accountRow
-    assert ReadCustomerRow(scenario.syncEngine, EDIT_CUSTOMER_ID) == scenario.customerRow
+def ReadRowVersions(syncEngine: Engine, acctId: str, custId: str) -> tuple[str, str]:
+    """Return the committed xmin of the ``acctId`` account row and the ``custId`` customer row."""
+    rowKeys = {"acctId": acctId, "custId": custId}
+    with syncEngine.connect() as connection:
+        accountVersion, customerVersion = connection.execute(ROW_VERSIONS_SQL, rowKeys).one()
+    return accountVersion, customerVersion
+
+
+def SnapshotRows(syncEngine: Engine, acctId: str, custId: str) -> StoredRows:
+    """Return the committed rows of ``acctId`` and ``custId`` with their row versions."""
+    return StoredRows(
+        acctId=acctId,
+        custId=custId,
+        accountRow=ReadAccountRow(syncEngine, acctId),
+        customerRow=ReadCustomerRow(syncEngine, custId),
+        rowVersions=ReadRowVersions(syncEngine, acctId, custId),
+    )
+
+
+def AssertRowsUnchanged(syncEngine: Engine, storedRows: StoredRows) -> None:
+    """Assert that the account and customer ``storedRows`` holds were not written since.
+
+    An unchanged xmin also rules out a REWRITE of identical values.
+    """
+    assert SnapshotRows(syncEngine, storedRows.acctId, storedRows.custId) == storedRows
 
 
 # --- Requests ------------------------------------------------------------------------------------
@@ -839,7 +887,7 @@ async def AssertEditFailureCase(scenario: UpdateScenario, fieldCase: FieldCase) 
     request = WithChanges(scenario.screen, {**VALID_BASELINE, **fieldCase.changes})
     error = await ExpectScreenError(scenario.context, EDIT_ACCOUNT_ID, request)
     AssertErrorScreen(error, EditFailure(fieldCase.expectedMessage, fieldCase.expectedFieldErrors))
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 # --- Read failure stubs: the CICS file conditions of 9000-READ-ACCT ------------------------------
@@ -905,6 +953,14 @@ def KeyScreenCase(
     return ReadFailureCase(readStubs, KeyFailure(httpStatus, message), KeyScreenFieldsOf)
 
 
+def CustomerOnlyCase(
+    readStubs: tuple[ReadStub, ...], httpStatus: int, message: str
+) -> ReadFailureCase:
+    """A CUSTDAT-only read failure on the key screen: FLG-CUSTFILTER-NOT-OK flags no field."""
+    expected = KeyFailure(httpStatus, message, NOTHING_FLAGGED)
+    return ReadFailureCase(readStubs, expected, KeyScreenFieldsOf)
+
+
 def UnreadAccountCase(
     readStubs: tuple[ReadStub, ...], httpStatus: int, message: str
 ) -> ReadFailureCase:
@@ -922,7 +978,8 @@ CUSTOMER_IOERR_STUB = ReadStub(CustomerRepository, "GetCustomer", FailCustomerRe
 # 9000-READ-ACCT (lines 3608-3649). A CXACAIX failure ends the chain; an ACCTDAT failure does not
 # (line 3719 is commented out), so CUSTDAT is still read: its NOTFND keeps a message already set
 # (IF WS-RETURN-MSG-OFF) and its WHEN OTHER replaces it. Only the CXACAIX and ACCTDAT failures
-# set FLG-ACCTFILTER-NOT-OK; the key is the cursor and the one field listed either way.
+# set FLG-ACCTFILTER-NOT-OK, which lists the key in field_errors; a CUSTDAT failure alone lists
+# no field. The key is the cursor either way.
 # A NORMAL CUSTDAT read sets FOUND-CUST-IN-MASTER (line 3765), and 2000-DECIDE-ACTION then sets
 # ACUP-SHOW-DETAILS (lines 2577-2578): after an ACCTDAT failure 9500 stores the customer and the
 # ACCOUNT-RECORD the failed READ never filled, and 3202 shows them under PROMPT-FOR-CHANGES.
@@ -936,9 +993,9 @@ ACCOUNT_IOERR_CASE = UnreadAccountCase(
 READ_FAILURE_CASES = [
     KeyScreenCase((XREF_PATH_CLOSED_STUB,), HTTP_FILE_ERROR, MSG_XREF_WINDOW_CLOSED),
     ACCOUNT_MISSING_CASE,
-    KeyScreenCase((CUSTOMER_MISSING_STUB,), HTTP_NOT_FOUND, MSG_CUSTOMER_NOT_FOUND),
+    CustomerOnlyCase((CUSTOMER_MISSING_STUB,), HTTP_NOT_FOUND, MSG_CUSTOMER_NOT_FOUND),
     ACCOUNT_IOERR_CASE,
-    KeyScreenCase((CUSTOMER_IOERR_STUB,), HTTP_FILE_ERROR, MSG_CUSTOMER_READ_ERROR),
+    CustomerOnlyCase((CUSTOMER_IOERR_STUB,), HTTP_FILE_ERROR, MSG_CUSTOMER_READ_ERROR),
     KeyScreenCase(
         (ACCOUNT_MISSING_STUB, CUSTOMER_IOERR_STUB), HTTP_FILE_ERROR, MSG_CUSTOMER_READ_ERROR
     ),
@@ -1019,13 +1076,13 @@ async def OnlineContextFixture(makeOnlineContext: Callable[..., Any]) -> Any:
 
 @pytest_asyncio.fixture(name="scenario")
 async def ScenarioFixture(onlineContext: Any, syncEngine: Engine) -> UpdateScenario:
-    """Return account 16 fetched into SHOW_DETAILS, with its rows as committed before the test."""
+    """Return account 16 fetched into SHOW_DETAILS, with its rows as committed before the fetch."""
+    storedRows = SnapshotRows(syncEngine, EDIT_ACCOUNT_ID, EDIT_CUSTOMER_ID)
     return UpdateScenario(
         context=onlineContext,
         syncEngine=syncEngine,
         screen=await FetchScreen(onlineContext, EDIT_ACCOUNT_ID),
-        accountRow=ReadAccountRow(syncEngine, EDIT_ACCOUNT_ID),
-        customerRow=ReadCustomerRow(syncEngine, EDIT_CUSTOMER_ID),
+        storedRows=storedRows,
     )
 
 
@@ -1070,7 +1127,7 @@ RECORD_CHANGED_SCREEN = ExpectedScreen(
     HTTP_RECORD_CHANGED,
     MSG_RECORD_CHANGED,
     INFO_PROMPT_FOR_CHANGES,
-    (ACCOUNT_ID_FIELD,),
+    NOTHING_FLAGGED,
     ACCOUNT_ID_FIELD,
     SHOW_DETAILS,
 )
@@ -1114,6 +1171,7 @@ async def test_fetch_shows_account_and_customer_with_ssn_unmasked(scenario):
         EXPECTED_FETCHED_FIELDS
     )
     assert scenario.screen.screen_token
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 @pytest.mark.parametrize("keyCase", KEY_CASES, ids=KEY_CASE_IDS)
@@ -1136,7 +1194,7 @@ async def test_fetch_read_failure_answers_its_file_literal_and_writes_nothing(
     error = await FetchWithReadStubs(scenario, monkeypatch, readFailureCase)
     AssertErrorScreen(error, readFailureCase.expected)
     assert error.Body()["fields"] == readFailureCase.expectedFields(scenario.screen)
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 @pytest.mark.parametrize("readFailureCase", UNREAD_ACCOUNT_CASES, ids=UNREAD_ACCOUNT_CASE_IDS)
@@ -1154,7 +1212,7 @@ async def test_enter_on_unread_account_screen_compares_with_its_token(
     noChange = await ExpectScreenError(scenario.context, EDIT_ACCOUNT_ID, enterRequest)
     AssertErrorScreen(noChange, NO_CHANGE_SCREEN)
     assert noChange.Body()["fields"] == shown.fields.model_dump()
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 async def test_enter_without_token_edits_the_keyed_account_id(onlineContext):
@@ -1187,7 +1245,7 @@ async def test_boundary_value_is_rejected(scenario, fieldCase):
 async def test_boundary_value_is_accepted(scenario, changes):
     """The passing side of the same edits validates, and validating writes nothing."""
     await ConfirmChanges(scenario, {**VALID_BASELINE, **changes})
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 @pytest.mark.parametrize("fieldCase", MULTI_FIELD_CASES, ids=CaseId)
@@ -1214,7 +1272,7 @@ async def test_birth_date_before_today_is_accepted(scenario, monkeypatch):
     PatchToday(monkeypatch)
     birthDate = FIXED_TODAY - timedelta(days=1)
     await ConfirmChanges(scenario, {**VALID_BASELINE, **BirthDateChanges(birthDate)})
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 @pytest.mark.usefixtures("restoreSeedState")
@@ -1227,7 +1285,7 @@ async def test_numval_c_amount_validates_and_is_saved_truncated(scenario, amount
     done = await ProcessAccountUpdate(scenario.context, EDIT_ACCOUNT_ID, saveRequest)
     AssertShownScreen(done, CHANGES_DONE, INFO_CONFIRM_UPDATE_SUCCESS)
     savedAccount = ReadAccountRow(scenario.syncEngine, EDIT_ACCOUNT_ID)
-    assert savedAccount == RewrittenAccount(scenario.accountRow, amountCase.storedAmount)
+    assert savedAccount == RewrittenAccount(scenario.storedRows.accountRow, amountCase.storedAmount)
 
 
 # --- Phase 3: the ACUP-CHANGE-ACTION state machine -----------------------------------------------
@@ -1241,18 +1299,19 @@ async def test_first_key_press_runs_only_the_key_edit_then_fetches(scenario, act
     shown = await ProcessAccountUpdate(scenario.context, EDIT_ACCOUNT_ID, request)
     AssertShownScreen(shown, SHOW_DETAILS, INFO_PROMPT_FOR_CHANGES)
     assert shown.fields == scenario.screen.fields
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 @pytest.mark.parametrize("noChangeCase", NO_CHANGE_CASES, ids=NO_CHANGE_IDS)
 async def test_unchanged_fields_answer_no_change_before_any_edit(scenario, noChangeCase):
     """1205-COMPARE-OLD-NEW runs first; no change exits 1200 before every field edit."""
+    storedRows = SnapshotRows(scenario.syncEngine, noChangeCase.acctId, noChangeCase.custId)
     shown = await FetchScreen(scenario.context, noChangeCase.acctId)
     request = WithChanges(shown, noChangeCase.changes)
     error = await ExpectScreenError(scenario.context, noChangeCase.acctId, request)
     AssertErrorScreen(error, NO_CHANGE_SCREEN)
     assert error.Body()["fields"] == shown.fields.model_dump()
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, storedRows)
 
 
 async def test_valid_change_asks_for_confirmation_without_writing(scenario):
@@ -1260,7 +1319,7 @@ async def test_valid_change_asks_for_confirmation_without_writing(scenario):
     confirmed = await ConfirmChanges(scenario, SAVE_CHANGES)
     shownTexts = (confirmed.fields.credit_limit, confirmed.fields.addr_state_cd)
     assert shownTexts == (SAVED_CREDIT_LIMIT_SHOWN, SAVED_STATE)
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 async def test_fetched_token_keeps_the_protected_fields(scenario):
@@ -1270,6 +1329,7 @@ async def test_fetched_token_keeps_the_protected_fields(scenario):
     assert {name: shownFields[name] for name in PROTECTED_FIELD_CHANGES} == {
         name: EXPECTED_FETCHED_FIELDS[name] for name in PROTECTED_FIELD_CHANGES
     }
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 async def test_enter_on_confirmation_screen_runs_no_edit(scenario):
@@ -1279,7 +1339,7 @@ async def test_enter_on_confirmation_screen_runs_no_edit(scenario):
     kept = await ProcessAccountUpdate(scenario.context, EDIT_ACCOUNT_ID, request)
     AssertShownScreen(kept, CHANGES_OK_NOT_CONFIRMED, INFO_PROMPT_FOR_CONFIRMATION)
     assert kept.fields == confirmed.fields
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 async def test_save_before_validation_only_validates(scenario):
@@ -1287,7 +1347,7 @@ async def test_save_before_validation_only_validates(scenario):
     request = WithChanges(scenario.screen, SAVE_CHANGES, UpdateAction.SAVE)
     validated = await ProcessAccountUpdate(scenario.context, EDIT_ACCOUNT_ID, request)
     AssertShownScreen(validated, CHANGES_OK_NOT_CONFIRMED, INFO_PROMPT_FOR_CONFIRMATION)
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 @pytest.mark.usefixtures("restoreSeedState")
@@ -1298,9 +1358,9 @@ async def test_save_writes_the_validated_token_values_not_the_request_fields(sce
     done = await ProcessAccountUpdate(scenario.context, EDIT_ACCOUNT_ID, saveRequest)
     AssertShownScreen(done, CHANGES_DONE, INFO_CONFIRM_UPDATE_SUCCESS)
     savedAccount = ReadAccountRow(scenario.syncEngine, EDIT_ACCOUNT_ID)
-    assert savedAccount == RewrittenAccount(scenario.accountRow, SAVED_CREDIT_LIMIT)
+    assert savedAccount == RewrittenAccount(scenario.storedRows.accountRow, SAVED_CREDIT_LIMIT)
     savedCustomer = ReadCustomerRow(scenario.syncEngine, EDIT_CUSTOMER_ID)
-    assert savedCustomer == {**scenario.customerRow, "addr_state_cd": SAVED_STATE}
+    assert savedCustomer == {**scenario.storedRows.customerRow, "addr_state_cd": SAVED_STATE}
 
 
 @pytest.mark.usefixtures("restoreSeedState")
@@ -1309,12 +1369,15 @@ async def test_cancel_rereads_the_record_and_discards_the_edits(scenario):
     editRequest = WithChanges(scenario.screen, {STATUS_FIELD: "X"})
     error = await ExpectScreenError(scenario.context, EDIT_ACCOUNT_ID, editRequest)
     assert error.Body()["state"] == CHANGES_NOT_OK
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
     SetAccountBalance(scenario.syncEngine, EDIT_ACCOUNT_ID, CHANGED_BALANCE)
+    rowsBeforeCancel = SnapshotRows(scenario.syncEngine, EDIT_ACCOUNT_ID, EDIT_CUSTOMER_ID)
     cancelRequest = PressKey(ScreenOfError(error), UpdateAction.CANCEL)
     cancelled = await ProcessAccountUpdate(scenario.context, EDIT_ACCOUNT_ID, cancelRequest)
     AssertShownScreen(cancelled, SHOW_DETAILS, INFO_PROMPT_FOR_CHANGES)
     shownTexts = (cancelled.fields.active_status, cancelled.fields.curr_balance)
     assert shownTexts == (EXPECTED_FETCHED_FIELDS[STATUS_FIELD], CHANGED_BALANCE_SHOWN)
+    AssertRowsUnchanged(scenario.syncEngine, rowsBeforeCancel)
 
 
 @pytest.mark.usefixtures("restoreSeedState")
@@ -1329,7 +1392,7 @@ async def test_key_after_changes_done_returns_the_empty_key_screen(scenario):
     AssertShownScreen(restarted, DETAILS_NOT_FETCHED, INFO_PROMPT_FOR_SEARCH_KEYS)
     assert restarted.fields == AccountScreenFields()
     savedAccount = ReadAccountRow(scenario.syncEngine, EDIT_ACCOUNT_ID)
-    assert savedAccount == RewrittenAccount(scenario.accountRow, SAVED_CREDIT_LIMIT)
+    assert savedAccount == RewrittenAccount(scenario.storedRows.accountRow, SAVED_CREDIT_LIMIT)
 
 
 @pytest.mark.usefixtures("restoreSeedState")
@@ -1341,7 +1404,7 @@ async def test_key_after_failed_save_returns_the_empty_key_screen(scenario, monk
     restarted = await ProcessAccountUpdate(scenario.context, EDIT_ACCOUNT_ID, nextRequest)
     AssertShownScreen(restarted, DETAILS_NOT_FETCHED, INFO_PROMPT_FOR_SEARCH_KEYS)
     assert restarted.fields == AccountScreenFields()
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 @pytest.mark.parametrize("forgeToken", TOKEN_FORGERS, ids=TOKEN_FORGER_IDS)
@@ -1353,7 +1416,7 @@ async def test_forged_token_restarts_at_details_not_fetched(scenario, forgeToken
     forgedRequest = keyedRequest.model_copy(update={"screen_token": forgedToken})
     error = await ExpectScreenError(scenario.context, EDIT_ACCOUNT_ID, forgedRequest)
     AssertErrorScreen(error, KeyFailure(HTTP_EDIT_FAILURE, MSG_ACCOUNT_KEY_INVALID))
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 # --- Phase 4: the F5 save outcomes of 9600-WRITE-PROCESSING --------------------------------------
@@ -1366,7 +1429,7 @@ async def test_lock_failure_answers_its_file_literal_and_writes_nothing(
     monkeypatch.setattr(lockCase.repositoryClass, lockCase.methodName, lockCase.stub)
     error = await SaveExpectingError(scenario)
     AssertErrorScreen(error, SaveFailure(HTTP_RECORD_LOCKED, lockCase.expectedMessage))
-    AssertRowsUnchanged(scenario)
+    AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
 @pytest.mark.usefixtures("restoreSeedState")
@@ -1382,9 +1445,9 @@ async def test_record_changed_since_fetch_shows_the_fresh_record(scenario):
         CHANGED_BALANCE_SHOWN,
         EXPECTED_FETCHED_FIELDS["credit_limit"],
     )
-    changedAccount = {**scenario.accountRow, "curr_balance": CHANGED_BALANCE}
+    changedAccount = {**scenario.storedRows.accountRow, "curr_balance": CHANGED_BALANCE}
     assert ReadAccountRow(scenario.syncEngine, EDIT_ACCOUNT_ID) == changedAccount
-    assert ReadCustomerRow(scenario.syncEngine, EDIT_CUSTOMER_ID) == scenario.customerRow
+    assert ReadCustomerRow(scenario.syncEngine, EDIT_CUSTOMER_ID) == scenario.storedRows.customerRow
 
 
 @pytest.mark.usefixtures("restoreSeedState", "rejectCustomerRewrite")
@@ -1404,23 +1467,27 @@ async def test_failed_customer_rewrite_keeps_the_committed_account_change(scenar
     ]
     assert loggedConditions == [(coactupc.LOGGER.name, "ERROR", CUSTOMER_REWRITE_REFUSED_LOG)]
     savedAccount = ReadAccountRow(scenario.syncEngine, EDIT_ACCOUNT_ID)
-    assert savedAccount == RewrittenAccount(scenario.accountRow, SAVED_CREDIT_LIMIT)
-    assert ReadCustomerRow(scenario.syncEngine, EDIT_CUSTOMER_ID) == scenario.customerRow
+    assert savedAccount == RewrittenAccount(scenario.storedRows.accountRow, SAVED_CREDIT_LIMIT)
+    assert ReadCustomerRow(scenario.syncEngine, EDIT_CUSTOMER_ID) == scenario.storedRows.customerRow
     assert LockCustomerRowWithoutWaiting(scenario.syncEngine, EDIT_CUSTOMER_ID) == 1
 
 
 @pytest.mark.parametrize("fieldCase", LOW_FICO_CASES, ids=["credit-limit-only", "fico-corrected"])
 async def test_low_fico_account_fails_the_edits_its_seed_values_fail(scenario, fieldCase):
     """Any change runs every edit, so account 1's seeded FICO 274 blocks a Credit Limit change."""
+    lowFicoRows = SnapshotRows(scenario.syncEngine, LOW_FICO_ACCOUNT_ID, LOW_FICO_CUSTOMER_ID)
     lowFicoScreen = await FetchScreen(scenario.context, LOW_FICO_ACCOUNT_ID)
     request = WithChanges(lowFicoScreen, fieldCase.changes)
     error = await ExpectScreenError(scenario.context, LOW_FICO_ACCOUNT_ID, request)
     AssertErrorScreen(error, EditFailure(fieldCase.expectedMessage, fieldCase.expectedFieldErrors))
+    AssertRowsUnchanged(scenario.syncEngine, lowFicoRows)
 
 
 async def test_low_fico_account_validates_once_its_seed_defects_are_corrected(scenario):
     """With the FICO score, state and Phone Number 2 area code corrected, account 1 validates."""
+    lowFicoRows = SnapshotRows(scenario.syncEngine, LOW_FICO_ACCOUNT_ID, LOW_FICO_CUSTOMER_ID)
     lowFicoScreen = await FetchScreen(scenario.context, LOW_FICO_ACCOUNT_ID)
     request = WithChanges(lowFicoScreen, LOW_FICO_CORRECTIONS)
     confirmed = await ProcessAccountUpdate(scenario.context, LOW_FICO_ACCOUNT_ID, request)
     AssertShownScreen(confirmed, CHANGES_OK_NOT_CONFIRMED, INFO_PROMPT_FOR_CONFIRMATION)
+    AssertRowsUnchanged(scenario.syncEngine, lowFicoRows)

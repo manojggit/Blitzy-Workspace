@@ -22,9 +22,10 @@ the security.users row back through syncEngine; restoreSeedState restores every 
 seed users and security.login_attempts included, at teardown.
 """
 
+import contextlib
 import json
 import secrets
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import datetime
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMock
@@ -86,6 +87,7 @@ USER_TYPE_FIELD = "user_type"
 CREDENTIAL_FIELD = "password"
 MESSAGE_KEY = "message"
 CURSOR_KEY = "cursor_field"
+FIELD_ERRORS_KEY = "field_errors"
 MENU_ROUTE = "/menu"
 
 EDIT_FAILURE_STATUS = 400
@@ -104,6 +106,11 @@ HASH_COST_INDEX = 2
 USER_ROW_QUERY = text(
     "SELECT first_name, last_name, user_type, password_hash, updated_at"
     " FROM security.users WHERE user_id = :userId"
+)
+# Every security.users row and column, the hash and both audit timestamps included, with xmin,
+# the row version any UPDATE replaces even when it rewrites identical values.
+ALL_USERS_QUERY = text(
+    "SELECT CAST(xmin AS TEXT) AS row_version, * FROM security.users ORDER BY user_id"
 )
 
 
@@ -176,6 +183,20 @@ def ReadUser(syncEngine: Engine, userId: str) -> StoredUser:
 def StoredUserOf(harness: UpdateHarness) -> StoredUser:
     """Return the committed row of the harness's generated user."""
     return ReadUser(harness.syncEngine, harness.user.userId)
+
+
+def ReadAllUsers(syncEngine: Engine) -> list[dict[str, object]]:
+    """Return every committed security.users row, each column and its row version, in key order."""
+    with syncEngine.connect() as connection:
+        return [dict(userRow) for userRow in connection.execute(ALL_USERS_QUERY).mappings()]
+
+
+@contextlib.contextmanager
+def NoUserWrites(syncEngine: Engine) -> Iterator[None]:
+    """Assert that the block inserts, rewrites and deletes no committed security.users row."""
+    usersBefore = ReadAllUsers(syncEngine)
+    yield
+    assert ReadAllUsers(syncEngine) == usersBefore
 
 
 def BuildUpdate(storedUser: StoredUser, overrides: Mapping[str, str]) -> UserUpdateRequest:
@@ -390,17 +411,25 @@ async def test_fetch_shows_the_stored_user_without_a_password_or_hash(harness):
 
 @pytest.mark.parametrize("refusal", FETCH_REFUSALS, ids=FETCH_REFUSAL_IDS)
 async def test_fetch_refuses_a_blank_or_unknown_user_id(harness, refusal):
-    """A blank USRIDIN (lines 146-151) is 400; NOTFND (lines 340-345) is 404, both at USRIDIN."""
+    """A blank USRIDIN (lines 146-151) is 400; NOTFND (lines 340-345) is 404, both at USRIDIN.
+
+    The refused fetch inserts, rewrites and deletes no security.users row.
+    """
     userId = refusal.userIdOf(harness.user.userId)
-    error = await FetchExpectingError(harness.context, userId)
+    with NoUserWrites(harness.syncEngine):
+        error = await FetchExpectingError(harness.context, userId)
     assert ScreenOutcome(error) == refusal.expectedOutcome
 
 
 @pytest.mark.parametrize("errorType", FETCH_FILE_CONDITIONS, ids=FETCH_FILE_CONDITION_IDS)
 async def test_fetch_file_condition_is_unable_to_lookup(harness, errorType):
-    """Any other READ condition is 503 ``Unable to lookup User...`` at FNAME (lines 346-352)."""
+    """Any other READ condition is 503 ``Unable to lookup User...`` at FNAME (lines 346-352).
+
+    The refused fetch inserts, rewrites and deletes no security.users row.
+    """
     RaiseOnRepository(harness, "GetUser", errorType)
-    error = await FetchExpectingError(harness.context, harness.user.userId)
+    with NoUserWrites(harness.syncEngine):
+        error = await FetchExpectingError(harness.context, harness.user.userId)
     expectedOutcome = (UNABLE_TO_LOOKUP_USER_MESSAGE, FIRST_NAME_FIELD, FILE_ERROR_STATUS)
     assert ScreenOutcome(error) == expectedOutcome
 
@@ -427,11 +456,15 @@ async def test_one_changed_field_rewrites_the_record_and_keeps_the_hash(harness,
 
 @pytest.mark.parametrize("overridesOf", NO_CHANGE_OVERRIDES, ids=NO_CHANGE_OVERRIDE_IDS)
 async def test_unchanged_fields_answer_please_modify(harness, overridesOf):
-    """USR-MODIFIED-NO (lines 238-242): 400 ``Please modify to update ...``; nothing rewritten."""
+    """USR-MODIFIED-NO (lines 238-242): 400 ``Please modify to update ...``; nothing rewritten.
+
+    No ERR-FLG is set and FNAME is only the cursor, so no field is listed as failing.
+    """
     before = StoredUserOf(harness)
     request = BuildUpdate(before, overridesOf(harness, before))
     error = await UpdateExpectingError(harness.context, harness.user.userId, request)
     assert ScreenOutcome(error) == (PLEASE_MODIFY_MESSAGE, FIRST_NAME_FIELD, EDIT_FAILURE_STATUS)
+    assert error.Body()[FIELD_ERRORS_KEY] == []
     assert StoredUserOf(harness) == before
 
 

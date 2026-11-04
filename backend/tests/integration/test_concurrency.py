@@ -1081,6 +1081,7 @@ async def test_concurrent_account_saves_lock_out_the_second(
         saved = ExpectOk(await firstSaveTask)
     lockedBody = AssertLegacyError(lockedOut, HTTP_RECORD_LOCKED, ACCOUNT_LOCK_TEXT)
     AssertScreenState(lockedBody, FAILED_STATE, CHANGES_FAILED_INFO)
+    assert lockedBody["field_errors"] == []
     AssertScreenState(saved, DONE_STATE, CHANGES_COMMITTED_INFO)
     assert ReadAccountAmounts(syncEngine, SAMPLE_ACCOUNT_ID)["credit_limit"] == FIRST_CREDIT_LIMIT
 
@@ -1114,6 +1115,7 @@ async def test_account_changed_since_fetch_answers_record_changed(
     body = AssertLegacyError(conflict, HTTP_RECORD_CHANGED, RECORD_CHANGED_TEXT)
     stored = ReadAccountAmounts(syncEngine, SAMPLE_ACCOUNT_ID)
     assert body["state"] == SHOW_DETAILS_STATE
+    assert body["field_errors"] == []
     assert ScreenAmount(body["fields"][BALANCE_FIELD]) == stored[BALANCE_FIELD]
     assert stored[CREDIT_LIMIT_FIELD] == seededLimit
 

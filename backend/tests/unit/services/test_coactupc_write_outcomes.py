@@ -211,12 +211,17 @@ def FailReadUpdate(readUpdate: AsyncMock, readFailure: RepositoryError | None) -
 
 
 def AssertLockFailureScreen(lockError: LegacyMessageError, expectedMessage: str) -> None:
-    """Assert the 423 CHANGES_FAILED screen with the lock literal and INFORM-FAILURE."""
+    """Assert the 423 CHANGES_FAILED screen with the lock literal and INFORM-FAILURE.
+
+    A lock failure sets no field flag, so no field is listed and 3300 WHEN OTHER puts the
+    cursor on ACCTSID.
+    """
     errorBody = lockError.Body()
     assert lockError.httpStatus == RECORD_LOCKED_STATUS
     assert (lockError.message, errorBody["message"]) == (expectedMessage, expectedMessage)
     assert errorBody["info_message"] == INFORM_FAILURE_INFO
     assert errorBody["state"] == CHANGES_FAILED_STATE
+    assert (errorBody["field_errors"], errorBody["cursor_field"]) == ([], ACCOUNT_ID_FIELD)
 
 
 def AssertNothingRewritten(stubbedSave: StubbedSave) -> None:

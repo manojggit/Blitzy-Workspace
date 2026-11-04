@@ -64,6 +64,9 @@ ACCOUNT_NOT_PROVIDED_MESSAGE = "Account number not provided"
 ACCOUNT_NOT_FOUND_MESSAGE = "Account ID NOT found..."
 OPEN_DATE_MESSAGE = "Open Date : Century is not valid."
 UPDATE_INFO_MESSAGE = "Update account details presented above."
+# NO-CHANGES-DETECTED fails no field; 3300 only puts the cursor on ACSTTUS.
+NO_CHANGES_MESSAGE = "No change detected with respect to values fetched."
+STATUS_FIELD = "active_status"
 # COACTUPC edits Open Date before Credit Limit, so source order is not alphabetical order.
 CAUP_FAILING_FIELDS = ("open_date", "credit_limit")
 CAUP_STATE_BODY = {"state": "CHANGES_NOT_OK"}
@@ -179,6 +182,13 @@ def test_body_has_exactly_the_legacy_keys():
     # A first-failure error lists its cursor field as its one failing field.
     assert errorBody["field_errors"] == [ACCT_ID_FIELD]
     assert errorBody["cursor_field"] == ACCT_ID_FIELD
+
+
+def test_exact_empty_field_errors_keep_only_the_cursor():
+    """An outcome declared to fail no field lists none, and the cursor field is still sent."""
+    details = LegacyErrorDetails(exactFieldErrors=True)
+    errorBody = LegacyMessageError(NO_CHANGES_MESSAGE, STATUS_FIELD, details=details).Body()
+    assert (errorBody["field_errors"], errorBody["cursor_field"]) == ([], STATUS_FIELD)
 
 
 def test_body_carries_details_in_order():

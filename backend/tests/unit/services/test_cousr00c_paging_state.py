@@ -150,11 +150,15 @@ def BuildContext() -> OnlineContext:
 
 
 def RefusalBody(message: str) -> dict[str, object]:
-    """Return the four standard keys of a 400 body, with the cursor on the search field."""
+    """Return the four standard keys of a 400 body, with the cursor on the search field.
+
+    COUSR00C sets no ERR-FLG for these refusals and only moves the cursor, so no field is
+    listed in ``field_errors``.
+    """
     return {
         "message": message,
         "info_message": "",
-        "field_errors": [SEARCH_CURSOR_FIELD],
+        "field_errors": [],
         "cursor_field": SEARCH_CURSOR_FIELD,
     }
 

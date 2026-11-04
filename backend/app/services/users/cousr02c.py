@@ -28,6 +28,7 @@ from app.core.dependencies import OnlineContext
 from app.core.errors import (
     HTTP_FILE_ERROR,
     HTTP_NOT_FOUND,
+    LegacyErrorDetails,
     LegacyMessageError,
     LogFileCondition,
     RecordLockError,
@@ -209,7 +210,9 @@ async def RewriteUserRecord(
     compare: the last writer wins, as in COUSR02C. A NOTFND read answers ``User ID NOT
     found...`` at once rather than falling through to a REWRITE that has no record to replace.
     An outcome raised inside the unit rolls it back, which discards nothing, since nothing has
-    been written by then.
+    been written by then. ``Please modify to update ...`` sets no ERR-FLG and the cursor is the
+    one the presence checks' WHEN OTHER moved to FNAME (lines 208-210), so it lists no field in
+    ``field_errors``.
     """
     repository = UserRepository(context)
     async with WriteUnit(context.engine, USER_FILE_NAME) as unit:
@@ -219,7 +222,11 @@ async def RewriteUserRecord(
         rounds = context.settings.BCRYPT_ROUNDS
         passwordHash = await ResolvePasswordHash(enteredPassword, storedRecord[HASH_COLUMN], rounds)
         if not IsModified(screenValues, storedRecord, passwordHash):
-            raise LegacyMessageError(PLEASE_MODIFY_MESSAGE, field=FIRST_NAME_FIELD)
+            raise LegacyMessageError(
+                PLEASE_MODIFY_MESSAGE,
+                field=FIRST_NAME_FIELD,
+                details=LegacyErrorDetails(exactFieldErrors=True),
+            )
         await repository.UpdateUser(unit, RewriteValues(screenValues, storedRecord, passwordHash))
 
 
@@ -238,7 +245,8 @@ async def UpdateUser(
     Raises:
         LegacyMessageError: 400 with the first presence literal in source order (user ID,
             first name, last name, user type); 400 ``Please modify to update ...`` when no
-            field changed; 404 ``User ID NOT found...`` for NOTFND; 503
+            field changed, with an empty ``field_errors`` and the cursor on the first name;
+            404 ``User ID NOT found...`` for NOTFND; 503
             ``Unable to Update User...`` for the batch window (NOTOPEN), a record lock held past
             the unit's lock timeout, or any other file condition.
     """

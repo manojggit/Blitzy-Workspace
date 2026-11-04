@@ -218,15 +218,21 @@ const REBROWSED_PAGE: Partial<UserListResponse> = {
     ...PageKeysOf(OTHER_PAGE_ROWS),
 };
 
-// The legacy error body a COUSR00C refusal carries: the cursor and the error on USRIDIN.
+// The legacy error body a COUSR00C refusal carries: the cursor on USRIDIN. A paging or
+// invalid-selection refusal sets no ERR-FLG and only moves the cursor, so it lists no field.
 function BuildErrorBody(overrides: Partial<ErrorBody> = {}): ErrorBody {
     return {
         message: "",
         info_message: "",
-        field_errors: [SEARCH_FIELD],
+        field_errors: [],
         cursor_field: SEARCH_FIELD,
         ...overrides,
     };
+}
+
+// The WHEN OTHER lookup failure (503) sets ERR-FLG and lists USRIDIN as its failing field.
+function FieldErrorsFor(status: number): string[] {
+    return status === HTTP_SERVICE_UNAVAILABLE ? [SEARCH_FIELD] : [];
 }
 
 function BuildAxiosError(status: number, body: unknown): AxiosError {
@@ -569,7 +575,11 @@ function OutcomeOf({ literal, status, listPage }: LiteralCase): Promise<UserList
     if (status === HTTP_OK) {
         return Promise.resolve(BuildListResponse({ ...listPage, message: literal }));
     }
-    const body = BuildErrorBody({ ...listPage, message: literal });
+    const body = BuildErrorBody({
+        ...listPage,
+        message: literal,
+        field_errors: FieldErrorsFor(status),
+    });
     return Promise.reject(BuildAxiosError(status, body));
 }
 
@@ -647,7 +657,7 @@ it("COUSR00C ENTER invalid-selection 400 shows its body's page and keeps the cod
     expect(BodyRowTexts()).toEqual(RowTextsOf(OTHER_PAGE_ROWS));
     expect(screen.getByText("Page: 1")).toBeVisible();
     expect(SearchField()).toHaveValue("");
-    expect(SearchField()).toHaveAttribute("aria-invalid", "true");
+    expect(SearchField()).toHaveAttribute("aria-invalid", "false");
     expect(SearchField()).toHaveFocus();
     expect(ShownSelectionCodes()).toEqual(["", "", "D"]);
     await PressKey(user, "F8");
@@ -767,7 +777,7 @@ it.each(KEPT_SEARCH_CASES)(
     },
 );
 
-it("COUSR00C F8 refusal marks USRIDIN in error and puts the cursor on it", async () => {
+it("COUSR00C F8 refusal puts the cursor on USRIDIN without marking it in error", async () => {
     const user = await RenderLoadedScreen();
     expect(SearchField()).not.toHaveFocus();
     expect(SearchField()).toHaveAttribute("aria-invalid", "false");
@@ -775,8 +785,8 @@ it("COUSR00C F8 refusal marks USRIDIN in error and puts the cursor on it", async
     mockListUsers.mockRejectedValueOnce(BuildAxiosError(HTTP_BAD_REQUEST, body));
     await PressKey(user, "F8");
     await ExpectAlert(ALREADY_AT_BOTTOM, ERRMSG_SEVERITY);
-    expect(SearchField()).toHaveAttribute("aria-invalid", "true");
-    expect(SearchField()).toHaveAccessibleDescription(ALREADY_AT_BOTTOM);
+    expect(SearchField()).toHaveAttribute("aria-invalid", "false");
+    expect(SearchField()).not.toHaveAccessibleDescription(ALREADY_AT_BOTTOM);
     expect(SearchField()).toHaveFocus();
     expect(BodyRowTexts()).toEqual(RowTextsOf(FIRST_PAGE_ROWS));
 });

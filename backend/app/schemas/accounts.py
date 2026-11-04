@@ -306,7 +306,8 @@ class AccountScreen(ScreenFeedback):
     ``AccountScreenErrorResponse``, so the page renders each field editable or read-only from
     ``state``, as the COACTUP attribute bytes did, whatever the status. ``field_errors`` lists
     every failing field in source edit order (all-field mode) and ``cursor_field`` the first of
-    them.
+    them; when none failed, ``field_errors`` is empty and ``cursor_field`` is where
+    3300-SETUP-SCREEN-ATTRS puts the cursor.
     """
 
     fields: AccountScreenFields = Field(

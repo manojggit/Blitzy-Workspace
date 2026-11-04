@@ -110,9 +110,11 @@ class LegacyErrorDetails:
     JSON-ready (for example ``model_dump(mode="json")``): the body is sent without
     ``jsonable_encoder``, which would turn ``Decimal`` amounts into floats.
     ``exactFieldErrors`` declares ``fieldErrors`` the exact failing-field list even when it is
-    empty, so a screen whose outcome fails no field, such as the CCUP no-change and write
-    outcomes, places the cursor without marking any field. Unset, an empty ``fieldErrors``
-    falls back to the cursor field, the contract of the first-failure programs.
+    empty, so an outcome that fails no field places the cursor without marking any field: the
+    CAUP and CCUP screens, whose no-change and write outcomes flag none, and the refusals in
+    which the program only moves the cursor, the CU00 paging and invalid-selection literals and
+    CU02's ``Please modify to update ...``. Unset, an empty ``fieldErrors`` falls back to the
+    cursor field, the contract of the first-failure programs' failing edits.
     """
 
     infoMessage: str = ""

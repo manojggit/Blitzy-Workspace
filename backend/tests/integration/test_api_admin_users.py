@@ -302,7 +302,7 @@ SEARCHED_INVALID_SELECTION_CASES = (
             SEED_ADMIN_USER_ID,
             HTTP_EDIT_FAILURE,
             INVALID_SELECTION_MESSAGE,
-            {"info_message": "", "field_errors": [SEARCH_CURSOR_FIELD]},
+            {"info_message": "", "field_errors": []},
         ),
         id="next-page-keeps-the-literal",
     ),
@@ -722,7 +722,10 @@ async def test_cu00_pages_list_every_user_in_ebcdic_key_order(
 async def test_cu00_paging_keys_refuse_past_either_end(
     adminClient: httpx.AsyncClient, syncEngine: Engine
 ) -> None:
-    """F7 on page 1 and F8 after the last page are refused with 400 and their literals."""
+    """F7 on page 1 and F8 after the last page are refused with 400 and their literals.
+
+    COUSR00C only moves the cursor to USRIDIN, so neither refusal lists a failing field.
+    """
     pages = await ReadAllPages(adminClient, len(ReadStoredUserIds(syncEngine)))
     topResponse = await PressPagingKey(adminClient, pages[0], BACKWARD_DIRECTION)
     AssertLegacyError(topResponse, HTTP_EDIT_FAILURE, ALREADY_AT_TOP_MESSAGE, SEARCH_CURSOR_FIELD)
@@ -730,6 +733,7 @@ async def test_cu00_paging_keys_refuse_past_either_end(
     AssertLegacyError(
         bottomResponse, HTTP_EDIT_FAILURE, ALREADY_AT_BOTTOM_MESSAGE, SEARCH_CURSOR_FIELD
     )
+    assert [topResponse.json()["field_errors"], bottomResponse.json()["field_errors"]] == [[], []]
 
 
 @pytest.mark.parametrize("case", WALK_FAILURE_CASES)
@@ -974,6 +978,7 @@ async def test_cu02_unchanged_submission_asks_for_a_modification(
     updateBody = UpdateBody(storedBefore, {"password": enteredPassword})
     response = await UpdateUser(harness.adminClient, user.userId, updateBody)
     AssertLegacyError(response, HTTP_EDIT_FAILURE, PLEASE_MODIFY_MESSAGE, FIRST_NAME_FIELD)
+    assert response.json()["field_errors"] == []
     assert response.json()["message"] != CREDENTIAL_EMPTY_MESSAGE
     assert ReadStoredUser(harness.syncEngine, user.userId) == storedBefore
 

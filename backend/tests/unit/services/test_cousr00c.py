@@ -89,6 +89,7 @@ BACKWARD = "backward"
 SEARCH_CURSOR_FIELD = "search_user_id"
 EDIT_FAILURE_STATUS = 400
 LOOKUP_ERROR_STATUS = 503
+LOOKUP_FIELD_ERRORS = (SEARCH_CURSOR_FIELD,)
 NO_MESSAGE = ""
 NO_KEY = ""
 NO_CODE = ""
@@ -193,12 +194,16 @@ def NoUserWrites(syncEngine: Engine) -> Iterator[None]:
     assert ReadUsers(syncEngine) == usersBefore
 
 
-def RefusalBody(message: str) -> dict[str, object]:
-    """Return the four standard keys of a refusal body, with the cursor on the search field."""
+def RefusalBody(message: str, fieldErrors: tuple[str, ...] = ()) -> dict[str, object]:
+    """Return the four standard keys of a refusal body, with the cursor on the search field.
+
+    A paging or invalid-selection refusal sets no ERR-FLG and only moves the cursor, so it
+    lists no field unless ``fieldErrors`` names one.
+    """
     return {
         "message": message,
         "info_message": "",
-        "field_errors": [SEARCH_CURSOR_FIELD],
+        "field_errors": list(fieldErrors),
         "cursor_field": SEARCH_CURSOR_FIELD,
     }
 
@@ -214,10 +219,15 @@ def AssertListPage(
 
 
 def AssertRefusal(refusal: LegacyMessageError, message: str, status: int) -> None:
-    """Assert a refusal's literal, status, cursor field and four-key body."""
+    """Assert a refusal's literal, status, cursor field and four-key body.
+
+    The 503 WHEN OTHER lookup failure, which sets ERR-FLG, keeps the first-failure contract and
+    lists the search field; a 400 refusal lists none.
+    """
     assert (refusal.message, refusal.httpStatus) == (message, status)
     assert refusal.field == SEARCH_CURSOR_FIELD
-    assert refusal.Body() == RefusalBody(message)
+    fieldErrors = LOOKUP_FIELD_ERRORS if status == LOOKUP_ERROR_STATUS else ()
+    assert refusal.Body() == RefusalBody(message, fieldErrors)
 
 
 async def ListPage(makeOnlineContext: ContextFactory, query: UserListQuery) -> UserListResponse:

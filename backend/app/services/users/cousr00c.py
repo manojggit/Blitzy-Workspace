@@ -128,8 +128,9 @@ async def ListUsers(context: OnlineContext, query: UserListQuery) -> UserListRes
             1 or 0), ``You are already at the bottom of the page...`` (F8 with a blank last key
             or with nothing after it), ``You are at the top of the page...`` (F7's STARTBR
             NOTFND) or ``You have reached the top of the page...`` (nothing before the first
-            key), each with the four standard keys only; 503 with ``Unable to lookup User...``
-            while the batch window holds USRSEC or on a database failure.
+            key), each with the four standard keys only, an empty ``field_errors`` and the
+            cursor on the search field; 503 with ``Unable to lookup User...`` while the batch
+            window holds USRSEC or on a database failure.
     """
     repository = UserRepository(context)
     if query.direction is None:
@@ -163,9 +164,9 @@ async def ProcessUserSelection(
         ``You are already at the bottom of the page...``.
 
     Raises:
-        LegacyMessageError: 400 ``Invalid selection. Valid values are U and D`` when the
-            browse leaves that literal on the ERRMSG line, its body adding the re-browsed
-            page's ``rows``, ``page``, ``first_key`` and ``last_key``; 503
+        LegacyMessageError: 400 ``Invalid selection. Valid values are U and D`` when the browse
+            leaves that literal on the ERRMSG line, with an empty ``field_errors``, its body adding
+            the re-browsed page's ``rows``, ``page``, ``first_key`` and ``last_key``; 503
             ``Unable to lookup User...`` while the batch window holds USRSEC or on a database
             failure.
     """
@@ -217,8 +218,17 @@ def _RouteWithUserId(route: str, userId: str) -> str:
 
 
 def _Refusal(message: str) -> LegacyMessageError:
-    """Return the 400 refusal of a browse that reads no row, with the cursor on the search."""
-    return LegacyMessageError(message, field=SEARCH_CURSOR_FIELD, httpStatus=REFUSAL_STATUS)
+    """Return the 400 refusal of a browse that reads no row, with the cursor on the search.
+
+    The paging paragraphs set no ERR-FLG and only MOVE -1 TO USRIDINL, so no field is listed
+    as failing in ``field_errors``.
+    """
+    return LegacyMessageError(
+        message,
+        field=SEARCH_CURSOR_FIELD,
+        httpStatus=REFUSAL_STATUS,
+        details=LegacyErrorDetails(exactFieldErrors=True),
+    )
 
 
 def _InvalidSelectionRefusal(listPage: UserListResponse) -> LegacyMessageError:
@@ -227,14 +237,15 @@ def _InvalidSelectionRefusal(listPage: UserListResponse) -> LegacyMessageError:
     The edit failure rides on the page the browse built: the body adds its ``rows``, ``page``,
     ``first_key`` and ``last_key`` beside the four standard keys, JSON-ready, as
     ``UserSelectionErrorResponse`` declares, so the client shows that page under the
-    invalid-selection literal.
+    invalid-selection literal. WHEN OTHER (lines 210-214) sets no ERR-FLG and only moves the
+    cursor to USRIDIN, so ``field_errors`` is empty.
     """
     pageBody = listPage.model_dump(mode="json", include=LIST_PAGE_BODY_FIELDS)
     return LegacyMessageError(
         INVALID_SELECTION_MESSAGE,
         field=SEARCH_CURSOR_FIELD,
         httpStatus=REFUSAL_STATUS,
-        details=LegacyErrorDetails(extraBody=pageBody),
+        details=LegacyErrorDetails(extraBody=pageBody, exactFieldErrors=True),
     )
 
 

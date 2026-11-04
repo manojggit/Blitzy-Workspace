@@ -617,7 +617,7 @@ const OUTCOME_CASES: readonly OutcomeCase[] = [
         status: HTTP_EDIT_FAILURE,
         accountScreen: BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
             message: MSG_NO_CHANGES,
-            field_errors: ["active_status"],
+            field_errors: [],
             cursor_field: "active_status",
         }),
         expectedAlerts: [
@@ -704,11 +704,13 @@ interface FieldEditCase {
     storedFields?: Partial<AccountScreenFields>;
 }
 
-// The message line and field attributes a failed request leaves; the cursor is the first field.
+// The message line and field attributes a failed request leaves; the cursor is the first field,
+// or cursorField for an outcome that flags no field.
 interface ExpectedFailure {
     message: string;
     infoMessage: string;
     fieldErrors: readonly AccountFieldName[];
+    cursorField?: AccountFieldName;
 }
 
 // ACCT-GROUP-ID: no 1200 edit checks it, so it is never a failing field.
@@ -1176,11 +1178,14 @@ const HTTP_NOT_FOUND = 404;
 const READ_FAILURE_ACCOUNT_ID = "00000000099";
 
 // One failed 9000-READ-ACCT (coactvwc.ReadAccountChain), with the text its builder composes for
-// READ_FAILURE_ACCOUNT_ID and the customer its cross-reference names.
+// READ_FAILURE_ACCOUNT_ID and the customer its cross-reference names. A CXACAIX or ACCTDAT failure
+// sets FLG-ACCTFILTER-NOT-OK, which flags ACCTSID; a CUSTDAT failure flags no field. ACCTSID is
+// the cursor either way.
 interface ReadFailureCase {
     source: string;
     status: number;
     message: string;
+    fieldErrors: readonly AccountFieldName[];
 }
 
 // The read failures that keep the empty key screen: no customer was read.
@@ -1189,21 +1194,25 @@ const READ_FAILURE_CASES: readonly ReadFailureCase[] = [
         source: "9200-GETCARDXREF-BYACCT NOTFND",
         status: HTTP_NOT_FOUND,
         message: "Account:00000000099 not found in Cross ref file.  Resp:000000013  Reas:0000",
+        fieldErrors: KEY_FIELD_NAMES,
     },
     {
         source: "9400-GETCUSTDATA-BYCUST NOTFND",
         status: HTTP_NOT_FOUND,
         message: "CustId:000000099 not found in customer master.Resp: 000000013  REAS:0000000",
+        fieldErrors: NO_FIELD_NAMES,
     },
     {
         source: "batch-window CXACAIX NOTOPEN",
         status: HTTP_FILE_ERROR,
         message: "File Error: READ     on CXACAIX   returned RESP 000000019 ,RESP2 000000060",
+        fieldErrors: KEY_FIELD_NAMES,
     },
     {
         source: "CUSTDAT IOERR",
         status: HTTP_FILE_ERROR,
         message: "File Error: READ     on CUSTDAT   returned RESP 000000017 ,RESP2 000000000",
+        fieldErrors: NO_FIELD_NAMES,
     },
 ];
 // 9300-GETACCTDATA-BYACCT never sets DID-NOT-FIND-ACCT-IN-ACCTDAT, so 9000-READ-ACCT still reads
@@ -1213,11 +1222,13 @@ const ACCOUNT_READ_FAILURE_CASES: readonly ReadFailureCase[] = [
         source: "9300-GETACCTDATA-BYACCT NOTFND",
         status: HTTP_NOT_FOUND,
         message: "Account:00000000099 not found in Acct Master file.Resp:000000013  Reas:0000",
+        fieldErrors: KEY_FIELD_NAMES,
     },
     {
         source: "ACCTDAT IOERR",
         status: HTTP_FILE_ERROR,
         message: "File Error: READ     on ACCTDAT   returned RESP 000000017 ,RESP2 000000000",
+        fieldErrors: KEY_FIELD_NAMES,
     },
 ];
 // The file errors name no key, so they also stand for a failed F12 re-read of the fetched account.
@@ -1312,7 +1323,7 @@ function FieldEditScreen(editCase: FieldEditCase): AccountScreen {
 }
 
 // AAP 0.6.3: ERRMSG in red with INFOMSG after it, as sent; every field the server names is marked
-// and no other; the cursor is on the first of them.
+// and no other; the cursor is on the first of them, or on cursorField when none is named.
 function ExpectFailureShown(expected: ExpectedFailure): void {
     expect(ShownAlerts()).toEqual([
         [expected.message, "error"],
@@ -1324,7 +1335,8 @@ function ExpectFailureShown(expected: ExpectedFailure): void {
         expect(markedInputs).toContain(InputOf(name));
     }
     expect(InputOf(UNEDITED_FIELD_NAME)).toHaveAttribute("aria-invalid", "false");
-    expect(InputOf(CursorFieldOf(expected.fieldErrors))).toHaveFocus();
+    const cursorField = expected.cursorField ?? CursorFieldOf(expected.fieldErrors);
+    expect(InputOf(cursorField)).toHaveFocus();
 }
 
 async function ShowsFieldEditFailure(editCase: FieldEditCase): Promise<void> {
@@ -1345,13 +1357,12 @@ async function ShowsFieldEditFailure(editCase: FieldEditCase): Promise<void> {
 }
 
 // The 423 body of a CUSTDAT lock failure: nothing is written and the update ends in
-// CHANGES_FAILED. No field failed, so app.core.errors.ErrorBody names the cursor field ACCTSID
-// in field_errors.
+// CHANGES_FAILED. No field failed, so field_errors is empty and ACCTSID is only the cursor.
 function CustomerLockScreen(): AccountScreen {
     return BuildAccountScreen(UpdateScreenState.CHANGES_FAILED, {
         screen_token: ADOPTED_SCREEN_TOKEN,
         message: MSG_LOCK_CUSTOMER,
-        field_errors: [...KEY_FIELD_NAMES],
+        field_errors: [],
         cursor_field: "acct_id",
     });
 }
@@ -1383,18 +1394,19 @@ async function ShowsCustomerLockFailure(): Promise<void> {
     ExpectFailureShown({
         message: MSG_LOCK_CUSTOMER,
         infoMessage: INFO_INFORM_FAILURE,
-        fieldErrors: KEY_FIELD_NAMES,
+        fieldErrors: NO_FIELD_NAMES,
+        cursorField: "acct_id",
     });
     await SendsKeyAfterFailedSave(user);
 }
 
 // ReadFailureOutcome: the DETAILS_NOT_FETCHED screen shows only the key as received. Whichever
-// file failed, the error body names ACCTSID as the failing field and the cursor.
+// file failed, the error body names ACCTSID as the cursor, and the case's flagged fields.
 function ReadFailureScreen(readCase: ReadFailureCase): AccountScreen {
     return BuildAccountScreen(UpdateScreenState.DETAILS_NOT_FETCHED, {
         fields: { ...BlankFields(), acct_id: READ_FAILURE_ACCOUNT_ID },
         message: readCase.message,
-        field_errors: [...KEY_FIELD_NAMES],
+        field_errors: [...readCase.fieldErrors],
         cursor_field: "acct_id",
     });
 }
@@ -1404,7 +1416,8 @@ function ExpectReadFailureShown(readCase: ReadFailureCase): void {
     ExpectFailureShown({
         message: readCase.message,
         infoMessage: INFO_PROMPT_FOR_SEARCH_KEYS,
-        fieldErrors: KEY_FIELD_NAMES,
+        fieldErrors: readCase.fieldErrors,
+        cursorField: "acct_id",
     });
     expect(InputOf("acct_id")).toHaveValue(READ_FAILURE_ACCOUNT_ID);
     ExpectEditable("acct_id", true);
@@ -1417,7 +1430,7 @@ function AccountReadFailureScreen(readCase: ReadFailureCase): AccountScreen {
         fields: { ...UNREAD_ACCOUNT_FIELDS },
         screen_token: ADOPTED_SCREEN_TOKEN,
         message: readCase.message,
-        field_errors: [...KEY_FIELD_NAMES],
+        field_errors: [...readCase.fieldErrors],
         cursor_field: "acct_id",
     });
 }
@@ -1427,7 +1440,8 @@ function ExpectAccountReadFailureShown(readCase: ReadFailureCase): void {
     ExpectFailureShown({
         message: readCase.message,
         infoMessage: INFO_PROMPT_FOR_CHANGES,
-        fieldErrors: KEY_FIELD_NAMES,
+        fieldErrors: readCase.fieldErrors,
+        cursorField: "acct_id",
     });
     expect(FieldValuesShown()).toEqual(UNREAD_ACCOUNT_FIELDS);
     expect(EditableFieldNames()).toEqual(DETAIL_FIELD_NAMES);
@@ -1493,12 +1507,12 @@ async function ShowsKeyEnterAccountReadFailure(readCase: ReadFailureCase): Promi
 }
 
 // F12 re-reads the token's account; CancelReadFailureOutcome keeps the provisional SHOW_DETAILS
-// screen, its values and its open fields, and flags the key.
+// screen, its values and its open fields, and flags the key when the case flags it.
 async function ShowsCancelReadFailure(readCase: ReadFailureCase): Promise<void> {
     const user = await RenderInState(UpdateScreenState.SHOW_DETAILS);
     const provisionalScreen = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
         message: readCase.message,
-        field_errors: [...KEY_FIELD_NAMES],
+        field_errors: [...readCase.fieldErrors],
         cursor_field: "acct_id",
     });
     QueueUpdateOutcome(readCase.status, provisionalScreen);
@@ -1506,7 +1520,8 @@ async function ShowsCancelReadFailure(readCase: ReadFailureCase): Promise<void> 
     ExpectFailureShown({
         message: readCase.message,
         infoMessage: INFO_PROMPT_FOR_CHANGES,
-        fieldErrors: KEY_FIELD_NAMES,
+        fieldErrors: readCase.fieldErrors,
+        cursorField: "acct_id",
     });
     ExpectEditable("credit_limit", true);
 }
@@ -2166,12 +2181,13 @@ const REREAD_SCREEN = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
     screen_token: NEXT_SCREEN_TOKEN,
     cursor_field: "acct_id",
 });
-// ENTER on the re-read values: the compare with the new before-image finds no change.
+// ENTER on the re-read values: the compare with the new before-image finds no change, which flags
+// no field and puts the cursor on the account status.
 const NO_CHANGE_SCREEN = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
     fields: { ...REREAD_FIELDS },
     screen_token: ADOPTED_SCREEN_TOKEN,
     message: MSG_NO_CHANGES,
-    field_errors: ["active_status"],
+    field_errors: [],
     cursor_field: "active_status",
 });
 // KeepConfirmationOutcome: ENTER runs no edit and shows the token's validated values again.
@@ -2199,13 +2215,13 @@ const SECOND_ACCOUNT_SCREEN = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS,
     cursor_field: "acct_id",
 });
 
-// The 423 or 503 body of a failed 9600 (CHANGES_FAILED) showing the confirmed values. ErrorBody
-// lists the cursor field as the failing one when no edit failed.
+// The 423 or 503 body of a failed 9600 (CHANGES_FAILED) showing the confirmed values. No field
+// failed, so field_errors is empty and ACCTSID is only the cursor.
 function FailedSaveScreen(message: string): AccountScreen {
     return BuildAccountScreen(UpdateScreenState.CHANGES_FAILED, {
         screen_token: NEXT_SCREEN_TOKEN,
         message,
-        field_errors: ["acct_id"],
+        field_errors: [],
         cursor_field: "acct_id",
     });
 }
@@ -2662,12 +2678,12 @@ const NAVIGATED_ACCOUNT_SCREEN = BuildAccountScreen(UpdateScreenState.SHOW_DETAI
     screen_token: NAVIGATED_SCREEN_TOKEN,
 });
 // NoChangeOutcome for account 00000000005's unedited fields: the state kept, no field failing an
-// edit and the cursor on the account status, which the error contract lists in field_errors.
+// edit, so field_errors is empty, and the cursor on the account status.
 const NAVIGATED_NO_CHANGE_SCREEN = BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
     fields: { ...NAVIGATED_FIELDS },
     screen_token: NAVIGATED_SCREEN_TOKEN,
     message: MSG_NO_CHANGES,
-    field_errors: ["active_status"],
+    field_errors: [],
     cursor_field: "active_status",
 });
 // What account 00000000004's ENTER with a valid change answers after the page has moved on to

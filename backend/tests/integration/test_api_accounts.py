@@ -606,11 +606,15 @@ async def test_save_and_cancel_before_fetch_are_processed_as_enter(
 async def test_enter_with_unchanged_fields_detects_no_change(
     regularClient: httpx.AsyncClient, syncEngine: Engine
 ) -> None:
-    """1205-COMPARE-OLD-NEW finds no change: the literal, the state kept, the cursor on status."""
+    """1205-COMPARE-OLD-NEW finds no change: the literal, the state kept, the cursor on status.
+
+    No field failed, so field_errors is empty and the status is only the cursor.
+    """
     acctId = MakeAccountEditable(syncEngine, SAMPLE_ACCOUNT_ID)
     screen = await FetchForEdit(regularClient, acctId)
     response = await PutAccount(regularClient, acctId, NextAction(screen, UpdateAction.ENTER, {}))
     body = AssertLegacyError(response, HTTP_EDIT_FAILURE, MSG_NO_CHANGES, STATUS_FIELD)
+    assert body["field_errors"] == []
     AssertScreenState(body, UpdateScreenState.SHOW_DETAILS)
     assert body["fields"] == screen["fields"]
     assert body["screen_token"]

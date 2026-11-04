@@ -320,7 +320,9 @@ defines:
     - Every edit paragraph runs. The first message is kept, because each edit sets a message only
         while `WS-RETURN-MSG-OFF` holds, and every failing field's flag is kept.
     - The response carries `message`, `field_errors` (the failing fields, in source order) and
-        `cursor_field` (the first of them).
+        `cursor_field` (the first of them). An outcome that fails no field, such as the CAUP and
+        CCUP no-change and failed-save outcomes, carries an empty `field_errors` and only places
+        the cursor.
     - In CAUP and CCUP, which edits run depends on the screen state
         ([CAUP and CCUP screen state machine](#caup-and-ccup-screen-state-machine)). Before details
         are fetched, only the key edits run. With details shown, the comparison with the fetched
@@ -329,7 +331,9 @@ defines:
         no edit runs.
 - **First-failure mode**: every other online program. Their edits are `EVALUATE` and `IF` chains
     in which the first failure ends validation. The response carries `message` and
-    `cursor_field`.
+    `cursor_field`. `field_errors` names the failing field, or nothing when the program only
+    moves the cursor, as for the CU00 paging and invalid-selection literals and CU02's
+    `Please modify to update ...`.
 
 Edits are table-driven: an ordered list of `(field, editFunction)` pairs walked by a short loop.
 This keeps COACTUPC's roughly 30 edits inside the 20-line function limit.

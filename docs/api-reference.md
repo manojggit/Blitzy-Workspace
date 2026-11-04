@@ -235,6 +235,16 @@ How many fields `field_errors` holds depends on the program's edit mode:
 - **First-failure mode** (every other program): the first failing edit ends validation, so
     `field_errors` holds only the failing field.
 
+An outcome that fails no field, where the legacy program only moves the cursor, carries an empty
+`field_errors` and names the field in `cursor_field` alone. These outcomes are:
+
+- CAUP: the no-change answer, the 423 lock, 409 record-changed and 503 update-failed save
+    outcomes, and a read failure that leaves the account key valid (a CUSTDAT not-found or file
+    error).
+- CCUP: the no-change answer and the lock, record-changed and update-failed save outcomes.
+- CU00: the paging refusals and the invalid-selection refusal.
+- CU02: `Please modify to update ...`.
+
 For example, CT02 refuses an amount keyed as `50` with status 400 and this body:
 
 ```json
@@ -938,9 +948,9 @@ The actions in the table do this:
 - **Key screen** discards the input and returns the empty key screen in `DETAILS_NOT_FETCHED`.
 
 Validation compares the keyed fields with the values fetched first. With no change, the answer is
-400 `No change detected with respect to values fetched.`, the state is kept and the cursor is on
-`active_status`. Otherwise every detail edit runs. Any failure gives 400 and `CHANGES_NOT_OK`;
-a pass gives 200, `CHANGES_OK_NOT_CONFIRMED` and the information line
+400 `No change detected with respect to values fetched.`, the state is kept, `field_errors` is
+empty and the cursor is on `active_status`. Otherwise every detail edit runs. Any failure gives
+400 and `CHANGES_NOT_OK`; a pass gives 200, `CHANGES_OK_NOT_CONFIRMED` and the information line
 `Changes validated.Press F5 to save`. Validation never writes.
 
 The information line of each state:
@@ -1163,6 +1173,8 @@ Save outcomes other than success:
 - 503 `Update of record failed`, state `CHANGES_FAILED`. When the customer rewrite fails after the
     account rewrite, the account change persists, as in the legacy program, whose files are not
     recoverable.
+
+None of these outcomes fails a field: `field_errors` is empty and `cursor_field` is `acct_id`.
 
 #### Edit failures
 
@@ -2283,7 +2295,8 @@ Other outcomes:
 - 503 `Unable to lookup User...`.
 
 Unlike CT00, a CU00 key press that reads no row is a 400 refusal with the four standard keys, and
-the page shown stays as it was.
+the page shown stays as it was. COUSR00C only moves the cursor for these refusals, so the field in
+parentheses is the `cursor_field` and `field_errors` is empty.
 
 ### POST /api/v1/admin/users/selection
 
@@ -2331,7 +2344,8 @@ Other outcomes:
 - A non-blank code other than `U`, `u`, `D` or `d`, on a row whose `user_id` is not blank, sets
     `Invalid selection. Valid values are U and D`, and the list is browsed again from
     `search_user_id`. When that literal stays, the answer is 400
-    (`UserSelectionErrorResponse`) with the browsed `rows`, `page`, `first_key` and `last_key`.
+    (`UserSelectionErrorResponse`) with the browsed `rows`, `page`, `first_key` and `last_key`,
+    an empty `field_errors` and `cursor_field` `search_user_id`.
     When the browse replaces it with a paging literal, the answer is a 200 list with `route` null.
 - 503 `Unable to lookup User...`.
 
@@ -2464,7 +2478,8 @@ Other outcomes, each naming its field:
 - 400 `User ID can NOT be empty...`, `First Name can NOT be empty...`,
     `Last Name can NOT be empty...` or `User Type can NOT be empty...`. The password is not
     required here.
-- 400 `Please modify to update ...` (`first_name`): nothing changed.
+- 400 `Please modify to update ...` (`first_name`): nothing changed. No field failed, so
+    `field_errors` is empty and `first_name` is only the `cursor_field`.
 - 404 `User ID NOT found...` (`user_id`).
 - 503 `Unable to Update User...` (`first_name`): the batch window is held, another request
     holds the user's row past the lock timeout, or the user file cannot be read or rewritten.

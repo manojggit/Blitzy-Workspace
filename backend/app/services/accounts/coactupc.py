@@ -531,7 +531,9 @@ class ScreenOutcome:
 
     ``fields`` holds the display text by AccountScreenFields attribute; a missing field is
     blank. A non-blank ``message`` (the ERRMSG line) is sent as an error with ``httpStatus``.
-    The information line is always the state's (3250-SETUP-INFOMSG).
+    The information line is always the state's (3250-SETUP-INFOMSG). ``fieldErrors`` are the
+    fields 3300 colours, and ``cursorField`` the one its cursor EVALUATE picks: by default
+    ACCTSID, its WHEN OTHER.
     """
 
     updateState: AccountUpdateState
@@ -1185,8 +1187,11 @@ def RaiseScreenError(outcome: ScreenOutcome, context: OnlineContext) -> NoReturn
     """Raise the LegacyMessageError of a screen sent back with its ERRMSG line set.
 
     The screen ``fields``, ``state`` and ``screen_token`` ride beside the four standard keys,
-    so the page keeps the state machine running on a 4xx or 5xx response. The error contract
-    lists the cursor field in ``field_errors`` when no field failed.
+    so the page keeps the state machine running on a 4xx or 5xx response. ``field_errors`` is
+    exactly the outcome's flagged fields and ``cursor_field`` its cursor, so an outcome that
+    flags no field lists none: NO-CHANGES-DETECTED, the 9600 lock, record-changed and
+    update-failed outcomes, and a read failure that leaves FLG-ACCTFILTER-ISVALID set colour no
+    field in 3300 while it still positions the cursor.
     """
     screen = BuildScreen(outcome, context)
     screenBody = screen.model_dump(mode="json", include={"fields", "state", "screen_token"})
@@ -1198,6 +1203,7 @@ def RaiseScreenError(outcome: ScreenOutcome, context: OnlineContext) -> NoReturn
             infoMessage=screen.info_message,
             fieldErrors=outcome.fieldErrors,
             extraBody=screenBody,
+            exactFieldErrors=True,
         ),
     )
 
@@ -1264,7 +1270,14 @@ def ReadFailureOutcome(readResult: AccountReadResult) -> ScreenOutcome:
 
 
 def ShowDetailsOutcome(readResult: AccountReadResult) -> ScreenOutcome:
-    """SET ACUP-SHOW-DETAILS after a 9000-READ-ACCT that read the account and the customer."""
+    """SET ACUP-SHOW-DETAILS after a 9000-READ-ACCT that read the account and the customer.
+
+    The cursor stays on ACCTSID, after a fetch and after an F12 re-read alike. FOUND-ACCOUNT-DATA,
+    which would put it on ACSTTUS (line 3010), is an 88-level of WS-INFO-MSG (lines 466-467),
+    and 3000-SEND-MAP performs 3250-SETUP-INFOMSG before 3300, so WS-INFO-MSG then holds
+    PROMPT-FOR-CHANGES. 3202-SHOW-ORIGINAL-VALUES has cleared every field flag, so 3300's WHEN
+    OTHER (lines 3165-3166) moves -1 to ACCTSIDL.
+    """
     beforeImage = BeforeImageOf(readResult.account, readResult.customer)
     shownState = AccountUpdateState(
         UpdateScreenState.SHOW_DETAILS,
