@@ -20,6 +20,7 @@ import {
     useMemo,
     useRef,
     useState,
+    useTransition,
     type Dispatch,
     type RefObject,
     type SetStateAction,
@@ -27,7 +28,7 @@ import {
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
-import { ScreenShell } from "@/components/ScreenShell";
+import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
 import { Login, Logout } from "@/lib/api/auth";
 import {
     ABEND_MESSAGE,
@@ -159,6 +160,12 @@ interface SignOnFormProps {
     form: SignOnForm;
 }
 
+// The PF keys, and whether the screen is busy: a call in flight, or the route change it started.
+interface SignOnKeys {
+    keys: FunctionKeyDefinition[];
+    isBusy: boolean;
+}
+
 interface CredentialFieldProps {
     definition: CredentialFieldDefinition;
     value: string;
@@ -281,8 +288,7 @@ async function SubmitExit(context: SignOnContext): Promise<void> {
 }
 
 // The COSGN00 legend ENTER=Sign-on  F3=Exit; no other key is bound.
-function BuildSignOnKeys(context: SignOnContext): FunctionKeyDefinition[] {
-    const { isBusy } = context.form;
+function BuildSignOnKeys(context: SignOnContext, isBusy: boolean): FunctionKeyDefinition[] {
     return [
         {
             key: "ENTER",
@@ -374,19 +380,22 @@ function useSignOnForm(): SignOnForm {
     );
 }
 
-function useSignOnKeys(form: SignOnForm): FunctionKeyDefinition[] {
+// The XCTL to the user's menu ends with that menu: the route change runs as a transition, so the
+// screen stays busy until the menu has rendered and a second ENTER cannot sign on again.
+function useSignOnKeys(form: SignOnForm): SignOnKeys {
     const router = useRouter();
     const { RefreshSession, ClearSession } = useSession();
-    return useMemo(
-        () =>
-            BuildSignOnKeys({
-                form,
-                RefreshSession,
-                ClearSession,
-                Navigate: (route) => router.push(route),
-            }),
-        [form, router, RefreshSession, ClearSession],
+    const [isNavigating, startNavigation] = useTransition();
+    const isBusy = form.isBusy || isNavigating;
+    const navigate = useCallback(
+        (route: string) => startNavigation(() => router.push(route)),
+        [router],
     );
+    const keys = useMemo(
+        () => BuildSignOnKeys({ form, RefreshSession, ClearSession, Navigate: navigate }, isBusy),
+        [form, RefreshSession, ClearSession, navigate, isBusy],
+    );
+    return { keys, isBusy };
 }
 
 function CredentialFieldId(name: CredentialName): string {
@@ -400,8 +409,10 @@ function CredentialInputProps({ definition, hasError }: CredentialFieldProps) {
     return { maxLength: definition.maxLength, ...ErrorMessageReference(hasError, helperTextId) };
 }
 
+// The field keeps the cursor but refuses keystrokes while a call is in flight.
 function CredentialField(props: CredentialFieldProps) {
     const { definition } = props;
+    const isBusy = useScreenBusy();
     return (
         <TextField
             id={CredentialFieldId(definition.name)}
@@ -414,7 +425,7 @@ function CredentialField(props: CredentialFieldProps) {
             error={props.hasError}
             inputRef={props.inputRef}
             onChange={(event) => props.onValueChange(definition.name, event.target.value)}
-            slotProps={{ htmlInput: CredentialInputProps(props) }}
+            slotProps={{ htmlInput: CredentialInputProps(props), input: { readOnly: isBusy } }}
         />
     );
 }
@@ -462,14 +473,14 @@ function SignOnMessages({ form }: SignOnFormProps) {
 
 function SignOnScreen() {
     const form = useSignOnForm();
-    const keys = useSignOnKeys(form);
+    const { keys, isBusy } = useSignOnKeys(form);
     useFunctionKeys(keys);
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}
             programName={PROGRAM_NAME}
             screenTitle={SCREEN_TITLE}
-            isBusy={form.isBusy}
+            isBusy={isBusy}
         >
             <Typography variant="bodyLarge">{INSTRUCTION_TEXT}</Typography>
             <CredentialFields form={form} />

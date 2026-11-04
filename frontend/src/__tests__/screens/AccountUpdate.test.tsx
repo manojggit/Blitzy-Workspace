@@ -3159,3 +3159,31 @@ describe("COACTUPC /accounts/update same-route ?acctId= change", () => {
         KeepsNewEntryWhilePutPending,
     );
 });
+
+// The 3270 keyboard locked from send to response: the cursor stays in the field it was in, and
+// no unprotected field takes keystrokes until the PUT answers, each keeping its outlined look;
+// then the state's fields open again.
+async function LocksEditableFieldsWhileBusy(): Promise<void> {
+    const user = await RenderInState(UpdateScreenState.SHOW_DETAILS);
+    await user.click(InputOf("credit_limit"));
+    const shownCreditLimit = InputOf("credit_limit").value;
+    const answerPut = HoldNextAccountPut();
+    await user.click(screen.getByRole("button", { name: ENTER_KEY.buttonName }));
+    expect(InputOf("credit_limit")).toHaveFocus();
+    expect(EditableFieldNames()).toEqual(NO_FIELD_NAMES);
+    expect(InputOf("credit_limit").closest(".MuiOutlinedInput-root")).not.toBeNull();
+    expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+    await user.keyboard("{Backspace}");
+    expect(InputOf("credit_limit")).toHaveValue(shownCreditLimit);
+    await answerPut(BuildAccountScreen(UpdateScreenState.SHOW_DETAILS));
+    await WaitForIdle();
+    expect(EditableFieldNames()).toEqual(DETAIL_FIELD_NAMES);
+    expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "false");
+}
+
+describe("COACTUPC /accounts/update fields while a request is in flight", () => {
+    it(
+        "COACTUPC ENTER in flight locks every unprotected field and keeps the cursor",
+        LocksEditableFieldsWhileBusy,
+    );
+});

@@ -437,6 +437,34 @@ describe("COUSR01C ENTER while the write is in flight on /admin/users/add", () =
     });
 });
 
+function ExpectFieldsReadOnly(isReadOnly: boolean): void {
+    for (const name of FIELD_NAMES) {
+        expect(FieldInput(name).hasAttribute("readonly")).toBe(isReadOnly);
+    }
+}
+
+// The 3270 keyboard locked from send to response: the cursor stays in USRTYPE, where it was
+// keyed, and no field takes keystrokes until the add answers.
+describe("COUSR01C fields while the write is in flight on /admin/users/add", () => {
+    it("COUSR01C Add User by pointer keeps the cursor in USRTYPE and locks every field", async () => {
+        const settleAdd = DeferAddUser();
+        const user = RenderScreen();
+        await FillUser(user, KEYED_USER);
+        await user.click(LegendButton("ENTER"));
+        expect(FieldInput("user_type")).toHaveFocus();
+        ExpectFieldsReadOnly(true);
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+        await user.keyboard("{Backspace}");
+        expect(FieldInput("user_type")).toHaveValue(KEYED_USER.user_type);
+        await act(async () => {
+            settleAdd({ message: ADDED_MESSAGE, cursor_field: "first_name" });
+        });
+        await ExpectAlert(ADDED_MESSAGE, "success");
+        ExpectFieldsReadOnly(false);
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "false");
+    });
+});
+
 // The keys disable a render after ENTER, so a key pressed in that gap meets the in-flight lock:
 // one write is sent, its answer lands on the form that was sent, and the lock then clears.
 describe("COUSR01C keys pressed in the same turn as ENTER on /admin/users/add", () => {

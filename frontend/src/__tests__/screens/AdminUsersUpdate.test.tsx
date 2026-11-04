@@ -1082,3 +1082,31 @@ describe("COUSR02C field error description", () => {
         expect(FieldInput(PASSWORD_LABEL)).toHaveAccessibleDescription("(8 Char)");
     });
 });
+
+function ExpectFieldsReadOnly(isReadOnly: boolean): void {
+    for (const label of ALL_FIELD_LABELS) {
+        expect(FieldInput(label).hasAttribute("readonly")).toBe(isReadOnly);
+    }
+}
+
+// The 3270 keyboard locked from send to response: the cursor stays in USRIDIN, where it was
+// keyed, and no field takes keystrokes until the read answers.
+describe("COUSR02C fields while a fetch is in flight", () => {
+    it("COUSR02C Fetch by pointer keeps the cursor in USRIDIN and locks every field", async () => {
+        const resolveFetch = DeferNextFetch();
+        const view = RenderScreen();
+        await view.user.type(FieldInput(USER_ID_LABEL), TYPED_USER_ID);
+        await Trigger(view, FETCH_ACTION, "click");
+        expect(FieldInput(USER_ID_LABEL)).toHaveFocus();
+        ExpectFieldsReadOnly(true);
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+        await view.user.keyboard("{Backspace}");
+        expect(FieldInput(USER_ID_LABEL)).toHaveValue(TYPED_USER_ID);
+        await act(async () => {
+            resolveFetch(BuildUserDetail({ user_id: TYPED_USER_ID }));
+        });
+        await WaitForIdle();
+        ExpectFieldsReadOnly(false);
+        expect(FieldInput(LAST_NAME_LABEL)).toHaveValue(FETCHED_LAST_NAME);
+    });
+});

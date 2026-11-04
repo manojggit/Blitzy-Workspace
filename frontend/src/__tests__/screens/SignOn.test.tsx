@@ -520,6 +520,28 @@ describe("COSGN00C ENTER while the sign-on call is in flight on /signon", () => 
     });
 });
 
+// The 3270 keyboard locked from send to response: the cursor stays where it was typed, and
+// neither field takes keystrokes until the answer arrives.
+describe("COSGN00C fields while the sign-on call is in flight on /signon", () => {
+    it("COSGN00C keeps the cursor in Password and locks both fields until the answer", async () => {
+        const resolveLogin = DeferLogin();
+        const { user } = await RenderScreen();
+        await TypeCredentials(user, TYPED_CREDENTIALS);
+        await user.click(SignOnButton());
+        expect(CredentialInput("password")).toHaveFocus();
+        expect(CredentialInput("user_id")).toHaveAttribute("readonly");
+        expect(CredentialInput("password")).toHaveAttribute("readonly");
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+        await user.keyboard("{Backspace}");
+        expect(CredentialInput("password")).toHaveValue(TYPED_CREDENTIALS.password);
+        await resolveLogin(REGULAR_SIGN_ON);
+        await WaitForIdle();
+        expect(CredentialInput("user_id")).not.toHaveAttribute("readonly");
+        expect(CredentialInput("password")).not.toHaveAttribute("readonly");
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "false");
+    });
+});
+
 describe("COSGN00C sign-on failure literals on /signon", () => {
     it.each(SIGN_ON_FAILURE_CASES)(
         "COSGN00C ENTER shows $message ($status) in red with the cursor on $cursorField",

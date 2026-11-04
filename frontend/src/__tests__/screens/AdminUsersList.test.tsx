@@ -400,7 +400,9 @@ it("COUSR00C SEL0001 offers only a blank, U and D", async () => {
     expect(offeredCodes).toEqual(OFFERED_SELECTION_CODES);
 });
 
-it("COUSR00C locks every key until the first browse answers", async () => {
+// The map, keys included, paints only once the first browse answers, as the first SEND MAP
+// painted the whole screen; until then only the header, the busy bar and the title show.
+it("COUSR00C locks every key and holds the map back until the first browse answers", async () => {
     let answerFirstBrowse: (response: UserListResponse) => void = () => undefined;
     mockListUsers.mockReturnValueOnce(
         new Promise((resolve) => {
@@ -408,15 +410,17 @@ it("COUSR00C locks every key until the first browse answers", async () => {
         }),
     );
     const user = RenderScreen();
-    for (const buttonName of Object.values(KEY_BUTTON_NAMES)) {
-        expect(screen.getByRole("button", { name: buttonName })).toBeDisabled();
-    }
+    expect(screen.getByRole("heading", { level: 1, name: SCREEN_TITLE })).toBeVisible();
+    expect(screen.queryByRole("group", { name: "Function keys" })).toBeNull();
+    expect(screen.queryByRole("table")).toBeNull();
     expect(screen.getByRole("progressbar", { name: "Processing" })).toBeInTheDocument();
+    expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
     await PressKey(user, "F3");
     expect(mockRouterPush).not.toHaveBeenCalled();
     answerFirstBrowse(BuildListResponse());
     await ExpectKeysReady();
     expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(BodyRowTexts()).toEqual(RowTextsOf(FIRST_PAGE_ROWS));
 });
 
 it("COUSR00C first entry puts the cursor on USRIDIN (MOVE -1 TO USRIDINL)", async () => {
@@ -919,7 +923,7 @@ it("COUSR00C StrictMode's second first-entry browse alone answers the screen", a
     expect(ReadSignal(0)?.aborted).toBe(true);
     expect(ReadSignal(1)?.aborted).toBe(false);
     await SettlePendingWork();
-    expect(screen.getByRole("button", { name: KEY_BUTTON_NAMES.ENTER })).toBeDisabled();
+    expect(screen.queryByRole("group", { name: "Function keys" })).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
     answerSecondBrowse(BuildListResponse({ rows: OTHER_PAGE_ROWS, message: REACHED_BOTTOM }));
     await ExpectKeysReady();
@@ -1018,4 +1022,66 @@ it("COUSR00C ENTER opens the selection route re-encoded, not as the server wrote
         expect(mockRouterPush).toHaveBeenCalledWith("/admin/users/delete?userId=TEST+U%26");
     });
     expect(mockRouterPush).toHaveBeenCalledTimes(1);
+});
+
+// An F7 or F8 browse held in flight until the test answers it, inside act, through the returned
+// function.
+function HoldNextBrowse(): (response: UserListResponse) => Promise<void> {
+    let answerBrowse: (response: UserListResponse) => void = () => undefined;
+    mockListUsers.mockReturnValueOnce(
+        new Promise((resolve) => {
+            answerBrowse = resolve;
+        }),
+    );
+    return async (response) => {
+        await act(async () => {
+            answerBrowse(response);
+        });
+    };
+}
+
+function ExpectSelectionCodesReadOnly(isReadOnly: boolean): void {
+    for (const field of screen.getAllByRole("combobox")) {
+        expect(field.getAttribute("aria-readonly") === "true").toBe(isReadOnly);
+    }
+}
+
+// The 3270 keyboard locked from send to response: USRIDIN and every SELnnnn keep the cursor but
+// refuse keystrokes until the browse answers.
+it("COUSR00C F8 pressed by pointer locks USRIDIN and SEL0001-10 until it answers", async () => {
+    const user = await RenderLoadedScreen();
+    const answerBrowse = HoldNextBrowse();
+    await user.type(SearchField(), SEARCH_TEXT);
+    await TriggerKey(user, "F8", "button");
+    expect(SearchField()).toHaveFocus();
+    expect(SearchField()).toHaveAttribute("readonly");
+    expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+    ExpectSelectionCodesReadOnly(true);
+    await user.keyboard("X");
+    expect(SearchField()).toHaveValue(SEARCH_TEXT);
+    await user.click(screen.getByRole("combobox", { name: SelectionLabelFor(1) }));
+    expect(screen.queryByRole("listbox")).toBeNull();
+    await answerBrowse(BuildListResponse({ rows: OTHER_PAGE_ROWS, page: 2 }));
+    await ExpectKeysReady();
+    expect(SearchField()).not.toHaveAttribute("readonly");
+    ExpectSelectionCodesReadOnly(false);
+});
+
+// A SEL0001 menu opened before F8 is pressed from it closes as the keyboard locks, the cursor back
+// on SEL0001, and the answer neither reopens it nor brings a code.
+it("COUSR00C F8 from an open SEL0001 menu closes it for good and brings no code", async () => {
+    const user = await RenderLoadedScreen();
+    const answerBrowse = HoldNextBrowse();
+    const field = screen.getByRole("combobox", { name: SelectionLabelFor(1) });
+    await user.click(field);
+    expect(screen.getByRole("listbox")).toBeVisible();
+    await PressKey(user, "F8");
+    expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+    expect(field).toHaveFocus();
+    await answerBrowse(BuildListResponse({ rows: OTHER_PAGE_ROWS, page: 2 }));
+    await ExpectKeysReady();
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(ShownSelectionCodes()).toEqual(OTHER_PAGE_ROWS.map(() => ""));
 });

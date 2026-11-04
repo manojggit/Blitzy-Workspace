@@ -3,13 +3,14 @@
 import { Typography } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
 import { render, screen, within } from "@testing-library/react";
-import type { ReactElement, ReactNode } from "react";
+import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
 
 import { CARD_DEMO_THEME } from "@/app/theme";
 import {
     FormatHeaderDate,
     FormatHeaderTime,
     ScreenShell,
+    useScreenBusy,
     type ScreenShellProps,
 } from "@/components/ScreenShell";
 import type { CurrentUserResponse } from "@/lib/api/auth";
@@ -232,5 +233,103 @@ describe("ScreenShell header layout", () => {
         expect(tranProgGroup).toContainElement(screen.getByText(/^Prog:/));
         expect(tranProgGroup).not.toHaveStyle({ marginLeft: RIGHT_EDGE_ALIGNMENT.marginLeft });
         expect(tranProgGroup).not.toHaveStyle({ textAlign: RIGHT_EDGE_ALIGNMENT.textAlign });
+    });
+});
+
+// isBusy, then main's aria-busy value.
+const ARIA_BUSY_CASES: readonly [boolean | undefined, string][] = [
+    [true, "true"],
+    [false, "false"],
+    [undefined, "false"],
+];
+
+// What a field under the shell reads from useScreenBusy, as text.
+const KEYBOARD_LOCKED_TEXT = "keyboard locked";
+const KEYBOARD_FREE_TEXT = "keyboard free";
+
+// isBusy, then the text the keyboard-lock probe shows.
+const KEYBOARD_LOCK_CASES: readonly [boolean | undefined, string][] = [
+    [true, KEYBOARD_LOCKED_TEXT],
+    [false, KEYBOARD_FREE_TEXT],
+    [undefined, KEYBOARD_FREE_TEXT],
+];
+
+// isMapPending, then whether the children are mounted.
+const MAP_PENDING_CASES: readonly [boolean | undefined, boolean][] = [
+    [true, false],
+    [false, true],
+    [undefined, true],
+];
+
+// The CT02 shell's title heading, which shows while the map is pending.
+const CT02_TITLE_HEADING = { level: 1, name: "Add Transaction" } as const;
+
+// A field under the shell, reading the keyboard lock as the screens' inputs do.
+function KeyboardLockProbe() {
+    const isBusy = useScreenBusy();
+    return <Typography>{isBusy ? KEYBOARD_LOCKED_TEXT : KEYBOARD_FREE_TEXT}</Typography>;
+}
+
+function ShellWithMap(props: Pick<ScreenShellProps, "isMapPending">) {
+    return (
+        <ThemeProvider theme={CARD_DEMO_THEME}>
+            <ScreenShell {...CT02_SHELL_PROPS} isMapPending={props.isMapPending}>
+                <Typography>{CHILD_TEXT}</Typography>
+            </ScreenShell>
+        </ThemeProvider>
+    );
+}
+
+describe("ScreenShell busy state", () => {
+    it.each(ARIA_BUSY_CASES)("isBusy %p sets aria-busy %p on main", (isBusy, ariaBusy) => {
+        RenderShell({ isBusy });
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", ariaBusy);
+    });
+
+    it.each(KEYBOARD_LOCK_CASES)("isBusy %p reads through useScreenBusy as %p", (isBusy, text) => {
+        RenderWithTheme(
+            <ScreenShell {...CT02_SHELL_PROPS} isBusy={isBusy}>
+                <KeyboardLockProbe />
+            </ScreenShell>,
+        );
+        expect(screen.getByText(text)).toBeInTheDocument();
+    });
+
+    it("useScreenBusy outside a ScreenShell reads a free keyboard", () => {
+        RenderWithTheme(<KeyboardLockProbe />);
+        expect(screen.getByText(KEYBOARD_FREE_TEXT)).toBeInTheDocument();
+    });
+});
+
+describe("ScreenShell pending map", () => {
+    it.each(MAP_PENDING_CASES)(
+        "isMapPending %p mounts the children: %p; the title heading and tab title show",
+        (isMapPending, isChildShown) => {
+            RenderShell({ isMapPending });
+            expect(screen.getByRole("heading", CT02_TITLE_HEADING)).toBeVisible();
+            expect(screen.queryByText(CHILD_TEXT) !== null).toBe(isChildShown);
+            expect(document.title).toBe("Add Transaction - CardDemo");
+        },
+    );
+
+    it("the map's children mount once it is no longer pending; the frame is not remounted", () => {
+        const { rerender } = render(<ShellWithMap isMapPending />);
+        const heading = screen.getByRole("heading", CT02_TITLE_HEADING);
+        expect(screen.queryByText(CHILD_TEXT)).toBeNull();
+        rerender(<ShellWithMap isMapPending={false} />);
+        expect(screen.getByText(CHILD_TEXT)).toBeInTheDocument();
+        expect(screen.getByRole("heading", CT02_TITLE_HEADING)).toBe(heading);
+    });
+});
+
+// Next.js resets the scroll on a route change from the first element a page renders, and gives
+// up on one React hoists into the head, so the tab title must come after the header.
+describe("ScreenShell element order", () => {
+    it("the tab title is the shell's last element, never its first", () => {
+        const shellTree = ScreenShell({ ...CT02_SHELL_PROPS, children: CHILD_TEXT });
+        const shellParts = Children.toArray(shellTree.props.children).filter(isValidElement);
+        expect(shellParts.length).toBeGreaterThan(1);
+        expect(shellParts.filter((part) => part.type === "title")).toHaveLength(1);
+        expect(shellParts.at(-1)?.type).toBe("title");
     });
 });

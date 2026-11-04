@@ -1,12 +1,13 @@
 // Screen tests: BMS COMEN01, program COMEN01C (CM00), page /menu.
 // Literals verbatim from backend/app/services/menu/comen01c.py, menu_options.py,
 // backend/app/core/messages.py and cbl/COMEN01C.cbl; option labels from cpy/COMEN02Y.cpy.
+import { Typography } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { AxiosError, AxiosHeaders, CanceledError, type InternalAxiosRequestConfig } from "axios";
 import type * as NavigationModule from "next/navigation";
-import { StrictMode, type ReactNode } from "react";
+import { StrictMode, Suspense, use, useEffect, useState, type ReactNode } from "react";
 
 import MainMenuPage from "@/app/menu/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
@@ -278,9 +279,12 @@ function KeyButton(name: string): HTMLElement {
     return screen.getByRole("button", { name });
 }
 
-// useFunctionKeys listens on window, as the 3270 AID key belonged to the whole screen.
-function PressKey(key: string): void {
-    fireEvent.keyDown(window, { key });
+// useFunctionKeys listens on window, as the 3270 AID key belonged to the whole screen. The async
+// act also covers the state updates of the call the key starts, which settle in later microtasks.
+async function PressKey(key: string): Promise<void> {
+    await act(async () => {
+        fireEvent.keyDown(window, { key });
+    });
 }
 
 // Raw textContent, so a double or trailing blank of the literal has to survive to match.
@@ -340,12 +344,12 @@ const ENTER_CASES: readonly KeyPressCase[] = [
         keyName: "the Continue (Enter) button",
         Press: (user) => user.click(KeyButton(CONTINUE_BUTTON_NAME)),
     },
-    { keyName: "the Enter key", Press: async () => PressKey("Enter") },
+    { keyName: "the Enter key", Press: () => PressKey("Enter") },
 ];
 
 const EXIT_CASES: readonly KeyPressCase[] = [
     { keyName: "the Exit (F3) button", Press: (user) => user.click(KeyButton(EXIT_BUTTON_NAME)) },
-    { keyName: "the F3 key", Press: async () => PressKey("F3") },
+    { keyName: "the F3 key", Press: () => PressKey("F3") },
 ];
 
 // Both literals are red. COMEN01C moves DFHRED to ERRMSGC for the not-installed literal (line
@@ -503,7 +507,7 @@ it("COMEN01C shows a stored refusal only once its options load, in one update", 
     const answerMenuRead = HoldMenuRead();
     RenderScreen();
     expect(screen.getByRole("progressbar")).toBeInTheDocument();
-    expect(within(MenuList()).queryAllByRole("button")).toHaveLength(0);
+    expect(screen.queryByRole("navigation", { name: MENU_OPTIONS_LABEL })).toBeNull();
     expect(screen.queryAllByRole("alert")).toHaveLength(0);
     await act(async () => {
         answerMenuRead(BuildMenuResponse());
@@ -693,11 +697,11 @@ it("COMEN01C F3 again after a failed sign-off signs off to /signon", async () =>
     mockLogout.mockRejectedValueOnce(BuildNetworkError());
     mockLogout.mockResolvedValue({ message: THANK_YOU_MESSAGE });
     await RenderLoadedScreen();
-    PressKey("F3");
+    await PressKey("F3");
     await ExpectAlert(ABEND_MESSAGE, "error");
     await WaitForIdle();
     expect(mockClearSession).not.toHaveBeenCalled();
-    PressKey("F3");
+    await PressKey("F3");
     await waitFor(() => {
         expect(mockRouterPush).toHaveBeenCalledWith(SIGN_ON_ROUTE);
     });
@@ -706,4 +710,176 @@ it("COMEN01C F3 again after a failed sign-off signs off to /signon", async () =>
     expect(mockClearSession).toHaveBeenCalledTimes(1);
     expect(TakePendingMessage()).toBe(THANK_YOU_MESSAGE);
     expect(screen.queryAllByRole("alert")).toHaveLength(0);
+});
+
+interface MapPaintCase {
+    readName: string;
+    ArrangeRead: () => void;
+    optionCount: number;
+    alertTexts: readonly string[];
+}
+
+// The menu read answered with every COMEN02Y option, and failed without a legacy body.
+const MAP_PAINT_CASES: readonly MapPaintCase[] = [
+    {
+        readName: "answered",
+        ArrangeRead: () => mockFetchMainMenu.mockResolvedValue(BuildMenuResponse()),
+        optionCount: MAIN_MENU_LABELS.length,
+        alertTexts: [],
+    },
+    {
+        readName: "failed",
+        ArrangeRead: () => mockFetchMainMenu.mockRejectedValue(BuildServerError()),
+        optionCount: 0,
+        alertTexts: [ABEND_MESSAGE],
+    },
+];
+
+// One SEND-MENU-SCREEN paints the whole map, so nothing already shown moves when it arrives.
+it.each(MAP_PAINT_CASES)(
+    "COMEN01C menu read $readName: the map paints at once, with the cursor on OPTION",
+    async ({ ArrangeRead, optionCount, alertTexts }) => {
+        ArrangeRead();
+        RenderScreen();
+        expect(screen.getByRole("heading", { level: 1, name: SCREEN_TITLE })).toBeVisible();
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+        expect(screen.queryByRole("navigation", { name: MENU_OPTIONS_LABEL })).toBeNull();
+        expect(screen.queryByRole("textbox", { name: OPTION_PROMPT })).toBeNull();
+        expect(screen.queryByRole("group", { name: "Function keys" })).toBeNull();
+        await WaitForIdle();
+        expect(within(MenuList()).queryAllByRole("button")).toHaveLength(optionCount);
+        expect(OptionInput()).toHaveFocus();
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "false");
+        const shownAlertTexts = screen.queryAllByRole("alert").map((alert) => alert.textContent);
+        expect(shownAlertTexts).toEqual(alertTexts);
+    },
+);
+
+// A selection held in flight until the test answers it through the returned function.
+function HoldSelection(): (answer: MenuSelectionResponse) => Promise<void> {
+    let answerSelection: (answer: MenuSelectionResponse) => void = () => undefined;
+    mockSelectMainMenuOption.mockImplementation(
+        () =>
+            new Promise<MenuSelectionResponse>((resolve) => {
+                answerSelection = resolve;
+            }),
+    );
+    return async (answer) => {
+        await act(async () => {
+            answerSelection(answer);
+        });
+    };
+}
+
+// The two pointer presses that send a selection: the ENTER button and a listed option.
+const POINTER_SELECTION_CASES: readonly KeyPressCase[] = [
+    ENTER_CASES[0] ?? { keyName: "", Press: async () => undefined },
+    {
+        keyName: "listed option 11",
+        Press: (user) => user.click(OptionButton(MAIN_MENU_LABELS.length)),
+    },
+];
+
+// The 3270 keyboard locked from send to response: the cursor stays in OPTION, which refuses
+// keystrokes until the answer arrives.
+it.each(POINTER_SELECTION_CASES)(
+    "COMEN01C a selection sent by $keyName locks OPTION, keeping the cursor, until it answers",
+    async ({ Press }) => {
+        const answerSelection = HoldSelection();
+        const user = await RenderLoadedScreen();
+        await user.type(OptionInput(), "1");
+        await Press(user);
+        expect(OptionInput()).toHaveFocus();
+        expect(OptionInput()).toHaveAttribute("readonly");
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+        await user.keyboard("2");
+        expect(OptionInput()).toHaveValue("1");
+        await answerSelection(NOT_INSTALLED_ANSWER);
+        await WaitForIdle();
+        expect(OptionInput()).not.toHaveAttribute("readonly");
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "false");
+        await user.keyboard("1");
+        expect(OptionInput()).toHaveValue("11");
+    },
+);
+
+// The routed page's text once its payload has loaded.
+const NEXT_PAGE_TEXT = "Account View page";
+// A wait long enough for every task an answered call queued to run.
+const SCHEDULED_WORK_MS = 20;
+
+// router.push hands the stand-in for the next page its pending payload; set by the stand-in.
+let showNextPage: (payload: Promise<string>) => void = () => undefined;
+
+interface NextPageContentProps {
+    payload: Promise<string>;
+}
+
+function NextPageContent({ payload }: NextPageContentProps) {
+    return <Typography>{use(payload)}</Typography>;
+}
+
+// Stands in for the App Router's next page: it suspends until its payload loads, as Next.js
+// suspends the route transition router.push starts until the routed page can render.
+function NextPageStandIn() {
+    const [payload, setPayload] = useState<Promise<string> | null>(null);
+    useEffect(() => {
+        showNextPage = setPayload;
+    }, []);
+    return payload === null ? null : <NextPageContent payload={payload} />;
+}
+
+function RenderScreenBesideNextPage(): UserEvent {
+    const user = userEvent.setup();
+    render(
+        <ThemeProvider theme={CARD_DEMO_THEME}>
+            <Suspense fallback={null}>
+                <NextPageStandIn />
+            </Suspense>
+            <MainMenuPage />
+        </ThemeProvider>,
+    );
+    return user;
+}
+
+// Lets every task the answered call queued run, outside act, as the browser runs them.
+async function RunScheduledWork(): Promise<void> {
+    await waitFor(() => new Promise((resolve) => setTimeout(resolve, SCHEDULED_WORK_MS)));
+}
+
+// router.push opens a next page whose payload loads, inside act, when the test calls the
+// returned function.
+function HoldNextPage(): (pageText: string) => Promise<void> {
+    let loadPayload: (pageText: string) => void = () => undefined;
+    const nextPagePayload = new Promise<string>((resolve) => {
+        loadPayload = resolve;
+    });
+    mockRouterPush.mockImplementation(() => showNextPage(nextPagePayload));
+    return async (pageText) => {
+        await act(async () => {
+            loadPayload(pageText);
+        });
+    };
+}
+
+// The XCTL ends with the next screen: the menu stays locked after the selection answers, until
+// the routed page has rendered, so a second ENTER in that time sends no second selection.
+it("COMEN01C stays busy until the routed page renders; a second ENTER sends nothing", async () => {
+    const loadNextPage = HoldNextPage();
+    mockSelectMainMenuOption.mockResolvedValue(ACCOUNT_VIEW_ANSWER);
+    const user = RenderScreenBesideNextPage();
+    await WaitForIdle();
+    await user.type(OptionInput(), "1");
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(mockRouterPush).toHaveBeenCalledWith(ACCOUNT_VIEW_ANSWER.route));
+    await RunScheduledWork();
+    expect(screen.getByRole("progressbar", { name: "Processing" })).toBeInTheDocument();
+    expect(KeyButton(CONTINUE_BUTTON_NAME)).toBeDisabled();
+    expect(OptionInput()).toHaveAttribute("readonly");
+    await user.keyboard("{Enter}");
+    expect(mockSelectMainMenuOption).toHaveBeenCalledTimes(1);
+    await loadNextPage(NEXT_PAGE_TEXT);
+    expect(screen.getByText(NEXT_PAGE_TEXT)).toBeInTheDocument();
+    await WaitForIdle();
+    expect(mockSelectMainMenuOption).toHaveBeenCalledTimes(1);
 });

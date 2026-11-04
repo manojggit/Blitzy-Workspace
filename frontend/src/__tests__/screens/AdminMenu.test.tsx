@@ -1,11 +1,12 @@
 // Screen tests: BMS COADM01, program COADM01C (CA00), page /admin.
 // Copybooks COADM02Y (the six admin options) and CSMSG01Y (the sign-off literal). The literals are
 // copied verbatim from backend/app/services/menu/coadm01c.py, menu_options.py and core/messages.py.
+import { Typography } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { AxiosError, AxiosHeaders, CanceledError, type InternalAxiosRequestConfig } from "axios";
-import { StrictMode, type ReactNode } from "react";
+import { StrictMode, Suspense, use, useEffect, useState, type ReactNode } from "react";
 
 import AdminMenuPage from "@/app/admin/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
@@ -711,4 +712,148 @@ describe("COADM01C unexpected selection route", () => {
             expect(screen.getByRole("button", { name: CONTINUE_BUTTON })).toBeEnabled();
         },
     );
+});
+
+// A menu read held in flight until the test answers it, inside act, through the returned function.
+function HoldMenuRead(): (response: MenuResponse) => Promise<void> {
+    let answerRead: (response: MenuResponse) => void = () => undefined;
+    mockFetchAdminMenu.mockImplementation(
+        () =>
+            new Promise<MenuResponse>((resolve) => {
+                answerRead = resolve;
+            }),
+    );
+    return async (response) => {
+        await act(async () => {
+            answerRead(response);
+        });
+    };
+}
+
+// One SEND-MENU-SCREEN paints the whole map, so nothing already shown moves when it arrives.
+describe("COADM01C map painted once the menu read answers", () => {
+    it("COADM01C paints the map at once when the read answers; OPTION has the cursor", async () => {
+        const answerMenuRead = HoldMenuRead();
+        RenderScreen();
+        expect(screen.getByRole("heading", { level: 1, name: SCREEN_TITLE })).toBeVisible();
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+        expect(screen.queryByRole("navigation", { name: OPTION_LIST_LABEL })).toBeNull();
+        expect(screen.queryByRole("textbox", { name: OPTION_PROMPT })).toBeNull();
+        expect(screen.queryByRole("group", { name: "Function keys" })).toBeNull();
+        await answerMenuRead(BuildMenuResponse());
+        expect(within(OptionList()).getAllByRole("button")).toHaveLength(LABEL_CASES.length);
+        expect(OptionField()).toHaveFocus();
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "false");
+    });
+});
+
+// The two pointer presses that send a selection: the ENTER button and a listed option.
+const POINTER_SELECTIONS: readonly [string, KeyPress][] = [
+    ["Continue (Enter) button", ClickKey(CONTINUE_BUTTON)],
+    ["listed option 5", (user) => user.click(OptionButton(5, TRAN_TYPE_LIST_LABEL))],
+];
+
+// The 3270 keyboard locked from send to response: the cursor stays in OPTION, which refuses
+// keystrokes until the answer arrives.
+describe("COADM01C OPTION locked while a selection is in flight", () => {
+    it.each(POINTER_SELECTIONS)(
+        "COADM01C a selection sent by the %s keeps the cursor in a read-only OPTION",
+        async (_via, press) => {
+            const answerSelection = DeferSelection();
+            const user = await RenderLoadedScreen();
+            await user.type(OptionField(), "5");
+            await press(user);
+            expect(OptionField()).toHaveFocus();
+            expect(OptionField()).toHaveAttribute("readonly");
+            expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+            await user.keyboard("6");
+            expect(OptionField()).toHaveValue("5");
+            answerSelection(NOT_INSTALLED_RESPONSE);
+            await WaitForIdle();
+            expect(OptionField()).not.toHaveAttribute("readonly");
+            expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "false");
+        },
+    );
+});
+
+// The routed page's text once its payload has loaded.
+const NEXT_PAGE_TEXT = "User Update page";
+// A wait long enough for every task an answered call queued to run.
+const SCHEDULED_WORK_MS = 20;
+
+// router.push hands the stand-in for the next page its pending payload; set by the stand-in.
+let showNextPage: (payload: Promise<string>) => void = () => undefined;
+
+interface NextPageContentProps {
+    payload: Promise<string>;
+}
+
+function NextPageContent({ payload }: NextPageContentProps) {
+    return <Typography>{use(payload)}</Typography>;
+}
+
+// Stands in for the App Router's next page: it suspends until its payload loads, as Next.js
+// suspends the route transition router.push starts until the routed page can render.
+function NextPageStandIn() {
+    const [payload, setPayload] = useState<Promise<string> | null>(null);
+    useEffect(() => {
+        showNextPage = setPayload;
+    }, []);
+    return payload === null ? null : <NextPageContent payload={payload} />;
+}
+
+function RenderScreenBesideNextPage(): UserEvent {
+    const user = userEvent.setup();
+    render(
+        <ThemeProvider theme={CARD_DEMO_THEME}>
+            <Suspense fallback={null}>
+                <NextPageStandIn />
+            </Suspense>
+            <AdminMenuPage />
+        </ThemeProvider>,
+    );
+    return user;
+}
+
+// Lets every task the answered call queued run, outside act, as the browser runs them.
+async function RunScheduledWork(): Promise<void> {
+    await waitFor(() => new Promise((resolve) => setTimeout(resolve, SCHEDULED_WORK_MS)));
+}
+
+// router.push opens a next page whose payload loads, inside act, when the test calls the
+// returned function.
+function HoldNextPage(): (pageText: string) => Promise<void> {
+    let loadPayload: (pageText: string) => void = () => undefined;
+    const nextPagePayload = new Promise<string>((resolve) => {
+        loadPayload = resolve;
+    });
+    mockRouterPush.mockImplementation(() => showNextPage(nextPagePayload));
+    return async (pageText) => {
+        await act(async () => {
+            loadPayload(pageText);
+        });
+    };
+}
+
+// The XCTL ends with the next screen: the menu stays locked after the selection answers, until
+// the routed page has rendered, so a second ENTER in that time sends no second selection.
+describe("COADM01C busy until the routed page renders", () => {
+    it("COADM01C option 3 then ENTER again before the page renders sends one selection", async () => {
+        const loadNextPage = HoldNextPage();
+        mockSelectAdminMenuOption.mockResolvedValue(BuildRouteResponse("/admin/users/update"));
+        const user = RenderScreenBesideNextPage();
+        await screen.findByText(USER_LIST_LABEL);
+        await user.type(OptionField(), "3");
+        await PressKey(user, "Enter");
+        await waitFor(() => expect(mockRouterPush).toHaveBeenCalledWith("/admin/users/update"));
+        await RunScheduledWork();
+        expect(screen.getByRole("progressbar", { name: "Processing" })).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: CONTINUE_BUTTON })).toBeDisabled();
+        expect(OptionField()).toHaveAttribute("readonly");
+        await PressKey(user, "Enter");
+        expect(mockSelectAdminMenuOption).toHaveBeenCalledTimes(1);
+        await loadNextPage(NEXT_PAGE_TEXT);
+        expect(screen.getByText(NEXT_PAGE_TEXT)).toBeInTheDocument();
+        await WaitForIdle();
+    });
 });

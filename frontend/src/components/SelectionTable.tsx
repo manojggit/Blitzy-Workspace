@@ -208,9 +208,18 @@ function SelectionMenuPropsFor(rowNumber: number): Partial<MenuProps> {
     return { slotProps: { list: { "aria-label": SelectionLabelFor(rowNumber) } } };
 }
 
+// A locked field refuses a code even from a menu still closing as the lock lands.
+function SelectionChangeHandlerFor(rowKey: string, tableProps: SelectionHandlers) {
+    return (event: SelectChangeEvent<string>): void => {
+        if (!tableProps.readOnly) {
+            tableProps.onSelectionChange(rowKey, event.target.value);
+        }
+    };
+}
+
 // A read-only Select marks its combobox aria-readonly and ignores the pointer and every key.
 function SelectionCell({ row, rowNumber, tableProps }: SelectionCellProps) {
-    const { allowedCodes, onSelectionChange, readOnly = false } = tableProps;
+    const { allowedCodes, readOnly = false } = tableProps;
     const menu = useSelectionMenu(readOnly);
     return (
         <Select
@@ -221,9 +230,7 @@ function SelectionCell({ row, rowNumber, tableProps }: SelectionCellProps) {
             {...menu}
             inputProps={SelectionInputProps(row, rowNumber)}
             MenuProps={SelectionMenuPropsFor(rowNumber)}
-            onChange={(event: SelectChangeEvent<string>) =>
-                onSelectionChange(row.rowKey, event.target.value)
-            }
+            onChange={SelectionChangeHandlerFor(row.rowKey, tableProps)}
         >
             {SelectionOptionsFor(allowedCodes, row.selectedCode)}
         </Select>

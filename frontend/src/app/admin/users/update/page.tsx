@@ -8,10 +8,12 @@ import {
     useEffect,
     useRef,
     useState,
+    useTransition,
     type Dispatch,
     type FormEvent,
     type RefObject,
     type SetStateAction,
+    type TransitionStartFunction,
 } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Divider, Grid, Stack, TextField } from "@mui/material";
@@ -102,8 +104,17 @@ interface UpdateScreenContext {
     SetFeedback: Dispatch<SetStateAction<ScreenFeedbackState>>;
     SetIsBusy: Dispatch<SetStateAction<boolean>>;
     router: AppRouter;
+    // Runs F3's route change as a transition, which keeps the screen busy until the screen it
+    // opens has rendered.
+    startNavigation: TransitionStartFunction;
     openedFromList: boolean;
     fetchControllerRef: FetchControllerRef;
+}
+
+interface RoutedNavigation {
+    router: AppRouter;
+    isNavigating: boolean;
+    startNavigation: TransitionStartFunction;
 }
 
 interface UserUpdateModel {
@@ -374,7 +385,8 @@ async function HandleSave(context: UpdateScreenContext): Promise<void> {
 async function HandleSaveAndExit(context: UpdateScreenContext): Promise<void> {
     await RunBusy(context, async () => {
         await SaveIgnoringOutcome(context);
-        context.router.push(context.openedFromList ? USER_LIST_ROUTE : ADMIN_MENU_ROUTE);
+        const route = context.openedFromList ? USER_LIST_ROUTE : ADMIN_MENU_ROUTE;
+        context.startNavigation(() => context.router.push(route));
     });
 }
 
@@ -435,7 +447,7 @@ function AbortPendingFetch(
     hasStartedRef.current = false;
 }
 
-// React recognises hooks only by the camelCase "use" prefix, so the four hook names below are a
+// React recognises hooks only by the camelCase "use" prefix, so the five hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 
 // Leaving the screen aborts the fetch in flight. React Strict Mode's rehearsal unmount aborts the
@@ -478,8 +490,15 @@ function useCursorFocus(feedback: ScreenFeedbackState, fieldRefs: FieldRefs): vo
     }, [feedback, fieldRefs]);
 }
 
-function useUserUpdate(userId: string | null): UserUpdateModel {
+function useRoutedNavigation(): RoutedNavigation {
     const router = useRouter();
+    const [isNavigating, startNavigation] = useTransition();
+    return { router, isNavigating, startNavigation };
+}
+
+// The screen is busy while a call runs and, after F3's save, until the routed screen renders.
+function useUserUpdate(userId: string | null): UserUpdateModel {
+    const { router, isNavigating, startNavigation } = useRoutedNavigation();
     const [values, setValues] = useState<UserFieldValues>(() => InitialValues(userId));
     const [feedback, setFeedback] = useState<ScreenFeedbackState>(EMPTY_FEEDBACK);
     const [isBusy, setIsBusy] = useState(false);
@@ -490,12 +509,13 @@ function useUserUpdate(userId: string | null): UserUpdateModel {
         SetFeedback: setFeedback,
         SetIsBusy: setIsBusy,
         router,
+        startNavigation,
         openedFromList: userId !== null,
         fetchControllerRef: useRef<AbortController | null>(null),
     };
     useInitialFetch(context, userId);
     useCursorFocus(feedback, fieldRefs);
-    return { context, feedback, isBusy, fieldRefs };
+    return { context, feedback, isBusy: isBusy || isNavigating, fieldRefs };
 }
 
 function PreventFormSubmit(event: FormEvent<HTMLFormElement>): void {
@@ -506,6 +526,15 @@ function PreventFormSubmit(event: FormEvent<HTMLFormElement>): void {
 function ErrorReferenceOf(definition: FieldDefinition, model: UserUpdateModel) {
     const hasError = model.feedback.fieldErrors.includes(definition.name);
     return ErrorMessageReference(hasError, HelperTextIdOf(definition.name, definition.helperText));
+}
+
+// The BMS LENGTH, the tie to the ERRMSG line, and the keyboard lock: the field keeps the cursor
+// but refuses keystrokes while a call is in flight.
+function DetailSlotProps(maxLength: number, definition: FieldDefinition, model: UserUpdateModel) {
+    return {
+        htmlInput: { maxLength, ...ErrorReferenceOf(definition, model) },
+        input: { readOnly: model.isBusy },
+    };
 }
 
 // The value is stored exactly as typed; only the BMS LENGTH limits it.
@@ -524,7 +553,7 @@ function UserDetailField({ definition, model }: UserDetailFieldProps) {
                 error={model.feedback.fieldErrors.includes(name)}
                 onChange={(event) => ChangeFieldValue(model.context, name, event.target.value)}
                 inputRef={model.fieldRefs[name]}
-                slotProps={{ htmlInput: { maxLength, ...ErrorReferenceOf(definition, model) } }}
+                slotProps={DetailSlotProps(maxLength, definition, model)}
             />
         </Grid>
     );

@@ -1,7 +1,8 @@
 // Tests FunctionKeyBar, which replaces the PF-key legend line of every BMS map
 // (bms/COSGN00.bms, bms/COACTUP.bms, bms/COCRDLI.bms, bms/COTRN00.bms, bms/COBIL00.bms).
+import { TextField } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent, { PointerEventsCheckLevel } from "@testing-library/user-event";
 import type { ReactElement } from "react";
 
@@ -157,4 +158,40 @@ describe("FunctionKeyBar disabled PF key", () => {
         await user.click(button);
         expect(onPress).not.toHaveBeenCalled();
     });
+});
+
+// The unprotected field the cursor rests in while a PF key is pressed with the pointer.
+const CURSOR_FIELD_LABEL = "Enter Acct #:";
+
+// The legend beside the field the cursor rests in; returns that field's input.
+function RenderLegendBesideField(definitions: readonly FunctionKeyDefinition[]): HTMLElement {
+    RenderWithTheme(
+        <>
+            <TextField label={CURSOR_FIELD_LABEL} />
+            <FunctionKeyBar keys={definitions} />
+        </>,
+    );
+    return screen.getByRole("textbox", { name: CURSOR_FIELD_LABEL });
+}
+
+// A PF key never moved the 3270 cursor: a pointer press runs the key and leaves the focus where
+// it was, so a key the busy screen then disables cannot drop the focus to the page body.
+describe("FunctionKeyBar pointer press", () => {
+    it.each(LEGEND_CASES)(
+        "PF legend pointer press on $name keeps the cursor in its field and runs its onPress",
+        async (legendCase) => {
+            const user = userEvent.setup();
+            const definitions = BuildDefinitions();
+            const field = RenderLegendBesideField(definitions);
+            await user.click(field);
+            const button = screen.getByRole("button", { name: legendCase.name });
+            expect(fireEvent.mouseDown(button)).toBe(false);
+            await user.click(button);
+            expect(field).toHaveFocus();
+            const expectedCounts = definitions.map((definition) =>
+                definition.key === legendCase.key ? 1 : 0,
+            );
+            expect(PressCounts(definitions)).toEqual(expectedCounts);
+        },
+    );
 });

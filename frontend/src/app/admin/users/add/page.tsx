@@ -19,7 +19,7 @@ import { Grid, TextField, type TextFieldProps } from "@mui/material";
 
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
-import { ScreenShell } from "@/components/ScreenShell";
+import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
 import {
     ADMIN_HOME_ROUTE,
     SeverityForOutcome,
@@ -372,8 +372,10 @@ function HtmlInputProps(definition: UserFieldDefinition, hasError: boolean) {
     return { maxLength: definition.maxLength, ...ErrorMessageReference(hasError, helperTextId) };
 }
 
+// The field keeps the cursor but refuses keystrokes while the add is in flight.
 function UserAddField(props: UserAddFieldProps) {
     const { definition, fieldElementsRef, onFieldChange } = props;
+    const isBusy = useScreenBusy();
     return (
         <TextField
             {...StaticFieldProps(definition)}
@@ -384,7 +386,10 @@ function UserAddField(props: UserAddFieldProps) {
                 fieldElementsRef.current[definition.name] = element;
             }}
             fullWidth
-            slotProps={{ htmlInput: HtmlInputProps(definition, props.hasError) }}
+            slotProps={{
+                htmlInput: HtmlInputProps(definition, props.hasError),
+                input: { readOnly: isBusy },
+            }}
         />
     );
 }

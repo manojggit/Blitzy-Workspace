@@ -4,6 +4,7 @@
 import { Button, Stack, type ButtonProps } from "@mui/material";
 import ChevronLeft from "@mui/icons-material/ChevronLeft";
 import ChevronRight from "@mui/icons-material/ChevronRight";
+import type { MouseEvent } from "react";
 import type { FunctionKeyDefinition, PfKey } from "@/lib/useFunctionKeys";
 
 export interface FunctionKeyBarProps {
@@ -41,6 +42,15 @@ export function FormatKeyLabel(definition: FunctionKeyDefinition): string {
     return `${definition.label} (${KEY_DISPLAY_NAMES[definition.key]})`;
 }
 
+/**
+ * A pointer press runs the key without taking focus from the field the cursor is in, as a PF key
+ * never moved the 3270 cursor; the click still fires. Without it the pressed control holds focus,
+ * and the browser drops it to the page body once the busy screen disables that control.
+ */
+export function KeepCursorOnPointerPress(event: MouseEvent<HTMLElement>): void {
+    event.preventDefault();
+}
+
 // F7 and F8 page backward and forward, so their chevrons point the way the list moves.
 function KeyIconProps(key: PfKey): KeyIcons {
     if (key === "F7") {
@@ -60,6 +70,7 @@ function KeyButton(props: { definition: FunctionKeyDefinition }) {
         <Button
             variant={KEY_BUTTON_VARIANTS[definition.key]}
             onClick={() => definition.onPress()}
+            onMouseDown={KeepCursorOnPointerPress}
             disabled={definition.disabled ?? false}
             aria-label={FormatKeyLabel(definition)}
             {...KeyIconProps(definition.key)}

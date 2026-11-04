@@ -14,11 +14,22 @@ import {
 } from "@mui/material";
 import axios from "axios";
 import { useRouter } from "next/navigation";
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import {
+    Suspense,
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+    useTransition,
+    type Dispatch,
+    type RefObject,
+    type SetStateAction,
+} from "react";
 
-import { FunctionKeyBar } from "@/components/FunctionKeyBar";
+import { FunctionKeyBar, KeepCursorOnPointerPress } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
-import { ScreenShell } from "@/components/ScreenShell";
+import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
 import { Logout } from "@/lib/api/auth";
 import { FetchMainMenu, SelectMainMenuOption, type MenuOption } from "@/lib/api/menu";
 import {
@@ -57,6 +68,7 @@ const FAILED_CALL_OUTCOME: OutcomeFlags = { isError: true, isCompletedWrite: fal
 // The selection answer carries no colour. COMEN01C paints the not-installed literal DFHRED; the
 // green coming-soon literal belongs to DUMMY entries, and no active COMEN02Y entry is one.
 const STAYED_ON_MENU_OUTCOME: OutcomeFlags = { isError: true, isCompletedWrite: false };
+const NO_OPTIONS: readonly MenuOption[] = [];
 // The only pages a selection may open: the routes of the installed options in MAIN_MENU_OPTIONS
 // (backend/app/services/menu/menu_options.py, COMEN02Y); option 11 has none.
 const MAIN_MENU_ROUTE_ALLOWANCE: RouteAllowance = {
@@ -73,8 +85,6 @@ const MAIN_MENU_ROUTE_ALLOWANCE: RouteAllowance = {
         "/billpay",
     ],
 };
-
-type MenuRouter = ReturnType<typeof useRouter>;
 
 // The ERRMSG line and the cursor of the screen; isError moves the cursor to the OPTION field.
 interface MenuFeedback {
@@ -116,9 +126,12 @@ interface MenuFeedbackState {
     ClearFeedback: () => void;
 }
 
+// The listed options, or null until the first read settles and the map paints.
+type ShownOptions = readonly MenuOption[] | null;
+
 interface MenuLoad {
     callContext: ScreenCallContext;
-    SetOptions: (options: readonly MenuOption[]) => void;
+    SetOptions: Dispatch<SetStateAction<ShownOptions>>;
     // The refusal another screen's 403 left for this menu, or "" when there is none.
     pendingMessage: string;
     signal: AbortSignal;
@@ -126,8 +139,13 @@ interface MenuLoad {
 
 interface MenuActionContext {
     callContext: ScreenCallContext;
-    router: MenuRouter;
+    Navigate: (route: string) => void;
     ClearSession: () => void;
+}
+
+interface MenuActionState {
+    actionContext: MenuActionContext;
+    isNavigating: boolean;
 }
 
 interface FunctionKeyInputs {
@@ -143,6 +161,7 @@ interface MenuControls {
 
 interface MainMenuState {
     options: readonly MenuOption[];
+    isMapPending: boolean;
     optionText: string;
     isBusy: boolean;
     isOptionInError: boolean;
@@ -159,6 +178,12 @@ interface MainMenuContentProps {
 
 interface MenuOptionListProps {
     options: readonly MenuOption[];
+    onSelect: (option: MenuOption) => void;
+    disabled: boolean;
+}
+
+interface MenuOptionItemProps {
+    option: MenuOption;
     onSelect: (option: MenuOption) => void;
     disabled: boolean;
 }
@@ -261,10 +286,17 @@ function ShowLoadedMenu(load: MenuLoad, options: readonly MenuOption[]): void {
     }
 }
 
+// The read has settled: the map paints, with no options when none arrived, and the keyboard
+// unlocks.
+function SettleMenuLoad(load: MenuLoad): void {
+    load.SetOptions((shownOptions) => shownOptions ?? NO_OPTIONS);
+    load.callContext.SetIsBusy(false);
+}
+
 // SEND-MENU-SCREEN's option list, with the carried-over refusal or, when the read fails, the
 // failure's message in its place, as the screen has one ERRMSG line. Cleaning up the effect aborts
 // the read, so its GET stops and nothing it answers is shown; the cancellation is discarded
-// silently, and the busy state and message line belong to the effect's next run, if any.
+// silently, and the map, busy state and message line belong to the effect's next run, if any.
 async function LoadMenuOptions(load: MenuLoad): Promise<void> {
     try {
         const response = await FetchMainMenu({ signal: load.signal });
@@ -281,15 +313,16 @@ async function LoadMenuOptions(load: MenuLoad): Promise<void> {
         }
     } finally {
         if (!load.signal.aborted) {
-            load.callContext.SetIsBusy(false);
+            SettleMenuLoad(load);
         }
     }
 }
 
 // A refusal carried over from another screen by apiClient's 403 handling. Taking it empties the
 // store, so it is taken once and kept in a ref: a StrictMode re-run of the effect still shows it.
-function useMenuOptions(callContext: ScreenCallContext): readonly MenuOption[] {
-    const [options, setOptions] = useState<readonly MenuOption[]>([]);
+// The options stay null until the read settles, so the whole map paints at once.
+function useMenuOptions(callContext: ScreenCallContext): ShownOptions {
+    const [options, setOptions] = useState<ShownOptions>(null);
     const pendingMessageRef = useRef<string | null>(null);
     useEffect(() => {
         const controller = new AbortController();
@@ -330,7 +363,7 @@ function FollowRoute(context: MenuActionContext, route: unknown): void {
         context.callContext.ShowFeedback(UnexpectedRouteFeedback());
         return;
     }
-    context.router.push(allowedRoute);
+    context.Navigate(allowedRoute);
 }
 
 // PROCESS-ENTER-KEY: the server edits the raw option text and answers with the route replacing the
@@ -352,17 +385,25 @@ async function SignOff(context: MenuActionContext): Promise<void> {
         const response = await Logout();
         context.ClearSession();
         StorePendingMessage(response.message);
-        context.router.push(SIGN_ON_ROUTE);
+        context.Navigate(SIGN_ON_ROUTE);
     });
 }
 
-function useMenuActionContext(callContext: ScreenCallContext): MenuActionContext {
+// The XCTL ends with the next screen: the route change runs as a transition, so the menu stays
+// busy until the routed page has rendered and a second ENTER cannot send another call.
+function useMenuActionContext(callContext: ScreenCallContext): MenuActionState {
     const router = useRouter();
     const { ClearSession } = useSession();
-    return useMemo(
-        () => ({ callContext, router, ClearSession }),
+    const [isNavigating, startNavigation] = useTransition();
+    const actionContext = useMemo(
+        () => ({
+            callContext,
+            Navigate: (route: string) => startNavigation(() => router.push(route)),
+            ClearSession,
+        }),
         [callContext, router, ClearSession],
     );
+    return { actionContext, isNavigating };
 }
 
 // The COMEN01 legend; no other key is bound, and this screen passes no invalid-key action, so
@@ -398,15 +439,18 @@ function useMenuControls(inputs: FunctionKeyInputs): MenuControls {
     return { keys, SelectListedOption: selectListedOption };
 }
 
-// ENTER sends the OPTION text as keyed; a click on a listed option sends that option's number.
+// ENTER sends the OPTION text as keyed; a click on a listed option sends that option's number. The
+// screen is busy from the call until the screen it routes to has rendered.
 function useMainMenu(): MainMenuState {
     const [optionText, setOptionText] = useState("");
-    const { isBusy, feedback, inputRef, callContext } = useScreenCall();
+    const { isBusy: isCalling, feedback, inputRef, callContext } = useScreenCall();
     const options = useMenuOptions(callContext);
-    const actionContext = useMenuActionContext(callContext);
+    const { actionContext, isNavigating } = useMenuActionContext(callContext);
+    const isBusy = isCalling || isNavigating;
     const { keys, SelectListedOption } = useMenuControls({ actionContext, optionText, isBusy });
     return {
-        options,
+        options: options ?? NO_OPTIONS,
+        isMapPending: options === null,
         optionText,
         isBusy,
         isOptionInError: IsOptionInError(feedback),
@@ -418,20 +462,34 @@ function useMainMenu(): MainMenuState {
     };
 }
 
-// Every option the server lists, in its order, the option number as secondary text.
+// One listed option, the option number as secondary text. A pointer press leaves the cursor in
+// the OPTION field.
+function MenuOptionItem({ option, onSelect, disabled }: MenuOptionItemProps) {
+    return (
+        <ListItem disablePadding>
+            <ListItemButton
+                disabled={disabled}
+                onClick={() => onSelect(option)}
+                onMouseDown={KeepCursorOnPointerPress}
+            >
+                <ListItemText primary={option.label} secondary={String(option.number)} />
+            </ListItemButton>
+        </ListItem>
+    );
+}
+
+// Every option the server lists, in its order.
 function MenuOptionList({ options, onSelect, disabled }: MenuOptionListProps) {
     return (
         <Box component="nav" aria-label={MENU_OPTIONS_LABEL}>
             <List dense>
                 {options.map((option) => (
-                    <ListItem key={option.number} disablePadding>
-                        <ListItemButton disabled={disabled} onClick={() => onSelect(option)}>
-                            <ListItemText
-                                primary={option.label}
-                                secondary={String(option.number)}
-                            />
-                        </ListItemButton>
-                    </ListItem>
+                    <MenuOptionItem
+                        key={option.number}
+                        option={option}
+                        onSelect={onSelect}
+                        disabled={disabled}
+                    />
                 ))}
             </List>
         </Box>
@@ -448,8 +506,11 @@ function OptionInputProps(hasError: boolean) {
 }
 
 // The OPTION field keeps the text exactly as keyed: COMEN01C's own edit decides whether a blank,
-// non-numeric, zero or out-of-range option is valid.
+// non-numeric, zero or out-of-range option is valid. It keeps the cursor but refuses keystrokes
+// while a call is in flight. It mounts with the listed options, so its autoFocus brings it into
+// view once the whole map shows and nothing moves it afterwards.
 function OptionEntryField({ value, onChange, error, inputRef }: OptionEntryFieldProps) {
+    const isBusy = useScreenBusy();
     return (
         <Grid container>
             <Grid size={{ xs: 12, md: 6 }}>
@@ -461,7 +522,7 @@ function OptionEntryField({ value, onChange, error, inputRef }: OptionEntryField
                     inputRef={inputRef}
                     autoFocus
                     fullWidth
-                    slotProps={{ htmlInput: OptionInputProps(error) }}
+                    slotProps={{ htmlInput: OptionInputProps(error), input: { readOnly: isBusy } }}
                 />
             </Grid>
         </Grid>
@@ -510,6 +571,7 @@ function MainMenuScreen() {
             programName={PROGRAM_NAME}
             screenTitle={SCREEN_TITLE}
             isBusy={menu.isBusy}
+            isMapPending={menu.isMapPending}
         >
             <MainMenuContent menu={menu} />
         </ScreenShell>

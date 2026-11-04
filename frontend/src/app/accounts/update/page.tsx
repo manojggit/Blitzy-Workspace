@@ -32,7 +32,7 @@ import {
 import { RowEndAlignmentFrom, RowShareStyle } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
-import { ScreenShell } from "@/components/ScreenShell";
+import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
 import {
     FetchAccountForEdit,
     UpdateAccount,
@@ -825,12 +825,14 @@ function StaticFieldProps(
 // The BMS UNPROT/ASKIP attribute: a protected field stays focusable, but cannot be changed, and
 // its label stays raised, so a blank protected value shows as an empty field under it. A
 // protected field renders a native textarea, which takes no type, so the input type MUI passes
-// is dropped. While the server names the field in error, its input is tied to the ERRMSG line
+// is dropped. An unprotected field also refuses keystrokes while a request is in flight, keeping
+// its look. While the server names the field in error, its input is tied to the ERRMSG line
 // ahead of the field's hint.
 function FieldSlotProps(
     definition: ScreenFieldDefinition,
     isEditable: boolean,
     hasError: boolean,
+    isBusy: boolean,
 ): TextFieldProps["slotProps"] {
     const helperTextId = HelperTextIdOf(FieldIdOf(definition.name), definition.helperText);
     const htmlInput = {
@@ -841,7 +843,7 @@ function FieldSlotProps(
     const inputComponent = isEditable ? undefined : PROTECTED_FIELD_ELEMENT;
     return {
         htmlInput: isEditable ? htmlInput : { ...htmlInput, type: undefined },
-        input: { readOnly: !isEditable, inputComponent },
+        input: { readOnly: !isEditable || isBusy, inputComponent },
         inputLabel: isEditable ? {} : { shrink: true },
     };
 }
@@ -855,6 +857,7 @@ function FieldSlotProps(
 // replaced while it has focus never blurs, and MUI would keep showing the old field as focused.
 function ScreenFieldInput(props: ScreenFieldInputProps) {
     const { definition, value, isEditable, hasError, RegisterInput, onFieldChange } = props;
+    const isBusy = useScreenBusy();
     return (
         <TextField
             key={isEditable ? EDITABLE_FIELD_KEY : PROTECTED_FIELD_KEY}
@@ -867,13 +870,14 @@ function ScreenFieldInput(props: ScreenFieldInputProps) {
             error={hasError}
             inputRef={(element: FieldElement | null) => RegisterInput(definition.name, element)}
             onChange={(event) => onFieldChange(definition.name, event.target.value)}
-            slotProps={FieldSlotProps(definition, isEditable, hasError)}
+            slotProps={FieldSlotProps(definition, isEditable, hasError, isBusy)}
         />
     );
 }
 
-// A field renders again only when its own value, protection or error mark changes, so a key
-// typed in one field re-renders that field alone, not every field on the screen.
+// A field renders again only when its own value, protection or error mark changes, or the
+// screen's busy lock turns on or off, so a key typed in one field re-renders that field alone,
+// not every field on the screen.
 function ScreenField({ definition, view }: ScreenFieldProps) {
     const isEditable = view.editableFields.has(definition.name);
     const hasError = view.fieldErrors.has(definition.name);

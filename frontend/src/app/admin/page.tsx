@@ -5,11 +5,19 @@
 import { Box, Grid, List, ListItem, ListItemButton, ListItemText, TextField } from "@mui/material";
 import axios from "axios";
 import { useRouter } from "next/navigation";
-import { Suspense, useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import {
+    Suspense,
+    useCallback,
+    useEffect,
+    useRef,
+    useState,
+    useTransition,
+    type RefObject,
+} from "react";
 
-import { FunctionKeyBar } from "@/components/FunctionKeyBar";
+import { FunctionKeyBar, KeepCursorOnPointerPress } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
-import { ScreenShell } from "@/components/ScreenShell";
+import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
 import { Logout } from "@/lib/api/auth";
 import { FetchAdminMenu, SelectAdminMenuOption, type MenuOption } from "@/lib/api/menu";
 import {
@@ -90,7 +98,7 @@ interface BusyTracker {
 }
 
 interface MenuActions {
-    router: ReturnType<typeof useRouter>;
+    Navigate: (route: string) => void;
     ShowMessage: (screenMessage: ScreenMessage) => void;
     TrackBusy: BusyTracker["TrackBusy"];
     ClearSession: () => void;
@@ -99,6 +107,7 @@ interface MenuActions {
 interface MenuActionsState {
     actions: MenuActions;
     isCalling: boolean;
+    isNavigating: boolean;
 }
 
 interface FunctionKeyHandlers {
@@ -128,6 +137,7 @@ interface OptionEntryFieldProps {
 
 interface AdminMenuState extends MenuCommands {
     menuOptions: MenuOption[];
+    isLoading: boolean;
     screenMessage: ScreenMessage;
     optionEntry: OptionEntryFieldProps;
 }
@@ -227,7 +237,7 @@ async function HandleSelectOption(actions: MenuActions, optionText: string): Pro
     actions.ShowMessage(NO_MESSAGE);
     const outcome = await actions.TrackBusy(() => SelectOption(optionText));
     if ("route" in outcome) {
-        actions.router.push(outcome.route);
+        actions.Navigate(outcome.route);
         return;
     }
     actions.ShowMessage(outcome.screenMessage);
@@ -245,7 +255,7 @@ async function HandleSignOff(actions: MenuActions): Promise<void> {
     }
     actions.ClearSession();
     StorePendingMessage(outcome.thankYouMessage);
-    actions.router.push(SIGN_ON_ROUTE);
+    actions.Navigate(SIGN_ON_ROUTE);
 }
 
 // The map legend "ENTER=Continue  F3=Exit"; the keyboard is locked while a call is in flight.
@@ -314,17 +324,25 @@ function useMenuLoad(showMessage: (screenMessage: ScreenMessage) => void): MenuL
     return loadState;
 }
 
+// The XCTL ends with the next screen: the route change runs as a transition, so the menu stays
+// busy until the routed page has rendered and a second ENTER cannot send another call.
 function useMenuActions(showMessage: MenuActions["ShowMessage"]): MenuActionsState {
     const router = useRouter();
     const { ClearSession } = useSession();
     const { isBusy, TrackBusy } = useBusyTracker();
-    const actions: MenuActions = { router, ShowMessage: showMessage, TrackBusy, ClearSession };
-    return { actions, isCalling: isBusy };
+    const [isNavigating, startNavigation] = useTransition();
+    const actions: MenuActions = {
+        Navigate: (route) => startNavigation(() => router.push(route)),
+        ShowMessage: showMessage,
+        TrackBusy,
+        ClearSession,
+    };
+    return { actions, isCalling: isBusy, isNavigating };
 }
 
 function useMenuCommands(inputs: MenuCommandInputs): MenuCommands {
-    const { actions, isCalling } = useMenuActions(inputs.ShowMessage);
-    const isBusy = inputs.isLoading || isCalling;
+    const { actions, isCalling, isNavigating } = useMenuActions(inputs.ShowMessage);
+    const isBusy = inputs.isLoading || isCalling || isNavigating;
     const onSelectOption = (optionText: string): void => {
         void HandleSelectOption(actions, optionText);
     };
@@ -342,7 +360,7 @@ function useAdminMenu(): AdminMenuState {
     const { menuOptions, isLoading } = useMenuLoad(setScreenMessage);
     const { optionText } = optionEntry;
     const commands = useMenuCommands({ optionText, isLoading, ShowMessage: setScreenMessage });
-    return { ...commands, menuOptions, screenMessage, optionEntry };
+    return { ...commands, menuOptions, isLoading, screenMessage, optionEntry };
 }
 
 // BUILD-MENU-OPTIONS (OPTN001-OPTN012): every server option, label verbatim, number beside it.
@@ -356,6 +374,7 @@ function AdminMenuOptions({ menuOptions, isBusy, onSelectOption }: AdminMenuOpti
                         <ListItemButton
                             disabled={isBusy}
                             onClick={() => onSelectOption(String(number))}
+                            onMouseDown={KeepCursorOnPointerPress}
                         >
                             <ListItemText primary={label} secondary={String(number)} />
                         </ListItemButton>
@@ -375,8 +394,15 @@ function OptionInputProps(hasError: boolean) {
     };
 }
 
+// The field keeps the cursor but refuses keystrokes while a call is in flight.
+function OptionSlotProps(hasError: boolean, isBusy: boolean) {
+    return { htmlInput: OptionInputProps(hasError), input: { readOnly: isBusy } };
+}
+
 // The OPTION field: BMS LENGTH=2 and NUM, with the initial cursor (IC). The text is sent as keyed.
+// It mounts with the listed options, so its autoFocus brings it into view once the map shows.
 function OptionEntryField(props: OptionEntryFieldProps) {
+    const isBusy = useScreenBusy();
     return (
         <Grid container>
             <Grid size={{ xs: 12, md: 6 }}>
@@ -388,7 +414,7 @@ function OptionEntryField(props: OptionEntryFieldProps) {
                     inputRef={props.inputRef}
                     autoFocus
                     fullWidth
-                    slotProps={{ htmlInput: OptionInputProps(props.hasError) }}
+                    slotProps={OptionSlotProps(props.hasError, isBusy)}
                 />
             </Grid>
         </Grid>
@@ -422,6 +448,7 @@ function AdminMenuScreen() {
             programName={PROGRAM_NAME}
             screenTitle={SCREEN_TITLE}
             isBusy={adminMenu.isBusy}
+            isMapPending={adminMenu.isLoading}
         >
             <AdminMenuBody adminMenu={adminMenu} />
         </ScreenShell>

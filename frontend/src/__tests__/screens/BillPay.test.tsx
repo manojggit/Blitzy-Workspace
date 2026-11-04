@@ -459,6 +459,14 @@ async function PressInOneTurn(user: UserEvent, keyNames: readonly string[]): Pro
     });
 }
 
+// A click on the ENTER key leaves the cursor in its field, as a PF key never moved it, and the
+// busy render then disables that focused field. As in PressInOneTurn, the pointer first leaves
+// the inputs, so MUI's FormControl does not update its focus state outside act.
+async function ClickEnterWithNoFieldFocused(user: UserEvent): Promise<void> {
+    await user.click(document.body);
+    await UseMapKey(user, "ENTER", "button");
+}
+
 // The confirmed payment screen as sent: the account, the Y answer and the CURBAL shown.
 function ExpectPaymentScreenKept(): void {
     expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID);
@@ -620,7 +628,7 @@ it("COBIL00C keyboard lock: nothing is keyed while PayBill runs", async () => {
     const pendingPayBill = DeferPayBill();
     const user = RenderScreen();
     await KeyRequest(user, PROMPT_REQUEST);
-    await UseMapKey(user, "ENTER", "button");
+    await ClickEnterWithNoFieldFocused(user);
     ExpectKeyboardLocked();
     await TryToEditWhileLocked(user, "");
     await Settle(() => pendingPayBill.Answer(BuildBillPayResponse()));
@@ -640,7 +648,7 @@ it("COBIL00C PF4 is locked while PayBill runs, so its answer applies to the scre
     await ShowConfirmPrompt(user);
     const pendingPayBill = DeferPayBill();
     await KeyInto(user, "confirm", "Y");
-    await UseMapKey(user, "ENTER", "button");
+    await ClickEnterWithNoFieldFocused(user);
     ExpectKeyboardLocked();
     await TryToEditWhileLocked(user, "Y");
     await Settle(() => pendingPayBill.Fail(FailureOf(DUPLICATE_TRAN_ID_CASE)));

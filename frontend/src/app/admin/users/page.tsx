@@ -10,16 +10,18 @@ import {
     useEffect,
     useRef,
     useState,
+    useTransition,
     type Dispatch,
     type Ref,
     type RefObject,
     type SetStateAction,
+    type TransitionStartFunction,
 } from "react";
 
 import { VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
-import { ScreenShell } from "@/components/ScreenShell";
+import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
 import {
     SelectionTable,
     type SelectionColumn,
@@ -53,6 +55,11 @@ import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKe
 const TRANSACTION_ID = "CU00";
 const PROGRAM_NAME = "COUSR00C";
 const SCREEN_TITLE = "List Users";
+const SCREEN_IDENTITY = {
+    transactionId: TRANSACTION_ID,
+    programName: PROGRAM_NAME,
+    screenTitle: SCREEN_TITLE,
+} as const;
 // USRIDIN LENGTH=8 (USRIDINI X(8)).
 const SEARCH_MAX_LENGTH = 8;
 const SEARCH_LABEL = "Search User ID:";
@@ -99,7 +106,8 @@ type FieldRefs = Partial<Record<string, HTMLInputElement | null>>;
 type PageRouter = ReturnType<typeof useRouter>;
 
 // The COUSR00 screen the page holds. selectionCodes holds SEL0001-SEL0010 by screen position,
-// index 0 being row 1, whichever user each row shows.
+// index 0 being row 1, whichever user each row shows. isAwaitingFirstPage holds the map back
+// until the first entry's browse settles, so the whole map paints at once.
 interface ListScreenState {
     rows: readonly UserListRow[];
     pageState: PageState;
@@ -107,6 +115,7 @@ interface ListScreenState {
     searchText: string;
     feedback: CompleteScreenFeedback;
     isBusy: boolean;
+    isAwaitingFirstPage: boolean;
 }
 
 type ScreenUpdate = Dispatch<SetStateAction<ListScreenState>>;
@@ -118,6 +127,9 @@ interface ScreenActions {
     setScreen: ScreenUpdate;
     router: PageRouter;
     startPageRead: PageReadStarter;
+    // Runs a selection's route change as a transition, which keeps the screen busy until the
+    // routed screen has rendered.
+    startNavigation: TransitionStartFunction;
 }
 
 const EMPTY_FEEDBACK: CompleteScreenFeedback = {
@@ -142,7 +154,12 @@ const INITIAL_SCREEN: ListScreenState = {
     searchText: BLANK_TEXT,
     feedback: EMPTY_FEEDBACK,
     isBusy: true,
+    isAwaitingFirstPage: true,
 };
+
+// What a settled browse changes: a key press unlocks the keys; the first entry also paints the map.
+const CALL_SETTLED: Partial<ListScreenState> = { isBusy: false };
+const FIRST_ENTRY_SETTLED: Partial<ListScreenState> = { isBusy: false, isAwaitingFirstPage: false };
 
 function PatchScreen(setScreen: ScreenUpdate, patch: Partial<ListScreenState>): void {
     setScreen((current) => ({ ...current, ...patch }));
@@ -243,7 +260,7 @@ function FollowSelectionRoute(actions: ScreenActions, route: unknown): void {
         PatchScreen(actions.setScreen, { feedback });
         return;
     }
-    actions.router.push(allowedRoute);
+    actions.startNavigation(() => actions.router.push(allowedRoute));
 }
 
 // ENTER sends the search key exactly as typed. A U or D selection answers with the route of
@@ -311,18 +328,19 @@ async function LoadFirstPage(
     }
 }
 
-// A browse abandoned through its signal leaves the keys locked: the screen has gone, or the
-// browse that replaced it unlocks them when it answers.
+// A browse abandoned through its signal leaves the keys locked, and a first entry's map unpainted:
+// the screen has gone, or the browse that replaced it settles them when it answers.
 async function SettleBusy(
     setScreen: ScreenUpdate,
     task: () => Promise<void>,
     signal?: AbortSignal,
+    settled: Partial<ListScreenState> = CALL_SETTLED,
 ): Promise<void> {
     try {
         await task();
     } finally {
         if (signal?.aborted !== true) {
-            PatchScreen(setScreen, { isBusy: false });
+            PatchScreen(setScreen, settled);
         }
     }
 }
@@ -357,8 +375,12 @@ function PageKeyPress(
 }
 
 // The legend ENTER=Continue  F3=Back  F7=Backward  F8=Forward, in its order.
-function BuildKeys(actions: ScreenActions, screen: ListScreenState): FunctionKeyDefinition[] {
-    const disabled = screen.isBusy;
+function BuildKeys(
+    actions: ScreenActions,
+    screen: ListScreenState,
+    isBusy: boolean,
+): FunctionKeyDefinition[] {
+    const disabled = isBusy;
     const enter = BusyKeyPress(actions, () => HandleEnter(actions, screen));
     const backward = PageKeyPress(actions, screen, Direction.BACKWARD);
     const forward = PageKeyPress(actions, screen, Direction.FORWARD);
@@ -419,7 +441,8 @@ function useFirstEntry(setScreen: ScreenUpdate): void {
         const pendingMessage = pendingMessageRef.current;
         const controller = new AbortController();
         const { signal } = controller;
-        void SettleBusy(setScreen, () => LoadFirstPage(setScreen, pendingMessage, signal), signal);
+        const firstBrowse = (): Promise<void> => LoadFirstPage(setScreen, pendingMessage, signal);
+        void SettleBusy(setScreen, firstBrowse, signal, FIRST_ENTRY_SETTLED);
         return () => controller.abort();
     }, [setScreen]);
 }
@@ -448,11 +471,14 @@ interface UserListModel {
     setScreen: ScreenUpdate;
     keys: FunctionKeyDefinition[];
     searchInputRef: Ref<HTMLInputElement>;
+    isBusy: boolean;
 }
 
+// The screen is busy while a call runs and, after a selection, until the routed screen renders.
 function useUserList(): UserListModel {
     const router = useRouter();
     const [screen, setScreen] = useState<ListScreenState>(INITIAL_SCREEN);
+    const [isNavigating, startNavigation] = useTransition();
     const fieldRefs = useRef<FieldRefs>({});
     useFirstEntry(setScreen);
     const startPageRead = usePageRead();
@@ -460,8 +486,9 @@ function useUserList(): UserListModel {
     const searchInputRef = (element: HTMLInputElement | null): void => {
         fieldRefs.current[SEARCH_FIELD] = element;
     };
-    const keys = BuildKeys({ setScreen, router, startPageRead }, screen);
-    return { screen, setScreen, keys, searchInputRef };
+    const isBusy = screen.isBusy || isNavigating;
+    const keys = BuildKeys({ setScreen, router, startPageRead, startNavigation }, screen, isBusy);
+    return { screen, setScreen, keys, searchInputRef, isBusy };
 }
 
 interface UserSearchBarProps {
@@ -479,8 +506,18 @@ interface PageStatusProps {
     statusText: string;
 }
 
+// USRIDIN's LENGTH and its tie to the ERRMSG line while in error. The field keeps the cursor but
+// refuses keystrokes while a call is in flight.
+function SearchSlotProps(hasError: boolean, isBusy: boolean) {
+    return {
+        htmlInput: { maxLength: SEARCH_MAX_LENGTH, ...ErrorMessageReference(hasError) },
+        input: { readOnly: isBusy },
+    };
+}
+
 // USRIDIN: free text sent as typed; the server's ported edits are its only check.
 function SearchField(props: SearchFieldProps) {
+    const isBusy = useScreenBusy();
     return (
         <TextField
             label={SEARCH_LABEL}
@@ -490,12 +527,7 @@ function SearchField(props: SearchFieldProps) {
             onChange={(event) => props.onSearchChange(event.target.value)}
             autoComplete="off"
             fullWidth
-            slotProps={{
-                htmlInput: {
-                    maxLength: SEARCH_MAX_LENGTH,
-                    ...ErrorMessageReference(props.hasError),
-                },
-            }}
+            slotProps={SearchSlotProps(props.hasError, isBusy)}
         />
     );
 }
@@ -534,12 +566,14 @@ function UserSearchBar({ page, pageStatus, ...searchFieldProps }: UserSearchBarP
     );
 }
 
-type UserListBodyProps = Omit<UserListModel, "keys">;
+type UserListBodyProps = Omit<UserListModel, "keys" | "isBusy">;
 
 type UserRowsProps = Pick<UserListBodyProps, "screen" | "setScreen">;
 
-// The ten USRIDnn/FNAMEnn/LNAMEnn/UTYPEnn rows with their SELnnnn codes, and the row-21 hint.
+// The ten USRIDnn/FNAMEnn/LNAMEnn/UTYPEnn rows with their SELnnnn codes, and the row-21 hint. The
+// codes refuse changes while a call is in flight.
 function UserRows({ screen, setScreen }: UserRowsProps) {
+    const isBusy = useScreenBusy();
     return (
         <>
             <SelectionTable
@@ -550,6 +584,7 @@ function UserRows({ screen, setScreen }: UserRowsProps) {
                     setScreen(WithSelectionCode(Number(rowKey), code))
                 }
                 label={SCREEN_TITLE}
+                readOnly={isBusy}
             />
             <Typography variant="bodyLarge" component="p">
                 {SELECTION_INSTRUCTION}
@@ -575,14 +610,13 @@ function UserListBody({ screen, setScreen, searchInputRef }: UserListBodyProps) 
 }
 
 function UserListScreen() {
-    const { keys, ...model } = useUserList();
+    const { keys, isBusy, ...model } = useUserList();
     useFunctionKeys(keys);
     return (
         <ScreenShell
-            transactionId={TRANSACTION_ID}
-            programName={PROGRAM_NAME}
-            screenTitle={SCREEN_TITLE}
-            isBusy={model.screen.isBusy}
+            {...SCREEN_IDENTITY}
+            isBusy={isBusy}
+            isMapPending={model.screen.isAwaitingFirstPage}
         >
             <UserListBody {...model} />
             <MessageLine

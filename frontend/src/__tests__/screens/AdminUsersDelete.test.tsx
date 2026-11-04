@@ -879,6 +879,26 @@ describe("COUSR03C USRIDIN keyboard lock while a call runs", () => {
     });
 });
 
+// A PF key never moved the 3270 cursor: a pointer press on the key leaves it in USRIDIN for the
+// whole call, rather than on a key the busy screen disables.
+describe("COUSR03C cursor while a call started by pointer runs", () => {
+    it.each(SCREEN_CALLS)("COUSR03C keeps the cursor in USRIDIN while %s runs", async (call) => {
+        const settleCall = DeferCall(call);
+        const user = await RenderWithTypedId(TEST_USER_ID);
+        await PressFunction(user, CALL_KEYS[call], "click");
+        const userIdInput = screen.getByLabelText(USER_ID_LABEL);
+        expect(userIdInput).toHaveFocus();
+        expect(userIdInput).toHaveAttribute("readonly");
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+        await act(async () => {
+            settleCall();
+        });
+        await ExpectIdle();
+        expect(userIdInput).toHaveFocus();
+        expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "false");
+    });
+});
+
 describe("COUSR03C PF5 after keys typed while FetchUser ran", () => {
     it("COUSR03C shows the fetched user beside its own ID and PF5 deletes that user", async () => {
         const settleFetch = DeferCall("fetch");

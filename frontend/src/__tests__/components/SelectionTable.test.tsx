@@ -1,7 +1,7 @@
 // Tests SelectionTable, which replaces the COCRDLI CRDSEL1-7, COTRN00 SEL0001-10 and COUSR00
 // SEL0001-10 selection fields.
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import type { ReactElement } from "react";
 
@@ -112,7 +112,7 @@ function BuildRows(columns: readonly SelectionColumn[], rowCount: number): Selec
     return RowNumbersUpTo(rowCount).map((rowNumber) => BuildRow(columns, rowNumber));
 }
 
-function RenderTable(mapCase: MapCase, onSelectionChange = jest.fn()) {
+function RenderTable(mapCase: MapCase, onSelectionChange = jest.fn(), readOnly?: boolean) {
     RenderWithTheme(
         <SelectionTable
             columns={mapCase.columns}
@@ -121,6 +121,7 @@ function RenderTable(mapCase: MapCase, onSelectionChange = jest.fn()) {
             onSelectionChange={onSelectionChange}
             label={mapCase.label}
             selectionHeader={mapCase.selectionHeader}
+            readOnly={readOnly}
         />,
     );
     return onSelectionChange;
@@ -503,6 +504,85 @@ describe("SelectionTable field width", () => {
         "$mapName $fieldNames keeps every field one width, blank and with echoed code $code",
         KeepsFieldWidthWithEchoedCode,
     );
+});
+
+interface ReadOnlyPressCase {
+    press: string;
+    Act: (user: UserEvent, field: HTMLElement) => Promise<void>;
+}
+
+// Presses on the read-only CRDSEL1 field, which has the cursor: the pointer, the keys that open
+// a closed menu, and a typed code that a closed field would otherwise take.
+const READ_ONLY_PRESS_CASES: readonly ReadOnlyPressCase[] = [
+    { press: "a pointer press", Act: (user, field) => user.click(field) },
+    { press: "Space", Act: (user) => user.keyboard("[Space]") },
+    { press: "ArrowDown", Act: (user) => user.keyboard("{ArrowDown}") },
+    { press: "the typed code S", Act: (user) => user.keyboard("S") },
+];
+
+// COUSR00 as the CU00 page renders it, with the busy screen's lock passed as readOnly.
+function LockableTableTree(readOnly: boolean, onSelectionChange: SelectionChangeMock) {
+    const rows = BuildRows(COUSR00_CASE.columns, COUSR00_CASE.rowCount);
+    return TableTree(COUSR00_CASE, rows, onSelectionChange, readOnly);
+}
+
+// The lock lands while SEL0001's menu is open; U is then clicked in the menu as it closes, a
+// click user-event does not deliver to a closing menu, so it is dispatched directly.
+async function ClosesMenuOpenedBeforeLock() {
+    const user = userEvent.setup();
+    const onSelectionChange: SelectionChangeMock = jest.fn();
+    const { rerender } = render(LockableTableTree(false, onSelectionChange));
+    const field = screen.getByRole("combobox", { name: SelectionFieldName(1) });
+    await user.click(field);
+    const optionU = within(screen.getByRole("listbox")).getByRole("option", { name: "U" });
+    rerender(LockableTableTree(true, onSelectionChange));
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(optionU);
+    await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+    expect(onSelectionChange).not.toHaveBeenCalled();
+    expect(DisplayedCode(1)).toBe("");
+    rerender(LockableTableTree(false, onSelectionChange));
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("listbox")).toBeNull();
+    await user.click(field);
+    expect(screen.getByRole("listbox")).toBeVisible();
+}
+
+// A busy screen's locked keyboard: every code field keeps the cursor but refuses changes.
+describe("SelectionTable read-only", () => {
+    it.each(READ_ONLY_PRESS_CASES)(
+        "COCRDLI CRDSEL1 read-only stays focusable; $press neither opens nor changes it",
+        async ({ Act }) => {
+            const user = userEvent.setup();
+            const onSelectionChange = RenderTable(COCRDLI_CASE, jest.fn(), true);
+            await TabToFirstSelectionField(user, COCRDLI_CASE);
+            const field = screen.getByRole("combobox", { name: SelectionFieldName(1) });
+            expect(field).toHaveFocus();
+            expect(field).toHaveAttribute("aria-readonly", "true");
+            await Act(user, field);
+            expect(field).toHaveAttribute("aria-expanded", "false");
+            expect(screen.queryByRole("listbox")).toBeNull();
+            expect(onSelectionChange).not.toHaveBeenCalled();
+        },
+    );
+});
+
+// The lock refuses changes from a menu opened before it too.
+describe("SelectionTable read-only over an open menu", () => {
+    it(
+        "COUSR00 SEL0001 menu opened before the lock closes, refuses U, and stays closed after",
+        ClosesMenuOpenedBeforeLock,
+    );
+});
+
+// A table given no readOnly is unlocked, so its code fields keep taking codes.
+describe("SelectionTable without readOnly", () => {
+    it("COTRN00 SEL0001-10 are not read-only when readOnly is not passed", () => {
+        RenderTable(COTRN00_CASE);
+        for (const field of screen.getAllByRole("combobox")) {
+            expect(field).not.toHaveAttribute("aria-readonly");
+        }
+    });
 });
 
 // A locked field ignores the pointer, the keys that open its menu and a typed code, which MUI would

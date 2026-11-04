@@ -14,7 +14,7 @@ import {
     type SxProps,
     type Theme,
 } from "@mui/material";
-import { useSyncExternalStore, type ReactNode } from "react";
+import { createContext, useContext, useSyncExternalStore, type ReactNode } from "react";
 
 import { useSession } from "@/lib/session";
 
@@ -62,6 +62,10 @@ const BUSY_SLOT_STYLE: SxProps<Theme> = {
 // Out of flow inside the slot, across its full width, so showing it never moves the page.
 const BUSY_BAR_STYLE: SxProps<Theme> = { position: "absolute", top: 0, left: 0, right: 0 };
 
+// The 3270 keyboard locked from send to response: while a call runs, every input keeps the
+// cursor but refuses keystrokes. The fields under the shell read the lock through useScreenBusy.
+const SCREEN_BUSY_CONTEXT = createContext(false);
+
 export interface ScreenShellProps {
     // The legacy transaction ID shown in TRNNAME, for example CT02.
     transactionId: string;
@@ -70,6 +74,16 @@ export interface ScreenShellProps {
     // The map's row-4 screen title, shown verbatim, for example "Add Transaction".
     screenTitle: string;
     isBusy?: boolean;
+    // While true the header, busy bar, frame and title show but the children do not mount; they
+    // mount together once it turns false, as one SEND MAP painted the whole map, so nothing
+    // already on the screen moves.
+    isMapPending?: boolean;
+    children: ReactNode;
+}
+
+interface ScreenMapProps {
+    screenTitle: string;
+    isMapPending: boolean;
     children: ReactNode;
 }
 
@@ -142,6 +156,16 @@ function useHeaderClock(): HeaderClock {
     }
     const now = new Date(clockSecond * MILLISECONDS_PER_SECOND);
     return { dateText: FormatHeaderDate(now), timeText: FormatHeaderTime(now) };
+}
+
+/**
+ * Whether the screen's keyboard is locked: true while the page's isBusy holds. Each input under
+ * ScreenShell turns read-only with it. React recognises hooks only by the camelCase "use" prefix,
+ * so this name is a framework-mandated exception to the MK_Modernization Rule's PascalCase
+ * function naming.
+ */
+export function useScreenBusy(): boolean {
+    return useContext(SCREEN_BUSY_CONTEXT);
 }
 
 // Each line is one text node, label and value together, for example "Tran: CT02". Lines keep
@@ -228,24 +252,42 @@ function BusyIndicator({ isBusy }: BusyIndicatorProps) {
     );
 }
 
+// The frame and the row-4 title paint at once; the map's fields follow when it is no longer
+// pending.
+function ScreenMap({ screenTitle, isMapPending, children }: ScreenMapProps) {
+    return (
+        <Paper sx={{ p: 6 }}>
+            <Stack spacing={4}>
+                <Typography component="h1" variant="headlineSmall">
+                    {screenTitle}
+                </Typography>
+                {isMapPending ? null : children}
+            </Stack>
+        </Paper>
+    );
+}
+
 // The page frame every BMS-map page renders inside; each page places its own MessageLine and
-// FunctionKeyBar in children. React places the title in the document head.
+// FunctionKeyBar in children. React places the title in the document head. It comes last, so the
+// header stays the screen's first element: Next.js resets the scroll on a route change from that
+// element, and stops at one React has hoisted into the head, leaving the previous screen's offset.
 export function ScreenShell(props: ScreenShellProps) {
+    const isBusy = props.isBusy ?? false;
     return (
         <>
-            <title>{ScreenTabTitle(props.screenTitle)}</title>
             <ShellHeader transactionId={props.transactionId} programName={props.programName} />
-            <BusyIndicator isBusy={props.isBusy} />
-            <Container component="main" maxWidth="lg" sx={{ py: 6 }}>
-                <Paper sx={{ p: 6 }}>
-                    <Stack spacing={4}>
-                        <Typography component="h1" variant="headlineSmall">
-                            {props.screenTitle}
-                        </Typography>
+            <BusyIndicator isBusy={isBusy} />
+            <Container component="main" maxWidth="lg" sx={{ py: 6 }} aria-busy={isBusy}>
+                <SCREEN_BUSY_CONTEXT value={isBusy}>
+                    <ScreenMap
+                        screenTitle={props.screenTitle}
+                        isMapPending={props.isMapPending ?? false}
+                    >
                         {props.children}
-                    </Stack>
-                </Paper>
+                    </ScreenMap>
+                </SCREEN_BUSY_CONTEXT>
             </Container>
+            <title>{ScreenTabTitle(props.screenTitle)}</title>
         </>
     );
 }
