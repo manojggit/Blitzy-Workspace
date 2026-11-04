@@ -1,7 +1,12 @@
-// Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE, PRINT_LINE_STYLE),
-// the Material Design 3 token theme of AAP 0.5.3–0.5.4.
+// Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE, PRINT_LINE_STYLE,
+// AUTOFILL_KEYFRAMES_STYLE), the Material Design 3 token theme of AAP 0.5.3–0.5.4.
 import type { Theme, TypeAction } from "@mui/material/styles";
-import { CARD_DEMO_THEME, PRINT_LINE_STYLE, VISUALLY_HIDDEN_STYLE } from "@/app/theme";
+import {
+    AUTOFILL_KEYFRAMES_STYLE,
+    CARD_DEMO_THEME,
+    PRINT_LINE_STYLE,
+    VISUALLY_HIDDEN_STYLE,
+} from "@/app/theme";
 
 type ColourReader = (theme: Theme) => string | undefined;
 
@@ -782,6 +787,33 @@ const TEXT_FIELD_INSET_RULES: readonly ThemeRuleExpectation[] = [
     },
 ];
 
+// MUI 9.2.0's InputBase autofill detection, written out here rather than read from app/theme.ts:
+// the animations its input runs and the keyframes they name, which MUI compares by these names.
+const MUI_AUTO_FILL = "mui-auto-fill";
+const MUI_AUTO_FILL_CANCEL = "mui-auto-fill-cancel";
+const MUI_AUTOFILL_KEYFRAMES = {
+    [`@keyframes ${MUI_AUTO_FILL}`]: { from: { animationName: MUI_AUTO_FILL } },
+    [`@keyframes ${MUI_AUTO_FILL_CANCEL}`]: { from: { animationName: MUI_AUTO_FILL_CANCEL } },
+};
+
+// The InputBase input animations the theme restates once it stops InputBase injecting keyframes.
+const AUTOFILL_DETECTION_RULES: readonly ThemeRuleExpectation[] = [
+    {
+        rule: "a resting input starts MUI's 10 ms autofill cancel animation",
+        component: "MuiInputBase",
+        slot: "input",
+        selectorPath: [],
+        expectedStyle: { animationName: MUI_AUTO_FILL_CANCEL, animationDuration: "10ms" },
+    },
+    {
+        rule: "an autofilled input starts MUI's 5000 s autofill animation",
+        component: "MuiInputBase",
+        slot: "input",
+        selectorPath: ["&:-webkit-autofill"],
+        expectedStyle: { animationName: MUI_AUTO_FILL, animationDuration: "5000s" },
+    },
+];
+
 const THEME_RULE_GROUPS: readonly [string, readonly ThemeRuleExpectation[]][] = [
     ["M3 outlines, fills and dividers", OUTLINE_AND_FILL_RULES],
     ["M3 focus ring", FOCUS_RING_RULES],
@@ -789,6 +821,7 @@ const THEME_RULE_GROUPS: readonly [string, readonly ThemeRuleExpectation[]][] = 
     ["Forced colours", FORCED_COLOUR_RULES],
     ["M3 component typography and spacing", TYPE_AND_SPACING_RULES],
     ["M3 text-field insets (FE2A-F12)", TEXT_FIELD_INSET_RULES],
+    ["MUI autofill detection (QPERF2-F01)", AUTOFILL_DETECTION_RULES],
 ];
 
 // Overrides MUI applies only to components in one state: a small or hidden-label field, a dense
@@ -1262,6 +1295,17 @@ describe("Small table cells on the 4 dp grid (FE2A-F12)", () => {
 describe("Focus ripple (FE1A-F02, FE2A-F05, FE2C-F05)", () => {
     it.each(NO_FOCUS_RIPPLE_COMPONENTS)("%s turns the pulsing focus ripple off", (component) => {
         expect(ReadComponentEntry(component)?.defaultProps?.disableFocusRipple).toBe(true);
+    });
+});
+
+describe("Autofill keyframes inserted once per app (QPERF2-F01)", () => {
+    it("InputBase stops injecting its own autofill keyframes on every mount", () => {
+        const inputBaseDefaults = ReadComponentEntry("MuiInputBase")?.defaultProps;
+        expect(inputBaseDefaults?.disableInjectingGlobalStyles).toBe(true);
+    });
+
+    it("AUTOFILL_KEYFRAMES_STYLE holds MUI's two autofill keyframes", () => {
+        expect(AUTOFILL_KEYFRAMES_STYLE).toEqual(MUI_AUTOFILL_KEYFRAMES);
     });
 });
 

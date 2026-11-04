@@ -7,6 +7,10 @@ Checks the system's actual outputs against the oracle's expected fixtures in
   normalised text of ``legacy_oracle.CsvValue`` (``Decimal`` at 2 places, ISO dates, timestamps
   to the microsecond beside their format codes, right-trimmed text) with the expected CSVs, or
   with records decoded at the oracle's copybook offsets.
+- The generated EBCDIC sort columns ``user_id_sort``, ``card_num_sort`` and ``tran_id_sort``
+  (``SORT_KEY_SPECS``), which ``TABLE_SPECS`` leaves out of the field comparison, are compared
+  separately with the sort key derived from the code page 037 bytes of each expected key
+  (AAP 0.6.5).
 - GDG generations (TRANSACT.BKUP, DALYREJS, SYSTRAN, TRANSACT.COMBINED) and the CREASTMT
   statements (STATEMNT.PS, STATEMNT.HTML) are compared byte for byte after their ``\\n``
   terminators are removed. The oracle offsets serve only to name the field that differs.
@@ -19,6 +23,7 @@ generation numbers, the users audit timestamps and password hashes are never com
 
 import csv
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import column, select, table, text
@@ -45,6 +50,30 @@ LATEST_PUBLISHED_GENERATION_SQL = text(
     " WHERE base_name = :baseName AND state = :state"
     " ORDER BY generation DESC OFFSET :skip LIMIT 1"
 )
+
+
+@dataclass(frozen=True)
+class SortKeySpec:
+    """One stored generated column ebcdic_sort_key(keyColumn), which ``TABLE_SPECS`` leaves out.
+
+    tableName is the qualified table, keyColumn the key the column is generated from, and
+    sortColumn the generated column.
+    """
+
+    tableName: str
+    keyColumn: str
+    sortColumn: str
+
+
+# Every generated EBCDIC sort column (AAP 0.6.5, 0.6.7), by qualified table name.
+SORT_KEY_SPECS: dict[str, SortKeySpec] = {
+    spec.tableName: spec
+    for spec in (
+        SortKeySpec(legacy_oracle.USERS_TABLE, "user_id", "user_id_sort"),
+        SortKeySpec(legacy_oracle.CARDS_TABLE, "card_num", "card_num_sort"),
+        SortKeySpec(legacy_oracle.TRANSACTIONS_TABLE, "tran_id", "tran_id_sort"),
+    )
+}
 
 
 def NormalizeValue(value: object) -> str:
@@ -438,6 +467,90 @@ def CompareTableWithRecords(
     actualRows, actualDuplicates = IndexByRowKey(spec, actualList, "the table")
     differences.extend(duplicates + actualDuplicates)
     differences.extend(CompareIndexedRows(spec, expectedRows, actualRows))
+    return CapDifferences(differences)
+
+
+def ExpectedSortKey(keyText: str) -> str:
+    """Return the ebcdic_sort_key value of a key: each character as the code point of its byte.
+
+    The byte is the character's code page 037 byte, the oracle's VSAM collating key, so a space
+    is U+0040, "a" U+0081, "A" U+00C1 and "0" U+00F0 (AAP 0.6.5). Under COLLATE "C" the text
+    therefore orders as the EBCDIC key bytes do.
+
+    Raises:
+        UnicodeEncodeError: A character has no code page 037 byte.
+    """
+    return "".join(chr(byteValue) for byteValue in legacy_oracle.EbcdicSortKey(keyText))
+
+
+def ReadSortKeys(connection: Connection, sortSpec: SortKeySpec) -> tuple[dict[str, str], list[str]]:
+    """Read every row's key and stored sort value, both normalised, reporting each repeated key.
+
+    The identifiers come only from sortSpec, for example a ``SORT_KEY_SPECS`` entry, and are
+    rendered by Core ``table()`` and ``column()`` constructs, never by string formatting.
+
+    Returns:
+        The stored sort value by key text (a repeated key keeps its last row) and one message
+        per repetition.
+    """
+    schemaName, tableName = sortSpec.tableName.split(".", 1)
+    statement = select(column(sortSpec.keyColumn), column(sortSpec.sortColumn)).select_from(
+        table(tableName, schema=schemaName)
+    )
+    sortValues: dict[str, str] = {}
+    duplicates = []
+    for keyValue, sortValue in connection.execute(statement):
+        keyText = NormalizeValue(keyValue)
+        if keyText in sortValues:
+            duplicates.append(f"{sortSpec.tableName} key={keyText!r}: duplicate key in the table")
+        sortValues[keyText] = NormalizeValue(sortValue)
+    return sortValues, duplicates
+
+
+def SortValueDifference(sortSpec: SortKeySpec, keyText: str, actualSort: str | None) -> str | None:
+    """Describe one expected key the table lacks, or whose stored sort value is not its own."""
+    if actualSort is None:
+        return f"{sortSpec.tableName} key={keyText!r}: expected row is missing"
+    expectedSort = ExpectedSortKey(keyText)
+    if actualSort == expectedSort:
+        return None
+    return (
+        f"{sortSpec.tableName} key={keyText!r} field={sortSpec.sortColumn}: "
+        f"expected {expectedSort!r}, actual {actualSort!r}"
+    )
+
+
+def CompareSortKeys(
+    connection: Connection, sortSpec: SortKeySpec, expectedKeys: Iterable[str | None]
+) -> list[str]:
+    """Compare a generated EBCDIC sort column with the code page 037 keys of the expected keys.
+
+    ``TABLE_SPECS`` leaves the generated columns out of the field comparison, so they are
+    checked here: the table holds exactly the expected keys, and each row's stored sort value
+    equals ``ExpectedSortKey`` of its key. Keys and stored values are normalised like every
+    table value, so text is right-trimmed (AAP 0.9.3).
+
+    Args:
+        connection: An open connection to the database the batch run used.
+        sortSpec: The generated column, one of ``SORT_KEY_SPECS``.
+        expectedKeys: The key values the table must hold, for example the user_id column of
+            loader_rows/users.csv or the TRAN-IDs of combtran_combined.dat.
+
+    Returns:
+        Difference messages naming the table, key and sort column: each missing key and wrong
+        sort value in expected order, then each unexpected key; [] when the column matches.
+
+    Raises:
+        UnicodeEncodeError: An expected key has a character with no code page 037 byte.
+    """
+    actualSorts, differences = ReadSortKeys(connection, sortSpec)
+    expectedTexts = [NormalizeValue(keyValue) for keyValue in expectedKeys]
+    for keyText in expectedTexts:
+        difference = SortValueDifference(sortSpec, keyText, actualSorts.get(keyText))
+        if difference is not None:
+            differences.append(difference)
+    for keyText in sorted(set(actualSorts).difference(expectedTexts)):
+        differences.append(f"{sortSpec.tableName} key={keyText!r}: unexpected row")
     return CapDifferences(differences)
 
 

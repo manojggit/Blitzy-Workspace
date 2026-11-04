@@ -3,8 +3,11 @@
 cbl/CBTRN02C.cbl, run by jcl/POSTTRAN.jcl, validates each DALYTRAN-RECORD (CVTRA06Y) against the
 card cross-reference (CVACT03Y) and the account (CVACT01Y), then posts it to the category balance
 (CVTRA01Y), the account and TRAN-RECORD (CVTRA05Y). The module is pure, so these tests call it
-directly with no database. Expected values are typed from the cited COBOL lines and worked by
-hand with Decimal literals, never taken from the module:
+directly with no database. The 109 path also drives batch/jobs/posttran.py's per-record sequence
+(PostAllRecords through InsertTransaction) against a stand-in engine whose account rewrite
+matches no row, its staged-record read and validation unit replaced, again with no database.
+Expected values are typed from the cited COBOL lines and worked by hand with Decimal literals,
+never taken from the module:
 - lines 370-399: a missing cross-reference rejects 100 and a missing account 101; the account is
     read only when the cross-reference was found (line 372);
 - lines 403-412: WS-TEMP-BAL = ACCT-CURR-CYC-CREDIT - ACCT-CURR-CYC-DEBIT + DALYTRAN-AMT, stored
@@ -12,7 +15,9 @@ hand with Decimal literals, never taken from the module:
 - lines 414-419: ACCT-EXPIRAION-DATE below DALYTRAN-ORIG-TS (1:10), a text compare, rejects 103,
     overwriting a 102 set just before;
 - lines 211-215: only a validation reason is counted and written to DALYREJS, so the 109 that
-    2800-UPDATE-ACCOUNT-REC sets on a REWRITE INVALID KEY (lines 554-558) is neither;
+    2800-UPDATE-ACCOUNT-REC sets on a REWRITE INVALID KEY (lines 554-558) is neither, and
+    2900-WRITE-TRANSACTION-FILE still writes the transaction (lines 441-442) before the next
+    record is read;
 - lines 425-438: TRAN-RECORD copies the daily fields and ORIG-TS; PROC-TS is the clock in the DB2
     form YYYY-MM-DD-HH.MM.SS.cc0000 (Z-GET-DB2-FORMAT-TIMESTAMP, lines 692-703);
 - lines 503-527: TRAN-CAT-BAL S9(09)V99 starts at zero for a new key and adds the amount;
@@ -22,13 +27,19 @@ hand with Decimal literals, never taken from the module:
     the run ends with two DISPLAY counters and RETURN-CODE 4 when any record was rejected.
 """
 
-from collections.abc import Mapping
-from dataclasses import replace
+import logging
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from batch.jobs import posttran
+from batch.orchestration.job_context import JobResult
+from sqlalchemy import Insert, Update
 
 from app.services.transactions.cbtrn02c import (
     ACCOUNT_REWRITE_NOT_FOUND,
@@ -41,6 +52,7 @@ from app.services.transactions.cbtrn02c import (
     REJECTS_RETURN_CODE,
     ApplyPosting,
     BuildValidationTrailer,
+    PostingEffects,
     PostingInput,
     RejectOutcome,
     ValidateDailyTransaction,
@@ -276,6 +288,142 @@ def test_account_rewrite_not_found_109_is_not_a_validation_reject():
     # and 2900-WRITE-TRANSACTION-FILE still writes its transaction (line 442).
     assert ValidateDailyTransaction(postingInput) is None
     assert ApplyPosting(postingInput).transaction == EXPECTED_TRANSACTION_ROW
+
+
+# The 109 path through POSTTRAN's per-record sequence (batch/jobs/posttran.py). The second staged
+# record is the default one with the next DALYTRAN-ID, so the run visibly goes on after the 109.
+SECOND_STAGED_TRAN_ID = "0000000000683581"
+POSTING_RUN_RECORDS = (
+    BuildStaged(),
+    BuildStaged({"record_seq": 2, "tran_id": SECOND_STAGED_TRAN_ID}),
+)
+# The first account REWRITE matches no row, the INVALID KEY of lines 554-558; the second
+# matches its account.
+REWRITE_ROWCOUNTS = (0, 1)
+ACCOUNT_REWRITE_EVENT = "UPDATE accounts.accounts"
+TRANSACTION_INSERT_EVENT = "INSERT transactions.transactions"
+# 2000-POST-TRANSACTION, lines 441-442: 2800 rewrites the account, then 2900 writes the
+# transaction whatever 2800 found, for each record in turn.
+EXPECTED_POSTING_STATEMENTS = [ACCOUNT_REWRITE_EVENT, TRANSACTION_INSERT_EVENT] * 2
+EXPECTED_POSTED_TRANSACTIONS = [
+    EXPECTED_TRANSACTION_ROW,
+    {**EXPECTED_TRANSACTION_ROW, "tran_id": SECOND_STAGED_TRAN_ID},
+]
+# Line 206 counts both records, lines 211-215 reject neither, and lines 229-231 leave
+# RETURN-CODE 0, so both records are posted.
+EXPECTED_POSTING_RESULT = JobResult(
+    0,
+    {posttran.PROCESSED_COUNT_KEY: 2, posttran.REJECTED_COUNT_KEY: 0, posttran.POSTED_COUNT_KEY: 2},
+)
+# The run's only warning, for record 1: MOVE 109 and 'ACCOUNT RECORD NOT FOUND' (lines
+# 556-558), the reason shown as 9(04).
+EXPECTED_REWRITE_NOT_FOUND_WARNING = (
+    "DALYTRAN RECORD 1: REWRITE OF ACCOUNT 00000000004 FOUND NO RECORD, REASON 0109"
+    " ACCOUNT RECORD NOT FOUND; THE TRANSACTION IS STILL WRITTEN AND NO REJECT IS COUNTED"
+)
+
+
+def StatementEvent(statement: object) -> str:
+    """Name an executed statement by its verb and table, as UPDATE accounts.accounts."""
+    if isinstance(statement, Update):
+        return f"UPDATE {statement.table.fullname}"
+    if isinstance(statement, Insert):
+        return f"INSERT {statement.table.fullname}"
+    raise AssertionError(f"POSTTRAN executed an unexpected statement {statement!r}")
+
+
+@dataclass
+class PostingDatabaseStub:
+    """The account and transaction files as POSTTRAN's 2800 and 2900 units reach them.
+
+    Each unit's connection records every statement as its verb and table, and the values of
+    each transactions INSERT. The n-th accounts UPDATE matches rewriteRowcounts[n] rows, 0
+    being the REWRITE INVALID KEY of reason 109.
+    """
+
+    rewriteRowcounts: tuple[int, ...]
+    statements: list[str] = field(default_factory=list)
+    insertedTransactions: list[dict[str, Any]] = field(default_factory=list)
+
+    @contextmanager
+    def BeginUnit(self) -> Iterator[SimpleNamespace]:
+        """Stand in for Engine.begin(): one unit whose connection executes into this stub."""
+        yield SimpleNamespace(execute=self.Execute)
+
+    def Execute(self, statement: object) -> SimpleNamespace:
+        """Record one Connection.execute call and return its result's rowcount."""
+        event = StatementEvent(statement)
+        self.statements.append(event)
+        if event == ACCOUNT_REWRITE_EVENT:
+            rewriteIndex = self.statements.count(ACCOUNT_REWRITE_EVENT) - 1
+            return SimpleNamespace(rowcount=self.rewriteRowcounts[rewriteIndex])
+        if event == TRANSACTION_INSERT_EVENT:
+            self.insertedTransactions.append(statement.compile().params)
+            return SimpleNamespace(rowcount=1)
+        raise AssertionError(f"POSTTRAN executed an unexpected {event}")
+
+
+@dataclass
+class RecordingRejectWriter:
+    """A DALYREJS(+1) writer that keeps each record 2500-WRITE-REJECT-REC writes."""
+
+    records: list[str] = field(default_factory=list)
+
+    def WriteRecord(self, record: str) -> None:
+        """Keep one REJECT-RECORD."""
+        self.records.append(record)
+
+
+def StagedPostingRunRecords(context: object) -> Iterator[dict[str, Any]]:
+    """Stand in for StagedRecordsInOrder: POSTING_RUN_RECORDS in record_seq order."""
+    yield from POSTING_RUN_RECORDS
+
+
+def ValidatedPostingEffects(context: object, stagedRow: Mapping[str, Any]) -> PostingEffects:
+    """Stand in for RunValidationUnit: each record passes 1500-VALIDATE-TRAN.
+
+    Its cross-reference and account 00000000004 are found and its category balance is new, so
+    its effects are ApplyPosting's.
+    """
+    return ApplyPosting(BuildInput(stagedRow, BuildAccount(), BuildXref(), None))
+
+
+def RunPostingOverRewriteStub(
+    monkeypatch: pytest.MonkeyPatch, postingDatabase: PostingDatabaseStub
+) -> tuple[posttran.PostingCounts, RecordingRejectWriter]:
+    """Run the real posttran.PostAllRecords over POSTING_RUN_RECORDS against postingDatabase.
+
+    Only the staged-record read and the validation unit, which need a database, are replaced:
+    ProcessStagedRecord, PostValidRecord, RewriteAccount and InsertTransaction run unchanged.
+    """
+    monkeypatch.setattr(posttran, "StagedRecordsInOrder", StagedPostingRunRecords)
+    monkeypatch.setattr(posttran, "RunValidationUnit", ValidatedPostingEffects)
+    context = SimpleNamespace(engine=SimpleNamespace(begin=postingDatabase.BeginUnit))
+    rejectWriter = RecordingRejectWriter()
+    return posttran.PostAllRecords(context, rejectWriter), rejectWriter
+
+
+def PostingWarnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The WARNING messages POSTTRAN's logger emitted."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == posttran.LOGGER.name and record.levelno == logging.WARNING
+    ]
+
+
+def test_account_rewrite_not_found_109_still_writes_the_transaction_and_counts_no_reject(
+    monkeypatch, caplog
+):
+    caplog.set_level(logging.WARNING, logger=posttran.LOGGER.name)
+    postingDatabase = PostingDatabaseStub(REWRITE_ROWCOUNTS)
+    counts, rejectWriter = RunPostingOverRewriteStub(monkeypatch, postingDatabase)
+    assert postingDatabase.statements == EXPECTED_POSTING_STATEMENTS
+    assert postingDatabase.insertedTransactions == EXPECTED_POSTED_TRANSACTIONS
+    assert (counts.processed, counts.rejected, counts.Posted()) == (2, 0, 2)
+    assert rejectWriter.records == []
+    assert posttran.BuildPostingResult(counts) == EXPECTED_POSTING_RESULT
+    assert PostingWarnings(caplog) == [EXPECTED_REWRITE_NOT_FOUND_WARNING]
 
 
 def test_end_of_run_display_labels_and_return_code():

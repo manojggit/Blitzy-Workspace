@@ -5,7 +5,8 @@ with the clients, generated sign-on users and seed restore of tests/conftest.py:
 
 - CU00 (COUSR00C, map COUSR00): pages of at most 10 rows in EBCDIC user-ID order, which differs
   from ASCII order; the F7 and F8 refusals at either end; the inclusive search (STARTBR GTEQ)
-  that resets the page number; the U and D selection routes and the invalid-code literal.
+  that resets the page number; the U and D selection routes, taken before any search key, and
+  the invalid-code literal, after which the page is browsed from the search key.
 - CU01 (COUSR01C, map COUSR01): presence checks in source order, the first blank field ending
   validation; any user type stored as entered; the password hashed as entered, so a lower-case
   one never signs on through COSGN00C's upper-cased input; the duplicate key; the BMS length.
@@ -110,6 +111,23 @@ SELECTION_ROUTE_CASES = (
     pytest.param("D", "/admin/users/delete?userId={userId}", id="delete"),
 )
 INVALID_SELECTION_CODE = "X"
+# A seed key above the lowest one: with no users added, at most 10 user IDs are at or after it.
+LATER_SEARCH_KEY = "ADMIN003"
+# U and D transfer before the search key is read (cbl/COUSR00C.cbl lines 189-209), keyed with
+# or without one.
+SELECTION_SEARCH_KEYS = (
+    pytest.param("", id="no-search"),
+    pytest.param(LATER_SEARCH_KEY, id="with-search"),
+)
+# The list fields of a route answer: no page is browsed, so each keeps its default.
+UNBROWSED_PAGE_FIELDS = {
+    "rows": [],
+    "page": 0,
+    "first_key": "",
+    "last_key": "",
+    "message": "",
+    "cursor_field": None,
+}
 
 # --- CU01 (COUSR01C) -----------------------------------------------------------------------------
 # cbl/COUSR01C.cbl lines 120-144, in source order: (request field and cursor, literal).
@@ -244,6 +262,44 @@ REFUSED_ORIGINS = (
 )
 
 
+class SearchedInvalidSelection(NamedTuple):
+    """An invalid code keyed with a search key, the users added first, and the answer.
+
+    ``outcomeFields`` are the body fields beside the page and its literal: the 400's other
+    legacy error keys, or the 200's empty route.
+    """
+
+    addedUserIds: tuple[str, ...]
+    searchUserId: str
+    expectedStatus: int
+    expectedMessage: str
+    outcomeFields: Mapping[str, Any]
+
+
+# With MIXED_KEYS added, a1 is the lowest key and more than 10 user IDs are at or after ADMIN001:
+# the look-ahead READNEXT finds a row and the invalid-selection literal stays (cbl/COUSR00C.cbl
+# line 212). With none added, READNEXT ENDFILE after LATER_SEARCH_KEY moves the bottom literal
+# over it (line 637).
+SEARCHED_INVALID_SELECTION_CASES = (
+    pytest.param(
+        SearchedInvalidSelection(
+            MIXED_KEYS,
+            SEED_ADMIN_USER_ID,
+            HTTP_EDIT_FAILURE,
+            INVALID_SELECTION_MESSAGE,
+            {"info_message": "", "field_errors": [SEARCH_CURSOR_FIELD]},
+        ),
+        id="next-page-keeps-the-literal",
+    ),
+    pytest.param(
+        SearchedInvalidSelection(
+            (), LATER_SEARCH_KEY, HTTP_OK, REACHED_BOTTOM_MESSAGE, {"route": None}
+        ),
+        id="end-of-file-replaces-the-literal",
+    ),
+)
+
+
 # --- Generated values ----------------------------------------------------------------------------
 def NewUserId() -> str:
     """Return a generated 7-character upper-case user ID that no seed or fixture user has."""
@@ -282,6 +338,12 @@ def NewUserEntry(userId: str, userType: str = REGULAR_USER_TYPE, password: str =
 def EbcdicOrder(userIds: Iterable[str]) -> list[str]:
     """Return ``userIds`` in code-page-037 byte order, the VSAM key order of USRSEC."""
     return sorted(userIds, key=lambda value: value.encode(EBCDIC_CODEC))
+
+
+def UserIdsFrom(orderedIds: Iterable[str], searchUserId: str) -> list[str]:
+    """Return the ``orderedIds`` at or after ``searchUserId`` in code-page-037 order: GTEQ."""
+    searchKey = searchUserId.encode(EBCDIC_CODEC)
+    return [userId for userId in orderedIds if userId.encode(EBCDIC_CODEC) >= searchKey]
 
 
 # --- Database reads (security.users, through the test database's psycopg2 engine) ---------------
@@ -347,6 +409,24 @@ def AssertNoSecrets(response: httpx.Response, plaintext: str, storedHash: str) -
         assert not any(fragment in keyName.lower() for fragment in SECRET_KEY_FRAGMENTS), keyName
 
 
+def AssertSearchedPage(
+    body: Mapping[str, Any], case: SearchedInvalidSelection, pageIds: list[str]
+) -> None:
+    """Assert page 1 browsed from the search key: every body field, and its rows' user IDs."""
+    expectedFields = {
+        "message": case.expectedMessage,
+        "cursor_field": SEARCH_CURSOR_FIELD,
+        "page": FIRST_PAGE,
+        "first_key": pageIds[0],
+        "last_key": pageIds[-1],
+        **case.outcomeFields,
+    }
+    assert {fieldName: value for fieldName, value in body.items() if fieldName != "rows"} == (
+        expectedFields
+    )
+    assert [row["user_id"] for row in body["rows"]] == pageIds
+
+
 # --- Requests ------------------------------------------------------------------------------------
 async def AddUser(client: httpx.AsyncClient, request: NewUser) -> httpx.Response:
     """Send ``request`` to CU01's ENTER, POST /admin/users."""
@@ -399,9 +479,12 @@ def BlankedFrom(body: Mapping[str, str], order: tuple[str, ...], firstBlank: str
     }
 
 
-def SelectionBody(userId: str, selectionCode: str) -> dict[str, Any]:
-    """Return a COUSR00 ENTER body with one row selected and a blank search key."""
-    return {"selections": [{"user_id": userId, "selection": selectionCode}], "search_user_id": ""}
+def SelectionBody(userId: str, selectionCode: str, searchUserId: str = "") -> dict[str, Any]:
+    """Return a COUSR00 ENTER body with one row selected and ``searchUserId``, blank by default."""
+    return {
+        "selections": [{"user_id": userId, "selection": selectionCode}],
+        "search_user_id": searchUserId,
+    }
 
 
 async def PressPagingKey(
@@ -531,15 +614,23 @@ async def test_cu00_blank_search_starts_at_lowest_key(
     assert listPage["page"] == FIRST_PAGE
 
 
+@pytest.mark.parametrize("searchUserId", SELECTION_SEARCH_KEYS)
 @pytest.mark.parametrize(("selectionCode", "routeTemplate"), SELECTION_ROUTE_CASES)
 async def test_cu00_selection_routes_to_update_or_delete(
-    adminClient: httpx.AsyncClient, selectionCode: str, routeTemplate: str
+    harness: UserAdminHarness, selectionCode: str, routeTemplate: str, searchUserId: str
 ) -> None:
-    """U routes to the COUSR02C page and D to the COUSR03C page, keyed by the selected ID."""
-    selectionBody = SelectionBody(SEED_REGULAR_USER_ID, selectionCode)
-    response = await adminClient.post(SELECTION_URL, json=selectionBody)
+    """U routes to the COUSR02C page and D to the COUSR03C page, keyed by the selected ID.
+
+    The selection is processed before the search key and its XCTL ends the task, so a keyed
+    search key is never browsed: the answer is the route with no page, and USRSEC is unchanged.
+    """
+    usersBefore = ReadAllStoredUsers(harness.syncEngine)
+    selectionBody = SelectionBody(SEED_REGULAR_USER_ID, selectionCode, searchUserId)
+    response = await harness.adminClient.post(SELECTION_URL, json=selectionBody)
     assert response.status_code == HTTP_OK, response.text
-    assert response.json()["route"] == routeTemplate.format(userId=SEED_REGULAR_USER_ID)
+    expectedRoute = routeTemplate.format(userId=SEED_REGULAR_USER_ID)
+    assert response.json() == {"route": expectedRoute, **UNBROWSED_PAGE_FIELDS}
+    assert ReadAllStoredUsers(harness.syncEngine) == usersBefore
 
 
 async def test_cu00_invalid_selection_code_is_refused_with_its_page(
@@ -557,6 +648,32 @@ async def test_cu00_invalid_selection_code_is_refused_with_its_page(
     assert refusalBody["page"] == FIRST_PAGE
     assert len(refusalBody["rows"]) == PAGE_SIZE
     assert "route" not in refusalBody
+
+
+@pytest.mark.parametrize("case", SEARCHED_INVALID_SELECTION_CASES)
+async def test_cu00_invalid_selection_with_a_search_browses_from_the_search_key(
+    harness: UserAdminHarness, case: SearchedInvalidSelection
+) -> None:
+    """Any other code with a search key browses page 1 from that key, inclusive.
+
+    The search key, not the lowest key, is moved to SEC-USR-ID after the selection
+    (cbl/COUSR00C.cbl lines 218-228). The literal stays on a 400 while a next page exists, and
+    gives way to the bottom literal on a 200 at end of file. USRSEC is unchanged either way.
+    """
+    for userId in case.addedUserIds:
+        AssertAdded(await AddUser(harness.adminClient, NewUserEntry(userId)), userId)
+    storedOrder = EbcdicOrder(ReadStoredUserIds(harness.syncEngine))
+    keyedIds = UserIdsFrom(storedOrder, case.searchUserId)
+    usersBefore = ReadAllStoredUsers(harness.syncEngine)
+    selectionBody = SelectionBody(SEED_REGULAR_USER_ID, INVALID_SELECTION_CODE, case.searchUserId)
+    response = await harness.adminClient.post(SELECTION_URL, json=selectionBody)
+    assert ReadAllStoredUsers(harness.syncEngine) == usersBefore
+    hasNextPage = len(keyedIds) > PAGE_SIZE
+    assert hasNextPage == (case.expectedStatus == HTTP_EDIT_FAILURE)
+    assert keyedIds[0] == case.searchUserId
+    assert storedOrder[0] != case.searchUserId
+    assert response.status_code == case.expectedStatus, response.text
+    AssertSearchedPage(response.json(), case, keyedIds[:PAGE_SIZE])
 
 
 # --- CU01: COUSR01C add user ---------------------------------------------------------------------

@@ -15,8 +15,8 @@ Expected values are typed from those lines and from the seed (data/EBCDIC images
 and account 00000000099 does not exist. Each test calls coactvwc.ViewAccount with a regular
 user's context against the migrated, seeded test database. CAVW is read-only, so the seed rows
 read back unchanged. The account and customer NOTFND outcomes, which the cross-reference
-foreign keys make unreachable on real data, and the batch-window refusal are stubbed on the
-repository classes.
+foreign keys make unreachable on real data, the batch-window refusal and a CUSTDAT I/O error
+(CICS IOERR, RESP 17) are stubbed on the repository classes.
 """
 
 import json
@@ -29,7 +29,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import Engine, text
 
-from app.core.errors import LegacyMessageError
+from app.core.errors import FileIoError, LegacyMessageError
 from app.core.locks import FileNotOpenError
 from app.repositories.account_repository import AccountRepository
 from app.repositories.card_xref_repository import CardXrefRepository
@@ -78,6 +78,12 @@ CXACAIX_FILE_NAME = "CXACAIX"
 FILE_ERROR_OPERATION = "READ"
 CXACAIX_WINDOW_MESSAGE = (
     "File Error: READ     on CXACAIX   returned RESP 000000019 ,RESP2 000000060"
+)
+# 9400 WHEN OTHER for CICS IOERR (RESP 17, RESP2 0): 'READ' in X(8), LIT-CUSTFILENAME in X(9),
+# with the trailing blanks of ERROR-RESP2 and the closing FILLER trimmed.
+CUSTDAT_FILE_NAME = "CUSTDAT"
+CUSTDAT_IO_ERROR_MESSAGE = (
+    "File Error: READ     on CUSTDAT   returned RESP 000000017 ,RESP2 000000000"
 )
 
 # The seed account shown, and its cross-reference record.
@@ -153,6 +159,13 @@ class StubbedReadCase(NamedTuple):
     message: str
 
 
+class CustomerIoErrorCase(NamedTuple):
+    """A read chain that reaches 9400 for ``acctIdText``, whose CUSTDAT read ends WHEN OTHER."""
+
+    install: Callable[[pytest.MonkeyPatch], None]
+    acctIdText: str
+
+
 def ReadRecord(syncEngine: Engine, sql: str, key: str) -> dict[str, Any]:
     """Return the one committed row ``sql`` selects for ``key``, keyed by column name."""
     with syncEngine.connect() as connection:
@@ -197,6 +210,11 @@ async def StubXrefWindowClosed(self: Any, acctId: str) -> dict[str, Any] | None:
     raise FileNotOpenError(CXACAIX_FILE_NAME)
 
 
+async def StubCustomerIoError(self: Any, custId: str) -> dict[str, Any] | None:
+    """Fail the CUSTDAT read as a database or connection failure does: CICS IOERR, RESP 17."""
+    raise FileIoError(CUSTDAT_FILE_NAME)
+
+
 def InstallAccountMissing(monkeypatch: pytest.MonkeyPatch, seedAccountRow: dict[str, Any]) -> None:
     """Find the cross-reference of account 99, then answer the ACCTDAT read with NOTFND."""
     monkeypatch.setattr(CardXrefRepository, "GetXrefByAccount", StubReturning(MISSING_XREF))
@@ -211,11 +229,28 @@ def InstallCustomerMissing(monkeypatch: pytest.MonkeyPatch, seedAccountRow: dict
     monkeypatch.setattr(CustomerRepository, "GetCustomer", StubReturning(None))
 
 
+def InstallCustomerIoError(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leave the CXACAIX and ACCTDAT reads real, then fail the CUSTDAT read with IOERR."""
+    monkeypatch.setattr(CustomerRepository, "GetCustomer", StubCustomerIoError)
+
+
+def InstallAccountMissingThenCustomerIoError(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Find account 99's cross-reference, answer ACCTDAT with NOTFND, then fail CUSTDAT."""
+    monkeypatch.setattr(CardXrefRepository, "GetXrefByAccount", StubReturning(MISSING_XREF))
+    monkeypatch.setattr(AccountRepository, "GetAccount", StubReturning(None))
+    InstallCustomerIoError(monkeypatch)
+
+
 STUBBED_READ_CASES = [
     StubbedReadCase(InstallAccountMissing, ACCOUNT_NOT_FOUND_99),
     StubbedReadCase(InstallCustomerMissing, CUSTOMER_NOT_FOUND_99),
 ]
 STUBBED_READ_CASE_IDS = ["account-master", "customer-master"]
+CUSTOMER_IO_ERROR_CASES = [
+    CustomerIoErrorCase(InstallCustomerIoError, VIEWED_ACCT_ID),
+    CustomerIoErrorCase(InstallAccountMissingThenCustomerIoError, MISSING_ACCT_ID),
+]
+CUSTOMER_IO_ERROR_CASE_IDS = ["account-found", "account-not-found-replaced"]
 
 
 @pytest_asyncio.fixture(name="regularContext")
@@ -290,6 +325,25 @@ async def test_batch_window_refusal_answers_the_cxacaix_file_error(regularContex
     raisedError = await RaisedViewError(regularContext, VIEWED_ACCT_ID)
     assert raisedError.httpStatus == FILE_ERROR_STATUS
     assert raisedError.Body() == ExpectedErrorBody(CXACAIX_WINDOW_MESSAGE)
+
+
+@pytest.mark.parametrize("ioErrorCase", CUSTOMER_IO_ERROR_CASES, ids=CUSTOMER_IO_ERROR_CASE_IDS)
+async def test_customer_read_io_error_answers_the_custdat_file_error(
+    regularContext, monkeypatch, syncEngine, ioErrorCase
+):
+    """9400 WHEN OTHER: a CUSTDAT I/O error shows the file error, and nothing is written.
+
+    The MOVE of WS-FILE-ERROR-MESSAGE (line 865) is unconditional, so it also replaces the
+    ACCTDAT NOTFND text 9300 set first.
+    """
+    accountBefore = ReadRecord(syncEngine, ACCOUNT_VERSION_SQL, VIEWED_ACCT_ID)
+    customerBefore = ReadRecord(syncEngine, CUSTOMER_VERSION_SQL, VIEWED_CUST_ID)
+    ioErrorCase.install(monkeypatch)
+    raisedError = await RaisedViewError(regularContext, ioErrorCase.acctIdText)
+    assert raisedError.httpStatus == FILE_ERROR_STATUS
+    assert raisedError.Body() == ExpectedErrorBody(CUSTDAT_IO_ERROR_MESSAGE)
+    assert ReadRecord(syncEngine, ACCOUNT_VERSION_SQL, VIEWED_ACCT_ID) == accountBefore
+    assert ReadRecord(syncEngine, CUSTOMER_VERSION_SQL, VIEWED_CUST_ID) == customerBefore
 
 
 @pytest.mark.parametrize(

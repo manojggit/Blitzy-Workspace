@@ -18,10 +18,10 @@ docs/batch.md ("Step 13: POSTTRAN", "POSTTRAN: posting") transcribes this contra
 Durability: every CardDemo file is RECOVERY(NONE), so each write commits as it is made and an
 abend leaves the earlier records posted. The category-balance write commits with the validation
 reads that lock its account; the account rewrite and the transaction insert follow in units of
-their own. The DALYREJS generation's COMMITTED catalog row and the run's completion share one
-final transaction, committed after the last posting write, and the generation is published once
-that has committed. An abend deletes the .part file and catalogs nothing, as
-DISP=(NEW,CATLG,DELETE) does.
+their own. The run's completion and then the DALYREJS generation's COMMITTED catalog row, the
+job's final database write, share one final transaction, committed after the last posting
+write; the chain (batch_chain) publishes the generation once that has committed. An abend
+deletes the .part file and catalogs nothing, as DISP=(NEW,CATLG,DELETE) does.
 
 Exit statuses: EXIT_OK; REJECTS_RETURN_CODE (4) when the stored reject count is above zero; or
 JobFailure with EXIT_ABEND (9999-ABEND-PROGRAM, CEE3ABD 999) on a duplicate key or any database,
@@ -76,6 +76,9 @@ COUNTER_MODULUS = 10**9
 # FD-TRAN-CAT-KEY (CVTRA01Y): TRANCAT-ACCT-ID 9(11), TRANCAT-TYPE-CD X(02), TRANCAT-CD 9(04).
 CATEGORY_TYPE_LENGTH = 2
 CATEGORY_CODE_DIGITS = 4
+# The key as the TCATBAL display logs it: each field after its CVTRA01Y name, so no two fields
+# run together into the 16-digit chain the log masking filter hides.
+TCATBAL_KEY_TEMPLATE = "TRANCAT-ACCT-ID={acctId} TRANCAT-TYPE-CD={typeCd} TRANCAT-CD={catCd}"
 
 # The DISPLAY texts of the mainline and of 2700-UPDATE-TCATBAL. COUNT_LOG shows a PIC 9(09)
 # counter after its label, as DISPLAY does.
@@ -154,15 +157,15 @@ def RunJob(context: JobContext) -> JobResult:
 
     Returns EXIT_OK, or REJECTS_RETURN_CODE when any record was rejected, with the processed,
     rejected and posted counts, once the final transaction has recorded the run COMPLETED and
-    the generation is published. Raises JobFailure with EXIT_ABEND on any abend: the postings
-    committed before it stay, and no DALYREJS generation is cataloged.
+    cataloged the generation COMMITTED. Raises JobFailure with EXIT_ABEND on any abend: the
+    postings committed before it stay, and no DALYREJS generation is cataloged.
     """
     LOGGER.info(START_LOG, PROGRAM_NAME)
     with AbendOn(REJECTS_FILE_ERROR, None):
         result = PostDailyTransactions(context)
-    # Outside the abend mapping: the run is already COMPLETED, so a publication failure is not
-    # an abend, and the next command's gdg.ReconcileCatalog publishes the COMMITTED row.
-    gdg.PublishRunGenerations(context)
+    # No publication here: the run is already COMPLETED, so the chain (batch_chain.FinishStep)
+    # publishes the COMMITTED generation outside its runner-failure mapping, and a publication
+    # error there leaves the step COMPLETED for the next command's gdg.ReconcileCatalog.
     LOGGER.info(END_LOG, PROGRAM_NAME)
     return result
 
@@ -170,15 +173,18 @@ def RunJob(context: JobContext) -> JobResult:
 def PostDailyTransactions(context: JobContext) -> JobResult:
     """The mainline, lines 193-234: open the files, post every record, close the files.
 
-    The DALYREJS catalog row and the run completion commit together on finalConnection, after
-    the last posting write has committed in its own unit (Technical Specification 0.7.2).
+    The run completion and the DALYREJS catalog row commit together on finalConnection, after
+    the last posting write has committed in its own unit (Technical Specification 0.7.2). The
+    completion runs inside the generation block, so the COMMITTED row, inserted as the block
+    exits, is the final write, and a failure there or in the close discards the .part file.
+    The counts are displayed after the close, as lines 221-228 do.
     """
     with context.engine.connect() as finalConnection:
         with gdg.NewGeneration(context, gdg.DALYREJS, connection=finalConnection) as rejectWriter:
             counts = PostAllRecords(context, rejectWriter)
+            result = BuildPostingResult(counts)
+            run_ledger.FinishAtomicRun(finalConnection, context, result)
         LogCounts(counts)
-        result = BuildPostingResult(counts)
-        run_ledger.FinishAtomicRun(finalConnection, context, result)
         finalConnection.commit()
     return result
 
@@ -332,10 +338,18 @@ def WriteCategoryBalance(connection: Connection, effects: PostingEffects, record
 
 
 def CategoryBalanceKeyText(balanceRow: dict[str, object]) -> str:
-    """FD-TRAN-CAT-KEY as DISPLAY shows it: account 9(11), type X(02) and category 9(04)."""
+    """FD-TRAN-CAT-KEY with each field labelled: account 9(11), type X(02) and category 9(04).
+
+    DISPLAY shows the 17 key bytes run together. The log masking filter hides every chain of
+    16 or more digits but its last four, so with a numeric type code that form would log as
+    asterisks and the category code, alike for every account. Each field therefore follows its
+    CVTRA01Y name (TCATBAL_KEY_TEMPLATE), with the value as DISPLAY shows it, and stays readable.
+    """
     typeText = str(balanceRow["tran_type_cd"]).ljust(CATEGORY_TYPE_LENGTH)
     categoryText = f"{balanceRow['tran_cat_cd']:0{CATEGORY_CODE_DIGITS}d}"
-    return f"{balanceRow['acct_id']}{typeText}{categoryText}"
+    return TCATBAL_KEY_TEMPLATE.format(
+        acctId=balanceRow["acct_id"], typeCd=typeText, catCd=categoryText
+    )
 
 
 def CreateCategoryBalance(

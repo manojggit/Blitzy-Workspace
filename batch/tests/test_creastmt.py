@@ -1009,14 +1009,22 @@ def StatementDifferences(
     ]
 
 
-def WriteOracleStatements(engine: Engine, oracleDir: Path) -> tuple[Path, Path]:
-    """Run the oracle's CREASTMT over the tables as they stand and write its two files.
+def RunOracleStatements(engine: Engine) -> legacy_oracle.StatementOutcome:
+    """Run the oracle's CREASTMT over the tables as they stand, read through compare's plain SQL.
 
-    The tables are read through compare's plain SQL, and the lines are written as the fixtures
-    are: Latin-1, one LF after every record. Returns the paths, as StatementPaths(oracleDir).
+    Returns its STATEMNT.PS and STATEMNT.HTML lines and exit status: no lines on an abend.
     """
     with engine.connect() as connection:
-        outcome = legacy_oracle.RunCreastmt(compare.ReadTableAsOracleState(connection))
+        return legacy_oracle.RunCreastmt(compare.ReadTableAsOracleState(connection))
+
+
+def WriteOracleStatements(engine: Engine, oracleDir: Path) -> tuple[Path, Path]:
+    """Write the two files of RunOracleStatements(engine), after asserting the oracle succeeded.
+
+    The lines are written as the fixtures are: Latin-1, one LF after every record. Returns the
+    paths, as StatementPaths(oracleDir).
+    """
+    outcome = RunOracleStatements(engine)
     assert outcome.exitCode == legacy_oracle.EXIT_OK
     oraclePaths = StatementPaths(oracleDir)
     oraclePaths[0].parent.mkdir(parents=True)
@@ -1182,6 +1190,7 @@ def test_capacity_of_51_cards_by_10_transactions_is_processed_exactly(
 
 # The 52nd-card and 11th-transaction refusals differ only in their input, and the fresh and
 # previous output directories only in what must survive, so one parameterized test covers all.
+# The expected outcome is legacy_oracle.RunCreastmt's, run in-test on the arranged tables.
 @pytest.mark.parametrize(
     "fillOverCapacity",
     [
@@ -1197,13 +1206,19 @@ def test_over_capacity_statement_run_exits_16_and_leaves_previous_files_untouche
     fillOverCapacity: Callable[[Engine], None],
     hasPrevious: bool,
 ) -> None:
-    """Input past the 51 by 10 table exits 16 before any statement is written: a fresh output
-    directory stays without statement files, previous files keep their bytes, step 17 FAILED."""
+    """Input past the 51 by 10 table ends as legacy_oracle.RunCreastmt predicts in-test: exit 16
+    and no statement lines, so a fresh output directory stays without statement files, previous
+    files keep their bytes, and step 17 is FAILED."""
+    engine = batchEnvironment.engine
     statementsDir = StatementPaths(batchEnvironment.outputDir)[0].parent
     previous = PublicationWritePair(statementsDir, "PREVIOUS") if hasPrevious else None
-    fillOverCapacity(batchEnvironment.engine)
-    outcome = RunStatementJob(EXIT_ABEND)
+    fillOverCapacity(engine)
+    oracleOutcome = RunOracleStatements(engine)
+    assert oracleOutcome == legacy_oracle.StatementOutcome(
+        psLines=[], htmlLines=[], exitCode=legacy_oracle.EXIT_ABEND
+    )
+    outcome = RunStatementJob(oracleOutcome.exitCode)
     assert CAPACITY_MESSAGE_PREFIX in outcome.output
     assert PublicationFiles(statementsDir) == previous
-    statementStep = StepRow(batchEnvironment.engine, STATEMENT_STEP_NO)
+    statementStep = StepRow(engine, STATEMENT_STEP_NO)
     assert statementStep["state"] == run_ledger.STEP_FAILED

@@ -246,6 +246,8 @@ AMOUNT_FIELDS = (
     "curr_cycle_credit",
     "curr_cycle_debit",
 )
+# An amount of an ACCOUNT-RECORD no READ filled: LOW-VALUES digits, shown as zero.
+UNREAD_ACCOUNT_AMOUNT = Decimal("0.00")
 # 3300-SETUP-SCREEN-ATTRS cursor order: field_errors are listed and the cursor placed in it.
 FIELD_ORDER = (
     (ACCOUNT_ID_FIELD, STATUS_FIELD)
@@ -1225,21 +1227,39 @@ def KeyErrorOutcome(keyText: str, message: str) -> ScreenOutcome:
     )
 
 
-def ReadFailureOutcome(readResult: AccountReadResult) -> ScreenOutcome:
-    """The screen of a 9000-READ-ACCT that left WS-RETURN-MSG set, before details are shown.
+def UnreadAccountRecord(acctId: str) -> dict[str, Any]:
+    """ACCOUNT-RECORD as 9500-STORE-FETCHED-DATA moves it after an ACCTDAT READ that failed.
 
-    The key is flagged when FLG-ACCTFILTER-NOT-OK is set. The source enters SHOW_DETAILS
-    whenever the customer is found even after an account NOTFND; that cannot happen here,
-    because ``xref.card_xref`` has foreign keys to both masters, so the state stays
-    DETAILS_NOT_FETCHED.
+    The failed READ never filled the record area, so the source moves into ACUP-OLD-* what the
+    area holds. The port gives it the empty record area's form, LOW-VALUES: blank texts, blank
+    dates and zero amounts. ACCT-ID is the key, which ACCTSIDO shows as CC-ACCT-ID.
     """
-    fieldErrors = () if readResult.acctFilterOk else (ACCOUNT_ID_FIELD,)
-    return ScreenOutcome(
-        NOT_FETCHED_STATE,
-        KeyScreenFields(readResult.acctId),
-        readResult.message,
-        readResult.httpStatus,
-        fieldErrors,
+    record: dict[str, Any] = {column: "" for column in ACCOUNT_TEXT_COLUMNS}
+    record[ACCOUNT_ID_FIELD] = acctId
+    record.update({column: UNREAD_ACCOUNT_AMOUNT for column in AMOUNT_FIELDS})
+    record.update({column: None for column in ACCOUNT_DATE_FIELDS})
+    return record
+
+
+def ReadFailureOutcome(readResult: AccountReadResult) -> ScreenOutcome:
+    """The screen of a 9000-READ-ACCT that left WS-RETURN-MSG set, with its message and status.
+
+    A NORMAL CUSTDAT read sets FOUND-CUST-IN-MASTER, and 2000 WHEN ACUP-DETAILS-NOT-FETCHED then
+    sets ACUP-SHOW-DETAILS (lines 2577-2578). A customer found after an ACCTDAT NOTFND or file
+    error therefore gives SHOW_DETAILS: 9500 stores the customer and the unread account
+    (UnreadAccountRecord), and 3202 shows them. Every other failure stays DETAILS_NOT_FETCHED
+    with the key alone. The key is flagged when FLG-ACCTFILTER-NOT-OK is set.
+    """
+    if readResult.customerFound:
+        unreadAccount = replace(readResult, account=UnreadAccountRecord(readResult.acctId))
+        shownOutcome = ShowDetailsOutcome(unreadAccount)
+    else:
+        shownOutcome = ScreenOutcome(NOT_FETCHED_STATE, KeyScreenFields(readResult.acctId))
+    return replace(
+        shownOutcome,
+        message=readResult.message,
+        httpStatus=readResult.httpStatus,
+        fieldErrors=() if readResult.acctFilterOk else (ACCOUNT_ID_FIELD,),
     )
 
 
@@ -1262,7 +1282,9 @@ async def FetchDetails(context: OnlineContext, keyText: str) -> AccountScreen:
     NO-SEARCH-CRITERIA-RECEIVED, so the answer is ``No input received``; anything but 11 digits,
     or all zeros, is ``Account Number if supplied must be a 11 digit Non-Zero Number``. Both
     are 400. A read failure answers with the chain's message: 404 for a NOTFND builder, 503 for
-    a file error, the batch-window CXACAIX literal included.
+    a file error, the batch-window CXACAIX literal included. It is sent in SHOW_DETAILS when the
+    customer was found after an ACCTDAT failure, and on the DETAILS_NOT_FETCHED key screen
+    otherwise (ReadFailureOutcome).
     """
     keyFlag = EditAccountField(keyText)[0]
     if keyFlag != FLAG_VALID:
@@ -1711,6 +1733,9 @@ async def FetchAccountForEdit(context: OnlineContext, acctId: str) -> AccountScr
     Raises:
         LegacyMessageError: 400 with the key edit literal, 404 with a not-found builder, or
             503 with the READ file-error text (the CXACAIX literal during the batch window).
+            An ACCTDAT not-found or file error with the customer found is raised in
+            SHOW_DETAILS, the customer shown and the account fields blank; every other
+            failure is raised on the DETAILS_NOT_FETCHED key screen.
     """
     return await FetchDetails(context, acctId)
 

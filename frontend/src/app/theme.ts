@@ -222,6 +222,42 @@ const NOTCH_LABEL_LETTER_SPACING = `calc(${LABEL_LETTER_SPACING} * ${LABEL_SCALE
 // The Select arrow sits 8 px in from the field's edge, inside the 32 px MUI keeps beside the value.
 const SELECT_ICON_INSET_UNITS = 2;
 
+// MUI's InputBase learns of browser autofill from the animationstart event of its input: a resting
+// input starts the cancel animation, an autofilled one the other, which marks the field filled so
+// its label shrinks. MUI tells the two apart by these exact animation names.
+const MUI_AUTO_FILL_ANIMATION = "mui-auto-fill";
+const MUI_AUTO_FILL_CANCEL_ANIMATION = "mui-auto-fill-cancel";
+
+/**
+ * MUI's own autofill animations on every InputBase input, which the outlined, filled and standard
+ * inputs build on. The theme restates them because it stops InputBase injecting their keyframes,
+ * and MUI drops these animations from any input that injects none.
+ */
+const AUTOFILL_DETECTION_INPUT_STYLE: CSSObject = {
+    animationName: MUI_AUTO_FILL_CANCEL_ANIMATION,
+    animationDuration: "10ms",
+    "&:-webkit-autofill": {
+        animationDuration: "5000s",
+        animationName: MUI_AUTO_FILL_ANIMATION,
+    },
+};
+
+/**
+ * The keyframes of MUI's two autofill animations, for Providers to insert once for the whole app.
+ * InputBase would insert its own copy on every mount, and the App Router Emotion cache records
+ * every such insert in the browser for good. As in MUI, each keyframe holds one declaration so
+ * Emotion's production build keeps it; browsers ignore animation properties inside keyframes, so
+ * nothing visibly animates.
+ */
+export const AUTOFILL_KEYFRAMES_STYLE: CSSObject = {
+    [`@keyframes ${MUI_AUTO_FILL_ANIMATION}`]: {
+        from: { animationName: MUI_AUTO_FILL_ANIMATION },
+    },
+    [`@keyframes ${MUI_AUTO_FILL_CANCEL_ANIMATION}`]: {
+        from: { animationName: MUI_AUTO_FILL_CANCEL_ANIMATION },
+    },
+};
+
 // Forced-colours mode drops fills and shadows, so the components that rely on them draw a 1 px
 // boundary in a CSS system colour instead, and a selected option takes the Highlight pair.
 const FORCED_COLORS_QUERY = "@media (forced-colors: active)";
@@ -845,6 +881,10 @@ export const CARD_DEMO_THEME = createTheme({
         MuiToggleButton: {
             defaultProps: NO_FOCUS_RIPPLE_PROPS,
             styleOverrides: { root: BuildSegmentStyle, sizeMedium: BuildMediumSegmentStyle },
+        },
+        MuiInputBase: {
+            defaultProps: { disableInjectingGlobalStyles: true },
+            styleOverrides: { input: AUTOFILL_DETECTION_INPUT_STYLE },
         },
         MuiTextField: { defaultProps: { variant: "outlined" } },
         MuiOutlinedInput: {

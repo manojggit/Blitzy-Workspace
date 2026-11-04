@@ -13,24 +13,47 @@ Specification, Sections 0.6.8 and 0.9.1):
   becomes LOST at the next command and blocks the cycle with exit 12 (catlg/LISTCAT.txt LIMIT 5
   SCRATCH bases, as the GDG archives of Section 0.6.8 replace them).
 
-Each test first runs chain steps 6, 13, 14 and 15 through the CLI on the seeded test database
-with the reconciliation clock frozen, so COMBTRAN reads the generations those steps published.
+- The sort streams: its result equals the oracle's stable sort even when an input is out of
+  TRAN-ID order (a SYSTRAN whose suffix wrapped at 999999), its memory does not grow with the
+  generations, and the load writes, decodes and inserts in one pass of bounded batches.
+- Publication order, pinned for every GDG producer since this module's setup runs all of them:
+  the COMMITTED catalog row is the final write of the producer's transaction, an fsync failure
+  as the generation closes rolls the run's completion back with everything else, and the
+  atomic producers (TRANBKP, COMBTRAN) leave publication to batch_chain, so a rename error after
+  the commit keeps the step COMPLETED and an unforced rerun skips it.
+
+Each CLI test first runs chain steps 6, 13, 14 and 15, or as many of them as its producer
+needs, through the CLI on the seeded test database with the reconciliation clock frozen, so
+COMBTRAN reads the generations those steps published.
 """
 
+import contextlib
+import errno
 import hashlib
 import itertools
+import tempfile
+import tracemalloc
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
+from types import ModuleType
+from unittest import mock
 
+import pytest
 from app.models import GDG_GENERATIONS, Transaction
-from sqlalchemy import delete, func, insert, select
+from sqlalchemy import Engine, delete, event, func, insert, select
 from sqlalchemy.engine import Connection, Row
 
+from batch.jobs import combtran, tranbkp
 from batch.orchestration import gdg
+from batch.orchestration.job_context import JobContext, JobResult
+from batch.orchestration.run_ledger import RUN_SKIPPED
 from batch.tests.conftest import (
     EXPECTED_DIR,
     BatchEnvironment,
     CliOutcome,
+    CountJobRuns,
     InvokeCli,
     StepRow,
     SyntheticTransactionRow,
@@ -63,6 +86,175 @@ DUPLICATE_KEY_TEXT = "DUPLICATE KEY"
 UNWRITTEN_FILE_SHA256 = hashlib.sha256(b"").hexdigest()
 NO_GENERATION_MESSAGE = "no PUBLISHED {baseName} generation was resolved"
 
+# A transaction inserted before any step runs, so the TRANBKP case archives a record.
+ARCHIVE_MARKER_TRAN_ID = "0000000000000001"
+INJECTED_PUBLICATION_MESSAGE = "injected rename failure"
+INJECTED_SYNC_MESSAGE = "injected fsync failure"
+TRAN_BACKUP_FIRST_ARGUMENTS = ("job", "tran-backup", "--occurrence", "1")
+TRAN_BACKUP_FIRST_STEP_NO = 6
+# No setup command, or all four of SetUpCommands: chain steps 6, 13, 14 and 15.
+NO_SET_UP_COMMANDS = 0
+ALL_SET_UP_COMMANDS = 4
+
+
+@dataclass(frozen=True)
+class AtomicProducerCase:
+    """An atomic GDG producer, run after the first setUpCount commands of SetUpCommands."""
+
+    setUpCount: int
+    arguments: tuple[str, ...]
+    stepNo: int
+    module: ModuleType
+    baseName: str
+
+
+@dataclass(frozen=True)
+class ProducerState:
+    """The step state, the newest catalog row's state and the counts a rerun must not change."""
+
+    stepState: str
+    generationState: str
+    catalogRowCount: int
+    transactionCount: int
+
+
+@dataclass(frozen=True)
+class ArchiveState:
+    """What a rolled-back producer leaves unchanged: its base's catalog and files, and TRANSACT."""
+
+    catalogRowCount: int
+    archiveFileNames: tuple[str, ...]
+    transactionCount: int
+
+
+# Statement capture of one command: transaction boundaries are recorded as these markers, and
+# the producer's final transaction must end with its catalog INSERT right before COMMIT.
+BEGIN_MARKER = "BEGIN"
+COMMIT_MARKER = "COMMIT"
+CATALOG_INSERT_PREFIX = "INSERT INTO batch.gdg_generations"
+RUN_COMPLETION_PREFIX = "UPDATE batch.job_runs"
+# The GDG producers by their position in SetUpCommands followed by COMBTRAN: chain steps 6
+# (TRANSACT.BKUP), 13 (DALYREJS), 14 (SYSTRAN) and 16 (TRANSACT.COMBINED).
+FINAL_WRITE_CASES = (
+    pytest.param(0, id="tran-backup"),
+    pytest.param(1, id="post-tran"),
+    pytest.param(2, id="interest-calc"),
+    pytest.param(ALL_SET_UP_COMMANDS, id="comb-tran"),
+)
+
+ATOMIC_PRODUCER_CASES = (
+    pytest.param(
+        AtomicProducerCase(
+            NO_SET_UP_COMMANDS,
+            TRAN_BACKUP_FIRST_ARGUMENTS,
+            TRAN_BACKUP_FIRST_STEP_NO,
+            tranbkp,
+            BKUP_BASE_NAME,
+        ),
+        id="tran-backup",
+    ),
+    pytest.param(
+        AtomicProducerCase(
+            ALL_SET_UP_COMMANDS, COMB_TRAN_ARGUMENTS, COMBTRAN_STEP_NO, combtran, COMBINED_BASE_NAME
+        ),
+        id="comb-tran",
+    ),
+)
+
+
+# --- Streamed STEP05R merge ------------------------------------------------------------------
+# Synthetic SORTIN records: the TRAN-ID, then a tag naming the input and the record's position
+# in it, padded with spaces to LRECL 350, so equal keys stay distinguishable.
+BKUP_TAG = "BKUP"
+SYSTRAN_TAG = "SYST"
+SYNTHETIC_GENERATION_NUMBER = 1
+SYNTHETIC_FILE_TEMPLATE = "{baseName}.dat"
+SPILL_ROOT_NAME = "spill"
+INPUT_DIRECTORY_TEMPLATE = "inputs-{recordCount}"
+# The parity cases spill runs of two records, merged two at a time, so even five records take
+# more than one merge pass.
+TINY_RUN_RECORD_COUNT = 2
+TINY_MERGE_FAN_IN = 2
+# The memory cases: inputs ten times the size of the first ones, runs of 500 merged 8 at a time,
+# and the most the traced peak may grow between them, far below the 14 MB or so that the 36,000
+# extra records would add held whole.
+SMALL_INPUT_RECORD_COUNT = 2_000
+LARGE_INPUT_RECORD_COUNT = 20_000
+MEMORY_RUN_RECORD_COUNT = 500
+MEMORY_MERGE_FAN_IN = 8
+MERGE_PEAK_GROWTH_LIMIT = 1024 * 1024
+# INTCALC's TRAN-ID: PARM-DATE 2022071800, then WS-TRANID-SUFFIX 9(06), which wraps to 000000.
+INTEREST_TRAN_ID_PREFIX = "2022071800"
+TRANID_SUFFIX_MODULUS = 10**6
+# The one-pass load case: an insert batch of seven rows over the fixture's records.
+SMALL_INSERT_BATCH_SIZE = 7
+
+
+@dataclass(frozen=True)
+class MergeCase:
+    """Two SORTIN inputs by TRAN-ID, and whether one is out of order, so the merge spills it."""
+
+    bkupTranIds: tuple[str, ...]
+    systranTranIds: tuple[str, ...]
+    spills: bool
+
+
+MERGE_CASES = (
+    pytest.param(
+        MergeCase(
+            ("0000000000000005", "2022071800000001", "2022071800000003"),
+            ("2022071800000001", "2022071800000002", "2022071800000003"),
+            False,
+        ),
+        id="ordered-inputs-tied-across-inputs",
+    ),
+    pytest.param(
+        MergeCase(
+            ("2022071800000001", "2022071800999999"),
+            (
+                "2022071800999997",
+                "2022071800999998",
+                "2022071800999999",
+                "2022071800000000",
+                "2022071800000001",
+            ),
+            True,
+        ),
+        id="systran-suffix-wraps-at-999999",
+    ),
+    pytest.param(
+        MergeCase(
+            (
+                "2022071800000002",
+                "A000000000000001",
+                "2022071800000002",
+                "a000000000000001",
+                "0000000000000009",
+            ),
+            ("2022071800000002",),
+            True,
+        ),
+        id="backup-out-of-order-with-equal-keys",
+    ),
+)
+MEMORY_CASES = (
+    pytest.param(False, id="inputs-in-order"),
+    pytest.param(True, id="systran-suffix-wrapped"),
+)
+
+
+class RecordingWriter:
+    """Stands in for gdg.GenerationWriter: keeps and counts every record written to it."""
+
+    def __init__(self) -> None:
+        self.records: list[str] = []
+        self.recordCount = 0
+
+    def WriteRecord(self, record: str) -> None:
+        """Keep one record and count it, as GenerationWriter numbers the records it writes."""
+        self.records.append(record)
+        self.recordCount += 1
+
 
 def SetUpCommands(asOfText: str) -> tuple[tuple[tuple[str, ...], int], ...]:
     """Return chain steps 6, 13, 14 and 15 as CLI arguments, each with the exit status it gives.
@@ -77,15 +269,72 @@ def SetUpCommands(asOfText: str) -> tuple[tuple[tuple[str, ...], int], ...]:
     )
 
 
+def RunSetUpCommands(batchEnvironment: BatchEnvironment, commandCount: int) -> None:
+    """Run the first commandCount commands of SetUpCommands through the CLI, checking each."""
+    for arguments, expectedExitCode in SetUpCommands(batchEnvironment.asOfText)[:commandCount]:
+        outcome = InvokeCli(arguments)
+        assert outcome.exitCode == expectedExitCode, outcome.output
+
+
 def RunChainThroughSecondBackup(batchEnvironment: BatchEnvironment) -> None:
     """Run chain steps 6, 13, 14 and 15 in order through the CLI, asserting each exit status.
 
     COMBTRAN's inputs are then the PUBLISHED TRANSACT.BKUP(0) of step 15 and SYSTRAN(0) of step
     14, and transactions.transactions is empty.
     """
-    for arguments, expectedExitCode in SetUpCommands(batchEnvironment.asOfText):
-        outcome = InvokeCli(arguments)
-        assert outcome.exitCode == expectedExitCode, outcome.output
+    RunSetUpCommands(batchEnvironment, ALL_SET_UP_COMMANDS)
+
+
+def ProducerCommands(asOfText: str) -> tuple[tuple[tuple[str, ...], int], ...]:
+    """Return SetUpCommands followed by COMBTRAN, each with the exit status it gives."""
+    return (*SetUpCommands(asOfText), (COMB_TRAN_ARGUMENTS, legacy_oracle.EXIT_OK))
+
+
+@contextlib.contextmanager
+def CapturedStatements() -> Iterator[list[tuple[Connection, str]]]:
+    """Record every engine's BEGIN, statement and COMMIT, in order, with its connection."""
+    events: list[tuple[Connection, str]] = []
+
+    def RecordBegin(connection: Connection) -> None:
+        events.append((connection, BEGIN_MARKER))
+
+    def RecordStatement(**eventArguments: object) -> None:
+        events.append((eventArguments["conn"], eventArguments["statement"]))
+
+    def RecordCommit(connection: Connection) -> None:
+        events.append((connection, COMMIT_MARKER))
+
+    event.listen(Engine, "begin", RecordBegin)
+    event.listen(Engine, "before_cursor_execute", RecordStatement, named=True)
+    event.listen(Engine, "commit", RecordCommit)
+    try:
+        yield events
+    finally:
+        event.remove(Engine, "begin", RecordBegin)
+        event.remove(Engine, "before_cursor_execute", RecordStatement)
+        event.remove(Engine, "commit", RecordCommit)
+
+
+def CatalogInsertTransaction(events: list[tuple[Connection, str]]) -> list[str]:
+    """Return, from BEGIN to COMMIT, the transaction holding the command's one catalog INSERT."""
+    (insertIndex,) = [
+        index
+        for index, (connection, statement) in enumerate(events)
+        if statement.startswith(CATALOG_INSERT_PREFIX)
+    ]
+    owner = events[insertIndex][0]
+    ownerEvents = [
+        (index, statement)
+        for index, (connection, statement) in enumerate(events)
+        if connection is owner
+    ]
+    beginIndex = max(
+        index for index, text in ownerEvents if text == BEGIN_MARKER and index < insertIndex
+    )
+    commitIndex = min(
+        index for index, text in ownerEvents if text == COMMIT_MARKER and index > insertIndex
+    )
+    return [text for index, text in ownerEvents if beginIndex <= index <= commitIndex]
 
 
 def RunCombtranJob() -> CliOutcome:
@@ -209,6 +458,155 @@ def LostSystranBlockMessage(batchEnvironment: BatchEnvironment, generation: int)
     )
 
 
+def ReadProducerState(
+    batchEnvironment: BatchEnvironment, case: AtomicProducerCase
+) -> ProducerState:
+    """Return the producer's step state, its base's newest row state and the guarded counts."""
+    with batchEnvironment.engine.connect() as connection:
+        transactionCount = CountTransactions(connection)
+    return ProducerState(
+        stepState=StepRow(batchEnvironment.engine, case.stepNo)["state"],
+        generationState=NewestCatalogRow(batchEnvironment, case.baseName).state,
+        catalogRowCount=CountCatalogRows(batchEnvironment, case.baseName),
+        transactionCount=transactionCount,
+    )
+
+
+def ReadArchiveState(batchEnvironment: BatchEnvironment, baseName: str) -> ArchiveState:
+    """Return baseName's catalog row count and archive file names, and the TRANSACT row count."""
+    with batchEnvironment.engine.connect() as connection:
+        transactionCount = CountTransactions(connection)
+    return ArchiveState(
+        catalogRowCount=CountCatalogRows(batchEnvironment, baseName),
+        archiveFileNames=tuple(ListArchiveFiles(batchEnvironment, baseName)),
+        transactionCount=transactionCount,
+    )
+
+
+def FailGenerationSync(monkeypatch: pytest.MonkeyPatch, baseName: str) -> None:
+    """Make the fsync that closes a new baseName generation raise EIO, as a full disk can."""
+    originalSync = gdg.SyncAndClose
+
+    def SyncOrFail(writer: gdg.GenerationWriter) -> None:
+        if writer.base.name == baseName:
+            raise OSError(errno.EIO, INJECTED_SYNC_MESSAGE)
+        originalSync(writer)
+
+    monkeypatch.setattr(gdg, "SyncAndClose", SyncOrFail)
+
+
+def FailPublication(monkeypatch: pytest.MonkeyPatch, baseName: str) -> None:
+    """Make every rename of a baseName generation into place raise EIO, as os.replace can."""
+    originalPlace = gdg.PlaceGenerationFile
+
+    def PlaceOrFail(finalPath: Path, expectedSha256: str) -> str:
+        if finalPath.parent.name == baseName:
+            raise OSError(errno.EIO, INJECTED_PUBLICATION_MESSAGE, str(finalPath))
+        return originalPlace(finalPath, expectedSha256)
+
+    monkeypatch.setattr(gdg, "PlaceGenerationFile", PlaceOrFail)
+
+
+def ObserveStateOnReturn(
+    monkeypatch: pytest.MonkeyPatch,
+    batchEnvironment: BatchEnvironment,
+    case: AtomicProducerCase,
+    observedStates: list[str],
+) -> None:
+    """Wrap the producer's RunJob to record its base's newest catalog row state as it returns."""
+    originalRunJob = case.module.RunJob
+
+    def ObservingRunJob(context: JobContext) -> JobResult:
+        result = originalRunJob(context)
+        observedStates.append(NewestCatalogRow(batchEnvironment, case.baseName).state)
+        return result
+
+    monkeypatch.setattr(case.module, "RunJob", ObservingRunJob)
+
+
+def RunWithFailingPublication(
+    batchEnvironment: BatchEnvironment, case: AtomicProducerCase
+) -> tuple[list[str], CliOutcome]:
+    """Run the producer while its generation cannot be renamed into place.
+
+    Returns the catalog state its RunJob left on returning, empty when it raised, and the outcome.
+    """
+    observedStates: list[str] = []
+    with pytest.MonkeyPatch.context() as failurePatch:
+        ObserveStateOnReturn(failurePatch, batchEnvironment, case, observedStates)
+        FailPublication(failurePatch, case.baseName)
+        outcome = InvokeCli(case.arguments)
+    return observedStates, outcome
+
+
+def SyntheticRecords(tranIds: Iterable[str], inputTag: str) -> list[str]:
+    """Return one LRECL 350 record per TRAN-ID, tagged with its input and 1-based position."""
+    return [
+        f"{tranId}{inputTag}{position:06d}".ljust(legacy_oracle.TRANSACTION_LRECL)
+        for position, tranId in enumerate(tranIds, start=1)
+    ]
+
+
+def SyntheticGeneration(
+    directory: Path, base: gdg.GdgBase, records: Sequence[str]
+) -> gdg.Generation:
+    """Write records as a generation file of base under directory; return it as resolved."""
+    path = directory / SYNTHETIC_FILE_TEMPLATE.format(baseName=base.name)
+    with path.open("wb") as generationFile:
+        for record in records:
+            generationFile.write(record.encode(gdg.GDG_FILE_ENCODING) + gdg.RECORD_TERMINATOR)
+    return gdg.Generation(
+        baseName=base.name,
+        generation=SYNTHETIC_GENERATION_NUMBER,
+        path=path,
+        recordCount=len(records),
+        sha256=gdg.FileSha256(path),
+        state=gdg.GDG_PUBLISHED,
+    )
+
+
+def UseExternalSort(
+    monkeypatch: pytest.MonkeyPatch, spillRoot: Path, runRecordCount: int, mergeFanIn: int
+) -> None:
+    """Make COMBTRAN spill runs of runRecordCount under spillRoot, merged mergeFanIn at a time."""
+    spillRoot.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(spillRoot))
+    monkeypatch.setattr(combtran, "SORT_RUN_RECORD_COUNT", runRecordCount)
+    monkeypatch.setattr(combtran, "MERGE_FAN_IN", mergeFanIn)
+
+
+def InterestTranIds(recordCount: int, wrapped: bool) -> list[str]:
+    """Return INTCALC TRAN-IDs in write order: from suffix 000001, or wrapping at 999999 halfway."""
+    firstSuffix = TRANID_SUFFIX_MODULUS - recordCount // 2 if wrapped else 1
+    return [
+        f"{INTEREST_TRAN_ID_PREFIX}{(firstSuffix + index) % TRANID_SUFFIX_MODULUS:06d}"
+        for index in range(recordCount)
+    ]
+
+
+def MeasureMerge(directory: Path, recordCount: int, wrapped: bool) -> tuple[int, int]:
+    """Merge a recordCount-record BKUP and SYSTRAN under tracemalloc, keeping no record.
+
+    The BKUP TRAN-IDs ascend; the SYSTRAN ones ascend, or wrap at 999999 halfway. Returns the
+    traced peak in bytes and the number of records merged.
+    """
+    directory.mkdir()
+    bkupTranIds = [f"{index:016d}" for index in range(recordCount)]
+    systranTranIds = InterestTranIds(recordCount, wrapped)
+    inputGenerations = (
+        SyntheticGeneration(directory, gdg.TRANSACT_BKUP, SyntheticRecords(bkupTranIds, BKUP_TAG)),
+        SyntheticGeneration(directory, gdg.SYSTRAN, SyntheticRecords(systranTranIds, SYSTRAN_TAG)),
+    )
+    tracemalloc.start()
+    try:
+        with contextlib.ExitStack() as cleanup:
+            mergedCount = sum(1 for record in combtran.MergedRecords(inputGenerations, cleanup))
+        peakBytes = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    return peakBytes, mergedCount
+
+
 def test_combined_generation_equals_expected_fixture(batchEnvironment: BatchEnvironment) -> None:
     """STEP05R: COMBINED(+1) equals combtran_combined.dat byte for byte, terminators removed."""
     RunChainThroughSecondBackup(batchEnvironment)
@@ -323,3 +721,146 @@ def test_combtran_resolves_only_published_generations(batchEnvironment: BatchEnv
     assert NewestCatalogRow(batchEnvironment, SYSTRAN_BASE_NAME).state == gdg.GDG_LOST
     assert CountCatalogRows(batchEnvironment, COMBINED_BASE_NAME) == 0
     assert StepRow(batchEnvironment.engine, COMBTRAN_STEP_NO)["state"] == STEP_PENDING_STATE
+
+
+@pytest.mark.parametrize("producerPosition", FINAL_WRITE_CASES)
+def test_committed_catalog_row_is_the_final_write_of_each_producer(
+    batchEnvironment: BatchEnvironment, producerPosition: int
+) -> None:
+    """The producer's final transaction completes the run, inserts COMMITTED and commits.
+
+    The catalog INSERT is the last statement before COMMIT, and the run's completion precedes
+    it in the same transaction (Technical Specification 0.6.8 "Publication", 0.7.2).
+    """
+    RunSetUpCommands(batchEnvironment, producerPosition)
+    arguments, expectedExitCode = ProducerCommands(batchEnvironment.asOfText)[producerPosition]
+    with CapturedStatements() as events:
+        outcome = InvokeCli(arguments)
+    assert outcome.exitCode == expectedExitCode, outcome.output
+    statements = CatalogInsertTransaction(events)
+    assert statements[-1] == COMMIT_MARKER
+    assert statements[-2].startswith(CATALOG_INSERT_PREFIX), statements
+    completions = [text for text in statements[:-2] if text.startswith(RUN_COMPLETION_PREFIX)]
+    assert len(completions) == 1, statements
+
+
+@pytest.mark.parametrize("case", ATOMIC_PRODUCER_CASES)
+def test_failed_fsync_closing_the_generation_rolls_back_the_run_completion(
+    batchEnvironment: BatchEnvironment, case: AtomicProducerCase
+) -> None:
+    """An fsync error as the generation closes, after the run's completion, fails the step.
+
+    The completion, the step's writes and the catalog row roll back together and the .part file
+    is deleted: exit 12, the step FAILED, and the catalog, archive files and TRANSACT unchanged.
+    """
+    InsertTransaction(batchEnvironment, ARCHIVE_MARKER_TRAN_ID)
+    RunSetUpCommands(batchEnvironment, case.setUpCount)
+    stateBefore = ReadArchiveState(batchEnvironment, case.baseName)
+    with pytest.MonkeyPatch.context() as failurePatch:
+        FailGenerationSync(failurePatch, case.baseName)
+        outcome = InvokeCli(case.arguments)
+    assert outcome.exitCode == legacy_oracle.EXIT_UTILITY_FAILURE, outcome.output
+    assert ReadArchiveState(batchEnvironment, case.baseName) == stateBefore
+    assert StepRow(batchEnvironment.engine, case.stepNo)["state"] == STEP_FAILED_STATE
+
+
+@pytest.mark.parametrize("case", ATOMIC_PRODUCER_CASES)
+def test_publication_error_after_commit_keeps_step_completed_and_rerun_skips(
+    batchEnvironment: BatchEnvironment, case: AtomicProducerCase
+) -> None:
+    """The runner returns with its generation COMMITTED, so a rename error never demotes it.
+
+    The step stays COMPLETED; the unforced rerun records SKIPPED and its ReconcileCatalog
+    publishes the generation, with no second generation and no repeated delete or insert.
+    """
+    InsertTransaction(batchEnvironment, ARCHIVE_MARKER_TRAN_ID)
+    RunSetUpCommands(batchEnvironment, case.setUpCount)
+    observedStates, failedOutcome = RunWithFailingPublication(batchEnvironment, case)
+    stateAfterFailure = ReadProducerState(batchEnvironment, case)
+    rerunOutcome = InvokeCli(case.arguments)
+    assert observedStates == [gdg.GDG_COMMITTED], failedOutcome.output
+    assert stateAfterFailure.stepState == STEP_COMPLETED_STATE, failedOutcome.output
+    assert stateAfterFailure.generationState == gdg.GDG_COMMITTED, failedOutcome.output
+    assert rerunOutcome.exitCode == legacy_oracle.EXIT_OK, rerunOutcome.output
+    publishedState = replace(stateAfterFailure, generationState=gdg.GDG_PUBLISHED)
+    assert ReadProducerState(batchEnvironment, case) == publishedState
+    assert CountJobRuns(batchEnvironment.engine, case.stepNo, RUN_SKIPPED) == 1
+
+
+@pytest.mark.parametrize("case", MERGE_CASES)
+def test_streamed_merge_equals_the_stable_sort_of_the_concatenation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: MergeCase
+) -> None:
+    """STEP05R: the streamed merge equals the oracle's stable sort of BKUP(0) then SYSTRAN(0).
+
+    Equal keys keep BKUP before SYSTRAN and their order within an input. An input out of order,
+    such as a SYSTRAN whose suffix wrapped at 999999, is sorted through spilled runs over more
+    than one merge pass, and the spill directory is removed once the merge is closed.
+    """
+    spillRoot = tmp_path / SPILL_ROOT_NAME
+    UseExternalSort(monkeypatch, spillRoot, TINY_RUN_RECORD_COUNT, TINY_MERGE_FAN_IN)
+    bkupRecords = SyntheticRecords(case.bkupTranIds, BKUP_TAG)
+    systranRecords = SyntheticRecords(case.systranTranIds, SYSTRAN_TAG)
+    inputGenerations = (
+        SyntheticGeneration(tmp_path, gdg.TRANSACT_BKUP, bkupRecords),
+        SyntheticGeneration(tmp_path, gdg.SYSTRAN, systranRecords),
+    )
+    with contextlib.ExitStack() as cleanup:
+        mergedRecords = list(combtran.MergedRecords(inputGenerations, cleanup))
+        spilled = any(spillRoot.iterdir())
+    assert mergedRecords == legacy_oracle.RunCombtran(bkupRecords, systranRecords)
+    assert spilled == case.spills
+    assert list(spillRoot.iterdir()) == []
+
+
+@pytest.mark.parametrize("wrapped", MEMORY_CASES)
+def test_merge_memory_does_not_grow_with_the_generations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wrapped: bool
+) -> None:
+    """The merge holds a bounded number of records, whatever the size of its two inputs.
+
+    Inputs ten times larger raise the traced peak by less than MERGE_PEAK_GROWTH_LIMIT, both
+    when they stream from their files and when the wrapped SYSTRAN goes through spilled runs.
+    """
+    spillRoot = tmp_path / SPILL_ROOT_NAME
+    UseExternalSort(monkeypatch, spillRoot, MEMORY_RUN_RECORD_COUNT, MEMORY_MERGE_FAN_IN)
+    smallDirectory = tmp_path / INPUT_DIRECTORY_TEMPLATE.format(
+        recordCount=SMALL_INPUT_RECORD_COUNT
+    )
+    largeDirectory = tmp_path / INPUT_DIRECTORY_TEMPLATE.format(
+        recordCount=LARGE_INPUT_RECORD_COUNT
+    )
+    smallPeak, smallCount = MeasureMerge(smallDirectory, SMALL_INPUT_RECORD_COUNT, wrapped)
+    largePeak, largeCount = MeasureMerge(largeDirectory, LARGE_INPUT_RECORD_COUNT, wrapped)
+    assert (smallCount, largeCount) == (2 * SMALL_INPUT_RECORD_COUNT, 2 * LARGE_INPUT_RECORD_COUNT)
+    assert largePeak - smallPeak < MERGE_PEAK_GROWTH_LIMIT, (smallPeak, largePeak)
+    assert list(spillRoot.iterdir()) == []
+
+
+def test_load_writes_decodes_and_inserts_the_merge_in_one_bounded_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """STEP05R SORTOUT and STEP10 REPRO consume the merged stream once, a batch at a time.
+
+    Each insert carries at most INSERT_BATCH_SIZE rows, comes right after its records are
+    written, and the rows follow the records in file order, so no record is held beyond one
+    batch and the stream is never traversed twice.
+    """
+    monkeypatch.setattr(combtran, "INSERT_BATCH_SIZE", SMALL_INSERT_BATCH_SIZE)
+    fixtureRecords = compare.ReadFixedWidthRecords(COMBINED_FIXTURE)
+    writer = RecordingWriter()
+    insertedBatches: list[tuple[int, list[str]]] = []
+
+    def RecordInsert(statement: object, transactionRows: list[dict[str, object]]) -> None:
+        tranIds = [transactionRow["tran_id"] for transactionRow in transactionRows]
+        insertedBatches.append((writer.recordCount, tranIds))
+
+    connection = mock.Mock(spec=Connection)
+    connection.execute.side_effect = RecordInsert
+    combtran.LoadMergedRecords(connection, writer, iter(fixtureRecords))
+    insertedTranIds = [tranId for writtenCount, tranIds in insertedBatches for tranId in tranIds]
+    insertedCounts = list(itertools.accumulate(len(tranIds) for _, tranIds in insertedBatches))
+    assert writer.records == fixtureRecords
+    assert insertedTranIds == [record[legacy_oracle.TRAN_ID_SLICE] for record in fixtureRecords]
+    assert [writtenCount for writtenCount, _ in insertedBatches] == insertedCounts
+    assert max(len(tranIds) for _, tranIds in insertedBatches) == SMALL_INSERT_BATCH_SIZE

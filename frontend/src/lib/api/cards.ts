@@ -34,14 +34,14 @@ export const PROMPT_FOR_KEYS_INFO = "Please enter Account and Card Number";
 // array items are sent without axios's default "[]" suffix; blank items are kept.
 const REPEATED_PARAMS_SERIALIZER = { indexes: null };
 
-// The GET /cards query (COCRDLI). Without a direction it is ENTER or the first entry, re-reading
-// the page from startKey; F7 and F8 send the shown page's first_key or last_key as startKey, an
-// opaque token rather than a card number.
+// The GET /cards query (COCRDLI). Without a direction (omitted or null, which axios does not send)
+// it is ENTER or the first entry, re-reading the page from startKey; F7 and F8 send the shown
+// page's first_key or last_key as startKey, an opaque token rather than a card number.
 export interface CardListQuery {
     acctId?: string;
     cardNum?: string;
     startKey?: string;
-    direction?: Direction;
+    direction?: Direction | null;
     page?: number;
     // The CRDSEL1-7 code of every row shown, in row order and blank ("") where none was keyed.
     // The server edits them before paging and never transfers on this call.

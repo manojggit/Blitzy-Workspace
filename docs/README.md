@@ -145,7 +145,8 @@ SECRET_KEY=SECRET_KEY_VALUE
 Replace `SECRET_KEY_VALUE` with the 64-character hexadecimal string that `openssl` printed. The
 key must be at least 32 characters long: the backend refuses to start while `SECRET_KEY` is blank
 or shorter. Batch and Alembic do not need it. Every other value in the template works as it stands
-for local development, and `backend/.env.example` documents each variable.
+for local development. [Configuration reference](#configuration-reference) describes every
+variable.
 
 To create the frontend environment file:
 
@@ -157,19 +158,132 @@ cp frontend/.env.local.example frontend/.env.local
 with no `/api/v1` path; the API client appends it. Next.js inlines the value into the browser
 bundle when the frontend is built, so a change takes effect only after a rebuild.
 
-Both templates already carry the `127.0.0.1` URLs. The data and output directories in
-`backend/.env` are relative paths, which resolve against the repository root from any working
-directory:
+Both templates already carry the `127.0.0.1` URLs.
 
-| Variable | Default | Content |
-|---|---|---|
-| `CARDDEMO_EBCDIC_DIR` | `data/EBCDIC` | EBCDIC seed images for the seed and the loaders |
-| `CARDDEMO_ASCII_DIR` | `data/ASCII` | ASCII seed images for loaders run with `--encoding ascii` |
-| `CARDDEMO_OUTPUT_DIR` | `var/batch-output` | Batch GDG archives and statements; git-ignored |
+### Configuration reference
 
-`APP_ENV` is `local` in the template. The test suites set `test`. `production` makes the session
-cookie `Secure`, turns the API documentation off unless `ENABLE_API_DOCS` is true, skips the
-sample-data seed and refuses `carddemo-batch load init-users`.
+The backend, Alembic and the batch CLI take each variable from the process environment first,
+then from `backend/.env`, then from the default listed here. They find `backend/.env` from any
+working directory; where the file is absent, as in the containers, the environment alone applies.
+An empty value, such as `SECRET_KEY=`, counts as unset, so the next source supplies the variable.
+Names are case-sensitive, and a name that no component reads is ignored. A value outside the
+accepted values listed here stops the component that reads it: the backend refuses to start,
+Alembic stops before it migrates, and a batch command exits with status 12.
+
+#### Shared settings
+
+The backend, Alembic and the batch CLI read these variables:
+
+- `APP_ENV`: `local`, `test` or `production`; default `local`. The template sets `local`, and
+    the test suites set `test`. `production` makes the session cookie `Secure`, turns the API
+    documentation off unless `ENABLE_API_DOCS` is `true`, makes revision `0002` load no sample
+    data, and makes `carddemo-batch load init-users` exit with status 12.
+- `SYNC_DATABASE_URL`: a SQLAlchemy URL with the driver `postgresql+psycopg2`; required, with no
+    default. Alembic and the batch CLI connect with it. The backend connects through
+    `DATABASE_URL` but also refuses to start without this one. Only offline SQL generation,
+    `alembic upgrade head --sql`, runs without it. The two database URLs in the template, with
+    their local example credentials, are example values, not defaults.
+- `BCRYPT_ROUNDS`: an integer from 4 to 31; default `12`. The bcrypt cost of the password hashes
+    that the admin user add and update (CU01, CU02), revision `0002` and the `init-users` loader
+    write. Each stored hash keeps the cost it was written with.
+
+#### Backend settings
+
+Only the backend reads these variables:
+
+- `DATABASE_URL`: a SQLAlchemy URL with the driver `postgresql+asyncpg`; required, with no
+    default. The database connection of the API.
+- `SECRET_KEY`: a string of at least 32 characters, not counting leading and trailing spaces;
+    required. The default is blank, and the backend refuses to start while the key is blank or
+    shorter. The key signs the session cookie and derives the keys of the `card_ref` and
+    `screen_token` navigation tokens, so changing it ends every session.
+- `ACCESS_TOKEN_EXPIRE_MINUTES`: an integer greater than 0; default `60`. The session lifetime
+    in minutes: the expiry of the session token, the `Max-Age` of its cookie and the lifetime of
+    the navigation tokens.
+- `SESSION_COOKIE_NAME`: a cookie name; default `carddemo_session`. The name of the HttpOnly
+    session cookie.
+- `LOGIN_MAX_ATTEMPTS`: an integer from 1 to 32767; default `5`. The number of failed sign-ons
+    that locks a user ID.
+- `LOGIN_LOCKOUT_SECONDS`: an integer greater than 0; default `900`. How long, in seconds, a
+    locked user ID stays locked.
+- `BACKEND_CORS_ORIGINS`: a comma-separated list of origins; default `http://127.0.0.1:3000`.
+    The listed origins may call the API from a browser with the session cookie, and the CSRF
+    guard refuses a `POST`, `PUT` or `DELETE` other than sign-on whose `Origin` header is not
+    one of them. Each entry must be the exact text a browser sends as `Origin`: a lower-case
+    `http` or `https` scheme, the host, and a port from 1 to 65535 with no leading zero, left out
+    when it is the scheme's default. An entry has no path, trailing slash or wildcard, and an
+    IPv6 host is in compressed form inside brackets. The backend refuses to start when the list
+    has no entry or an entry in any other form.
+- `DB_CONNECT_TIMEOUT_SECONDS`: a finite number greater than 0; default `10`. The seconds the
+    API waits for a new database connection.
+- `DB_COMMAND_TIMEOUT_SECONDS`: a finite number greater than 0; default `30`. The seconds one
+    database statement of the API may run.
+- `HEALTH_READY_TIMEOUT_SECONDS`: a finite number greater than 0; default `2`. The seconds the
+    `SELECT 1` of `GET /health/ready` may take before the probe answers with status 503.
+- `ENABLE_API_DOCS`: `true` or `false`; unset by default. `true` serves `/docs`, `/redoc` and
+    `/openapi.json` in every environment, `production` included, and `false` makes all three
+    answer with status 404 in every environment. While it is unset, as in the template, they
+    are served unless `APP_ENV` is `production`.
+
+#### Directory settings
+
+Each directory variable takes a path. A relative path resolves against the repository root,
+never the working directory, and an absolute path is used unchanged:
+
+- `CARDDEMO_EBCDIC_DIR`: default `data/EBCDIC`. The EBCDIC seed images that revision `0002` and
+    the batch loaders read.
+- `CARDDEMO_ASCII_DIR`: default `data/ASCII`. The ASCII seed images that the batch loaders read
+    when they run with `--encoding ascii`.
+- `CARDDEMO_OUTPUT_DIR`: default `var/batch-output`, which is git-ignored. The batch CLI writes
+    the GDG archives under `gdg/` and the statements under `statements/` there; the backend does
+    not read it.
+
+#### Frontend settings
+
+The frontend reads one variable:
+
+- `NEXT_PUBLIC_API_URL`: the backend origin, `scheme://host[:port]` over `http` or `https`, with
+    no path, user name, query or fragment; required, with no default. `npm run build` and
+    `npm run dev` read it from the environment, or else from `frontend/.env.local`, and refuse
+    to run while it is unset, blank or not an origin. The template sets
+    `http://127.0.0.1:8000`, and the `frontend` image takes it as a build argument. The value
+    ships in the browser bundle, so it must never carry a secret.
+
+#### Compose settings
+
+`docker-compose.yml` reads these variables from the shell environment, never from
+`backend/.env`:
+
+- `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB`: strings; each defaults to `carddemo`.
+    They name the role, its password and the database that the `db` service creates on a new
+    `pgdata` volume. The `full` profile writes them into the `DATABASE_URL` and
+    `SYNC_DATABASE_URL` it gives the `migrator` and `backend` containers, with the host `db` and
+    port 5432. Compose inserts them into the URLs unencoded, so with the `full` profile each
+    value may use only letters, digits, `-`, `.`, `_` and `~`. Keep the database URLs in
+    `backend/.env` in step with them.
+
+The `full` profile passes `backend/.env` to the `migrator` and `backend` containers and
+overrides some of its values. `DATABASE_URL` and `SYNC_DATABASE_URL` name the host `db`, and
+`CARDDEMO_EBCDIC_DIR` and `CARDDEMO_ASCII_DIR` name the read-only `/app/data` mount. The
+`backend` container also gets `BACKEND_CORS_ORIGINS=http://127.0.0.1:3000` and
+`CARDDEMO_OUTPUT_DIR=/srv/var/batch-output`, which is mounted from `var/batch-output`.
+
+#### Test settings
+
+The backend and batch test suites read these variables from the process environment, or else
+from `backend/.env`:
+
+- `TEST_DATABASE_URL`: an async URL in the form of `DATABASE_URL`; default `DATABASE_URL` with
+    the database renamed `carddemo_test`. The test database of the backend suite.
+- `TEST_SYNC_DATABASE_URL`: a sync URL in the form of `SYNC_DATABASE_URL`; default
+    `SYNC_DATABASE_URL` with the database renamed `carddemo_test`. The test database of both
+    suites.
+
+Both suites refuse a database whose name does not end in `_test`, and the backend suite also
+refuses two URLs that reach different databases. For their run, both suites set `APP_ENV` to
+`test` and override `BCRYPT_ROUNDS`; the backend suite also generates its own `SECRET_KEY` and
+overrides `BACKEND_CORS_ORIGINS`. The Playwright variables are in `frontend/.env.e2e`, described
+in [End to end](#end-to-end).
 
 ## Start the database
 
@@ -232,7 +346,9 @@ tables hold these rows:
 | `transactions.daily_transactions` | 300 |
 | `transactions.transactions` | 0 |
 
-`transactions.transactions` stays empty until the batch chain posts the daily file. The reasons
+`transactions.transactions` is empty right after seeding. Rows are then added online by the CT02
+transaction add (`POST /api/v1/transactions`) and the CB00 bill payment (`POST /api/v1/billpay`),
+and by POSTTRAN, which posts the daily file in `run-all` or alone as `job post-tran`. The reasons
 for each count are in [Expected rows after migration](data-model.md#expected-rows-after-migration).
 
 To count the rows of one table, here `accounts.accounts`:
@@ -258,8 +374,12 @@ cd backend
 ```
 
 The API is served under `http://127.0.0.1:8000/api/v1`, and the health probes at `/health` and
-`/health/ready`. While `APP_ENV` is not `production`, the interactive API documentation is at
-`http://127.0.0.1:8000/docs` and `http://127.0.0.1:8000/redoc`.
+`/health/ready`. With the template's settings, the interactive API documentation is at
+`http://127.0.0.1:8000/docs` and `http://127.0.0.1:8000/redoc`, and the OpenAPI document at
+`http://127.0.0.1:8000/openapi.json`. `ENABLE_API_DOCS` decides whether the three exist: `true`
+serves them in every environment, `false` makes them answer with status 404 in every environment,
+and while it is unset, as in the template, they are served unless `APP_ENV` is `production`
+([Configuration reference](#configuration-reference)).
 
 ## Start the frontend
 
@@ -288,6 +408,16 @@ npm run dev -- --hostname 127.0.0.1
 ```
 
 The `dev` script serves port 3000.
+
+Dev mode rewrites the import in the tracked file `frontend/next-env.d.ts` from `.next/types` to
+`.next/dev/types`. Do not commit that change. After you stop the dev server, restore the committed
+file from the `frontend` directory:
+
+```bash
+git checkout -- next-env.d.ts
+```
+
+The next `npm run build` also writes the committed form back.
 
 ## Sign on
 
@@ -370,6 +500,25 @@ docker compose --profile full run --rm backend carddemo-batch run-all
 
 Its output is written to `var/batch-output` on the host.
 
+The image runs as root, so on a Linux host the files it writes there belong to root, and a later
+native `carddemo-batch` run or `rm -rf var` fails with `Permission denied`. Docker also creates a
+missing `var/batch-output`, and a missing `var` above it, as root. To create the directory and run
+the chain as your own user instead:
+
+```bash
+mkdir -p var/batch-output
+docker compose --profile full run --rm \
+    --user "$(id -u):$(id -g)" backend carddemo-batch run-all
+```
+
+To give `var`, and everything Docker wrote under it as root, back to your user:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" var
+```
+
+Docker Desktop on macOS maps bind-mounted files to your user, so it needs neither step.
+
 Migrations run with the backend stopped. To apply a later upgrade:
 
 ```bash
@@ -395,14 +544,15 @@ expected result:
 | Batch CLI | `.venv/bin/carddemo-batch --help` | Commands `run-all`, `seed-all`, `job`, `load` |
 | User interface | Open `http://127.0.0.1:3000/signon` | The sign-on screen |
 
-To sign on as a regular user and store the session cookie in `cookies.txt`:
+To sign on as a regular user and store the session cookie in the jar `var/session.cookies`:
 
 ```bash
-curl -s -i -c cookies.txt -X POST \
+mkdir -p var
+(umask 077 && curl -s -i -c var/session.cookies -X POST \
     http://127.0.0.1:8000/api/v1/auth/login \
     -H 'Content-Type: application/json' \
     -H 'Origin: http://127.0.0.1:3000' \
-    -d '{"user_id": "USER_ID", "password": "PASSWORD"}'
+    -d '{"user_id": "USER_ID", "password": "PASSWORD"}')
 ```
 
 Replace the following placeholders:
@@ -430,10 +580,13 @@ SameSite=lax
 list and every other regular-user endpoint need a regular user; an admin user gets status 403
 there.
 
+The jar holds that live token. `var/` is git-ignored, so `git add` skips the jar, and the
+`umask 077` subshell makes curl write it with mode `600`, readable and writable only by you.
+
 To list the first page of cards with the session cookie:
 
 ```bash
-curl -s -b cookies.txt http://127.0.0.1:8000/api/v1/cards
+curl -s -b var/session.cookies http://127.0.0.1:8000/api/v1/cards
 ```
 
 To check that a request without the cookie is refused:
@@ -453,7 +606,7 @@ To check that a write without an allowed `Origin` header is refused before it re
 endpoint:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' -b cookies.txt -X PUT \
+curl -s -o /dev/null -w '%{http_code}\n' -b var/session.cookies -X PUT \
     -H 'Content-Type: application/json' -d '{}' \
     http://127.0.0.1:8000/api/v1/accounts/00000000004
 ```
@@ -462,6 +615,15 @@ The output is:
 
 ```text
 403
+```
+
+The token in the jar stays valid until it expires, `ACCESS_TOKEN_EXPIRE_MINUTES` after sign-on
+(60 minutes by default): `POST /api/v1/auth/logout` only tells the client to drop the cookie and
+does not revoke the token. Never commit the jar or copy it out of `var/`. To delete it when you
+finish:
+
+```bash
+rm -f var/session.cookies
 ```
 
 Every endpoint, with its request and response samples, is in [api-reference.md](api-reference.md).
@@ -564,6 +726,12 @@ cd frontend
 npx playwright install chromium
 CI=true npm run test:e2e
 ```
+
+When a test fails, the suite copies its screenshot to `blitzy/screenshots` and its video to
+`blitzy/screen_recordings`, each named with an `e2e-` prefix and the test's result directory, so a
+rerun of the same test replaces its earlier copy. Playwright's own working files stay in
+`frontend/test-results`. The suite keeps no trace and writes no HTML report, because both would
+hold the sign-on passwords.
 
 ## Sample users
 

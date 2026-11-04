@@ -14,6 +14,9 @@ compares every chain output with the oracle fixtures in ``batch/tests/fixtures/e
 
 - the tables no later step writes equal their loader rows; accounts equal the INTCALC result,
   category balances the POSTTRAN result, and transactions the COMBTRAN generation;
+- the generated ``user_id_sort``, ``card_num_sort`` and ``tran_id_sort`` columns, which
+  ``compare.TABLE_SPECS`` leaves out of those field comparisons, are compared separately with the
+  code page 037 sort keys of the loaded users and cards and of the COMBTRAN transactions;
 - the DALYREJS, SYSTRAN, TRANSACT.BKUP and TRANSACT.COMBINED generations and STATEMNT.PS and
   STATEMNT.HTML equal their fixtures byte for byte, terminators removed.
 
@@ -99,6 +102,15 @@ STATEMENTS_SUBDIRECTORY = "statements"
 STATEMENT_FIXTURES = (
     ("STATEMNT.PS", "creastmt_STATEMNT.PS"),
     ("STATEMNT.HTML", "creastmt_STATEMNT.HTML"),
+)
+# (table, fixture, oracle layout): the keys each generated EBCDIC sort column is checked against.
+# No layout reads the key column of a loader-row CSV; a layout decodes the fixture's records.
+SORT_KEY_FIXTURES = (
+    pytest.param("security.users", LOADER_ROWS_DIR / "users.csv", None, id="user_id_sort"),
+    pytest.param("cards.cards", LOADER_ROWS_DIR / "cards.csv", None, id="card_num_sort"),
+    pytest.param(
+        TRANSACTIONS_TABLE, EXPECTED_DIR / COMBINED_FIXTURE, TRANSACTION_LAYOUT, id="tran_id_sort"
+    ),
 )
 
 # --- Messages ------------------------------------------------------------------------------------
@@ -298,6 +310,23 @@ def GenerationDifferences(connection: Any, chainRun: ChainRunResult) -> list[str
     return differences
 
 
+def ExpectedSortKeyTexts(
+    sortSpec: compare.SortKeySpec, fixturePath: Path, layoutName: str | None
+) -> tuple[list[str | None], list[str]]:
+    """Return the keys a fixture gives the table, with one message per record that fails to decode.
+
+    A CSV (no layout) gives its key column. A record fixture is decoded at the oracle's copybook
+    offsets for layoutName, so the TRAN-IDs come from the oracle's CVTRA05Y layout.
+    """
+    if layoutName is None:
+        _header, csvRows = compare.ReadExpectedCsv(fixturePath)
+        return [row[sortSpec.keyColumn] for row in csvRows], []
+    records = compare.ReadFixedWidthRecords(fixturePath)
+    tableSpec = compare.TABLE_SPECS[sortSpec.tableName]
+    rows, messages = compare.ParseExpectedRecords(tableSpec, records, layoutName)
+    return [row[sortSpec.keyColumn] for row in rows], messages
+
+
 # --- Tests ---------------------------------------------------------------------------------------
 def test_run_all_new_cycle_exits_with_posttran_reject_status(
     reconciledChain: ChainRunResult,
@@ -359,6 +388,24 @@ def test_transactions_table_equals_combined_generation_records(
             connection, TRANSACTIONS_TABLE, combinedRecords, TRANSACTION_LAYOUT
         )
     AssertNoDifferences(differences, TRANSACTIONS_TABLE)
+
+
+@pytest.mark.parametrize(("tableName", "fixturePath", "layoutName"), SORT_KEY_FIXTURES)
+def test_generated_sort_columns_equal_cp037_sort_keys(
+    reconciledChain: ChainRunResult, tableName: str, fixturePath: Path, layoutName: str | None
+) -> None:
+    """Each generated EBCDIC sort column holds the code page 037 sort key of its row's key.
+
+    ``compare.TABLE_SPECS`` leaves user_id_sort, card_num_sort and tran_id_sort out of the field
+    comparisons, so each is checked against the keys of its fixture: the loaded users and cards,
+    and the transactions COMBTRAN STEP10 reloads (jcl/COMBTRAN.jcl).
+    """
+    RequireChainCompleted(reconciledChain)
+    sortSpec = compare.SORT_KEY_SPECS[tableName]
+    expectedKeys, differences = ExpectedSortKeyTexts(sortSpec, fixturePath, layoutName)
+    with OpenConnection(reconciledChain.databaseUrl) as connection:
+        differences.extend(compare.CompareSortKeys(connection, sortSpec, expectedKeys))
+    AssertNoDifferences(differences, f"{tableName}.{sortSpec.sortColumn}")
 
 
 def test_gdg_generations_equal_expected_records(reconciledChain: ChainRunResult) -> None:

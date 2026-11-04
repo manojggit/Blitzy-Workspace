@@ -1,4 +1,5 @@
-"""Unit tests for CR00, the transaction report screen: ``corpt00c.RunTransactionReport``.
+"""Unit tests for CR00, the transaction report screen: ``corpt00c.RunTransactionReport``, and
+the screen JSON and downloads of ``RenderTransactionReportJson`` and ``ExportTransactionReport``.
 
 Replaces: CORPT00C (CR00), BMS map CORPT00, the CSUTLDTC date check it calls, and the TRANREPT
 job (``proc/TRANREPT.prc``) its TDQ ``JOBS`` write submitted, which the online report supersedes.
@@ -7,23 +8,31 @@ Each case calls the service directly with a regular user's context, the clock fr
 2022-07-18 and three committed transactions on card 2988091353094312 (proc dates 2022-06-30,
 2022-07-01 and 2022-07-31). It asserts the exact ERRMSG literal, the cursor (the ReportQuery
 wire name replacing ``MOVE -1 TO <field>L``), the status (a raised LegacyMessageError's
-httpStatus, or a returned 200 screen), and that TRANSACT keeps every row: the TRANREPT STEP01R
-backup that emptied TRANSACT is not reproduced. Expected literals are typed from
-``cbl/CORPT00C.cbl``, never imported from the service.
+httpStatus, or a returned 200 screen), and that the request wrote nothing, so the TRANREPT
+STEP01R backup (TRANSACT unloaded to a new TRANSACT.BKUP generation) is not reproduced:
+TRANSACT keeps every row with every column; batch.gdg_generations, job_runs, cycles and
+cycle_steps are unchanged; no TRANSACT.BKUP archive directory appears under an isolated batch
+output root; and every statement the application engine sends PostgreSQL is a SELECT. Expected
+literals are typed from ``cbl/CORPT00C.cbl``, never imported from the service.
 """
 
-from collections.abc import Awaitable, Callable, Mapping
+import contextlib
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
-from typing import NamedTuple, NoReturn
+from pathlib import Path
+from typing import Any, NamedTuple, NoReturn
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import Engine, text
+from batch.config import LoadBatchSettings
+from sqlalchemy import Connection, Engine, Table, event, select, text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.errors import FileIoError, LegacyMessageError
+from app.models import CYCLE_STEPS, CYCLES, GDG_GENERATIONS, JOB_RUNS, Transaction
 from app.repositories.transaction_repository import TransactionRepository
-from app.schemas.common import ReportType
+from app.schemas.common import ExportFormat, ReportType
 from app.schemas.reports import ReportLine, ReportLineKind, ReportQuery, TransactionReportResponse
 from app.services.reports import corpt00c
 from app.utils.date_validation import CheckDate
@@ -56,11 +65,13 @@ END_DATE_INVALID_MESSAGE = "End Date - Not a valid date..."
 # SUBMIT-JOB-TO-INTRDR's STRINGs (lines 465-470 and 485-490), WS-REPORT-NAME and CONFIRMI
 # DELIMITED BY SPACE, and the success STRING of lines 449-452.
 MONTHLY_PROMPT_MESSAGE = "Please confirm to print the Monthly report..."
+YEARLY_PROMPT_MESSAGE = "Please confirm to print the Yearly report..."
 CUSTOM_PROMPT_MESSAGE = "Please confirm to print the Custom report..."
 INVALID_CONFIRM_VALUE = "Q"
 INVALID_CONFIRM_MESSAGE = '"Q" is not a valid value to confirm...'
 MONTHLY_SUBMITTED_MESSAGE = "Monthly report submitted for printing ..."
 YEARLY_SUBMITTED_MESSAGE = "Yearly report submitted for printing ..."
+CUSTOM_SUBMITTED_MESSAGE = "Custom report submitted for printing ..."
 # INITIALIZE-ALL-FIELDS (lines 633-646) clears every field and WS-MESSAGE.
 CLEARED_TEXT = ""
 # WIRTE-JOBSUB-TDQ WHEN OTHER (line 531).
@@ -128,6 +139,8 @@ REPORT_ROWS = (
     (JULY_FIRST_TRAN_ID, datetime(2022, 7, 1), "D"),
     (JULY_LAST_TRAN_ID, datetime(2022, 7, 31, 23, 59, 59, 990000), "D"),
 )
+# The Yearly report on REPORT_TODAY holds all three, in TRANSACT key order.
+YEARLY_TRAN_IDS = (JUNE_TRAN_ID, JULY_FIRST_TRAN_ID, JULY_LAST_TRAN_ID)
 TRANSACTION_FIELDS = {
     "tran_type_cd": "01",
     "tran_cat_cd": 1,
@@ -144,16 +157,52 @@ INSERT_TRANSACTION_SQL = text(
     " VALUES (:tran_id, :tran_type_cd, :tran_cat_cd, :tran_source, :tran_desc, :tran_amt,"
     " :merchant_id, :card_num, :proc_ts, :proc_ts, :ts_format, :ts_format)"
 )
-COUNT_TRANSACTIONS_SQL = text("SELECT count(*) FROM transactions.transactions")
+
+# The superseded TRANREPT STEP01R unloaded TRANSACT to AWS.M2.CARDDEMO.TRANSACT.BKUP(+1)
+# (proc/TRANREPT.prc): a backup would add a TRANSACT.BKUP generation to the batch catalog, a
+# job run to its ledger and an archive under the base's directory of the batch output root.
+TRANSACT_BACKUP_BASE = "TRANSACT.BKUP"
+OUTPUT_DIR_VARIABLE = "CARDDEMO_OUTPUT_DIR"
+OUTPUT_ROOT_NAME = "batch-output"
+TRANSACT_TABLE = Transaction.__table__
+STORED_STATE_TABLES = (TRANSACT_TABLE, CYCLES, JOB_RUNS, CYCLE_STEPS, GDG_GENERATIONS)
+# The engine event every Core and ORM statement passes on its way to the driver, and the verb of
+# the only statements a report may send.
+CURSOR_EXECUTE_EVENT = "before_cursor_execute"
+READ_STATEMENT_VERB = "SELECT"
+
+type TableRows = tuple[tuple[Any, ...], ...]
+
+
+class ReportStore(NamedTuple):
+    """The engine holding the committed report rows, and the TRANSACT.BKUP archive directory."""
+
+    syncEngine: Engine
+    backupDirectory: Path
 
 
 class ReportScreen(NamedTuple):
-    """A regular user's CR00 context, the test's monkeypatch, and TRANSACT before the request."""
+    """A regular user's CR00 context, the test's monkeypatch and the store.
+
+    ``storedState`` holds TRANSACT and the batch catalog and ledger rows before the request;
+    ``issuedStatements`` collects the SQL the application engine sends while the test runs.
+    """
 
     context: corpt00c.OnlineContext
     monkeypatch: pytest.MonkeyPatch
-    syncEngine: Engine
-    storedCount: int
+    store: ReportStore
+    storedState: dict[str, TableRows]
+    issuedStatements: list[str]
+
+
+class PromptCase(NamedTuple):
+    """A report request with a blank CONFIRM, the frozen day, and the prompt and range it gets."""
+
+    fields: Mapping[str, str]
+    today: date
+    message: str
+    startDate: str
+    endDate: str
 
 
 def BuildQuery(overrides: Mapping[str, str]) -> ReportQuery:
@@ -170,10 +219,54 @@ def FreezeClock(monkeypatch: pytest.MonkeyPatch, today: date) -> None:
     monkeypatch.setattr(corpt00c, "CurrentDate", FrozenCurrentDate)
 
 
-def CountTransactions(syncEngine: Engine) -> int:
-    """Return the number of committed TRANSACT rows."""
+def ReadTableRows(connection: Connection, table: Table) -> TableRows:
+    """Return every row of ``table``, every column included, in primary-key order."""
+    statement = select(table).order_by(*table.primary_key.columns)
+    return tuple(tuple(row) for row in connection.execute(statement))
+
+
+def ReadStoredState(syncEngine: Engine) -> dict[str, TableRows]:
+    """Return the rows of TRANSACT and of the batch catalog and ledger, keyed by table name."""
     with syncEngine.connect() as connection:
-        return connection.execute(COUNT_TRANSACTIONS_SQL).scalar_one()
+        return {table.fullname: ReadTableRows(connection, table) for table in STORED_STATE_TABLES}
+
+
+@contextlib.contextmanager
+def RecordedStatements(engine: AsyncEngine) -> Iterator[list[str]]:
+    """Yield the SQL of every statement ``engine`` sends PostgreSQL while the block runs.
+
+    The listener sits on the engine's sync_engine, which every statement of the async engine
+    passes, and is removed however the block exits.
+    """
+    issuedStatements: list[str] = []
+
+    def RecordStatement(**eventArguments: Any) -> None:
+        issuedStatements.append(eventArguments["statement"])
+
+    event.listen(engine.sync_engine, CURSOR_EXECUTE_EVENT, RecordStatement, named=True)
+    try:
+        yield issuedStatements
+    finally:
+        event.remove(engine.sync_engine, CURSOR_EXECUTE_EVENT, RecordStatement)
+
+
+def WriteStatements(issuedStatements: list[str]) -> list[str]:
+    """Return the statements whose first word is not SELECT, an empty statement included."""
+    return [
+        statement
+        for statement in issuedStatements
+        if statement.upper().split(maxsplit=1)[:1] != [READ_STATEMENT_VERB]
+    ]
+
+
+def IsolateBatchOutput(monkeypatch: pytest.MonkeyPatch, outputRoot: Path) -> Path:
+    """Point the batch output root at ``outputRoot``; return its TRANSACT.BKUP base directory.
+
+    A backup written through the batch settings would create that directory, so its absence
+    shows no archive was written, and the shared var/ tree is never touched.
+    """
+    monkeypatch.setenv(OUTPUT_DIR_VARIABLE, str(outputRoot))
+    return LoadBatchSettings().GdgDir() / TRANSACT_BACKUP_BASE
 
 
 def StoreReportTransactions(syncEngine: Engine) -> None:
@@ -193,23 +286,34 @@ async def FailReportRead(
     raise FileIoError(TRANSACT_FILE_NAME)
 
 
-@pytest.fixture(name="reportTransactions")
-def ReportTransactionsFixture(restoreSeedState: None, syncEngine: Engine) -> None:
-    """Commit the three report transactions; restoreSeedState removes them at teardown."""
+@pytest.fixture(name="reportStore")
+def ReportStoreFixture(
+    restoreSeedState: None, syncEngine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> ReportStore:
+    """Commit the three report transactions and isolate the batch output root under tmp_path.
+
+    restoreSeedState removes the rows at teardown, and monkeypatch restores the output root.
+    """
     StoreReportTransactions(syncEngine)
+    return ReportStore(syncEngine, IsolateBatchOutput(monkeypatch, tmp_path / OUTPUT_ROOT_NAME))
 
 
 @pytest_asyncio.fixture(name="reportScreen")
 async def ReportScreenFixture(
     makeOnlineContext: Callable[..., Awaitable[corpt00c.OnlineContext]],
-    reportTransactions: None,
-    syncEngine: Engine,
+    reportStore: ReportStore,
     monkeypatch: pytest.MonkeyPatch,
-) -> ReportScreen:
-    """Return a regular user's context with the clock at REPORT_TODAY and the rows committed."""
+) -> AsyncIterator[ReportScreen]:
+    """Yield a regular user's context with the clock at REPORT_TODAY and the rows committed.
+
+    The stored state is read before the test; the statement spy on the context's application
+    engine records until teardown, which removes it.
+    """
     FreezeClock(monkeypatch, REPORT_TODAY)
     context = await makeOnlineContext(REGULAR_USER_TYPE)
-    return ReportScreen(context, monkeypatch, syncEngine, CountTransactions(syncEngine))
+    storedState = ReadStoredState(reportStore.syncEngine)
+    with RecordedStatements(context.engine) as issuedStatements:
+        yield ReportScreen(context, monkeypatch, reportStore, storedState, issuedStatements)
 
 
 async def RunReport(
@@ -243,9 +347,36 @@ def DetailLines(response: TransactionReportResponse) -> list[ReportLine]:
     return [line for line in response.lines if line.line_kind == ReportLineKind.DETAIL]
 
 
+async def RenderReport(
+    screen: ReportScreen, overrides: Mapping[str, str], exportFormat: ExportFormat | None
+) -> bytes:
+    """Return CR00 ENTER as the screen route's JSON bytes (no format) or as that download."""
+    query = BuildQuery(overrides)
+    if exportFormat is None:
+        return await corpt00c.RenderTransactionReportJson(screen.context, query)
+    documentBytes, _, _ = await corpt00c.ExportTransactionReport(
+        screen.context, query, exportFormat
+    )
+    return documentBytes
+
+
 def AssertTransactsKept(screen: ReportScreen) -> None:
-    """Assert TRANSACT still holds every report row: nothing was backed up or emptied."""
-    assert CountTransactions(screen.syncEngine) == screen.storedCount == len(REPORT_ROWS)
+    """Assert the request wrote nothing: the TRANREPT STEP01R backup is not reproduced.
+
+    TRANSACT keeps every report row with every column; the batch cycles, job runs, cycle steps
+    and GDG catalog are unchanged, so no TRANSACT.BKUP generation or job run was recorded; no
+    TRANSACT.BKUP archive directory exists; and the application engine sent no statement but
+    a SELECT.
+    """
+    assert len(screen.storedState[TRANSACT_TABLE.fullname]) == len(REPORT_ROWS)
+    assert ReadStoredState(screen.store.syncEngine) == screen.storedState
+    assert not screen.store.backupDirectory.exists()
+    assert WriteStatements(screen.issuedStatements) == []
+
+
+def AssertTransactRead(screen: ReportScreen) -> None:
+    """Assert the spy saw the report's TRANSACT read, so its silence on writes is not vacuous."""
+    assert any(TRANSACT_TABLE.fullname in statement for statement in screen.issuedStatements)
 
 
 # Every CORPT00 part blanked in turn, in the order of the presence EVALUATE; the cursor is the
@@ -276,12 +407,72 @@ INVALID_DATE_CASES = (
     ({CURSOR_START_MM: "02", CURSOR_START_DD: "30"}, START_DATE_INVALID_MESSAGE, CURSOR_START_MM),
     ({CURSOR_END_MM: "02", CURSOR_END_DD: "30"}, END_DATE_INVALID_MESSAGE, CURSOR_END_MM),
 )
-# The Monthly range across a month end, February of a leap year and the December roll into
-# the next year (lines 223-230).
-MONTHLY_RANGE_CASES = (
-    (REPORT_TODAY, MONTHLY_START_DATE, MONTHLY_END_DATE),
-    (date(2024, 2, 10), "2024-02-01", "2024-02-29"),
-    (date(2022, 12, 5), "2022-12-01", "2022-12-31"),
+# A blank CONFIRM on each report type: the Monthly range across a month end, February of a leap
+# year and the December roll into the next year (lines 223-230); the Yearly range of the frozen
+# year (lines 243-252); and the keyed Custom range (lines 256-436).
+PROMPT_CASES = (
+    pytest.param(
+        PromptCase(
+            MONTHLY_FIELDS,
+            REPORT_TODAY,
+            MONTHLY_PROMPT_MESSAGE,
+            MONTHLY_START_DATE,
+            MONTHLY_END_DATE,
+        ),
+        id="monthly",
+    ),
+    pytest.param(
+        PromptCase(
+            MONTHLY_FIELDS, date(2024, 2, 10), MONTHLY_PROMPT_MESSAGE, "2024-02-01", "2024-02-29"
+        ),
+        id="monthly-leap-february",
+    ),
+    pytest.param(
+        PromptCase(
+            MONTHLY_FIELDS, date(2022, 12, 5), MONTHLY_PROMPT_MESSAGE, "2022-12-01", "2022-12-31"
+        ),
+        id="monthly-december",
+    ),
+    pytest.param(
+        PromptCase(
+            YEARLY_FIELDS, REPORT_TODAY, YEARLY_PROMPT_MESSAGE, YEARLY_START_DATE, YEARLY_END_DATE
+        ),
+        id="yearly",
+    ),
+    pytest.param(
+        PromptCase(
+            YEARLY_FIELDS, date(2024, 2, 10), YEARLY_PROMPT_MESSAGE, "2024-01-01", "2024-12-31"
+        ),
+        id="yearly-2024",
+    ),
+    pytest.param(
+        PromptCase({}, REPORT_TODAY, CUSTOM_PROMPT_MESSAGE, CUSTOM_START_DATE, CUSTOM_END_DATE),
+        id="custom",
+    ),
+)
+# Confirmed Custom ranges whose ends fall on report rows: the TRANREPT STEP05R INCLUDE keeps
+# TRAN-PROC-DT GE the start and LE the end date (proc/TRANREPT.prc), so the June row at the last
+# second of 06/30, the July row at midnight of 07/01 and the July row at the last hundredth of
+# 07/31 are each kept by the end they sit on, and the row beyond either end is left out.
+CUSTOM_RANGE_CASES = (
+    pytest.param(
+        {CURSOR_START_MM: "06", CURSOR_START_DD: "30", CURSOR_END_MM: "07", CURSOR_END_DD: "01"},
+        ("2022-06-30", "2022-07-01"),
+        [JUNE_TRAN_ID, JULY_FIRST_TRAN_ID],
+        id="june-30-to-july-1",
+    ),
+    pytest.param(
+        {CURSOR_START_MM: "07", CURSOR_START_DD: "01", CURSOR_END_MM: "07", CURSOR_END_DD: "31"},
+        ("2022-07-01", "2022-07-31"),
+        [JULY_FIRST_TRAN_ID, JULY_LAST_TRAN_ID],
+        id="july-1-to-july-31",
+    ),
+)
+# The outputs of a confirmed report: the screen route's JSON (no format) and the two downloads.
+REPORT_OUTPUT_CASES = (
+    pytest.param(None, id="screen-json"),
+    pytest.param(ExportFormat.CSV, id="csv"),
+    pytest.param(ExportFormat.PDF, id="pdf"),
 )
 
 
@@ -313,6 +504,7 @@ async def test_confirmed_monthly_report_lists_only_the_current_months_rows(
     detailLines = DetailLines(response)
     assert [line.tran_id for line in detailLines] == [JULY_FIRST_TRAN_ID, JULY_LAST_TRAN_ID]
     assert {line.acct_id for line in detailLines} == {REPORT_ACCT_ID}
+    AssertTransactRead(reportScreen)
     AssertTransactsKept(reportScreen)
 
 
@@ -327,23 +519,50 @@ async def test_confirmed_yearly_report_lists_every_row_of_the_year(reportScreen)
         YEARLY_END_DATE,
     )
     assert ScreenOutcome(response) == expectedScreen
-    expectedTranIds = [JUNE_TRAN_ID, JULY_FIRST_TRAN_ID, JULY_LAST_TRAN_ID]
-    assert [line.tran_id for line in DetailLines(response)] == expectedTranIds
+    assert [line.tran_id for line in DetailLines(response)] == list(YEARLY_TRAN_IDS)
+    AssertTransactRead(reportScreen)
     AssertTransactsKept(reportScreen)
 
 
-@pytest.mark.parametrize(("today", "startDate", "endDate"), MONTHLY_RANGE_CASES)
-async def test_blank_confirm_prompts_for_the_monthly_range_without_lines(
-    reportScreen, today, startDate, endDate
+@pytest.mark.parametrize(("dateFields", "expectedRange", "expectedTranIds"), CUSTOM_RANGE_CASES)
+async def test_confirmed_custom_report_keeps_rows_on_both_inclusive_ends(
+    reportScreen, dateFields, expectedRange, expectedTranIds
 ):
+    """Custom reports the keyed range with both ends included; the row beyond an end is not."""
+    response = await RunReport(reportScreen, {**dateFields, CURSOR_CONFIRM: "Y"})
+
+    expectedScreen = (CUSTOM_SUBMITTED_MESSAGE, CURSOR_REPORT_TYPE, *expectedRange)
+    assert ScreenOutcome(response) == expectedScreen
+    detailLines = DetailLines(response)
+    assert [line.tran_id for line in detailLines] == expectedTranIds
+    assert {line.acct_id for line in detailLines} == {REPORT_ACCT_ID}
+    AssertTransactRead(reportScreen)
+    AssertTransactsKept(reportScreen)
+
+
+@pytest.mark.parametrize("exportFormat", REPORT_OUTPUT_CASES)
+async def test_report_json_and_downloads_only_read(reportScreen, exportFormat):
+    """The screen JSON, CSV and PDF of the confirmed Yearly report hold every row, writing none."""
+    yearlyConfirmedFields = {**YEARLY_FIELDS, CURSOR_CONFIRM: "Y"}
+
+    documentBytes = await RenderReport(reportScreen, yearlyConfirmedFields, exportFormat)
+
+    assert all(tranId.encode() in documentBytes for tranId in YEARLY_TRAN_IDS)
+    AssertTransactRead(reportScreen)
+    AssertTransactsKept(reportScreen)
+
+
+@pytest.mark.parametrize("promptCase", PROMPT_CASES)
+async def test_blank_confirm_prompts_for_the_report_range_without_lines(reportScreen, promptCase):
     """A blank CONFIRM answers 200 with the prompt and the cursor on confirm; nothing is read."""
-    FreezeClock(reportScreen.monkeypatch, today)
+    FreezeClock(reportScreen.monkeypatch, promptCase.today)
 
-    response = await RunReport(reportScreen, MONTHLY_FIELDS)
+    response = await RunReport(reportScreen, promptCase.fields)
 
-    expectedScreen = (MONTHLY_PROMPT_MESSAGE, CURSOR_CONFIRM, startDate, endDate)
+    expectedScreen = (promptCase.message, CURSOR_CONFIRM, promptCase.startDate, promptCase.endDate)
     assert ScreenOutcome(response) == expectedScreen
     assert response.lines == []
+    assert reportScreen.issuedStatements == []
     AssertTransactsKept(reportScreen)
 
 

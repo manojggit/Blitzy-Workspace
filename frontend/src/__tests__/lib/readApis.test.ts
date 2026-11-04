@@ -27,6 +27,8 @@ const CARD_LIST_QUERY: CardListQuery = { acctId: ACCOUNT_ID, direction: Directio
 const REPORT_QUERY: ReportQuery = { reportType: ReportType.MONTHLY, confirm: "Y" };
 const TRANSACTION_LIST_QUERY: TransactionListQuery = { searchTranId: TRAN_ID, page: 1 };
 const USER_LIST_QUERY: UserListQuery = { searchUserId: USER_ID, direction: Direction.BACKWARD };
+// CCLI ENTER may carry a null direction, as the server's Direction | None field allows.
+const CARD_ENTER_QUERY: CardListQuery = { acctId: ACCOUNT_ID, direction: null };
 // The CCLI list sends its selections as one repeated parameter per row, without the "[]" suffix.
 const REPEATED_PARAMS_SERIALIZER = { indexes: null };
 
@@ -144,3 +146,13 @@ it.each(READ_CASES)(
         expect(getSpy.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
     },
 );
+
+it("ListCards forwards a null ENTER direction, which axios leaves out of the URL", async () => {
+    const getSpy = jest.spyOn(API_CLIENT, "get").mockResolvedValue(BuildAnswer());
+    const query = { params: CARD_ENTER_QUERY, paramsSerializer: REPEATED_PARAMS_SERIALIZER };
+    await expect(ListCards(CARD_ENTER_QUERY)).resolves.toBe(ANSWER_DATA);
+    expect(getSpy.mock.calls).toStrictEqual([["/cards", { ...query, signal: undefined }]]);
+    const requestUri = API_CLIENT.getUri({ url: "/cards", ...query });
+    expect(requestUri).toContain(`/cards?acctId=${ACCOUNT_ID}`);
+    expect(requestUri).not.toContain("direction");
+});

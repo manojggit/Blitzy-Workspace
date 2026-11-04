@@ -24,15 +24,23 @@ state is the OPEN SEED cycle. Ledger rows are read and set with SQLAlchemy Core 
 """
 
 import inspect
+import logging
+from collections.abc import Callable
 from decimal import Decimal
 
 import pytest
 from app.models import CYCLE_STEPS, CYCLES, JOB_RUNS, Base, Card
-from sqlalchemy import Engine, Row, Table, func, insert, select, update
+from sqlalchemy import Connection, Engine, Row, Table, func, insert, select, update
 
 from batch.cli import POST_TRAN_JOB, TRAN_BACKUP_JOB, TRAN_INDEX_JOB
 from batch.orchestration import batch_chain, run_ledger
-from batch.orchestration.job_context import EXIT_FAILURE, EXIT_OK, EXIT_REJECTS, JobContext
+from batch.orchestration.job_context import (
+    EXIT_FAILURE,
+    EXIT_OK,
+    EXIT_REJECTS,
+    JobContext,
+    JobResult,
+)
 from batch.tests.conftest import (
     FIXED_AS_OF_TEXT,
     BatchEnvironment,
@@ -106,6 +114,14 @@ WRITER_STEP_STATES = {
 MARKER_AMOUNT = Decimal("12345.67")
 MARKED_AMOUNT_COLUMNS = {"accounts": "curr_balance", "tran-cat-balances": "balance"}
 
+# The completion a TRANBKP run commits in its own transaction, before it publishes its generation.
+COMMITTED_COUNTS = {"records_archived": 3}
+COMMITTED_RESULT = JobResult(EXIT_OK, COMMITTED_COUNTS)
+# The counts column of a run that never completed: the column's '{}' default.
+UNFINISHED_COUNTS: dict[str, int] = {}
+# How long a transaction runs before the run it finishes is recorded finished in it.
+LONG_TRANSACTION_SECONDS = 1.0
+
 
 # --- Ledger reads and writes ---------------------------------------------------------------------
 def OpenCycleId(engine: Engine) -> int:
@@ -140,6 +156,13 @@ def RunRow(engine: Engine, runId: int) -> Row:
     statement = select(JOB_RUNS).where(JOB_RUNS.c.run_id == runId)
     with engine.connect() as connection:
         return connection.execute(statement).one()
+
+
+def NewestRunId(engine: Engine) -> int:
+    """Return the id of the newest batch.job_runs row, of any cycle or of none."""
+    statement = select(func.max(JOB_RUNS.c.run_id))
+    with engine.connect() as connection:
+        return connection.execute(statement).scalar_one()
 
 
 def CycleRunHistory(engine: Engine, cycleId: int) -> list[tuple[int, str]]:
@@ -205,6 +228,37 @@ def InsertRunningRun(engine: Engine, cycleId: int, stepNo: int) -> int:
         return connection.execute(statement).scalar_one()
 
 
+def StartStepRun(jobContext: JobContext, stepNo: int) -> JobContext:
+    """Start a RUNNING run of a chain step in the OPEN cycle; return the context bound to it."""
+    cycleId = OpenCycleId(jobContext.engine)
+    runStart = run_ledger.RunStart(
+        cycleId=cycleId,
+        stepNo=stepNo,
+        jobName=LegacyJobName(stepNo),
+        params=run_ledger.BuildRunParams(jobContext),
+    )
+    runId = run_ledger.StartRun(jobContext, runStart)
+    return jobContext.ForRun(cycleId, stepNo, runId)
+
+
+def CommitStepCompletion(stepContext: JobContext) -> None:
+    """Commit the run and its step COMPLETED, as an atomic step's own transaction ends."""
+    with stepContext.engine.begin() as connection:
+        run_ledger.FinishAtomicRun(connection, stepContext, COMMITTED_RESULT)
+
+
+def FinishAtomicRunInTransaction(connection: Connection, stepContext: JobContext) -> None:
+    """Finish the run COMPLETED as the last statement of the step's own transaction."""
+    run_ledger.FinishAtomicRun(connection, stepContext, COMMITTED_RESULT)
+
+
+def ReclassifyRunInTransaction(connection: Connection, stepContext: JobContext) -> None:
+    """Reclassify the run INTERRUPTED, as ClassifyInterruptedRuns does in its own transaction."""
+    runKey = JOB_RUNS.c.run_id == stepContext.runId
+    runningRow = connection.execute(run_ledger.RUNNING_ROWS_STATEMENT.where(runKey)).one()
+    run_ledger.ReclassifyRun(connection, runningRow)
+
+
 def LegacyJobName(stepNo: int) -> str:
     """Return the legacy JCL name of a chain step's job, as batch.job_runs.job_name records it."""
     return batch_chain.CHAIN[stepNo - 1].job.LegacyName()
@@ -220,6 +274,33 @@ def ExpectedPerWriteRefusal(cycleId: int, stepNo: int, state: str) -> str:
     """Return the refusal text of a FAILED or INTERRUPTED per-write step, naming cycle and step."""
     return batch_chain.PER_WRITE_REFUSED_TEMPLATE.format(
         stepNo=stepNo, jobName=LegacyJobName(stepNo), cycleId=cycleId, state=state
+    )
+
+
+def ExpectedNewCycleStartRefusal(stepNo: int) -> str:
+    """Return the refusal text of a --start-at that names a step after step 1 for a new cycle."""
+    return batch_chain.NEW_CYCLE_START_REFUSED_TEMPLATE.format(
+        stepNo=stepNo, jobName=LegacyJobName(stepNo)
+    )
+
+
+def ExpectedRunLines(run: Row) -> tuple[str, str]:
+    """Return the STARTED and ENDED lines of a finished run, as its batch.job_runs row records it.
+
+    A run of a cycle step names its step; a load made with no OPEN cycle names its run only.
+    """
+    if run.cycle_id is None:
+        return (
+            run_ledger.RUN_STARTED_LOAD_LOG % (run.run_id, run.job_name),
+            batch_chain.LOAD_ENDED_TEMPLATE.format(
+                runId=run.run_id, jobName=run.job_name, exitCode=run.exit_code
+            ),
+        )
+    return (
+        run_ledger.RUN_STARTED_LOG % (run.run_id, run.step_no, run.job_name),
+        batch_chain.STEP_ENDED_TEMPLATE.format(
+            stepNo=run.step_no, jobName=run.job_name, exitCode=run.exit_code
+        ),
     )
 
 
@@ -362,6 +443,34 @@ def test_run_all_without_open_cycle_opens_one(batchEnvironment: BatchEnvironment
     assert CycleRunHistory(engine, newCycle.cycle_id) == FULL_CHAIN_HISTORY
 
 
+@pytest.mark.parametrize(
+    ("closeOpenCycle", "cycleOptions"),
+    [
+        pytest.param(False, ["--new-cycle"], id="new-cycle-over-open-seed-cycle"),
+        pytest.param(True, [], id="no-open-cycle"),
+    ],
+)
+def test_new_cycle_refuses_later_start_step_before_any_cycle_change(
+    batchEnvironment: BatchEnvironment, closeOpenCycle: bool, cycleOptions: list[str]
+) -> None:
+    """A cycle run-all would open starts at step 1: --start-at POSTTRAN exits 12, changing nothing.
+
+    Both ways run-all opens a cycle, --new-cycle and no cycle OPEN, refuse the later start step
+    before any cycle is abandoned or opened, so the new cycle can never skip the loaders.
+    """
+    engine = batchEnvironment.engine
+    if closeOpenCycle:
+        MarkCycleCompleted(engine, OpenCycleId(engine))
+    cyclesBefore = CycleRows(engine)
+    runCount = CountJobRuns(engine)
+    startAt = ["--start-at", LegacyJobName(POSTTRAN_STEP)]
+    outcome = InvokeCli(["run-all", *cycleOptions, *startAt, *AS_OF_ARGUMENTS])
+    refusal = ExpectedNewCycleStartRefusal(POSTTRAN_STEP)
+    assert (outcome.exitCode, refusal in outcome.output) == (EXIT_FAILURE, True), outcome.output
+    assert CycleRows(engine) == cyclesBefore
+    assert CountJobRuns(engine) == runCount
+
+
 # --- Step identity, skip, force and failure ------------------------------------------------------
 def test_tranbkp_steps_6_and_15_are_distinct_identities(batchEnvironment: BatchEnvironment) -> None:
     """job tran-backup runs step 6, then step 15: each occurrence is its own identity."""
@@ -439,6 +548,39 @@ def test_job_without_open_cycle_exits_12(batchEnvironment: BatchEnvironment) -> 
     assert [row.status for row in CycleRows(engine)] == [run_ledger.CYCLE_COMPLETED]
 
 
+@pytest.mark.parametrize(
+    ("cycleOpen", "absentTexts"),
+    [
+        (True, ("STEP None", "NO CYCLE STEP")),
+        (False, ("STEP None", "STEP 7 TRANTYPE")),
+    ],
+    ids=["seed-cycle-open", "no-cycle-open"],
+)
+def test_load_started_and_ended_lines_agree_with_its_history_row(
+    batchEnvironment: BatchEnvironment, cycleOpen: bool, absentTexts: tuple[str, ...]
+) -> None:
+    """load tran-types logs STARTED and ENDED lines that name what its batch.job_runs row holds.
+
+    With the SEED cycle OPEN, the run is step 7 of that cycle. With no cycle OPEN, the row has no
+    cycle and no step, so neither line prints "STEP None" or the chain's step number, and the
+    load opens no cycle.
+    """
+    engine = batchEnvironment.engine
+    cycleId = OpenCycleId(engine)
+    if not cycleOpen:
+        MarkCycleCompleted(engine, cycleId)
+    outcome = InvokeCli(["load", TRAN_TYPES_LOADER])
+    assert outcome.exitCode == EXIT_OK, outcome.output
+    newRun = RunRow(engine, NewestRunId(engine))
+    expectedStep = (cycleId, TRANTYPE_STEP) if cycleOpen else (None, None)
+    runColumns = (newRun.cycle_id, newRun.step_no, newRun.status, newRun.exit_code)
+    assert runColumns == (*expectedStep, run_ledger.RUN_COMPLETED, EXIT_OK)
+    assert all(line in outcome.output for line in ExpectedRunLines(newRun)), outcome.output
+    assert [text for text in absentTexts if text in outcome.output] == [], outcome.output
+    cycleStatus = run_ledger.CYCLE_OPEN if cycleOpen else run_ledger.CYCLE_COMPLETED
+    assert [row.status for row in CycleRows(engine)] == [cycleStatus]
+
+
 def test_failed_and_completed_status_commit_with_step_state(
     batchEnvironment: BatchEnvironment, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -464,6 +606,71 @@ def test_failed_and_completed_status_commit_with_step_state(
         True,
     )
     assert StepRow(engine, TRANTYPE_STEP)["last_run_id"] > failedRunId
+
+
+@pytest.mark.parametrize(
+    ("completedFirst", "expectedOutcome"),
+    [
+        pytest.param(
+            False,
+            (True, run_ledger.RUN_FAILED, EXIT_FAILURE, UNFINISHED_COUNTS, run_ledger.STEP_FAILED),
+            id="running-run-recorded-failed",
+        ),
+        pytest.param(
+            True,
+            (False, run_ledger.RUN_COMPLETED, EXIT_OK, COMMITTED_COUNTS, run_ledger.STEP_COMPLETED),
+            id="committed-completion-kept",
+        ),
+    ],
+)
+def test_record_failure_fails_a_running_run_and_never_overwrites_a_committed_completion(
+    jobContext: JobContext,
+    caplog: pytest.LogCaptureFixture,
+    completedFirst: bool,
+    expectedOutcome: tuple[object, ...],
+) -> None:
+    """RecordFailure fails a RUNNING step 15 run and leaves one committed COMPLETED unchanged.
+
+    A failure raised after TRANBKP committed its completion, while publishing its generation,
+    must leave the run's status, exit code and counts and the step's state and last_run_id as
+    committed, so the next command skips the step rather than archiving the emptied table.
+    """
+    engine = jobContext.engine
+    stepContext = StartStepRun(jobContext, SECOND_TRANBKP_STEP)
+    if completedFirst:
+        CommitStepCompletion(stepContext)
+    caplog.set_level(logging.WARNING, logger=run_ledger.LOGGER.name)
+    recorded = run_ledger.RecordFailure(stepContext, stepContext.runId, EXIT_FAILURE)
+    failedRun, stepRow = RunRow(engine, stepContext.runId), StepRow(engine, SECOND_TRANBKP_STEP)
+    runColumns = (failedRun.status, failedRun.exit_code, failedRun.counts)
+    assert (recorded, *runColumns, stepRow["state"]) == expectedOutcome
+    assert (stepRow["last_run_id"], failedRun.finished_at is not None) == (stepContext.runId, True)
+    keptWarning = run_ledger.FAILURE_NOT_RECORDED_LOG % (stepContext.runId, failedRun.status)
+    assert (keptWarning in caplog.messages) == completedFirst
+
+
+@pytest.mark.parametrize(
+    "finishInTransaction",
+    [
+        pytest.param(FinishAtomicRunInTransaction, id="finish-atomic-run"),
+        pytest.param(ReclassifyRunInTransaction, id="reclassify-interrupted-run"),
+    ],
+)
+def test_run_finished_late_in_a_long_transaction_records_when_it_finished(
+    jobContext: JobContext, finishInTransaction: Callable[[Connection, JobContext], None]
+) -> None:
+    """finished_at is when the run finished, not when the transaction finishing it began.
+
+    The transaction runs LONG_TRANSACTION_SECONDS before the run is finished in it, as a long
+    atomic load such as DUSRSECJ's bcrypt hashing does, so the recorded duration covers that time.
+    """
+    stepContext = StartStepRun(jobContext, TRANTYPE_STEP)
+    with jobContext.engine.begin() as connection:
+        connection.execute(select(func.pg_sleep(LONG_TRANSACTION_SECONDS)))
+        finishInTransaction(connection, stepContext)
+    finishedRun = RunRow(jobContext.engine, stepContext.runId)
+    recordedSeconds = (finishedRun.finished_at - finishedRun.started_at).total_seconds()
+    assert recordedSeconds >= LONG_TRANSACTION_SECONDS
 
 
 # --- Interrupted runs ----------------------------------------------------------------------------
@@ -576,14 +783,53 @@ def test_financial_reload_refused_while_later_writer_step_completed_failed_or_in
 
 
 @pytest.mark.parametrize("loaderName", FINANCIAL_LOADERS)
+@pytest.mark.parametrize("writerState", RELOAD_BLOCKING_STATES)
+@pytest.mark.parametrize(
+    "restart",
+    [
+        pytest.param((run_ledger.STEP_COMPLETED, (FORCE_FLAG,)), id="forced"),
+        pytest.param((run_ledger.STEP_FAILED, ()), id="failed-retry"),
+    ],
+)
+def test_run_all_start_at_financial_loader_step_refused_even_with_force(
+    batchEnvironment: BatchEnvironment,
+    loaderName: str,
+    writerState: str,
+    restart: tuple[str, tuple[str, ...]],
+) -> None:
+    """run-all reaching a financial loader's step is refused as load is, --force included.
+
+    With step 13 COMPLETED, FAILED or INTERRUPTED, run-all --start-at the loader's step either
+    forces the COMPLETED loader step or retries it FAILED. Either way it exits 12 with the
+    refusal and moves no table row, run history row or step state.
+    """
+    engine = batchEnvironment.engine
+    cycleId = OpenCycleId(engine)
+    loaderStepNo = LoaderStepNo(loaderName)
+    loaderState, forceOptions = restart
+    SetStepState(engine, cycleId, POSTTRAN_STEP, writerState)
+    SetStepState(engine, cycleId, loaderStepNo, loaderState)
+    MarkFinancialTable(engine, loaderName)
+    rowsBefore = TableRows(engine, ReloadTable(loaderName))
+    stepBefore, runCount = StepRow(engine, loaderStepNo), CountJobRuns(engine)
+    startAt = ["--start-at", str(loaderStepNo), *forceOptions]
+    outcome = InvokeCli(["run-all", *startAt, *AS_OF_ARGUMENTS])
+    assert outcome.exitCode == EXIT_FAILURE, outcome.output
+    assert ExpectedReloadRefusal(loaderName, [POSTTRAN_STEP], cycleId) in outcome.output
+    assert TableRows(engine, ReloadTable(loaderName)) == rowsBefore
+    assert (StepRow(engine, loaderStepNo), CountJobRuns(engine)) == (stepBefore, runCount)
+
+
+@pytest.mark.parametrize("loaderName", FINANCIAL_LOADERS)
 def test_financial_reload_refusal_is_not_overridden_by_force(
     jobContext: JobContext, loaderName: str
 ) -> None:
     """Nothing overrides the refusal: load has no --force, CheckFinancialReload no force flag.
 
     The CLI declares no --force on load, so `load NAME --force` is a usage error that runs
-    nothing; and CheckFinancialReload, which RunStandaloneLoad consults before every load, takes
-    only the context and the loader name, so no caller can pass it an override.
+    nothing; and CheckFinancialReload, which ExecuteStep consults before every loader run of
+    load and run-all alike, takes only the context and the loader name, so no caller can pass it
+    an override.
     """
     engine = jobContext.engine
     cycleId = OpenCycleId(engine)

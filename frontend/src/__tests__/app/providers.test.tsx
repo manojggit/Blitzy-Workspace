@@ -1,11 +1,12 @@
 // Tests: app/providers.tsx, the client Providers that app/layout.tsx wraps around every BMS-map
 // page: ThemeProvider with the Material Design 3 theme of app/theme.ts (AAP 0.5.3), CssBaseline,
-// and the lib/session.tsx SessionProvider that replaces the COCOM01Y CDEMO-USER-ID and
-// CDEMO-USER-TYPE COMMAREA fields. Only the GET /auth/me wrapper and the layout's font and
-// Emotion-cache boundaries are mocked; the theme, the session context and MUI are the real modules.
-import { Typography } from "@mui/material";
+// the input autofill keyframes inserted once per app, and the lib/session.tsx SessionProvider
+// that replaces the COCOM01Y CDEMO-USER-ID and CDEMO-USER-TYPE COMMAREA fields. Only the GET
+// /auth/me wrapper and the layout's font and Emotion-cache boundaries are mocked; the theme, the
+// session context and MUI are the real modules.
+import { MenuItem, Select, TextField, Typography } from "@mui/material";
 import { useTheme, type Theme, type TypographyVariants } from "@mui/material/styles";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, createEvent, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useEffect, type ReactElement, type ReactNode } from "react";
 
 import RootLayout from "@/app/layout";
@@ -62,6 +63,16 @@ interface HtmlElementProps {
     lang: string;
     className: string;
     children: ReactElement<BodyElementProps>;
+}
+
+interface AutofillAnimationCase {
+    animationName: string;
+    expectedShrink: string;
+}
+
+interface MountedTextField {
+    label: string;
+    variant: "outlined" | "filled";
 }
 
 // Eight characters, the CDEMO-USER-ID PIC X(08) width; fictitious, not a USRSEC seed user.
@@ -168,6 +179,30 @@ const M3_TYPE_ROLE_CASES: readonly TypeRoleCase[] = [
     { variant: "labelSmall", fontSize: "11px", lineHeight: "16px", fontWeight: 500 },
 ];
 
+// MUI's InputBase marks a field filled when the mui-auto-fill animation starts on its input, as
+// browser autofill makes it, and re-reads the input's own value when mui-auto-fill-cancel starts.
+const AUTOFILL_ANIMATION_NAME = "mui-auto-fill";
+const AUTOFILL_CANCEL_ANIMATION_NAME = "mui-auto-fill-cancel";
+const AUTOFILL_KEYFRAMES_NAMES = [AUTOFILL_ANIMATION_NAME, AUTOFILL_CANCEL_ANIMATION_NAME];
+// The resting input runs the cancel animation for 10 ms, so the browser starts it on every input.
+const AUTOFILL_CANCEL_DURATION = "10ms";
+
+// Outlined entry fields, a filled protected display field and selection-code Selects, as the form
+// screens and SelectionTable mount them.
+const EMPTY_OUTLINED_FIELD: MountedTextField = { label: "Account Number", variant: "outlined" };
+const MOUNTED_TEXT_FIELDS: readonly MountedTextField[] = [
+    EMPTY_OUTLINED_FIELD,
+    { label: "Card Number", variant: "outlined" },
+    { label: "Current Balance", variant: "filled" },
+];
+const SELECTION_CODE_COUNT = 2;
+const MOUNTED_INPUT_COUNT = MOUNTED_TEXT_FIELDS.length + SELECTION_CODE_COUNT;
+
+const AUTOFILL_ANIMATION_CASES: readonly AutofillAnimationCase[] = [
+    { animationName: AUTOFILL_ANIMATION_NAME, expectedShrink: "true" },
+    { animationName: AUTOFILL_CANCEL_ANIMATION_NAME, expectedShrink: "false" },
+];
+
 let capturedContexts: ProvidedContexts | null = null;
 let consoleErrorSpy: jest.SpyInstance;
 
@@ -238,6 +273,47 @@ function RenderShellInProviders(): void {
             </ScreenShell>
         </Providers>,
     );
+}
+
+function AutofillFields(): ReactElement {
+    const selectionCodeKeys = Array.from({ length: SELECTION_CODE_COUNT }, (_unused, row) => row);
+    return (
+        <>
+            {MOUNTED_TEXT_FIELDS.map(({ label, variant }) => (
+                <TextField key={label} label={label} variant={variant} />
+            ))}
+            {selectionCodeKeys.map((row) => (
+                <Select key={row} value="">
+                    <MenuItem value="">{row}</MenuItem>
+                </Select>
+            ))}
+        </>
+    );
+}
+
+async function RenderFieldsInProviders(): Promise<void> {
+    fetchCurrentUserMock.mockResolvedValue(SIGNED_ON_USER);
+    render(
+        <Providers>
+            <ContextProbe onValue={CaptureContexts} />
+            <AutofillFields />
+        </Providers>,
+    );
+    await WaitForSessionLoaded();
+}
+
+// jsdom has no CSSKeyframesRule global, so a keyframes rule is matched by its serialised head.
+function CountKeyframesRules(animationName: string): number {
+    const keyframesHead = `@keyframes ${animationName} {`;
+    const rules = Array.from(document.styleSheets).flatMap((sheet) => Array.from(sheet.cssRules));
+    return rules.filter((rule) => rule.cssText.startsWith(keyframesHead)).length;
+}
+
+// jsdom has no AnimationEvent, so the animation name a browser's event carries is set on it here.
+function StartInputAnimation(input: HTMLElement, animationName: string): void {
+    const animationStart = createEvent.animationStart(input);
+    Object.defineProperty(animationStart, "animationName", { value: animationName });
+    fireEvent(input, animationStart);
 }
 
 // createTheme keeps the case the author wrote, so colours compare case-insensitively.
@@ -337,6 +413,42 @@ it("CssBaseline inside the theme gives <body> the M3 surface, on-surface and Rob
     });
     expect(NormaliseFontStack(getComputedStyle(document.body).fontFamily)).toBe(ROBOTO_FONT_STACK);
 });
+
+it.each(AUTOFILL_KEYFRAMES_NAMES)(
+    `Providers inserts the %s keyframes once for ${MOUNTED_INPUT_COUNT} mounted inputs`,
+    async (animationName) => {
+        await RenderFieldsInProviders();
+        expect(CountKeyframesRules(animationName)).toBe(1);
+    },
+);
+
+it("outlined, filled and Select inputs under Providers run mui-auto-fill-cancel", async () => {
+    await RenderFieldsInProviders();
+    const inputs = [
+        ...MOUNTED_TEXT_FIELDS.map(({ label }) => screen.getByLabelText(label)),
+        ...screen.getAllByRole("combobox"),
+    ];
+    expect(inputs).toHaveLength(MOUNTED_INPUT_COUNT);
+    for (const input of inputs) {
+        expect(input).toHaveStyle({
+            animationName: AUTOFILL_CANCEL_ANIMATION_NAME,
+            animationDuration: AUTOFILL_CANCEL_DURATION,
+        });
+    }
+});
+
+it.each(AUTOFILL_ANIMATION_CASES)(
+    "an empty outlined field's label has data-shrink=$expectedShrink once $animationName starts",
+    async ({ animationName, expectedShrink }) => {
+        await RenderFieldsInProviders();
+        const { label } = EMPTY_OUTLINED_FIELD;
+        StartInputAnimation(screen.getByLabelText(label), animationName);
+        expect(screen.getByText(label, { selector: "label" })).toHaveAttribute(
+            "data-shrink",
+            expectedShrink,
+        );
+    },
+);
 
 it("ScreenShell under Providers shows User: from /auth/me once the read answers", async () => {
     const resolveUser = DeferCurrentUser();

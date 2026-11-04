@@ -12,6 +12,9 @@ cbl/COCRDLIC.cbl:
     flagged (all-field mode), and 1400-SETUP-MESSAGE sets no information line for them.
 - 9000-READ-FORWARD (lines 1219-1244): ENDFILE sets ``NO MORE RECORDS TO SHOW``, and page 1
     with no row read sets ``NO RECORDS FOUND FOR THIS SEARCH CONDITION.``.
+- The READNEXT and READPREV WHEN OTHER branches (lines 1222-1230, 1246-1254, 1308-1317,
+    1361-1369) move WS-FILE-ERROR-MESSAGE (lines 153-171), READ on CARDDAT with the condition's
+    RESP and RESP2, to WS-ERROR-MSG: a 503 file error on the account filter, either direction.
 - 1400-SETUP-MESSAGE (lines 895-930), after 1100-SCREEN-INIT blanks WS-INFO-MSG: F7 that ends
     on page 1 (SUBTRACT 1 from page 2, or F7 already there) sets ``NO PREVIOUS PAGES TO
     DISPLAY``; F8 with no next page once the last page was shown sets ``NO MORE PAGES TO
@@ -30,12 +33,19 @@ never raw and never with the CVV. CCLI only reads: every case asserts cards.card
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, NamedTuple
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 from sqlalchemy import Engine, text
 
-from app.core.errors import LegacyMessageError
+from app.core.errors import FileIoError, LegacyMessageError
 from app.core.security import DecodeCardRef
+from app.repositories.card_repository import (
+    BROWSE_BACKWARD,
+    BROWSE_FORWARD,
+    CARD_FILE_NAME,
+    CardRepository,
+)
 from app.schemas.cards import (
     CardListQuery,
     CardListResponse,
@@ -70,6 +80,25 @@ INVALID_ACTION_CODE_MESSAGE = "INVALID ACTION CODE"
 RECORD_ACTIONS_INFO = "TYPE S FOR DETAIL, U TO UPDATE ANY RECORD"
 NO_MESSAGE = ""
 EDIT_FAILURE_STATUS = 400
+FILE_ERROR_STATUS = 503
+
+# WS-FILE-ERROR-MESSAGE (lines 153-171): FILLER X(12) 'File Error:', ERROR-OPNAME X(8), ' on ',
+# ERROR-FILE X(9), ' returned RESP ', ERROR-RESP X(10), ',RESP2 ', ERROR-RESP2 X(10), FILLER X(5).
+FILE_ERROR_LABEL = "File Error:"
+FILE_ERROR_LABEL_WIDTH = 12
+ERROR_OPNAME_WIDTH = 8
+ERROR_FILE_WIDTH = 9
+ERROR_RESP_WIDTH = 10
+FILE_ERROR_FILLER_WIDTH = 5
+# Every CARDDAT WHEN OTHER branch moves 'READ' and LIT-CARD-FILE X(8) (lines 213-214, 1226-1227).
+READ_OPNAME = "READ"
+LIT_CARD_FILE = "CARDDAT "
+# WS-ERROR-MSG PIC X(75) (line 117), which receives the 80-byte group.
+ERROR_MSG_LENGTH = 75
+# That text for CICS IOERR (RESP 17, RESP2 0), as the message line shows it.
+CARD_FILE_IOERR_MESSAGE = (
+    "File Error: READ     on CARDDAT   returned RESP 000000017 ,RESP2 000000000"
+)
 
 # ACCTSID and CARDSID, and the CRDSEL1-7 code of a row as the selection request names it.
 ACCT_ID_FIELD = "acct_id"
@@ -142,6 +171,13 @@ class TransferCase(NamedTuple):
 
     code: str
     expectedAction: str
+
+
+class BrowseErrorCase(NamedTuple):
+    """The list request CARDDAT fails on, built with the real file, and the browse it runs."""
+
+    failingRequest: Callable[[OnlineContext], Awaitable[CardListQuery]]
+    expectedDirection: str
 
 
 FILTER_ERROR_CASES = [
@@ -305,6 +341,48 @@ def CodesSelecting(code: str, rowIndex: int) -> tuple[str, ...]:
     return tuple(code if index == rowIndex else BLANK_CODE for index in range(PAGE_SIZE))
 
 
+def ExpectedFileErrorMessage(error: FileIoError) -> str:
+    """Return WS-ERROR-MSG after a CARDDAT browse WHEN OTHER branch ends in ``error``.
+
+    'READ' and LIT-CARD-FILE fill the space-padded ERROR-OPNAME X(8) and ERROR-FILE X(9).
+    WS-RESP-CD and WS-REAS-CD, both S9(09) COMP (lines 47-50), moved to the X(10) ERROR-RESP and
+    ERROR-RESP2 give nine digits and a space. The 80-byte group is cut to WS-ERROR-MSG X(75),
+    whose trailing spaces are not shown.
+    """
+    fileErrorGroup = (
+        FILE_ERROR_LABEL.ljust(FILE_ERROR_LABEL_WIDTH)
+        + READ_OPNAME.ljust(ERROR_OPNAME_WIDTH)
+        + " on "
+        + LIT_CARD_FILE.ljust(ERROR_FILE_WIDTH)
+        + " returned RESP "
+        + f"{error.resp:09d}".ljust(ERROR_RESP_WIDTH)
+        + ",RESP2 "
+        + f"{error.resp2:09d}".ljust(ERROR_RESP_WIDTH)
+        + " " * FILE_ERROR_FILLER_WIDTH
+    )
+    return fileErrorGroup[:ERROR_MSG_LENGTH].rstrip(" ")
+
+
+async def FreshEntryRequest(context: OnlineContext) -> CardListQuery:
+    """Return ENTER on a fresh entry, which 9000-READ-FORWARD answers from the lowest key."""
+    return CardListQuery()
+
+
+async def SecondPageBackwardRequest(context: OnlineContext) -> CardListQuery:
+    """List page 1, press F8, and return F7 on page 2, which 9100-READ-BACKWARDS answers."""
+    secondPage = await PageForward(context, await ListCards(context, CardListQuery()))
+    return PagingQuery(secondPage, Direction.BACKWARD)
+
+
+# The READNEXT branches (lines 1222-1230, 1246-1254) and the READPREV ones (1308-1317, 1361-1369).
+BROWSE_ERROR_CASES = [
+    pytest.param(BrowseErrorCase(FreshEntryRequest, BROWSE_FORWARD), id="readnext-forward"),
+    pytest.param(
+        BrowseErrorCase(SecondPageBackwardRequest, BROWSE_BACKWARD), id="readprev-backward"
+    ),
+]
+
+
 @pytest.fixture(name="cardFile")
 def SeededCardFileFixture(migratedDatabase, syncEngine: Engine) -> SeededCardFile:
     """Return the seeded CARDDAT, so each case can show CCLI wrote nothing to it."""
@@ -415,6 +493,33 @@ async def test_non_numeric_filter_is_refused_without_rows(
         "field_errors": list(case.failedFields),
         "cursor_field": case.failedFields[0],
     }
+    assert cardFile.CurrentRows() == cardFile.seededRows
+
+
+@pytest.mark.parametrize("case", BROWSE_ERROR_CASES)
+async def test_card_file_browse_error_shows_the_read_error_text(
+    case: BrowseErrorCase,
+    makeOnlineContext: ContextFactory,
+    cardFile: SeededCardFile,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A READNEXT or READPREV ending WHEN OTHER is a 503 with the file error and the account."""
+    context = await makeOnlineContext(REGULAR_USER_TYPE)
+    query = await case.failingRequest(context)
+    ioError = FileIoError(CARD_FILE_NAME)
+    browseCards = AsyncMock(side_effect=ioError)
+    monkeypatch.setattr(CardRepository, "BrowseCards", browseCards)
+    with pytest.raises(LegacyMessageError) as refusal:
+        await ListCards(context, query)
+    assert refusal.value.httpStatus == FILE_ERROR_STATUS
+    assert refusal.value.Body() == {
+        "message": ExpectedFileErrorMessage(ioError),
+        "info_message": NO_MESSAGE,
+        "field_errors": [ACCT_ID_FIELD],
+        "cursor_field": ACCT_ID_FIELD,
+    }
+    assert ExpectedFileErrorMessage(ioError) == CARD_FILE_IOERR_MESSAGE
+    browseCards.assert_awaited_once_with(ANY, ANY, case.expectedDirection, PAGE_SIZE)
     assert cardFile.CurrentRows() == cardFile.seededRows
 
 

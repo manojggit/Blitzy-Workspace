@@ -86,8 +86,8 @@ const AUTHORIZATION_NOT_INSTALLED: NotInstalledOption = {
     message: MAIN_NOT_INSTALLED_MESSAGE,
 };
 
-// CSMSG01Y CCDA-MSG-THANK-YOU. ExpectMessage matches a substring, so the copybook's trailing
-// padding does not matter.
+// CSMSG01Y CCDA-MSG-THANK-YOU, as the logout response returns it: the copybook's trailing
+// padding is not part of the message, and ExpectMessage compares the whole text.
 const THANK_YOU_MESSAGE = "Thank you for using CardDemo application...";
 
 // COMEN01C line 139, trailing blank included; the 403 of the admin-only guard carries it.

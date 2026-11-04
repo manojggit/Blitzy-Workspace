@@ -9,10 +9,11 @@ Sections 0.6.8, 0.6.10, 0.7.3, 0.7.6, 0.9.2 and 0.9.3.
 Environment. Importing this module, before any test module, points every batch component of the
 session at the test database. The URL is TEST_SYNC_DATABASE_URL when set, otherwise
 SYNC_DATABASE_URL with the database renamed carddemo_test; each is read from the process
-environment first, then backend/.env. No URL, or a database whose name does not end in _test,
-stops the session at import, before anything can be dropped. The URL is then written to
-SYNC_DATABASE_URL and TEST_SYNC_DATABASE_URL, with APP_ENV=test (so Alembic revision 0002
-seeds) and BCRYPT_ROUNDS=4 (fast DUSRSECJ and seed hashing). In-process LoadBatchSettings()
+environment first, then backend/.env, by a pydantic-settings model with the env-file options of
+the settings classes, so the file has their dotenv syntax. No URL, or a database whose name does
+not end in _test, stops the session at import, before anything can be dropped. The URL is then
+written to SYNC_DATABASE_URL and TEST_SYNC_DATABASE_URL, with APP_ENV=test (so Alembic revision
+0002 seeds) and BCRYPT_ROUNDS=4 (fast DUSRSECJ and seed hashing). In-process LoadBatchSettings()
 calls, the Alembic subprocess and every carddemo-batch subprocess inherit os.environ, so all of
 them reach the test database. Database work happens only inside fixtures, so collecting the
 suite needs no database.
@@ -71,6 +72,8 @@ from app.models import (
     Customer,
     Transaction,
 )
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -119,9 +122,6 @@ BCRYPT_ROUNDS_VARIABLE = "BCRYPT_ROUNDS"
 OUTPUT_DIR_VARIABLE = "CARDDEMO_OUTPUT_DIR"
 TEST_APP_ENV = "test"
 TEST_BCRYPT_ROUNDS = "4"
-ENV_COMMENT_PREFIX = "#"
-ENV_ASSIGNMENT = "="
-ENV_QUOTES = ('"', "'")
 SLOW_MARKER_LINE = "slow: long-running interruption and kill tests"
 
 # --- Clock, paths and timeouts -------------------------------------------------------------------
@@ -262,46 +262,25 @@ SPEC_PER_CARD_MESSAGE = "perCard must not be negative, got {perCard}"
 
 
 # --- Environment resolution (runs at import) -----------------------------------------------------
-def StripQuotes(value: str) -> str:
-    """Return value without one pair of matching surrounding quotes, as env files allow."""
-    for quote in ENV_QUOTES:
-        if len(value) >= 2 and value.startswith(quote) and value.endswith(quote):
-            return value[1:-1]
-    return value
+class DatabaseUrlSettings(BaseSettings):
+    """The two batch database URLs as configured: the process environment, then backend/.env.
 
-
-def ParseEnvLine(line: str) -> tuple[str, str] | None:
-    """Return the (name, value) of a NAME=VALUE line; None for a blank, comment or other line."""
-    strippedLine = line.strip()
-    if not strippedLine or strippedLine.startswith(ENV_COMMENT_PREFIX):
-        return None
-    name, separator, value = strippedLine.partition(ENV_ASSIGNMENT)
-    if not separator:
-        return None
-    return name.strip(), StripQuotes(value.strip())
-
-
-def ReadEnvFileValue(variableName: str) -> str:
-    """Return the last value backend/.env assigns to variableName; "" when it assigns none.
-
-    The last assignment wins, as python-dotenv, which the settings classes use, reads the file.
+    The env-file options are those of batch.config.BatchSettings, so backend/.env is read with
+    the same python-dotenv syntax (export prefixes, quotes, inline comments) and an empty value
+    counts as unset. Field names are the environment-variable names.
     """
-    if not ENV_FILE.is_file():
-        return ""
-    value = ""
-    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-        assignment = ParseEnvLine(line)
-        if assignment is not None and assignment[0] == variableName:
-            value = assignment[1]
-    return value
 
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+        env_ignore_empty=True,
+        case_sensitive=True,
+        hide_input_in_errors=True,
+    )
 
-def ResolveSetting(variableName: str) -> str:
-    """Return the variable from the process environment, else from backend/.env.
-
-    An empty value counts as unset, as env_ignore_empty makes the settings classes treat it.
-    """
-    return os.environ.get(variableName) or ReadEnvFileValue(variableName)
+    TEST_SYNC_DATABASE_URL: str = Field(default="", repr=False)
+    SYNC_DATABASE_URL: str = Field(default="", repr=False)
 
 
 def ParseDatabaseUrl(url: str, variableName: str) -> URL:
@@ -312,18 +291,19 @@ def ParseDatabaseUrl(url: str, variableName: str) -> URL:
         raise RuntimeError(INVALID_URL_MESSAGE.format(variableName=variableName)) from None
 
 
-def ResolveTestDatabaseUrl() -> str:
+def ResolveTestDatabaseUrl(envFile: Path = ENV_FILE) -> str:
     """Return TEST_SYNC_DATABASE_URL, else SYNC_DATABASE_URL with the database carddemo_test.
 
+    Both are read from the process environment, then from envFile (backend/.env by default).
     Raises RuntimeError when neither is set or the URL does not parse.
     """
-    testUrl = ResolveSetting(TEST_SYNC_URL_VARIABLE)
-    if testUrl:
-        return testUrl
-    syncUrl = ResolveSetting(SYNC_URL_VARIABLE)
-    if not syncUrl:
+    configuredUrls = DatabaseUrlSettings(_env_file=envFile)
+    if configuredUrls.TEST_SYNC_DATABASE_URL:
+        return configuredUrls.TEST_SYNC_DATABASE_URL
+    if not configuredUrls.SYNC_DATABASE_URL:
         raise RuntimeError(MISSING_URL_MESSAGE)
-    renamedUrl = ParseDatabaseUrl(syncUrl, SYNC_URL_VARIABLE).set(database=TEST_DATABASE_NAME)
+    syncUrl = ParseDatabaseUrl(configuredUrls.SYNC_DATABASE_URL, SYNC_URL_VARIABLE)
+    renamedUrl = syncUrl.set(database=TEST_DATABASE_NAME)
     return renamedUrl.render_as_string(hide_password=False)
 
 

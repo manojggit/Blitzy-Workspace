@@ -46,10 +46,22 @@ copy whose query_string is masked as the query of a request target on the scope'
 its own bytes or str type, and whose raw_path is shown as <...>, the placeholder Uvicorn
 gives the headers.
 
+A stored value that fails a response or screen model, such as a customer's name, reaches the
+error log in the traceback of the unexpected 500. The input values that Pydantic's
+ValidationError and FastAPI's validation exceptions echo are therefore redacted wherever they
+appear, keeping each error's type, location and message.
+
+SQLAlchemy's pool writes a DBAPI connection's repr in the warnings and errors it still logs,
+such as a failed close, and psycopg2's repr carries the connection's libpq dsn: the database
+user, host, port and database name. Every such dsn is replaced by [REDACTED] at every level,
+keeping the rest of the repr.
+
 Masking covers each record's message, args, traceback and stack text. The root logger's
 stdout handler comes first among the root handlers, so every other root handler receives
 the record already masked. Each Uvicorn logger and handler masks too, and Uvicorn's error
-log, which its default configuration writes to stderr, is written to stdout instead.
+log, which its default configuration writes to stderr, is written to stdout instead. Uvicorn's
+handlers write the stdout handler's LOG_LINE_FORMAT, so its access and server lines carry the
+timestamp that application and batch lines carry, and the logs can be ordered together.
 
 This module imports only the standard library, so batch and the backend can both call
 ConfigureLogging() without any settings in the environment.
@@ -102,6 +114,32 @@ JWT_PATTERN = re.compile(
     rf"(?<!{BASE64URL_CHARACTER})(?>{BASE64URL_CHARACTER}*?eyJ{BASE64URL_CHARACTER}*+)"
     rf"\.{BASE64URL_CHARACTER}++\.{BASE64URL_CHARACTER}*+"
 )
+# Pydantic ends each error line of a ValidationError with [type=<error type>, input_value=<repr>,
+# input_type=<class name>]. The repr may itself hold ", input_type=str]", so the value runs to
+# the input_type that ends the line. Each line is tried once, from its start: the lookahead
+# finds that ending before the value is sought, so a long log line is scanned in linear time.
+VALIDATION_INPUT_VALUE_PATTERN = re.compile(
+    r"^(?=[^\n]*, input_type=\w++\]$)"
+    r"([^\n]*?\[type=\w++, input_value=)[^\n]*(, input_type=\w++\])$",
+    re.MULTILINE,
+)
+VALIDATION_INPUT_VALUE_REPLACEMENT = rf"\g<1>{REDACTED_REPLACEMENT}\g<2>"
+# FastAPI's validation exceptions print each error dict on a line, its 'input' after 'type',
+# 'loc' and 'msg'. The repr may hold any text, so the input and the rest of its line are
+# replaced. The quote that opens the key is never written by masking, which writes no quote,
+# so masking never makes a new match and masking its own result changes nothing.
+VALIDATION_INPUT_KEY_PATTERN = re.compile(r"( 'input': )[^\n]*+")
+VALIDATION_INPUT_KEY_REPLACEMENT = rf"\g<1>{REDACTED_REPLACEMENT}"
+# psycopg2 writes a connection as <connection object at 0x...; dsn: '...', closed: 0>, its libpq
+# dsn unescaped, and SQLAlchemy's pool logs that repr in its warnings and errors. A dsn value
+# may itself be quoted, as in dbname='my db', so the dsn runs to the last ', closed: <n>> on its
+# line; with no such tail, to the line's last quote, or else to the line's end. A match without
+# a tail leaves no quote on its line to start another, so a long line is still scanned in linear
+# time. The replacement writes no quote, so masking its own result again changes nothing.
+CONNECTION_DSN_PATTERN = re.compile(
+    r"dsn: '(?>[^\n]*(?=', closed: [0-9]++>)|[^\n]*(?=')|[^\n]*+)'?"
+)
+CONNECTION_DSN_REPLACEMENT = f"dsn: {REDACTED_REPLACEMENT}"
 # The slots are anchored to the API path and to query separators, so traceback file paths
 # such as services/cards/ and keyword arguments in traceback source lines stay readable.
 # Neither slot value takes in a ?, so redacting one never moves where a request query starts.
@@ -218,6 +256,9 @@ HANDLER_NAME = "carddemo-stdout"
 UVICORN_ACCESS_LOGGER = "uvicorn.access"
 UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", UVICORN_ACCESS_LOGGER, "uvicorn.asgi")
 LOG_LINE_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+# One formatter for the stdout handler and every Uvicorn handler, so their lines share one
+# timestamped form and can be ordered together. A formatter keeps no per-record state.
+LOG_LINE_FORMATTER = logging.Formatter(LOG_LINE_FORMAT)
 TRACEBACK_FORMATTER = logging.Formatter()
 
 
@@ -418,16 +459,40 @@ def MaskRequestQuery(queryMatch: re.Match[str]) -> str:
     return requestPath + "?" + MaskQueryString(queryText, requestPath)
 
 
+def RedactValidationInputs(text: str) -> str:
+    """Return text with the input values that Pydantic and FastAPI validation errors echo redacted.
+
+    A Pydantic error line keeps its error type and input type around input_value=[REDACTED]. A
+    FastAPI error dict keeps its type, loc and msg, and 'input': [REDACTED] ends its line, ctx
+    included. Either value may be a stored customer value that failed a response model.
+    """
+    redactedText = VALIDATION_INPUT_VALUE_PATTERN.sub(VALIDATION_INPUT_VALUE_REPLACEMENT, text)
+    return VALIDATION_INPUT_KEY_PATTERN.sub(VALIDATION_INPUT_KEY_REPLACEMENT, redactedText)
+
+
+def RedactConnectionDsns(text: str) -> str:
+    """Return text with the libpq dsn of each DBAPI connection repr replaced by [REDACTED].
+
+    The rest of the repr is kept, so a pool error still names the connection object and its
+    closed state: <connection object at 0x...; dsn: [REDACTED], closed: 0>.
+    """
+    return CONNECTION_DSN_PATTERN.sub(CONNECTION_DSN_REPLACEMENT, text)
+
+
 def MaskSensitiveText(text: str) -> str:
     """Return text with undeclared query parameters and tokens redacted and card numbers masked.
 
-    Each query after a ? is first rewritten pair by pair by MaskRequestQuery: a request target
-    keeps only the parameters its route declares and redacts a value without its declared shape,
-    and any other query has each parameter judged by its decoded value. MaskPlainText then
-    redacts each literal Fernet token, JWT and card slot and masks each digit chain that may
-    hold a card number. Applied to its own result, it returns that result unchanged.
+    The libpq dsn of each DBAPI connection repr is redacted first by RedactConnectionDsns, then
+    the input values that validation errors echo by RedactValidationInputs, before a query
+    rewrite could take in the separators that delimit them. Each query after a ? is then
+    rewritten pair by pair by MaskRequestQuery: a request target keeps only the parameters its
+    route declares and redacts a value without its declared shape, and any other query has each
+    parameter judged by its decoded value. MaskPlainText then redacts each literal Fernet token,
+    JWT and card slot and masks each digit chain that may hold a card number. Applied to its own
+    result, it returns that result unchanged.
     """
-    return MaskPlainText(REQUEST_QUERY_PATTERN.sub(MaskRequestQuery, text))
+    redactedText = RedactValidationInputs(RedactConnectionDsns(text))
+    return MaskPlainText(REQUEST_QUERY_PATTERN.sub(MaskRequestQuery, redactedText))
 
 
 def MaskValue(value: object) -> object:
@@ -526,8 +591,9 @@ def MaskMessage(record: logging.LogRecord) -> None:
 
     Each ASGI scope in args, as Uvicorn's TRACE log passes it, is first replaced by the copy
     ProjectArguments makes, whose query and raw path are safe to render. Uvicorn's
-    AccessFormatter unpacks record.args as the 5-tuple (client, method, path, HTTP version,
-    status), so string args are masked in place, and msg has only its card numbers masked,
+    AccessFormatter, which a logging configuration applied after ConfigureLogging can install
+    again, unpacks record.args as the 5-tuple (client, method, path, HTTP version, status),
+    so string args are masked in place, and msg has only its card numbers masked,
     since redacting a slot such as "/cards/%s" would consume its placeholder. The masked
     message is folded into msg only when the record still renders unmasked text. Uvicorn's
     color_message would re-render the original text, so it is dropped.
@@ -565,9 +631,10 @@ def MaskDiagnostics(record: logging.LogRecord) -> None:
 class PanMaskingFilter(logging.Filter):
     """Masks card numbers and redacts tokens and undeclared query parameters in a record in place.
 
-    A declared query parameter whose value lacks its route's value shape is redacted too. It
-    covers the message, its args (ASGI scopes included), the traceback and the stack text. It
-    never drops a record.
+    A declared query parameter whose value lacks its route's value shape is redacted too, as are
+    each input value a validation error echoes and each connection repr's libpq dsn. It covers
+    the message, its args (ASGI scopes included), the traceback and the stack text. It never
+    drops a record.
     """
 
     # logging calls this exact name, so it stays lower-case: a framework-mandated
@@ -601,7 +668,7 @@ def BuildStdoutHandler() -> logging.Handler:
     """Return the named stdout handler that masks every record it writes."""
     stdoutHandler = CurrentStdoutHandler()
     stdoutHandler.name = HANDLER_NAME
-    stdoutHandler.setFormatter(logging.Formatter(LOG_LINE_FORMAT))
+    stdoutHandler.setFormatter(LOG_LINE_FORMATTER)
     stdoutHandler.addFilter(PanMaskingFilter())
     return stdoutHandler
 
@@ -636,25 +703,30 @@ def RouteStderrToStdout(handler: logging.Handler) -> None:
 
 
 def ProtectUvicornLogger(loggerName: str) -> None:
-    """Mask what a Uvicorn logger and its handlers write, and move its stderr output to stdout.
+    """Mask what a Uvicorn logger and its handlers write, and send it to stdout in LOG_LINE_FORMAT.
 
     Under Uvicorn's default configuration its records never reach the root handler: the
     non-propagating "uvicorn" logger writes uvicorn.error records through its stderr handler,
     and the non-propagating uvicorn.access logger writes through its own handler. A logger's
     filter masks the records logged on it and survives a later logging.config.dictConfig; a
-    handler's filter masks every record the handler writes, including propagated ones.
+    handler's filter masks every record the handler writes, including propagated ones. Each
+    handler's formatter, which in Uvicorn's default configuration writes no time, is replaced
+    by LOG_LINE_FORMATTER, so Uvicorn's lines carry the timestamp, level and logger name that
+    application and batch lines carry.
     """
     uvicornLogger = logging.getLogger(loggerName)
     AttachMaskingFilter(uvicornLogger)
     for handler in uvicornLogger.handlers:
         AttachMaskingFilter(handler)
         RouteStderrToStdout(handler)
+        handler.setFormatter(LOG_LINE_FORMATTER)
 
 
 def ConfigureLogging() -> None:
     """Log to stdout at INFO with card numbers masked and card references redacted.
 
-    It covers the root handlers and Uvicorn's loggers. Calling it again changes nothing.
+    It covers the root handlers and Uvicorn's loggers, whose handlers then write the root
+    handler's timestamped LOG_LINE_FORMAT. Calling it again changes nothing.
     """
     InstallStdoutHandler()
     for loggerName in UVICORN_LOGGERS:
@@ -665,20 +737,31 @@ def ConfigureLogging() -> None:
 # fetched row at DEBUG to this logger, which every CardDemo engine uses (none sets a
 # logging_name), as soon as it or the "sqlalchemy" logger above it allows those levels.
 SQLALCHEMY_ENGINE_LOGGER = "sqlalchemy.engine.Engine"
+# Every connection pool logs below this logger (sqlalchemy.pool.impl.QueuePool, NullPool,
+# AsyncAdaptedQueuePool) and writes the DBAPI connection's repr at DEBUG (connect, checkout,
+# checkin, reset) and at INFO (invalidation, recycling). psycopg2's repr carries the libpq
+# dsn: the database user, host, port and database name. The pool's warnings and errors, such
+# as a failed close, still reach the log, with that dsn redacted by PanMaskingFilter.
+SQLALCHEMY_POOL_LOGGER = "sqlalchemy.pool"
+SUPPRESSED_SQLALCHEMY_LOGGERS = (SQLALCHEMY_ENGINE_LOGGER, SQLALCHEMY_POOL_LOGGER)
 
 
 def SuppressEngineStatementLogging() -> None:
-    """Keep SQLAlchemy from creating statement, parameter and result-row log records.
+    """Keep SQLAlchemy from creating statement, parameter, result-row and pool log records.
 
-    Bound parameters and fetched rows carry password hashes, SSNs, CVVs and customer data,
-    which no log may hold. The engine logger's own level is raised to WARNING unless it is
-    already WARNING or above, so isEnabledFor(INFO) and isEnabledFor(DEBUG) stay false and
-    SQLAlchemy never builds those records, even with the "sqlalchemy" logger at DEBUG; engine
-    warnings and errors still propagate. logging.config.fileConfig and dictConfig reset this
-    logger to NOTSET when they configure "sqlalchemy.engine", so each engine builder calls this
-    after logging is configured, and also sets hide_parameters=True, which keeps bound values
-    out of SQLAlchemy's error text.
+    Bound parameters and fetched rows carry password hashes, SSNs, CVVs and customer data, and
+    the pool's connection records carry the connection's dsn (database user, host, port and
+    database name), which no log may hold. The engine and pool loggers' own levels are raised
+    to WARNING unless already WARNING or above, so isEnabledFor(INFO) and isEnabledFor(DEBUG)
+    stay false on them and on each pool class logger without a level of its own. SQLAlchemy
+    then never builds those records, even with the "sqlalchemy" logger at DEBUG; engine and
+    pool warnings and errors still propagate, and PanMaskingFilter redacts the dsn of any
+    connection they show. logging.config.fileConfig and dictConfig reset these loggers to
+    NOTSET when they configure a logger above them, such as "sqlalchemy.engine", so each engine
+    builder calls this after logging is configured, and also sets hide_parameters=True, which
+    keeps bound values out of SQLAlchemy's error text.
     """
-    engineLogger = logging.getLogger(SQLALCHEMY_ENGINE_LOGGER)
-    if engineLogger.level < logging.WARNING:
-        engineLogger.setLevel(logging.WARNING)
+    for loggerName in SUPPRESSED_SQLALCHEMY_LOGGERS:
+        suppressedLogger = logging.getLogger(loggerName)
+        if suppressedLogger.level < logging.WARNING:
+            suppressedLogger.setLevel(logging.WARNING)

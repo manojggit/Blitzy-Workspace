@@ -29,7 +29,7 @@ def ParseAsOf(text: str) -> datetime:
     as month 13. The value is not truncated here; Clock.Now() truncates it.
     """
     if AS_OF_PATTERN.fullmatch(text) is None:
-        raise ValueError(f"--as-of must be YYYY-MM-DDTHH:MM:SS[.ffffff], got {text!r}")
+        raise ValueError("--as-of must be YYYY-MM-DDTHH:MM:SS[.ffffff]")
     return datetime.fromisoformat(text)
 
 

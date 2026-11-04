@@ -17,24 +17,33 @@ tests/conftest.py, and restoreSeedState undoes every committed row. The cases co
   confirmation (lines 258-494), and the 200 confirmation prompt and cleared screen;
 - the CSV and PDF downloads, which carry the same lines, guard formula text and run the same
   edits;
-- the superseded TDQ job submission: the report only reads, so TRANSACT is neither backed up
-  nor emptied;
+- the superseded TDQ job submission and its TRANREPT STEP01R backup: the screen and both
+  downloads leave every TRANSACT row and column, and the batch catalog and ledger
+  (batch.gdg_generations, job_runs, cycles, cycle_steps), unchanged, create no TRANSACT.BKUP
+  archive directory under an isolated batch output root, and send PostgreSQL only SELECTs
+  through the application engine;
 - the session and the regular role every CR00 route requires.
 """
 
+import contextlib
 import csv
 import io
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import httpx
 import pytest
-from sqlalchemy import Engine, text
+from batch.config import LoadBatchSettings
+from fastapi import FastAPI
+from sqlalchemy import Connection, Engine, Table, event, select, text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.models import CYCLE_STEPS, CYCLES, GDG_GENERATIONS, JOB_RUNS, Transaction
 from app.services.reports import corpt00c
 
 pytestmark = pytest.mark.usefixtures("restoreSeedState")
@@ -205,10 +214,6 @@ INSERT_TRANSACTION_SQL = text(
     " :source, :description, :amount, :merchantId, :merchantName, :merchantCity, :merchantZip,"
     " :cardNum, :origTs, :procTs, :origTsFormat, :procTsFormat)"
 )
-TRANSACTION_SNAPSHOT_SQL = text(
-    "SELECT tran_id, card_num, tran_amt, proc_ts, proc_ts_format"
-    " FROM transactions.transactions ORDER BY tran_id"
-)
 TYPE_DESCRIPTION_SQL = text(
     "SELECT description FROM reference.transaction_types WHERE tran_type = :typeCd"
 )
@@ -216,6 +221,22 @@ CATEGORY_DESCRIPTION_SQL = text(
     "SELECT description FROM reference.transaction_categories"
     " WHERE tran_type_cd = :typeCd AND tran_cat_cd = :catCd"
 )
+
+# --- The superseded backup -----------------------------------------------------------------------
+# TRANREPT STEP01R unloaded TRANSACT to AWS.M2.CARDDEMO.TRANSACT.BKUP(+1) (proc/TRANREPT.prc): a
+# backup would add a TRANSACT.BKUP generation to the batch catalog, a job run to its ledger and
+# an archive under the base's directory of the batch output root.
+TRANSACT_BACKUP_BASE = "TRANSACT.BKUP"
+OUTPUT_DIR_VARIABLE = "CARDDEMO_OUTPUT_DIR"
+OUTPUT_ROOT_NAME = "batch-output"
+TRANSACT_TABLE = Transaction.__table__
+STORED_STATE_TABLES = (TRANSACT_TABLE, CYCLES, JOB_RUNS, CYCLE_STEPS, GDG_GENERATIONS)
+# The engine event every Core and ORM statement passes on its way to the driver, and the verb of
+# the only statements a report may send.
+CURSOR_EXECUTE_EVENT = "before_cursor_execute"
+READ_STATEMENT_VERB = "SELECT"
+
+type TableRows = tuple[tuple[Any, ...], ...]
 
 
 class RangeCase(NamedTuple):
@@ -308,10 +329,53 @@ def InsertReportTransactions(syncEngine: Engine, rows: Sequence[ReportTransactio
         connection.execute(INSERT_TRANSACTION_SQL, [TransactionParameters(row) for row in rows])
 
 
-def ReadTransactionSnapshot(syncEngine: Engine) -> list[tuple[Any, ...]]:
-    """Return every row of transactions.transactions, in TRAN-ID order."""
+def ReadTableRows(connection: Connection, table: Table) -> TableRows:
+    """Return every row of ``table``, every column included, in primary-key order."""
+    statement = select(table).order_by(*table.primary_key.columns)
+    return tuple(tuple(row) for row in connection.execute(statement))
+
+
+def ReadStoredState(syncEngine: Engine) -> dict[str, TableRows]:
+    """Return the rows of TRANSACT and of the batch catalog and ledger, keyed by table name."""
     with syncEngine.connect() as connection:
-        return [tuple(row) for row in connection.execute(TRANSACTION_SNAPSHOT_SQL)]
+        return {table.fullname: ReadTableRows(connection, table) for table in STORED_STATE_TABLES}
+
+
+@contextlib.contextmanager
+def RecordedStatements(engine: AsyncEngine) -> Iterator[list[str]]:
+    """Yield the SQL of every statement ``engine`` sends PostgreSQL while the block runs.
+
+    The listener sits on the engine's sync_engine, which every statement of the async engine
+    passes, and is removed however the block exits.
+    """
+    issuedStatements: list[str] = []
+
+    def RecordStatement(**eventArguments: Any) -> None:
+        issuedStatements.append(eventArguments["statement"])
+
+    event.listen(engine.sync_engine, CURSOR_EXECUTE_EVENT, RecordStatement, named=True)
+    try:
+        yield issuedStatements
+    finally:
+        event.remove(engine.sync_engine, CURSOR_EXECUTE_EVENT, RecordStatement)
+
+
+def WriteStatements(issuedStatements: list[str]) -> list[str]:
+    """Return the statements whose first word is not SELECT, an empty statement included."""
+    return [
+        statement
+        for statement in issuedStatements
+        if statement.upper().split(maxsplit=1)[:1] != [READ_STATEMENT_VERB]
+    ]
+
+
+async def RequestReportAndDownloads(client: httpx.AsyncClient, query: dict[str, str]) -> None:
+    """Send ``query`` to the screen and to both downloads, asserting each answers 200."""
+    screenResponse = await RunReport(client, query)
+    assert screenResponse.status_code == HTTP_OK, screenResponse.text
+    for exportFormat in EXPORT_FORMATS:
+        exportResponse = await DownloadReport(client, query, exportFormat)
+        assert exportResponse.status_code == HTTP_OK, exportResponse.text
 
 
 def ReadReferenceDescriptions(syncEngine: Engine) -> tuple[str, str]:
@@ -409,6 +473,17 @@ def ReportDataFixture(
     """Commit REPORT_TRANSACTIONS and freeze today at FROZEN_TODAY."""
     InsertReportTransactions(syncEngine, REPORT_TRANSACTIONS)
     FreezeToday(monkeypatch, FROZEN_TODAY)
+
+
+@pytest.fixture(name="backupDirectory")
+def BackupDirectoryFixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the batch output root under tmp_path; return its TRANSACT.BKUP base directory.
+
+    A backup written through the batch settings would create that directory, so its absence
+    shows no archive was written, and the shared var/ tree is never touched.
+    """
+    monkeypatch.setenv(OUTPUT_DIR_VARIABLE, str(tmp_path / OUTPUT_ROOT_NAME))
+    return LoadBatchSettings().GdgDir() / TRANSACT_BACKUP_BASE
 
 
 # --- Cases ---------------------------------------------------------------------------------------
@@ -570,17 +645,23 @@ async def test_confirmed_range_without_transactions_has_no_lines(
 
 @pytest.mark.usefixtures("reportData")
 async def test_report_and_exports_leave_transact_unchanged(
-    regularClient: httpx.AsyncClient, syncEngine: Engine
+    regularClient: httpx.AsyncClient, syncEngine: Engine, testApp: FastAPI, backupDirectory: Path
 ) -> None:
-    """The superseded TRANREPT backup: rendering online neither archives nor empties TRANSACT."""
-    snapshotBefore = ReadTransactionSnapshot(syncEngine)
-    screenResponse = await RunReport(regularClient, YEARLY_CONFIRMED)
-    assert screenResponse.status_code == HTTP_OK, screenResponse.text
-    for exportFormat in EXPORT_FORMATS:
-        exportResponse = await DownloadReport(regularClient, YEARLY_CONFIRMED, exportFormat)
-        assert exportResponse.status_code == HTTP_OK, exportResponse.text
-    assert len(snapshotBefore) == len(REPORT_TRANSACTIONS)
-    assert ReadTransactionSnapshot(syncEngine) == snapshotBefore
+    """The superseded TRANREPT backup: the screen and both downloads only read.
+
+    TRANSACT keeps every row with every column; the batch cycles, job runs, cycle steps and GDG
+    catalog are unchanged, so no TRANSACT.BKUP generation or job run was recorded; no
+    TRANSACT.BKUP archive directory exists; and the application engine sent PostgreSQL no
+    statement but a SELECT, the TRANSACT read among them.
+    """
+    storedBefore = ReadStoredState(syncEngine)
+    with RecordedStatements(testApp.state.engine) as issuedStatements:
+        await RequestReportAndDownloads(regularClient, YEARLY_CONFIRMED)
+    assert len(storedBefore[TRANSACT_TABLE.fullname]) == len(REPORT_TRANSACTIONS)
+    assert ReadStoredState(syncEngine) == storedBefore
+    assert not backupDirectory.exists()
+    assert any(TRANSACT_TABLE.fullname in statement for statement in issuedStatements)
+    assert WriteStatements(issuedStatements) == []
 
 
 # --- First-failure literals ----------------------------------------------------------------------

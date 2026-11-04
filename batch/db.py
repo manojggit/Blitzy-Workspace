@@ -25,7 +25,8 @@ Diagnostics policy: the jobs bind password hashes, SSNs, card numbers and custom
 parameters and fetch them in rows. Both engines set hide_parameters=True, which keeps bound
 values out of SQLAlchemy's error text, and call app.core.logging's
 SuppressEngineStatementLogging, so SQLAlchemy never creates a statement, parameter or row log
-record, whatever level the "sqlalchemy" logger is given.
+record, nor a pool record of a connection and its libpq dsn below WARNING, whatever level the
+"sqlalchemy" logger is given.
 """
 
 from app.core.logging import SuppressEngineStatementLogging

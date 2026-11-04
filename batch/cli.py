@@ -32,14 +32,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
-from app.core.logging import ConfigureLogging
+from app.core.logging import ConfigureLogging, MaskSensitiveText
 from app.seed.image_reader import ENCODING_ASCII, ENCODING_EBCDIC
 from pydantic import ValidationError
 from sqlalchemy import Engine
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError, OperationalError
+from typer._click import ClickException, Context
+from typer.core import TyperGroup
 
 from batch.config import BatchSettings, LoadBatchSettings
 from batch.db import BuildEngine
@@ -47,6 +49,7 @@ from batch.orchestration import gdg, run_ledger
 from batch.orchestration.batch_chain import (
     LOADER_JOB_NAMES,
     PROCESSING_JOB_NAMES,
+    UNKNOWN_CODE,
     ChainOptions,
     FindJobDefinition,
     JobRequest,
@@ -64,6 +67,7 @@ from batch.orchestration.clock import Clock, ParseAsOf
 from batch.orchestration.job_context import (
     DEFAULT_RUN_DATE,
     EXIT_FAILURE,
+    OCCURRENCE_RULE_MESSAGE,
     RUN_DATE_LENGTH,
     JobContext,
     JobParameters,
@@ -71,11 +75,16 @@ from batch.orchestration.job_context import (
 
 LOGGER = logging.getLogger(__name__)
 
-# Batch operator messages, not legacy literals. Neither ever carries the database URL or a
-# rejected setting value: only exception class names and setting names are logged.
+# Batch operator messages, not legacy literals. None ever carries the database URL, a driver
+# message or a rejected setting value: only exception class names, SQLSTATEs and setting names
+# are logged. DATABASE ERROR names a database error that no step mapped to an exit status, for
+# example a missing relation in an unmigrated database: its wrapper class, driver class and
+# SQLSTATE, UNKNOWN_CODE standing in for either one the driver did not supply.
 DATABASE_UNAVAILABLE_MESSAGE = "DATABASE NOT AVAILABLE"
+DATABASE_ERROR_MESSAGE = "DATABASE ERROR"
 SETTINGS_INVALID_MESSAGE = "BATCH SETTINGS INVALID"
 DATABASE_UNAVAILABLE_LOG = DATABASE_UNAVAILABLE_MESSAGE + " (%s)"
+DATABASE_ERROR_LOG = DATABASE_ERROR_MESSAGE + " %s (%s) SQLSTATE %s"
 SETTINGS_INVALID_LOG = SETTINGS_INVALID_MESSAGE + ": %d error(s) in %s"
 SETTINGS_INVALID_DETAIL_LOG = SETTINGS_INVALID_MESSAGE + ": %s"
 SETTING_NAME_SEPARATOR = ", "
@@ -105,11 +114,50 @@ class EncodingChoice(str, Enum):
 # and `load ACCTFILE` resolve to the lowercase alias commands registered below.
 NORMALIZED_CONTEXT = {"token_normalize_func": str.lower, "help_option_names": ["-h", "--help"]}
 
+
+class MaskedUsageErrorGroup(TyperGroup):
+    """The top-level command group: every usage error it shows has its card numbers masked.
+
+    Click prints a usage error to stderr before any command runs, so before ConfigureLogging
+    installs the masking filter, and the error repeats what the operator typed: an unknown
+    command or option, an extra argument or a refused option value. The errors of the job and
+    load groups and of every command propagate through this group's make_context and invoke,
+    where MaskSensitiveText, the filter's own masking, rewrites their message. typer.Exit and
+    typer.Abort are not ClickExceptions, so they pass through unchanged. Typer vendors Click as
+    typer._click, so the ClickException caught is that copy's, the class Typer raises and shows,
+    not the click package's.
+    """
+
+    # Click calls these exact names, so they stay lower-case: a framework-mandated exception
+    # to the MK_Modernization Rule's PascalCase method naming.
+    def make_context(
+        self,
+        info_name: str | None,
+        args: list[str],
+        parent: Context | None = None,
+        **extra: Any,
+    ) -> Context:
+        try:
+            return super().make_context(info_name, args, parent, **extra)
+        except ClickException as error:
+            error.message = MaskSensitiveText(error.message)
+            raise
+
+    def invoke(self, ctx: Context) -> Any:
+        try:
+            return super().invoke(ctx)
+        except ClickException as error:
+            error.message = MaskSensitiveText(error.message)
+            raise
+
+
 # Plain Click help and error output (rich_markup_mode=None): help text is never read as Rich
 # markup, and the output stays the same in a terminal, a pipe and a test runner. Tracebacks of
-# unexpected errors never show local variables, which hold the settings and fetched rows.
+# unexpected errors never show local variables, which hold the settings and fetched rows. Usage
+# errors are shown with their card numbers masked (MaskedUsageErrorGroup).
 APP = typer.Typer(
     name="carddemo-batch",
+    cls=MaskedUsageErrorGroup,
     help="CardDemo batch jobs: the chain, the loaders and the processing jobs, run in the"
     " batch window.",
     no_args_is_help=True,
@@ -179,6 +227,19 @@ def ParseRunDateOption(text: str) -> str:
         raise typer.BadParameter(str(error)) from error
 
 
+def ParseOccurrenceOption(text: str) -> int:
+    """Return an --occurrence JobParameters accepts; any other value is a usage error, exit 2.
+
+    The rule is JobParameters' own: an integer in SUPPORTED_OCCURRENCES, TRANBKP's chain steps 6
+    and 15. A non-integer gets the same rule, and neither refusal repeats the value: int() drops
+    a typed card number's leading zero, leaving a digit run too short for the 16-digit masking.
+    """
+    try:
+        return JobParameters(occurrence=int(text)).occurrence
+    except ValueError as error:
+        raise typer.BadParameter(OCCURRENCE_RULE_MESSAGE) from error
+
+
 # Option declarations shared by several commands. Every name is declared explicitly, and the
 # boolean flags have no negative --no-* form.
 AS_OF_OPTION = Annotated[
@@ -227,8 +288,7 @@ OCCURRENCE_OPTION = Annotated[
     int | None,
     typer.Option(
         "--occurrence",
-        min=1,
-        max=2,
+        parser=ParseOccurrenceOption,
         metavar="OCCURRENCE",
         help="The TRANBKP occurrence: 1 for chain step 6, 2 for step 15.",
     ),
@@ -276,13 +336,28 @@ def BuildEngineOrExit(settings: BatchSettings) -> Engine:
         raise typer.Exit(code=EXIT_FAILURE) from None
 
 
+def LogDatabaseError(error: DBAPIError) -> None:
+    """Log a database error by its wrapper class, driver class and SQLSTATE at ERROR.
+
+    Never str(error): the driver message and the statement text can quote row values such as
+    card numbers and SSNs, which the batch diagnostics policy of batch/db.py keeps out of every
+    log line.
+    """
+    driverError = error.orig
+    sqlState = getattr(driverError, "pgcode", None) or UNKNOWN_CODE
+    driverClass = UNKNOWN_CODE if driverError is None else type(driverError).__name__
+    LOGGER.error(DATABASE_ERROR_LOG, type(error).__name__, driverClass, sqlState)
+
+
 def RunInBatchWindow(settings: BatchSettings, engine: Engine, invocation: CommandInvocation) -> int:
     """Run the invocation's prelude and action inside the batch window; return its status.
 
     The order is fixed: interrupted runs are classified first, then the generation catalog is
     reconciled, then the action resolves, skips or executes steps. A window not granted within
-    its lock timeout, or a database that cannot be reached, gives EXIT_FAILURE; BatchWindow has
-    then already released whatever it held.
+    its lock timeout, or a database that cannot be reached, gives EXIT_FAILURE. So does any
+    other database error that neither the prelude nor the action mapped to a status, such as
+    the missing relations of an unmigrated database: it is logged by class and SQLSTATE only.
+    In each case BatchWindow has then already released whatever it held.
     """
     context = JobContext(
         engine=engine,
@@ -300,6 +375,9 @@ def RunInBatchWindow(settings: BatchSettings, engine: Engine, invocation: Comman
         return EXIT_FAILURE
     except OperationalError as error:
         LOGGER.error(DATABASE_UNAVAILABLE_LOG, type(error).__name__)
+        return EXIT_FAILURE
+    except DBAPIError as error:
+        LogDatabaseError(error)
         return EXIT_FAILURE
 
 
@@ -352,8 +430,8 @@ def RunAllCommand(
         typer.Option(
             "--start-at",
             metavar="STEP",
-            help="Start at a step number 1-18 or a job name; for TRANBKP, its first incomplete"
-            " occurrence.",
+            help="Resume the OPEN cycle at a step number 1-18 or a job name; for TRANBKP, its"
+            " first incomplete occurrence. A new cycle starts at step 1.",
         ),
     ] = None,
     force: FORCE_OPTION = False,
@@ -480,7 +558,8 @@ JOB_COMMANDS = {
     TRAN_INDEX_JOB: TranIndexCommand,
 }
 
-# Registered in batch_chain's order, so `job --help` and `load --help` list chain order.
+# Each tuple's canonical names register in order, their legacy JCL aliases hidden. Typer lists
+# commands in creation order, so `job --help` and `load --help` list the names in tuple order.
 for jobName in PROCESSING_JOB_NAMES:
     RegisterCommand(JOB_APP, jobName, JOB_COMMANDS[jobName])
 for loaderName in LOADER_JOB_NAMES:

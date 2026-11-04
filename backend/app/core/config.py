@@ -1,4 +1,4 @@
-"""Environment settings of the CardDemo backend, its Alembic migrations and the batch CLI.
+"""Environment settings of the CardDemo backend and its Alembic migrations.
 
 Replaces: the CICS region configuration of csd/CARDDEMO.CSD (the CARDDEMO group's FILE,
 PROGRAM and TRANSACTION resources and the region they run in), the RACF sign-on parameters
@@ -128,7 +128,7 @@ def IsBrowserOrigin(entry: str) -> bool:
 
 
 class CommonSettings(BaseSettings):
-    """Settings shared by the backend runtime, Alembic and the batch CLI.
+    """Settings shared by the backend runtime and Alembic.
 
     Replaces the region-wide values every CardDemo program and job relied on: the runtime
     mode, the sync database connection that stands in for the VSAM catalog, the directory of

@@ -13,11 +13,19 @@ archived and emptied transactions.transactions.
 - STEP10 REPRO INFILE(TRANSACT) OUTFILE(TRANVSAM) adds every combined record to the TRANSACT
   KSDS; the port inserts each one into transactions.transactions in file order.
 
-Both steps run in one transaction with the generation's COMMITTED catalog row and the run's
-completion, so the step is atomic, and the generation is published after the commit. A duplicate
-key, or any other database, file or record failure, rolls everything back: the table is left as
-it was, no generation is cataloged and the .part file is deleted. This replaces the REPRO
-failure path (Technical Specification 0.6.12, "Utility steps").
+The sort streams, so memory never grows with the generations. Each input is checked for TRAN-ID
+order by a first read; one in order streams from its file, and one out of order (a SYSTRAN whose
+six-digit INTCALC suffix wrapped at 999999, or any other) is sorted stably in bounded memory with
+spilled runs, as DFSORT uses work files. The two ordered streams are merged stably, BKUP first on
+equal keys, and one pass writes each record, decodes it and inserts it in bounded batches.
+
+Both steps run in one transaction with the run's completion and then the generation's COMMITTED
+catalog row, the transaction's final write, so the step is atomic. This module never publishes:
+batch_chain publishes the generation once the transaction has committed, outside its
+runner-failure handling, so a publication error cannot turn the committed load into a failed,
+retryable step. A duplicate key, or any other database, file or record failure, rolls everything
+back: the table is left as it was, no generation is cataloged and the .part file is deleted.
+This replaces the REPRO failure path (Technical Specification 0.6.12, "Utility steps").
 
 Exit statuses: EXIT_OK; or JobFailure with EXIT_FAILURE when an input generation is missing or
 LOST, on a duplicate key or another constraint violation, and on a database, file or record
@@ -28,9 +36,15 @@ completed run from repeating in its cycle. The CLI holds the batch window around
 this job never enters the online window.
 """
 
+import collections
+import contextlib
 import errno
+import heapq
+import itertools
 import logging
-from collections.abc import Sequence
+import tempfile
+from collections.abc import Iterable, Iterator, Sequence
+from pathlib import Path
 
 from app.models import Transaction
 from app.utils.record_layouts import TRANSACTION_LAYOUT, DecodeRecord, RecordFormatError
@@ -58,6 +72,14 @@ TRAN_ID_LENGTH = 16
 EBCDIC_CODEC = "cp037"
 # Rows per executemany statement of the STEP10 load.
 INSERT_BATCH_SIZE = 500
+# The external sort an input out of TRAN-ID order goes through, as DFSORT sorts with work
+# files: runs of at most SORT_RUN_RECORD_COUNT records are sorted in memory and spilled to a
+# temporary directory, and at most MERGE_FAN_IN runs are open in any merge, so neither memory
+# nor open files grow with the generation.
+SORT_RUN_RECORD_COUNT = 10_000
+MERGE_FAN_IN = 64
+SPILL_DIRECTORY_PREFIX = "carddemo-combtran-"
+RUN_FILE_SUFFIX = ".run"
 
 TRANSACTION_TABLE = Transaction.__table__
 # Every stored column except the generated sort key, which PostgreSQL computes from tran_id.
@@ -96,10 +118,15 @@ RECORD_FIELD_TEMPLATE = (
     " is not valid CVTRA05Y content"
 )
 RECORD_LAYOUT_TEMPLATE = "TRANSACT.COMBINED(+1) record {recordNumber} is not a CVTRA05Y record"
+UNORDERED_RECORD_TEMPLATE = "{path} record {recordNumber} sorts before the record ahead of it"
 COMBINED_LOG = (
     "COMBTRAN: %d RECORDS (%d FROM TRANSACT.BKUP(0), %d FROM SYSTRAN(0)) SORTED INTO %s"
     " AND LOADED INTO TRANSACT"
 )
+
+
+class UnorderedGenerationError(gdg.GenerationRecordError):
+    """A generation record whose TRAN-ID sorts before the TRAN-ID of the record ahead of it."""
 
 
 def ResolveInputGenerations(context: JobContext) -> tuple[gdg.Generation, gdg.Generation]:
@@ -127,19 +154,116 @@ def TranIdSortKey(record: str) -> bytes:
     return record[:TRAN_ID_LENGTH].encode(EBCDIC_CODEC)
 
 
-def ReadMergedRecords(
-    bkupGeneration: gdg.Generation, systranGeneration: gdg.Generation
-) -> list[str]:
-    """STEP05R: concatenate BKUP(0) then SYSTRAN(0) and sort by TRAN-ID ascending.
+def KeyOrderedRecords(generation: gdg.Generation) -> Iterator[str]:
+    """Yield a generation's records as read, checking that their TRAN-IDs never descend.
 
-    sorted() is stable, so records with equal keys keep their SORTIN order. The records are
-    returned as read, never re-encoded.
+    Raises UnorderedGenerationError, naming the file and the 1-based record number, at the
+    first record whose key sorts before the key of the record ahead of it.
     """
-    concatenatedRecords = [
-        *gdg.ReadGeneration(bkupGeneration),
-        *gdg.ReadGeneration(systranGeneration),
+    previousKey = b""
+    for recordNumber, record in enumerate(gdg.ReadGeneration(generation), start=1):
+        recordKey = TranIdSortKey(record)
+        if recordKey < previousKey:
+            reason = UNORDERED_RECORD_TEMPLATE.format(
+                path=generation.path, recordNumber=recordNumber
+            )
+            raise UnorderedGenerationError(reason)
+        previousKey = recordKey
+        yield record
+
+
+def IsInKeyOrder(generation: gdg.Generation) -> bool:
+    """Read a whole generation once, keeping no record; return whether it is in TRAN-ID order.
+
+    Every line is validated as it is read, so a malformed generation fails here, before the
+    write transaction opens.
+    """
+    try:
+        collections.deque(KeyOrderedRecords(generation), maxlen=0)
+    except UnorderedGenerationError:
+        return False
+    return True
+
+
+def WriteRun(records: Iterable[str], spillDirectory: Path) -> Path:
+    """Write records, in the order given, to a new run file of the spill directory; return it."""
+    with tempfile.NamedTemporaryFile(
+        mode="wb", dir=spillDirectory, suffix=RUN_FILE_SUFFIX, delete=False
+    ) as runFile:
+        for record in records:
+            runFile.write(record.encode(gdg.GDG_FILE_ENCODING) + gdg.RECORD_TERMINATOR)
+    return Path(runFile.name)
+
+
+def ReadRun(runPath: Path) -> Iterator[str]:
+    """Yield the records of a run file in file order, terminators removed."""
+    with runPath.open("rb") as runFile:
+        for line in runFile:
+            yield line[: -len(gdg.RECORD_TERMINATOR)].decode(gdg.GDG_FILE_ENCODING)
+
+
+def MergeRuns(runPaths: Sequence[Path]) -> Iterator[str]:
+    """Merge sorted runs by TRAN-ID; on equal keys, records of earlier runs come first."""
+    return heapq.merge(*(ReadRun(runPath) for runPath in runPaths), key=TranIdSortKey)
+
+
+def MergeRunGroup(runGroup: Sequence[Path], spillDirectory: Path) -> Path:
+    """Merge consecutive runs into one new run, then delete them; return the new run."""
+    mergedPath = WriteRun(MergeRuns(runGroup), spillDirectory)
+    for runPath in runGroup:
+        runPath.unlink()
+    return mergedPath
+
+
+def SpillSortedRuns(records: Iterable[str], spillDirectory: Path) -> list[Path]:
+    """Cut records into runs of at most SORT_RUN_RECORD_COUNT, sort each stably and spill it."""
+    return [
+        WriteRun(sorted(runRecords, key=TranIdSortKey), spillDirectory)
+        for runRecords in itertools.batched(records, SORT_RUN_RECORD_COUNT)
     ]
-    return sorted(concatenatedRecords, key=TranIdSortKey)
+
+
+def ExternalSort(generation: gdg.Generation, cleanup: contextlib.ExitStack) -> Iterator[str]:
+    """Return a generation's records in stable TRAN-ID order, sorted in bounded memory.
+
+    Stably sorted runs are spilled to a temporary directory that cleanup removes, then merged
+    MERGE_FAN_IN consecutive runs at a time until one merge of at most MERGE_FAN_IN remains.
+    Each merge puts earlier runs first on equal keys, so the input order of equal keys is kept.
+    """
+    spillName = cleanup.enter_context(tempfile.TemporaryDirectory(prefix=SPILL_DIRECTORY_PREFIX))
+    spillDirectory = Path(spillName)
+    runPaths = SpillSortedRuns(gdg.ReadGeneration(generation), spillDirectory)
+    while len(runPaths) > MERGE_FAN_IN:
+        runGroups = itertools.batched(runPaths, MERGE_FAN_IN)
+        runPaths = [MergeRunGroup(runGroup, spillDirectory) for runGroup in runGroups]
+    return MergeRuns(runPaths)
+
+
+def SortedInputRecords(generation: gdg.Generation, cleanup: contextlib.ExitStack) -> Iterator[str]:
+    """Return one SORTIN input's records in stable TRAN-ID order, as a stream cleanup closes.
+
+    A generation is never assumed to be sorted. A first read checks it: one in order streams
+    from its file, checked again as it streams, and one out of order, such as a SYSTRAN whose
+    six-digit INTCALC suffix wrapped from 999999 to 000000, goes through ExternalSort.
+    """
+    if IsInKeyOrder(generation):
+        records = KeyOrderedRecords(generation)
+    else:
+        records = ExternalSort(generation, cleanup)
+    return cleanup.enter_context(contextlib.closing(records))
+
+
+def MergedRecords(
+    inputGenerations: tuple[gdg.Generation, gdg.Generation], cleanup: contextlib.ExitStack
+) -> Iterator[str]:
+    """STEP05R: BKUP(0) then SYSTRAN(0) sorted by TRAN-ID ascending, as one bounded stream.
+
+    Each input is in stable key order and heapq.merge puts the earlier input first on equal
+    keys, so the stream equals the stable sort of the concatenation, BKUP before SYSTRAN, while
+    holding one record per input. Records are yielded as read, never re-encoded.
+    """
+    sortedInputs = [SortedInputRecords(generation, cleanup) for generation in inputGenerations]
+    return heapq.merge(*sortedInputs, key=TranIdSortKey)
 
 
 def DescribeRecordError(error: RecordFormatError, recordNumber: int) -> str:
@@ -165,61 +289,72 @@ def TransactionRow(record: str, recordNumber: int) -> dict[str, object]:
     return {name: value for name, value in decodedRecord.items() if name in INSERT_COLUMN_NAMES}
 
 
-def InsertTransactions(connection: Connection, mergedRecords: Sequence[str]) -> None:
-    """STEP10 REPRO: insert every combined record into transactions.transactions, in file order.
+def LoadMergedRecords(
+    connection: Connection, writer: gdg.GenerationWriter, mergedRecords: Iterable[str]
+) -> None:
+    """STEP05R SORTOUT and STEP10 REPRO in one pass, holding at most one insert batch.
 
-    Records are not deduplicated: a TRAN-ID that repeats, or that the table already holds,
-    raises IntegrityError, as the KSDS refuses a duplicate key.
+    Each merged record is written to TRANSACT.COMBINED(+1) as read, never re-encoded, then
+    decoded, and every INSERT_BATCH_SIZE rows go into transactions.transactions in one
+    executemany, in file order. A refused decode names the record's 1-based position. Records
+    are not deduplicated: a TRAN-ID that repeats, or that the table already holds, raises
+    IntegrityError, as the KSDS refuses a duplicate key.
     """
-    for batchStart in range(0, len(mergedRecords), INSERT_BATCH_SIZE):
-        recordBatch = mergedRecords[batchStart : batchStart + INSERT_BATCH_SIZE]
-        transactionRows = [
-            TransactionRow(record, batchStart + batchOffset + 1)
-            for batchOffset, record in enumerate(recordBatch)
-        ]
+    transactionRows: list[dict[str, object]] = []
+    for record in mergedRecords:
+        writer.WriteRecord(record)
+        transactionRows.append(TransactionRow(record, writer.recordCount))
+        if len(transactionRows) == INSERT_BATCH_SIZE:
+            connection.execute(insert(TRANSACTION_TABLE), transactionRows)
+            transactionRows = []
+    if transactionRows:
         connection.execute(insert(TRANSACTION_TABLE), transactionRows)
 
 
-def WriteAndLoadCombined(
-    context: JobContext, connection: Connection, mergedRecords: Sequence[str]
-) -> gdg.GenerationWriter:
-    """Write TRANSACT.COMBINED(+1) (STEP05R SORTOUT), then load it (STEP10), on one transaction.
-
-    The load runs inside the generation block, so a failed insert discards the .part file.
-    Given the connection, the generation's COMMITTED row joins the job's transaction.
-    """
-    with gdg.NewGeneration(context, gdg.TRANSACT_COMBINED, connection=connection) as writer:
-        for record in mergedRecords:
-            writer.WriteRecord(record)
-        InsertTransactions(connection, mergedRecords)
-    return writer
-
-
 def BuildResult(
-    mergedRecords: Sequence[str], bkupGeneration: gdg.Generation, systranGeneration: gdg.Generation
+    recordCount: int, bkupGeneration: gdg.Generation, systranGeneration: gdg.Generation
 ) -> JobResult:
     """Return EXIT_OK with the combined count and the cataloged count of each input."""
     counts = {
-        RECORDS_COUNT_KEY: len(mergedRecords),
+        RECORDS_COUNT_KEY: recordCount,
         BACKUP_RECORDS_COUNT_KEY: bkupGeneration.recordCount,
         INTEREST_RECORDS_COUNT_KEY: systranGeneration.recordCount,
     }
     return JobResult(EXIT_OK, counts)
 
 
-def CombineAndReload(context: JobContext) -> tuple[JobResult, gdg.GenerationWriter]:
-    """Read and sort the inputs, then write, load and finish the run in one transaction.
+def WriteAndLoadCombined(
+    context: JobContext,
+    connection: Connection,
+    mergedRecords: Iterable[str],
+    inputGenerations: tuple[gdg.Generation, gdg.Generation],
+) -> tuple[JobResult, gdg.GenerationWriter]:
+    """Write TRANSACT.COMBINED(+1) (STEP05R SORTOUT), load it (STEP10) and finish the run.
 
-    The inputs are resolved and read before the write transaction opens. The run's completion
-    is the transaction's last statement, after the generation's COMMITTED row.
+    The load and the run's completion run inside the generation block, so a failure of either
+    discards the .part file. Given the connection, the generation's COMMITTED row, inserted as
+    the block exits, joins the job's transaction as its final write.
     """
-    bkupGeneration, systranGeneration = ResolveInputGenerations(context)
-    mergedRecords = ReadMergedRecords(bkupGeneration, systranGeneration)
-    with context.engine.begin() as connection:
-        writer = WriteAndLoadCombined(context, connection, mergedRecords)
-        result = BuildResult(mergedRecords, bkupGeneration, systranGeneration)
+    with gdg.NewGeneration(context, gdg.TRANSACT_COMBINED, connection=connection) as writer:
+        LoadMergedRecords(connection, writer, mergedRecords)
+        result = BuildResult(writer.recordCount, *inputGenerations)
         run_ledger.FinishAtomicRun(connection, context, result)
     return result, writer
+
+
+def CombineAndReload(context: JobContext) -> tuple[JobResult, gdg.GenerationWriter]:
+    """Order the inputs, then write, load and finish the run in one transaction.
+
+    The inputs are resolved, checked and, when out of order, sorted before the write
+    transaction opens; their merge then streams through it, and the spill files are removed
+    whatever happens. The generation's COMMITTED row is the transaction's last statement,
+    after the run's completion.
+    """
+    inputGenerations = ResolveInputGenerations(context)
+    with contextlib.ExitStack() as cleanup:
+        mergedRecords = MergedRecords(inputGenerations, cleanup)
+        with context.engine.begin() as connection:
+            return WriteAndLoadCombined(context, connection, mergedRecords, inputGenerations)
 
 
 def SqlState(error: DBAPIError) -> str:
@@ -286,10 +421,10 @@ def DescribeFailure(error: Exception) -> str:
 def RunJob(context: JobContext) -> JobResult:
     """Run COMBTRAN: sort BKUP(0) and SYSTRAN(0) into COMBINED(+1) and load it (chain step 16).
 
-    Returns EXIT_OK with the records, backup_records and interest_records counts, once the
-    transaction has committed and the generation is published. Raises JobFailure with
-    EXIT_FAILURE on a missing or LOST input, a duplicate key or another failure, after which
-    the table, the catalog and the archive directory are as they were.
+    Returns EXIT_OK with the records, backup_records and interest_records counts once the
+    transaction has committed, leaving the generation COMMITTED for batch_chain to publish.
+    Raises JobFailure with EXIT_FAILURE on a missing or LOST input, a duplicate key or another
+    failure, after which the table, the catalog and the archive directory are as they were.
     """
     try:
         result, writer = CombineAndReload(context)
@@ -297,9 +432,6 @@ def RunJob(context: JobContext) -> JobResult:
         raise JobFailure(EXIT_FAILURE, DescribeConstraintViolation(error)) from error
     except COMBTRAN_FAILURES as error:
         raise JobFailure(EXIT_FAILURE, DescribeFailure(error)) from error
-    # Outside the try: the step has committed, so a publication error must never be recorded as
-    # a failed, retryable step; the next ReconcileCatalog completes the publication.
-    gdg.PublishRunGenerations(context)
     counts = result.counts
     generationName = gdg.GenerationName(gdg.TRANSACT_COMBINED.name, writer.generation)
     LOGGER.info(

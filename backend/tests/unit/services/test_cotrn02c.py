@@ -12,7 +12,9 @@ literals, cursor fields and statuses are typed from cbl/COTRN02C.cbl:
 - the CONFIRMI EVALUATE of PROCESS-ENTER-KEY (lines 169-188);
 - ADD-TRANSACTION and WRITE-TRANSACT-FILE (lines 442-466, 711-749): the next TRAN-ID, the
   stored record, the success STRING with its two spaces and the DUPREC literal (409);
-- COPY-LAST-TRAN-DATA (lines 471-495): the F5 copy of the highest TRANSACT record.
+- COPY-LAST-TRAN-DATA (lines 471-495): the F5 copy of the highest TRANSACT record;
+- STARTBR-TRANSACT-FILE and READPREV-TRANSACT-FILE (lines 642-697), which ADD-TRANSACTION and
+  COPY-LAST-TRAN-DATA perform: WHEN OTHER (503) before any write.
 
 COTRN02C edits in first-failure mode, so a refusal names one literal and puts the cursor on its
 field. Seed account 00000000004 holds card 2988091353094312, a 40.00 balance and, like every
@@ -24,12 +26,14 @@ from datetime import datetime
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, NamedTuple
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import Engine, text
 
 from app.core.errors import FileIoError, LegacyMessageError
 from app.repositories.card_xref_repository import CardXrefRepository
+from app.repositories.transaction_repository import TransactionRepository
 from app.schemas.transactions import (
     TransactionAddFields,
     TransactionAddRequest,
@@ -51,9 +55,10 @@ MASKED_ADDING_CARD_NUM = "************4312"
 SEED_BALANCE = Decimal("40.00")
 UNKNOWN_ACCT_ID = "00000000099"
 UNKNOWN_CARD_NUM = "4000000000000000"
-# The CICS files READ-CXACAIX-FILE and READ-CCXREF-FILE address.
+# The CICS files READ-CXACAIX-FILE, READ-CCXREF-FILE and the TRANSACT browse address.
 ACCOUNT_PATH_FILE = "CXACAIX"
 CARD_XREF_FILE = "CCXREF"
+TRANSACTION_FILE = "TRANSACT"
 
 # --- The COTRN02 map keyed for the seed account; every field passes the CT02 edits -------------
 ENTERED_DATE = "2022-07-17"
@@ -105,6 +110,7 @@ MERCHANT_ID_NOT_NUMERIC_MESSAGE = "Merchant ID must be Numeric..."  # line 432
 CONFIRM_PROMPT_MESSAGE = "Confirm to add this transaction..."  # line 178
 CONFIRM_INVALID_MESSAGE = "Invalid value. Valid values are (Y/N)..."  # line 184
 DUPLICATE_TRAN_ID_MESSAGE = "Tran ID already exist..."  # line 738
+TRAN_LOOKUP_FAILED_MESSAGE = "Unable to lookup Transaction..."  # lines 664, 693
 # The STRING of lines 728-733: 'successfully. ' then ' Your Tran ID is ' leave two spaces.
 ADD_SUCCESS_TEMPLATE = "Transaction added successfully.  Your Tran ID is {tranId}."
 # WS-TRAN-ID-N PIC 9(16) (lines 444-449): zeros on READPREV ENDFILE plus 1, and the ADD 1 that
@@ -233,6 +239,13 @@ class XrefFailure(NamedTuple):
     fileName: str
     overrides: Mapping[str, str]
     refusal: Refusal
+
+
+class TranLookupFailure(NamedTuple):
+    """A TRANSACT browse method replaced by one failing with IOERR, and the keys and action."""
+
+    methodName: str
+    overrides: Mapping[str, str]
 
 
 class ShownField(NamedTuple):
@@ -389,6 +402,18 @@ XREF_FAILURE_CASES = [
     ),
 ]
 
+# The STARTBR/READPREV of HIGH-VALUES behind ENTER's next TRAN-ID and behind the F5 copy.
+TRAN_LOOKUP_FAILURE_CASES = [
+    pytest.param(
+        TranLookupFailure("AllocateNextTranId", NO_OVERRIDES),
+        id="allocate-next-tran-id-on-enter",
+    ),
+    pytest.param(
+        TranLookupFailure("GetHighestTransaction", {"action": COPY_LAST_ACTION, "confirm": "Y"}),
+        id="highest-transaction-on-copy-last",
+    ),
+]
+
 # Entries every edit accepts, keyed with a blank CONFIRM so the prompt shows the edited map.
 ACCEPTED_ENTRY_CASES = [
     pytest.param(
@@ -529,6 +554,29 @@ async def test_xref_file_error_is_the_when_other_literal(
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     request = BuildAddRequest(xrefFailure.overrides)
     await AssertRefusedWithoutWrite(context, syncEngine, request, xrefFailure.refusal)
+
+
+@pytest.mark.usefixtures("restoreSeedState")
+@pytest.mark.parametrize("tranLookupFailure", TRAN_LOOKUP_FAILURE_CASES)
+async def test_transact_browse_error_is_unable_to_lookup_transaction(
+    makeOnlineContext, syncEngine, monkeypatch, tranLookupFailure
+):
+    """A TRANSACT browse failing with IOERR gives the 503 WHEN OTHER literal and no INSERT.
+
+    A record is on file, so the F5 case cannot pass through the READPREV ENDFILE outcome.
+    """
+    InsertTransactionRow(syncEngine, LAST_TRAN_ID)
+    failingLookup = AsyncMock(side_effect=FileIoError(TRANSACTION_FILE))
+    insertSpy = AsyncMock()
+    monkeypatch.setattr(TransactionRepository, tranLookupFailure.methodName, failingLookup)
+    monkeypatch.setattr(TransactionRepository, "InsertTransaction", insertSpy)
+    context = await makeOnlineContext(REGULAR_USER_TYPE)
+    request = BuildAddRequest(tranLookupFailure.overrides)
+    refusal = Refusal(HTTP_FILE_ERROR, TRAN_LOOKUP_FAILED_MESSAGE, "acct_id")
+    await AssertRefusedWithoutWrite(context, syncEngine, request, refusal)
+    failingLookup.assert_awaited_once()
+    insertSpy.assert_not_awaited()
+    assert ReadBalance(syncEngine, ADDING_ACCT_ID) == SEED_BALANCE
 
 
 def test_pre_gregorian_date_is_ceedays_message_2513():

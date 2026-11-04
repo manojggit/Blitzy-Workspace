@@ -48,12 +48,13 @@ resolve to the IPv6 address `::1` first while the servers listen on IPv4.
 ### Samples and placeholders
 
 Samples use `curl` with a cookie jar: the login sample stores the session cookie with
-`-c cookies.txt`, and every later sample sends it with `-b cookies.txt`. Write samples also send the
-`Origin` header that the [CSRF guard](#csrf-origin-guard-and-cors) requires. For example, this
-command fetches one account:
+`-c var/session.cookies`, and every later sample sends it with `-b var/session.cookies`. The jar
+holds a live token, so it sits in the git-ignored `var/` directory, and the login sample's
+`umask 077` subshell gives it mode `600`. Write samples also send the `Origin` header that the
+[CSRF guard](#csrf-origin-guard-and-cors) requires. For example, this command fetches one account:
 
 ```bash
-curl -s -b cookies.txt http://127.0.0.1:8000/api/v1/accounts/ACCOUNT_ID
+curl -s -b var/session.cookies http://127.0.0.1:8000/api/v1/accounts/ACCOUNT_ID
 ```
 
 Replace the following placeholders wherever they appear in a sample:
@@ -75,8 +76,10 @@ the placeholders above. Where a sample shortens a list, the sentence that introd
 ## Session cookie
 
 `POST /api/v1/auth/login` is the only way to start a session. A successful sign-on sets an HttpOnly
-cookie, and every other `/api/v1` endpoint reads the user from it. The response body never carries
-a token.
+cookie, and the response body never carries a token. Every other `/api/v1` endpoint except
+`POST /api/v1/auth/logout` is protected: it reads the user from the cookie. Logout is public: it
+reads no identity and needs no session, so repeating it is harmless, but as a `POST` it still needs
+the `Origin` header that the [CSRF guard](#csrf-origin-guard-and-cors) requires.
 
 | Property | Value |
 |---|---|
@@ -102,7 +105,8 @@ SameSite=lax
 
 Session rules:
 
-- A missing, expired or invalid cookie is refused with status 401 and an empty `message`.
+- A protected endpoint refuses a missing, expired or invalid cookie with status 401 and an empty
+    `message`.
 - The user type in the token holds for the token's lifetime. A change to the user record, or its
     deletion, takes effect at that user's next sign-on.
 - `POST /api/v1/auth/logout` clears the cookie: it sends the cookie again with an empty value and
@@ -402,12 +406,14 @@ and returns the user with the menu route to open. This is the only endpoint exem
 | `user_id` | string, at most 8 | The user ID as keyed; upper-cased before the lookup |
 | `password` | string, at most 8 | The password as keyed; upper-cased before it is verified |
 
-This command signs on and stores the session cookie in `cookies.txt`:
+This command signs on and stores the session cookie in `var/session.cookies`:
 
 ```bash
-curl -s -c cookies.txt -X POST http://127.0.0.1:8000/api/v1/auth/login \
+mkdir -p var
+(umask 077 && curl -s -c var/session.cookies -X POST \
+    http://127.0.0.1:8000/api/v1/auth/login \
     -H 'Content-Type: application/json' \
-    -d '{"user_id": "USER_ID", "password": "PASSWORD"}'
+    -d '{"user_id": "USER_ID", "password": "PASSWORD"}')
 ```
 
 For a regular user, the response has status 200, sets the [session cookie](#session-cookie) and
@@ -450,7 +456,8 @@ sign-off literal. It needs no session, so repeating it is harmless, but as a `PO
 This command signs off:
 
 ```bash
-curl -s -b cookies.txt -X POST http://127.0.0.1:8000/api/v1/auth/logout \
+curl -s -b var/session.cookies -X POST \
+    http://127.0.0.1:8000/api/v1/auth/logout \
     -H 'Origin: http://127.0.0.1:3000'
 ```
 
@@ -464,6 +471,14 @@ Other outcomes:
 
 - 403 with an empty `message`: the `Origin` header is missing or not allow-listed.
 
+Logout does not revoke the token: the token in the jar stays valid until it expires,
+`ACCESS_TOKEN_EXPIRE_MINUTES` after sign-on (60 minutes by default). To delete the jar when you
+finish:
+
+```bash
+rm -f var/session.cookies
+```
+
 ### GET /api/v1/auth/me
 
 Replaces the COMMAREA user fields of CC00 / COSGN00C; role any signed-on user. Returns the user of
@@ -472,7 +487,7 @@ the session, which the frontend uses to choose the menu and fill the screen head
 This command reads the current user:
 
 ```bash
-curl -s -b cookies.txt http://127.0.0.1:8000/api/v1/auth/me
+curl -s -b var/session.cookies http://127.0.0.1:8000/api/v1/auth/me
 ```
 
 The response has status 200 and carries this `CurrentUser` body:
@@ -508,7 +523,7 @@ table order.
 This command lists the main menu:
 
 ```bash
-curl -s -b cookies.txt http://127.0.0.1:8000/api/v1/menu/main
+curl -s -b var/session.cookies http://127.0.0.1:8000/api/v1/menu/main
 ```
 
 The response has status 200 and carries this `MenuResponse` body:
@@ -548,7 +563,7 @@ on the keyed text and returns the route of the chosen option, replacing the prog
 This command selects option 1:
 
 ```bash
-curl -s -b cookies.txt -X POST \
+curl -s -b var/session.cookies -X POST \
     http://127.0.0.1:8000/api/v1/menu/main/selection \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
@@ -586,7 +601,7 @@ order.
 This command lists the admin menu:
 
 ```bash
-curl -s -b cookies.txt http://127.0.0.1:8000/api/v1/menu/admin
+curl -s -b var/session.cookies http://127.0.0.1:8000/api/v1/menu/admin
 ```
 
 The response has status 200 and carries this `MenuResponse` body:
@@ -617,7 +632,7 @@ Replaces CA00 / COADM01C / COADM01 (ENTER on the OPTION field); role admin. Take
 This command selects option 1:
 
 ```bash
-curl -s -b cookies.txt -X POST \
+curl -s -b var/session.cookies -X POST \
     http://127.0.0.1:8000/api/v1/menu/admin/selection \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
@@ -660,7 +675,7 @@ cross-reference, the account and the customer, and returns them for display with
 This command views an account:
 
 ```bash
-curl -s -b cookies.txt http://127.0.0.1:8000/api/v1/accounts/ACCOUNT_ID
+curl -s -b var/session.cookies http://127.0.0.1:8000/api/v1/accounts/ACCOUNT_ID
 ```
 
 For account `00000000004`, the response has status 200 and carries this `AccountViewResponse`
@@ -748,7 +763,7 @@ The SSN is not masked, because this screen edits it.
 This command fetches an account for update:
 
 ```bash
-curl -s -b cookies.txt \
+curl -s -b var/session.cookies \
     http://127.0.0.1:8000/api/v1/accounts/ACCOUNT_ID/edit
 ```
 
@@ -836,13 +851,22 @@ the SSN and the phone numbers in parts. Each field's maximum length is its BMS l
 | `phone_num_1_area`, `phone_num_1_prefix`, `phone_num_1_line` (also `phone_num_2_*`) | 3, 3, 4 |
 | `govt_issued_id` | 20 |
 
-Other outcomes, each with the key screen in state `DETAILS_NOT_FETCHED`, `info_message`
-`Enter or update id of account to update` and `acct_id` named:
+`cust_id` and `addr_country_cd` are display-only in every state
+([Screen state machine](#screen-state-machine)).
+
+Other outcomes, each with `acct_id` named and, unless stated, the key screen in state
+`DETAILS_NOT_FETCHED` with `info_message` `Enter or update id of account to update`:
 
 - 400 `No input received`: the key is blank.
 - 400 `Account Number if supplied must be a 11 digit Non-Zero Number`.
 - 404 with the three not-found texts of [`GET /api/v1/accounts/{acctId}`](#get-apiv1accountsacctid).
-- 503 with the CXACAIX file-error text.
+- 503 with the CXACAIX, ACCTDAT or CUSTDAT file-error text.
+- When the account record is missing or its read fails, but the customer is read, the 404
+    not-found text or the 503 ACCTDAT file-error text comes in state `SHOW_DETAILS`, with
+    `info_message` `Update account details presented above.`, as in the legacy program. The
+    customer fields are shown; the account fields other than `acct_id` are blank, and each
+    amount reads `+           .00`. The `screen_token` holds these values, so ENTER with them
+    unchanged answers 400 `No change detected with respect to values fetched.`
 
 ### PUT /api/v1/accounts/{acctId}
 
@@ -877,9 +901,13 @@ them is processed as `enter`.
 | State before the request | Editable fields | `enter` | `save` | `cancel` |
 |---|---|---|---|---|
 | `DETAILS_NOT_FETCHED` | `acct_id` | Fetch | As `enter` | As `enter` |
-| `SHOW_DETAILS`, `CHANGES_NOT_OK` | The detail fields | Validate | As `enter` | Re-read |
+| `SHOW_DETAILS`, `CHANGES_NOT_OK` | Most details, see below | Validate | As `enter` | Re-read |
 | `CHANGES_OK_NOT_CONFIRMED` | None | Keep | Write | Re-read |
 | `CHANGES_DONE`, `CHANGES_FAILED` | The key, when failed | Key screen | As `enter` | As `enter` |
+
+In `SHOW_DETAILS` and `CHANGES_NOT_OK`, every detail field is editable except `cust_id` and
+`addr_country_cd`, which stay protected like the key `acct_id`: their values always come from
+`screen_token`, and replacements sent in `fields` are ignored.
 
 The actions in the table do this:
 
@@ -967,7 +995,7 @@ the fetched `screen_token`. This file changes the credit limit:
 This command sends it:
 
 ```bash
-curl -s -b cookies.txt -X PUT \
+curl -s -b var/session.cookies -X PUT \
     http://127.0.0.1:8000/api/v1/accounts/ACCOUNT_ID \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
@@ -1039,7 +1067,7 @@ To save, send `save` with the `screen_token` of the validated screen. The server
 held in the token, so `fields` may be empty; any values it carries are ignored. This command saves:
 
 ```bash
-curl -s -b cookies.txt -X PUT \
+curl -s -b var/session.cookies -X PUT \
     http://127.0.0.1:8000/api/v1/accounts/ACCOUNT_ID \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
@@ -1218,8 +1246,12 @@ state-and-ZIP check. The SSN parts are named `SSN: First 3 chars`, `SSN 4th & 5t
 | Date day | ` : Day must be supplied.`, `:day must be a number between 1 and 31.` |
 | Day in month | `:Cannot have 31 days in this month.`, `:Cannot have 30 days in this month.` |
 | Leap year | `:Not a leap year.Cannot have 29 days in this month.` |
-| Date service | ` validation error Sev code: <sev> Message code: <msg>` |
+| Date service | ` validation error Sev code: SEVERITY_CODE Message code: MESSAGE_CODE` |
 | Date of birth | `:cannot be in the future ` (with a trailing space) |
+
+In the date-service suffix, `SEVERITY_CODE` and `MESSAGE_CODE` stand for the severity and the
+message number that the date service (CSUTLDTC's call to CEEDAYS) returned, each as four
+zero-padded digits. Every date-service error has severity `0003`.
 
 The leading and trailing spaces of each suffix are part of the literal. Every edit runs whenever
 any field changes, so an account whose stored values fail an edit cannot be updated until that
@@ -1255,7 +1287,7 @@ selection: a single valid `S` or `U` is sent to
 This command lists the first page:
 
 ```bash
-curl -s -b cookies.txt http://127.0.0.1:8000/api/v1/cards
+curl -s -b var/session.cookies http://127.0.0.1:8000/api/v1/cards
 ```
 
 The response has status 200 and carries a `CardListResponse` body. This sample is shortened to the
@@ -1291,7 +1323,7 @@ tokens:
 This command reads the next page (F8) from the page shown:
 
 ```bash
-curl -s -b cookies.txt -G http://127.0.0.1:8000/api/v1/cards \
+curl -s -b var/session.cookies -G http://127.0.0.1:8000/api/v1/cards \
     --data-urlencode 'startKey=START_KEY' \
     -d direction=forward -d page=1
 ```
@@ -1330,7 +1362,8 @@ COCRDUPC; role regular. Edits the filters and the selection codes, then returns 
 This command selects the card of the account filter's single row for update:
 
 ```bash
-curl -s -b cookies.txt -X POST http://127.0.0.1:8000/api/v1/cards/selection \
+curl -s -b var/session.cookies -X POST \
+    http://127.0.0.1:8000/api/v1/cards/selection \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
     -d '{"acct_id": "ACCOUNT_ID", "card_num": "",
@@ -1374,7 +1407,7 @@ sent with its row's 11-digit account number, is read with those keys and no key 
 This command views a card from the card list:
 
 ```bash
-curl -s -b cookies.txt \
+curl -s -b var/session.cookies \
     'http://127.0.0.1:8000/api/v1/cards/CARD_REF?acctId=ACCOUNT_ID'
 ```
 
@@ -1390,7 +1423,7 @@ and carries this `CardDetailResponse` body:
     "acct_id": "00000000004",
     "card_ref": "CARD_REF",
     "card_num_masked": "************4312",
-    "embossed_name": "DELBERT K PARISIAN",
+    "embossed_name": "Delbert Parisian",
     "active_status": "Y",
     "expiry_month": "12",
     "expiry_year": "2023"
@@ -1423,7 +1456,7 @@ row's account number is read without key edits; a typed card number has both key
 This command fetches a card for update:
 
 ```bash
-curl -s -b cookies.txt \
+curl -s -b var/session.cookies \
     'http://127.0.0.1:8000/api/v1/cards/CARD_REF/edit?acctId=ACCOUNT_ID'
 ```
 
@@ -1438,7 +1471,7 @@ The response has status 200 and carries this `CardScreen` body:
     "fields": {
         "acct_id": "00000000004",
         "card_num": "************4312",
-        "embossed_name": "DELBERT K PARISIAN",
+        "embossed_name": "DELBERT PARISIAN",
         "active_status": "Y",
         "expiry_month": "12",
         "expiry_year": "2023",
@@ -1451,7 +1484,9 @@ The response has status 200 and carries this `CardScreen` body:
 ```
 
 `fields.card_num` is always masked once details are fetched; the card key travels in
-`screen_token`. `expiry_day` is a dark, protected field carried for the rewrite.
+`screen_token`. `fields.embossed_name` is the stored name upper-cased; the card view shows it as
+stored. `expiry_day` is always blank in responses and ignored in requests: the stored expiry day
+travels only in the encrypted before-image inside `screen_token`, and a save keeps it.
 
 | Fields (`CardScreenFields`) | Length |
 |---|---|
@@ -1493,7 +1528,8 @@ The differences from the account update:
     update's lines.
 
 To validate a new embossed name, write the fetched `fields` to `card-enter.json` with the new name
-keyed, and the fetched `screen_token`:
+keyed, and the fetched `screen_token`. The name must differ from the fetched one in more than
+letter case, because the no-change test compares both upper-cased:
 
 ```json
 {
@@ -1502,7 +1538,7 @@ keyed, and the fetched `screen_token`:
     "fields": {
         "acct_id": "00000000004",
         "card_num": "************4312",
-        "embossed_name": "DELBERT PARISIAN",
+        "embossed_name": "DELBERT K PARISIAN",
         "active_status": "Y",
         "expiry_month": "12",
         "expiry_year": "2023",
@@ -1514,7 +1550,7 @@ keyed, and the fetched `screen_token`:
 This command sends it:
 
 ```bash
-curl -s -b cookies.txt -X PUT \
+curl -s -b var/session.cookies -X PUT \
     http://127.0.0.1:8000/api/v1/cards/CARD_REF \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
@@ -1532,7 +1568,7 @@ The response has status 200 and this body, in state `CHANGES_OK_NOT_CONFIRMED`:
     "fields": {
         "acct_id": "00000000004",
         "card_num": "************4312",
-        "embossed_name": "DELBERT PARISIAN",
+        "embossed_name": "DELBERT K PARISIAN",
         "active_status": "Y",
         "expiry_month": "12",
         "expiry_year": "2023",
@@ -1547,7 +1583,7 @@ The response has status 200 and this body, in state `CHANGES_OK_NOT_CONFIRMED`:
 This command saves the validated change:
 
 ```bash
-curl -s -b cookies.txt -X PUT \
+curl -s -b var/session.cookies -X PUT \
     http://127.0.0.1:8000/api/v1/cards/CARD_REF \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
@@ -1556,11 +1592,12 @@ curl -s -b cookies.txt -X PUT \
 
 The response has status 200, state `CHANGES_DONE` and `info_message`
 `Changes committed to database`, with the same `fields`, a new `screen_token` and the `card_ref`.
+The card now holds the validated values, with the name as keyed, and keeps its stored expiry day.
 
 Other outcomes:
 
-- 400 `No change detected with respect to values fetched.`: `enter` with nothing changed; the
-    state is kept.
+- 400 `No change detected with respect to values fetched.`: `enter` with nothing changed but
+    letter case, such as the fetched `fields` sent back as they are; the state is kept.
 - 400 `Card name not provided` (`embossed_name`).
 - 400 `Card name can only contain alphabets and spaces` (`embossed_name`).
 - 400 `Card Active Status must be Y or N` (`active_status`).
@@ -1605,7 +1642,7 @@ a search finds nothing.
 This command lists the first page:
 
 ```bash
-curl -s -b cookies.txt http://127.0.0.1:8000/api/v1/transactions
+curl -s -b var/session.cookies http://127.0.0.1:8000/api/v1/transactions
 ```
 
 The response has status 200 and carries this `TransactionListResponse` body:
@@ -1641,7 +1678,7 @@ program blanked the search field, so the page shows it empty.
 This command reads the next page (F8) after the page shown:
 
 ```bash
-curl -s -b cookies.txt -G http://127.0.0.1:8000/api/v1/transactions \
+curl -s -b var/session.cookies -G http://127.0.0.1:8000/api/v1/transactions \
     -d startKey=START_KEY -d firstKey=0000000000000001 \
     -d direction=forward -d page=1
 ```
@@ -1665,13 +1702,14 @@ Other outcomes:
 ### POST /api/v1/transactions/selection
 
 Replaces CT00 / COTRN00C / COTRN00 (ENTER with a selection code) and its `XCTL` to COTRN01C; role
-regular. The first row with a selection code decides; then the search key is applied.
+regular. Only the first row with a non-blank selection code counts: blank codes and later codes
+are ignored, and a blank `tran_id` on that row selects nothing. The search key is then applied.
 
 | Body field (`TransactionSelectionRequest`) | Type | Description |
 |---|---|---|
 | `selections` | list of at most 10 `TransactionSelection` | The rows shown, in screen order |
 | `selections[].tran_id` | string, at most 16 | The row's transaction ID |
-| `selections[].selection` | string, at most 1 | `S`, another code, or blank |
+| `selections[].selection` | string, at most 1 | `S`/`s` (view), another code, or blank |
 | `search_tran_id` | string, at most 16 | The search key as keyed |
 | `first_key` | string, at most 16 | The `first_key` shown |
 | `page` | integer, 0 to 99999999 | The page number shown |
@@ -1679,7 +1717,7 @@ regular. The first row with a selection code decides; then the search key is app
 This command selects a transaction for display:
 
 ```bash
-curl -s -b cookies.txt -X POST \
+curl -s -b var/session.cookies -X POST \
     http://127.0.0.1:8000/api/v1/transactions/selection \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
@@ -1705,12 +1743,14 @@ Transaction View page for the selected ID:
 
 Other outcomes:
 
-- Any code other than `S` sets `Invalid selection. Valid value is S` and the list is browsed again
-    from `search_tran_id`. When that literal stays, the answer is 400 with the browsed `rows`,
-    `page`, `first_key`, `last_key` and `search_cleared`. When the browse replaces it with a paging
-    literal, the answer is a 200 list with `route` null.
-- 400 `Tran ID must be Numeric ...` (`search_tran_id`): no `S` was selected and the search key is
-    not numeric.
+- A non-blank code other than `S` or `s`, on a row whose `tran_id` is not blank, sets
+    `Invalid selection. Valid value is S`, and the list is browsed again from `search_tran_id`. When
+    that literal stays, the answer is 400 with the browsed `rows`, `page`, `first_key`, `last_key`
+    and `search_cleared`. When the browse replaces it with a paging literal, the answer is a 200
+    list with `route` null.
+- 400 `Tran ID must be Numeric ...` (`search_tran_id`): no row was routed by `S` or `s`, and the
+    search key is not numeric. On an empty file the answer is `You are at the top of the page...`
+    instead.
 - 503 `Unable to lookup transaction...`.
 
 ### GET /api/v1/transactions/{tranId}
@@ -1724,7 +1764,7 @@ Replaces CT01 / COTRN01C / COTRN01; role regular. Reads one transaction for disp
 This command views a transaction:
 
 ```bash
-curl -s -b cookies.txt http://127.0.0.1:8000/api/v1/transactions/TRAN_ID
+curl -s -b var/session.cookies http://127.0.0.1:8000/api/v1/transactions/TRAN_ID
 ```
 
 The response has status 200 and carries this `TransactionDetailResponse` body:
@@ -1807,7 +1847,8 @@ Every field is a string. To add a transaction, write the request to `add.json`:
 This command sends it:
 
 ```bash
-curl -s -b cookies.txt -X POST http://127.0.0.1:8000/api/v1/transactions \
+curl -s -b var/session.cookies -X POST \
+    http://127.0.0.1:8000/api/v1/transactions \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
     -d @add.json
@@ -1860,9 +1901,9 @@ Other outcomes, in edit order, each naming its field:
 - 400 `Account or Card Number must be entered...`.
 - 400 `Account ID must be Numeric...`, `Card Number must be Numeric...`.
 - 404 `Account ID NOT found...`, `Card Number NOT found...`.
-- 400 `<Field> can NOT be empty...`, for the fields `Type CD`, `Category CD`, `Source`,
-    `Description`, `Amount`, `Orig Date`, `Proc Date`, `Merchant ID`, `Merchant Name`,
-    `Merchant City` and `Merchant Zip`.
+- 400 `FIELD_NAME can NOT be empty...`, where `FIELD_NAME` is the label of the first blank field,
+    checked in this order: `Type CD`, `Category CD`, `Source`, `Description`, `Amount`,
+    `Orig Date`, `Proc Date`, `Merchant ID`, `Merchant Name`, `Merchant City`, `Merchant Zip`.
 - 400 `Type CD must be Numeric...`, `Category CD must be Numeric...`.
 - 400 `Amount should be in format -99999999.99`.
 - 400 `Orig Date should be in format YYYY-MM-DD`, `Proc Date should be in format YYYY-MM-DD`.
@@ -1904,7 +1945,7 @@ report screen as a `TransactionReportResponse`.
 This command builds a custom report for one day:
 
 ```bash
-curl -s -b cookies.txt -G \
+curl -s -b var/session.cookies -G \
     http://127.0.0.1:8000/api/v1/reports/transactions \
     -d reportType=custom -d startMm=07 -d startDd=17 -d startYyyy=2022 \
     -d endMm=07 -d endDd=17 -d endYyyy=2022 -d confirm=Y
@@ -1954,11 +1995,18 @@ then transaction-ID order. `line_kind` is one of these:
 
 | `line_kind` | Content |
 |---|---|
-| `header` | The report title and date range, a blank line, the column headings and a rule |
+| `header` | Title and date range, a blank line, column headings, a rule; the rule after a total |
 | `detail` | One transaction: ID, account, type, category, source and amount |
 | `account_total` | `Account Total` of the previous card, written when the card number changes |
-| `page_total` | `Page Total`, after every 20 lines, followed by the headers again |
-| `grand_total` | `Grand Total`, at the end, after a last `page_total` |
+| `page_total` | `Page Total` and a rule, then the headers again at a page break; also at the end |
+| `grand_total` | `Grand Total`, at the end, after the last `page_total` and its rule |
+
+Every line but `grand_total` is counted: 4 per set of headers, 2 per total with its rule and 1 per
+detail. Only just before a detail does the program test the count; when it is a multiple of 20,
+the page breaks there with `page_total`, its rule and the headers. An `account_total` adds 2 lines
+between two tests, so the count can pass a multiple of 20 untested and the page runs on: two cards
+of 15 transactions give 39 lines and one `page_total`, at the end. That last `page_total` is
+followed by its rule and `grand_total`, never by headers.
 
 The totals reproduce CBTRN03C exactly. At end of file the program adds the last amount to the page
 and grand totals a second time and never writes the final account total, so a report with one
@@ -1977,20 +2025,35 @@ Other outcomes:
 - 400 `Select a report type to print report...` (`reportType`).
 - 400 `Start Date - Month can NOT be empty...`, and the same form for `Day` and `Year` and for
     `End Date`.
-- 400 `Start Date - Not a valid Month...`, and the same form for `Day` and `Year` and for
-    `End Date`.
-- 400 `Start Date - Not a valid date...`, `End Date - Not a valid date...`: the parts form no
-    calendar date, such as 30 February.
+- 400 `Start Date - Not a valid Month...` (`startMm`) for a month above 12, and
+    `Start Date - Not a valid Day...` (`startDd`) for a day above 31, both after normalisation;
+    the `End Date` forms name `endMm` and `endDd`.
+- 400 `Start Date - Not a valid date...` (`startMm`), `End Date - Not a valid date...` (`endMm`):
+    the normalised parts form no calendar date, such as 30 February or a month or day of `00`.
 - 400 `"X" is not a valid value to confirm...` (`confirm`): the keyed value, here `X`, in double
     quotes.
 - 503 `Unable to Write TDQ (JOBS)...` (`reportType`): the transactions cannot be read. The literal
     is the program's only file-error message.
 
+CORPT00C normalises each date part before these checks: NUMVAL-C reads the text into an unsigned
+two- or four-digit field, which drops any sign and fraction, and unreadable text becomes zero. So
+`-5` becomes `05`, `1.` becomes `01`, `AB` becomes `00` and `ABCD` becomes `0000`. A part longer
+than its field, such as the year `-2022`, is refused with 422 first ([Input limits](#input-limits)).
+A normalised year is always four digits, so `Start Date - Not a valid Year...` and
+`End Date - Not a valid Year...` are assigned in the source but never returned. A date that exists
+in the calendar but falls before 15 October 1582, year `0000` included, passes the calendar-date
+check, because CORPT00C accepts CEEDAYS message 2513: `startYyyy=ABCD` with month `07` and day
+`17` returns 200 with `start_date` `0000-07-17`. A month of `00` or a day the month lacks still
+fails in any year: `startYyyy=0000` with month `02` and day `30` returns 400
+`Start Date - Not a valid date...` (`startMm`). A `0000` start precedes every stored date, and a
+`0000` end selects no transaction.
+
 ### GET /api/v1/reports/transactions/export
 
 Replaces the TRANREPT print file of CR00 / CORPT00C and CBTRN03C; role regular. Runs the same edits
-and streams the same lines as an attachment named `TRANREPT_<start>_<end>.<format>`, built in
-memory. Only `confirm` `Y` downloads.
+and streams the same lines as an attachment named `TRANREPT_START_DATE_END_DATE.FORMAT`, built
+in memory. `START_DATE` and `END_DATE` stand for the report's first and last days as `YYYY-MM-DD`,
+and `FORMAT` for the `format` parameter, `csv` or `pdf`. Only `confirm` `Y` downloads.
 
 | Parameter | In | Type | Description |
 |---|---|---|---|
@@ -2000,7 +2063,7 @@ memory. Only `confirm` `Y` downloads.
 This command downloads the one-day report as CSV:
 
 ```bash
-curl -s -b cookies.txt -G -OJ \
+curl -s -b var/session.cookies -G -OJ \
     http://127.0.0.1:8000/api/v1/reports/transactions/export \
     -d reportType=custom -d startMm=07 -d startDd=17 -d startYyyy=2022 \
     -d endMm=07 -d endDd=17 -d endYyyy=2022 -d confirm=Y -d format=csv
@@ -2067,7 +2130,7 @@ balance by it.
 This command shows the balance and asks for confirmation:
 
 ```bash
-curl -s -b cookies.txt -X POST http://127.0.0.1:8000/api/v1/billpay \
+curl -s -b var/session.cookies -X POST http://127.0.0.1:8000/api/v1/billpay \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
     -d '{"acct_id": "ACCOUNT_ID", "confirm": ""}'
@@ -2087,7 +2150,7 @@ For account `00000000005`, the response has status 200 and carries this `BillPay
 This command confirms the payment:
 
 ```bash
-curl -s -b cookies.txt -X POST http://127.0.0.1:8000/api/v1/billpay \
+curl -s -b var/session.cookies -X POST http://127.0.0.1:8000/api/v1/billpay \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
     -d '{"acct_id": "ACCOUNT_ID", "confirm": "Y"}'
@@ -2150,7 +2213,7 @@ Without a `direction`, the browse starts at the first user ID greater than or eq
 This command lists the first page:
 
 ```bash
-curl -s -b cookies.txt http://127.0.0.1:8000/api/v1/admin/users
+curl -s -b var/session.cookies http://127.0.0.1:8000/api/v1/admin/users
 ```
 
 The response has status 200 and carries a `UserListResponse` body. This sample is shortened to the
@@ -2183,7 +2246,7 @@ first two of the page's ten rows:
 This command reads the next page (F8):
 
 ```bash
-curl -s -b cookies.txt -G http://127.0.0.1:8000/api/v1/admin/users \
+curl -s -b var/session.cookies -G http://127.0.0.1:8000/api/v1/admin/users \
     -d startKey=START_KEY -d direction=forward -d page=1
 ```
 
@@ -2206,19 +2269,21 @@ the page shown stays as it was.
 ### POST /api/v1/admin/users/selection
 
 Replaces CU00 / COUSR00C / COUSR00 (ENTER with a selection code) and its `XCTL` to COUSR02C or
-COUSR03C; role admin. The first row with a selection code decides; then the search key is applied.
+COUSR03C; role admin. Only the first row with a non-blank selection code counts: blank codes and
+later codes are ignored, and a blank `user_id` on that row selects nothing. The search key is then
+applied.
 
 | Body field (`UserSelectionRequest`) | Type | Description |
 |---|---|---|
 | `selections` | list of at most 10 `UserSelection` | Every row shown, in screen order |
 | `selections[].user_id` | string, at most 8 | The row's user ID |
-| `selections[].selection` | string, at most 1 | `U` (update), `D` (delete), other, or blank |
+| `selections[].selection` | string, at most 1 | `U`/`u` update, `D`/`d` delete, other, or blank |
 | `search_user_id` | string, at most 8 | The search key as keyed |
 
 This command selects a user for update:
 
 ```bash
-curl -s -b cookies.txt -X POST \
+curl -s -b var/session.cookies -X POST \
     http://127.0.0.1:8000/api/v1/admin/users/selection \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
@@ -2240,12 +2305,13 @@ The response has status 200 and carries this `UserSelectionResponse` body:
 }
 ```
 
-`D` routes to `/admin/users/delete?userId=` and the user ID.
+`u` routes as `U` does, and `D` or `d` routes to `/admin/users/delete?userId=` and the user ID.
 
 Other outcomes:
 
-- Any other code sets `Invalid selection. Valid values are U and D` and the list is browsed again
-    from `search_user_id`. When that literal stays, the answer is 400
+- A non-blank code other than `U`, `u`, `D` or `d`, on a row whose `user_id` is not blank, sets
+    `Invalid selection. Valid values are U and D`, and the list is browsed again from
+    `search_user_id`. When that literal stays, the answer is 400
     (`UserSelectionErrorResponse`) with the browsed `rows`, `page`, `first_key` and `last_key`.
     When the browse replaces it with a paging literal, the answer is a 200 list with `route` null.
 - 503 `Unable to lookup User...`.
@@ -2267,7 +2333,8 @@ access. The password is stored as a bcrypt hash of the text as entered, case kep
 This command adds a regular user:
 
 ```bash
-curl -s -b cookies.txt -X POST http://127.0.0.1:8000/api/v1/admin/users \
+curl -s -b var/session.cookies -X POST \
+    http://127.0.0.1:8000/api/v1/admin/users \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
     -d '{"first_name": "Ada", "last_name": "Lovelace",
@@ -2308,7 +2375,7 @@ returned.
 This command fetches a user for the delete screen:
 
 ```bash
-curl -s -b cookies.txt \
+curl -s -b var/session.cookies \
     'http://127.0.0.1:8000/api/v1/admin/users/USER_ID?screen=delete'
 ```
 
@@ -2359,7 +2426,7 @@ so the password is handled this way:
 This command changes a user's last name and keeps the password:
 
 ```bash
-curl -s -b cookies.txt -X PUT \
+curl -s -b var/session.cookies -X PUT \
     http://127.0.0.1:8000/api/v1/admin/users/USER_ID \
     -H 'Origin: http://127.0.0.1:3000' \
     -H 'Content-Type: application/json' \
@@ -2378,9 +2445,10 @@ Other outcomes, each naming its field:
 - 400 `User ID can NOT be empty...`, `First Name can NOT be empty...`,
     `Last Name can NOT be empty...` or `User Type can NOT be empty...`. The password is not
     required here.
-- 400 `Please modify to update ...`: nothing changed.
+- 400 `Please modify to update ...` (`first_name`): nothing changed.
 - 404 `User ID NOT found...` (`user_id`).
-- 503 `Unable to lookup User...` or `Unable to Update User...`.
+- 503 `Unable to Update User...` (`first_name`): the batch window is held, another request
+    holds the user's row past the lock timeout, or the user file cannot be read or rewritten.
 
 ### DELETE /api/v1/admin/users/{userId}
 
@@ -2393,7 +2461,7 @@ Replaces CU03 / COUSR03C / COUSR03 (F5); role admin. Deletes the user.
 This command deletes a user:
 
 ```bash
-curl -s -b cookies.txt -X DELETE \
+curl -s -b var/session.cookies -X DELETE \
     http://127.0.0.1:8000/api/v1/admin/users/USER_ID \
     -H 'Origin: http://127.0.0.1:3000'
 ```

@@ -14,14 +14,17 @@ Every command runs in process through InvokeCli, so the monkeypatched hook and t
 rollback reach the job.
 """
 
+import contextlib
 import hashlib
-from collections.abc import Callable, Sequence
+import tracemalloc
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from app.models import GDG_GENERATIONS, Transaction
-from sqlalchemy import Engine, func, insert, select
+from sqlalchemy import Engine, event, func, insert, select
 from sqlalchemy.engine import Row
 
 from batch.cli import INTEREST_CALC_JOB, POST_TRAN_JOB
@@ -86,6 +89,34 @@ SYNTHETIC_ROW_COUNT = 2
 
 NO_PUBLISHED_BACKUP_MESSAGE = "No PUBLISHED TRANSACT.BKUP generation was cataloged"
 RECORD_LENGTH_MESSAGE = "A TRANSACT.BKUP record is not {lrecl} characters: {lengths!r}"
+
+# The bounded-read probe: a small fetch batch, a table 20 times the size of the first one, and
+# the most the traced peak may grow between them, far below the roughly 1 KB per row that a
+# result held whole would add (3.8 MB for the 3,800 extra rows).
+SMALL_FETCH_BATCH_SIZE = 50
+SMALL_TABLE_ROW_COUNT = 200
+LARGE_TABLE_ROW_COUNT = 4000
+ARCHIVE_PEAK_GROWTH_LIMIT = 256 * 1024
+
+
+@dataclass(frozen=True)
+class ArchiveReadMeasure:
+    """One traced pass of the archive read: its peak, the records it wrote, its cursors' names."""
+
+    peakBytes: int
+    recordCount: int
+    cursorNames: tuple[str | None, ...]
+
+
+class CountingWriter:
+    """Stands in for gdg.GenerationWriter: counts the records written and keeps none of them."""
+
+    def __init__(self) -> None:
+        self.recordCount = 0
+
+    def WriteRecord(self, record: str) -> None:
+        """Count one record; its text is not kept."""
+        self.recordCount += 1
 
 
 def TranBackupArguments(occurrence: int) -> list[str]:
@@ -159,6 +190,45 @@ def GenerationFileNames(outputDir: Path) -> list[str]:
     return sorted(
         path.name for path in baseDirectory.glob("*") if path.suffix in GENERATION_FILE_SUFFIXES
     )
+
+
+def InsertRowsOnCards(engine: Engine, cardNums: Sequence[str], rowCount: int) -> None:
+    """Insert rowCount more posted transactions on each of the given existing cards."""
+    spec = SyntheticTransactionSpec(cardNums=cardNums, perCard=rowCount, amount=SYNTHETIC_AMOUNT)
+    InsertSyntheticTransactions(engine, spec)
+
+
+@contextlib.contextmanager
+def CapturedCursorNames(engine: Engine) -> Iterator[list[str | None]]:
+    """Record the DBAPI cursor name of every statement the engine runs; None means client-side."""
+    cursorNames: list[str | None] = []
+
+    def RecordCursorName(**eventArguments: object) -> None:
+        cursorNames.append(getattr(eventArguments["cursor"], "name", None))
+
+    event.listen(engine, "before_cursor_execute", RecordCursorName, named=True)
+    try:
+        yield cursorNames
+    finally:
+        event.remove(engine, "before_cursor_execute", RecordCursorName)
+
+
+def MeasureArchiveRead(engine: Engine) -> ArchiveReadMeasure:
+    """Stream the table through the archive read into a CountingWriter under tracemalloc.
+
+    An untraced first pass warms the statement cache, so passes over tables of different sizes
+    trace the same code; the transaction is rolled back, so nothing changes.
+    """
+    writer = CountingWriter()
+    with engine.connect() as connection, CapturedCursorNames(engine) as cursorNames:
+        tranbkp.WriteArchiveRecords(connection, CountingWriter())
+        tracemalloc.start()
+        try:
+            tranbkp.WriteArchiveRecords(connection, writer)
+            peakBytes = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+    return ArchiveReadMeasure(peakBytes, writer.recordCount, tuple(cursorNames))
 
 
 def BuildCountingHook(engine: Engine, observedCounts: list[int]) -> Callable[[], None]:
@@ -239,6 +309,31 @@ def test_after_archive_read_hook_fires_once_per_run(
     InvokeExpecting(TranBackupArguments(FIRST_OCCURRENCE), EXIT_OK)
     assert observedCounts == [SYNTHETIC_ROW_COUNT]
     assert CountTransactions(engine) == 0
+
+
+def test_archive_read_streams_from_a_server_side_cursor_in_bounded_memory(
+    batchEnvironment: BatchEnvironment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The archive read holds one fetch batch, never the table, however large the table grows.
+
+    Every statement runs on a named, server-side cursor, so the driver buffers no whole result,
+    and the traced peak for a table 20 times larger stays within ARCHIVE_PEAK_GROWTH_LIMIT.
+    """
+    engine = batchEnvironment.engine
+    monkeypatch.setattr(tranbkp, "ARCHIVE_FETCH_BATCH_SIZE", SMALL_FETCH_BATCH_SIZE)
+    cardNums = InsertSyntheticCards(engine, 1)
+    InsertRowsOnCards(engine, cardNums, SMALL_TABLE_ROW_COUNT)
+    smallMeasure = MeasureArchiveRead(engine)
+    InsertRowsOnCards(engine, cardNums, LARGE_TABLE_ROW_COUNT - SMALL_TABLE_ROW_COUNT)
+    largeMeasure = MeasureArchiveRead(engine)
+    assert (smallMeasure.recordCount, largeMeasure.recordCount) == (
+        SMALL_TABLE_ROW_COUNT,
+        LARGE_TABLE_ROW_COUNT,
+    )
+    cursorNames = smallMeasure.cursorNames + largeMeasure.cursorNames
+    assert cursorNames and None not in cursorNames, cursorNames
+    peakGrowth = largeMeasure.peakBytes - smallMeasure.peakBytes
+    assert peakGrowth < ARCHIVE_PEAK_GROWTH_LIMIT, (smallMeasure, largeMeasure)
 
 
 def test_completed_backup_step_rerun_is_skipped_without_new_generation(

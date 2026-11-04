@@ -6,9 +6,13 @@ Chain step 3 and the `load customers` command, with the JCL name CUSTFILE as its
 IDCAMS STEP05 DELETE, STEP10 DEFINE CLUSTER KEYS(9 0) RECORDSIZE(500 500) and STEP15 REPRO
 INFILE(CUSTDATA) OUTFILE(CUSTVSAM) become one atomic replace of the table from
 AWS.M2.CARDDEMO.CUSTDATA.PS, or from its custdata.txt ASCII copy, through
-replace_loader.ReplaceTable. The CLCIFIL and OPCIFIL CEMT close and open of CUSTDAT are the
-batch window that batch/cli.py holds around the command. Every CVCUS01Y field is loaded as
-decoded, FICO scores below 300 included.
+replace_loader.ReplaceTable. The command runs inside the BatchWindow that batch/cli.py holds around
+every command, but customers.customers is not one of the app.core.locks WINDOW_TABLES: the CLCIFIL
+and OPCIFIL CEMT close and open of CUSTDAT have no counterpart, and reads of the table are not
+refused during the load. CAVW and CAUP, the only online programs that read it, access CXACAIX or
+ACCTDAT first, so the window refuses them before that read. Any reader sees the customers as
+committed before or after the replace, never a partial one: ReplaceTable deletes and inserts in one
+transaction. Every CVCUS01Y field is loaded as decoded, FICO scores below 300 included.
 """
 
 from app.models import Customer

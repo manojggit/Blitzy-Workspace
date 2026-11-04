@@ -54,13 +54,21 @@ interface EnterCase {
     confirm: string;
 }
 
-// One COTRN02C outcome: the screen keyed, the HTTP status, the literal, its colour and cursor.
+// One COTRN02C outcome: the screen keyed, the HTTP status, the literal, its colour and cursor,
+// and the fields the answer marks in error.
 interface LiteralCase {
     input: AddScreenValues;
     status: number;
     message: string;
     severity: MessageSeverity;
     cursorField: AddInputName;
+    fieldErrors: readonly AddInputName[];
+}
+
+// One required map field and the literal its blank entry returns.
+interface RequiredFieldMessage {
+    name: AddInputName;
+    message: string;
 }
 
 const mockRouterPush = jest.fn();
@@ -177,19 +185,55 @@ const KEY_METHODS: readonly KeyMethod[] = ["button", "physical key"];
 
 const TEST_ACCOUNT_ID = "00000000004";
 const UNKNOWN_ACCOUNT_ID = "99999999999";
+// Key texts at their full BMS LENGTH (11 and 16): IS NUMERIC fails on the last character.
+const NON_NUMERIC_ACCOUNT_ID = "0000000000A";
+const NON_NUMERIC_CARD_NUMBER = "000000000000000A";
+// Neutral 16-digit card keys that pass IS NUMERIC: one keyed card and one on no xref record.
+const KEYED_CARD_NUMBER = "0000000000000004";
+const UNKNOWN_CARD_NUMBER = "9999999999999999";
+// The date-format edit fails on the separators; CSUTLDTC rejects 30 February (CEEDAYS 2508).
+const NOT_ISO_FORMAT_DATE = "2022/07/17";
+const NON_CALENDAR_DATE = "2022-02-30";
 const ADDED_TRAN_ID = "0000000000000001";
 // The xref card COTRN02C moves into CARDNINI, as the server's MaskCardNumber sends it back.
 const SERVED_CARD_MASKED = "************4312";
 
 // cbl/COTRN02C.cbl lines 164-470 and 600-745, as the cotrn02c.py module constants hold them.
 const ACCOUNT_OR_CARD_REQUIRED_MESSAGE = "Account or Card Number must be entered...";
+const ACCOUNT_NOT_NUMERIC_MESSAGE = "Account ID must be Numeric...";
+const CARD_NOT_NUMERIC_MESSAGE = "Card Number must be Numeric...";
 const ACCOUNT_NOT_FOUND_MESSAGE = "Account ID NOT found...";
+const CARD_NOT_FOUND_MESSAGE = "Card Number NOT found...";
+const ACCOUNT_XREF_LOOKUP_FAILED_MESSAGE = "Unable to lookup Acct in XREF AIX file...";
+const CARD_XREF_LOOKUP_FAILED_MESSAGE = "Unable to lookup Card # in XREF file...";
 const TYPE_REQUIRED_MESSAGE = "Type CD can NOT be empty...";
+const TYPE_NOT_NUMERIC_MESSAGE = "Type CD must be Numeric...";
+const CATEGORY_NOT_NUMERIC_MESSAGE = "Category CD must be Numeric...";
 const AMOUNT_FORMAT_MESSAGE = "Amount should be in format -99999999.99";
+const ORIG_DATE_FORMAT_MESSAGE = "Orig Date should be in format YYYY-MM-DD";
+const PROC_DATE_FORMAT_MESSAGE = "Proc Date should be in format YYYY-MM-DD";
+const ORIG_DATE_INVALID_MESSAGE = "Orig Date - Not a valid date...";
+const PROC_DATE_INVALID_MESSAGE = "Proc Date - Not a valid date...";
+const MERCHANT_ID_NOT_NUMERIC_MESSAGE = "Merchant ID must be Numeric...";
 const CONFIRM_PROMPT_MESSAGE = "Confirm to add this transaction...";
 const CONFIRM_INVALID_MESSAGE = "Invalid value. Valid values are (Y/N)...";
+const TRAN_LOOKUP_FAILED_MESSAGE = "Unable to lookup Transaction...";
 const DUPLICATE_TRAN_ID_MESSAGE = "Tran ID already exist...";
 const ADD_FAILED_MESSAGE = "Unable to Add Transaction...";
+// The presence edits after Type CD, in PRESENCE_CHECKS order, each literal as the
+// REQUIRED_FIELD_TEMPLATE writes it for the field's label.
+const REQUIRED_FIELD_MESSAGES: readonly RequiredFieldMessage[] = [
+    { name: "cat_cd", message: "Category CD can NOT be empty..." },
+    { name: "source", message: "Source can NOT be empty..." },
+    { name: "desc", message: "Description can NOT be empty..." },
+    { name: "amount", message: "Amount can NOT be empty..." },
+    { name: "orig_date", message: "Orig Date can NOT be empty..." },
+    { name: "proc_date", message: "Proc Date can NOT be empty..." },
+    { name: "merchant_id", message: "Merchant ID can NOT be empty..." },
+    { name: "merchant_name", message: "Merchant Name can NOT be empty..." },
+    { name: "merchant_city", message: "Merchant City can NOT be empty..." },
+    { name: "merchant_zip", message: "Merchant Zip can NOT be empty..." },
+];
 // The STRING of 'Transaction added successfully. ' and ' Your Tran ID is ' keeps two spaces.
 const ADDED_MESSAGE = `Transaction added successfully.  Your Tran ID is ${ADDED_TRAN_ID}.`;
 // jsdom implements no navigation, so window.location.assign reports this through console.error.
@@ -325,41 +369,119 @@ function BuildAxiosError(status: number, body: unknown): AxiosError {
 }
 
 // A screen sent with WS-ERR-FLG set. ERRMSG is COLOR=RED and the confirm prompt sets the flag as
-// well, so every outcome but the written transaction (DFHGREEN) is red.
+// well, so every outcome but the written transaction (DFHGREEN) is red. A rejection's
+// field_errors names its one failing field, the cursor field.
 function ErrorFlagCase(
     status: number,
     message: string,
     cursorField: AddInputName,
     input: AddScreenValues,
 ): LiteralCase {
-    return { input, status, message, severity: "error", cursorField };
+    return { input, status, message, severity: "error", cursorField, fieldErrors: [cursorField] };
 }
 
-// First-failure edits, the NOTFND, DUPREC and WHEN OTHER literals, and the prompt sent with 200.
+// The 200 confirm prompt is red too, but a 200 answer names no field in error.
+function ConfirmPromptCase(input: AddScreenValues): LiteralCase {
+    return {
+        ...ErrorFlagCase(HTTP_OK, CONFIRM_PROMPT_MESSAGE, "confirm", input),
+        fieldErrors: [],
+    };
+}
+
+// A blank account sends VALIDATE-INPUT-KEY-FIELDS down the card path, as a keyed account
+// takes precedence over the card.
+function CardKeyedInput(cardNumber: string): AddScreenValues {
+    return { ...E2E_LIKE_INPUT, acct_id: "", card_num: cardNumber };
+}
+
+// Each later required field left blank, every earlier edit passing.
+const REQUIRED_FIELD_CASES: readonly LiteralCase[] = REQUIRED_FIELD_MESSAGES.map(
+    ({ name, message }) =>
+        ErrorFlagCase(HTTP_EDIT_FAILURE, message, name, { ...E2E_LIKE_INPUT, [name]: "" }),
+);
+
+// Every literal COTRN02C returns but the green added literal, which the ENTER cases assert, in
+// source order, each keyed so that every earlier edit passes: the key edits, NOTFND and xref
+// WHEN OTHER literals on the account path, then on the card path; the eleven required fields;
+// the type, category, amount, date-format, CSUTLDTC and merchant ID edits; the invalid confirm
+// value; the TRANSACT browse, DUPREC and WRITE literals; and the prompt sent with 200.
 const LITERAL_CASES: readonly LiteralCase[] = [
     ErrorFlagCase(HTTP_EDIT_FAILURE, ACCOUNT_OR_CARD_REQUIRED_MESSAGE, "acct_id", {
         ...E2E_LIKE_INPUT,
         acct_id: "",
     }),
+    ErrorFlagCase(HTTP_EDIT_FAILURE, ACCOUNT_NOT_NUMERIC_MESSAGE, "acct_id", {
+        ...E2E_LIKE_INPUT,
+        acct_id: NON_NUMERIC_ACCOUNT_ID,
+    }),
     ErrorFlagCase(HTTP_NOT_FOUND, ACCOUNT_NOT_FOUND_MESSAGE, "acct_id", {
         ...E2E_LIKE_INPUT,
         acct_id: UNKNOWN_ACCOUNT_ID,
     }),
+    ErrorFlagCase(HTTP_FILE_ERROR, ACCOUNT_XREF_LOOKUP_FAILED_MESSAGE, "acct_id", E2E_LIKE_INPUT),
+    ErrorFlagCase(
+        HTTP_EDIT_FAILURE,
+        CARD_NOT_NUMERIC_MESSAGE,
+        "card_num",
+        CardKeyedInput(NON_NUMERIC_CARD_NUMBER),
+    ),
+    ErrorFlagCase(
+        HTTP_NOT_FOUND,
+        CARD_NOT_FOUND_MESSAGE,
+        "card_num",
+        CardKeyedInput(UNKNOWN_CARD_NUMBER),
+    ),
+    ErrorFlagCase(
+        HTTP_FILE_ERROR,
+        CARD_XREF_LOOKUP_FAILED_MESSAGE,
+        "card_num",
+        CardKeyedInput(KEYED_CARD_NUMBER),
+    ),
     ErrorFlagCase(HTTP_EDIT_FAILURE, TYPE_REQUIRED_MESSAGE, "type_cd", {
         ...E2E_LIKE_INPUT,
         type_cd: "",
+    }),
+    ...REQUIRED_FIELD_CASES,
+    ErrorFlagCase(HTTP_EDIT_FAILURE, TYPE_NOT_NUMERIC_MESSAGE, "type_cd", {
+        ...E2E_LIKE_INPUT,
+        type_cd: "0A",
+    }),
+    ErrorFlagCase(HTTP_EDIT_FAILURE, CATEGORY_NOT_NUMERIC_MESSAGE, "cat_cd", {
+        ...E2E_LIKE_INPUT,
+        cat_cd: "000A",
     }),
     ErrorFlagCase(HTTP_EDIT_FAILURE, AMOUNT_FORMAT_MESSAGE, "amount", {
         ...E2E_LIKE_INPUT,
         amount: "50.00",
     }),
+    ErrorFlagCase(HTTP_EDIT_FAILURE, ORIG_DATE_FORMAT_MESSAGE, "orig_date", {
+        ...E2E_LIKE_INPUT,
+        orig_date: NOT_ISO_FORMAT_DATE,
+    }),
+    ErrorFlagCase(HTTP_EDIT_FAILURE, PROC_DATE_FORMAT_MESSAGE, "proc_date", {
+        ...E2E_LIKE_INPUT,
+        proc_date: NOT_ISO_FORMAT_DATE,
+    }),
+    ErrorFlagCase(HTTP_EDIT_FAILURE, ORIG_DATE_INVALID_MESSAGE, "orig_date", {
+        ...E2E_LIKE_INPUT,
+        orig_date: NON_CALENDAR_DATE,
+    }),
+    ErrorFlagCase(HTTP_EDIT_FAILURE, PROC_DATE_INVALID_MESSAGE, "proc_date", {
+        ...E2E_LIKE_INPUT,
+        proc_date: NON_CALENDAR_DATE,
+    }),
+    ErrorFlagCase(HTTP_EDIT_FAILURE, MERCHANT_ID_NOT_NUMERIC_MESSAGE, "merchant_id", {
+        ...E2E_LIKE_INPUT,
+        merchant_id: "00000000A",
+    }),
     ErrorFlagCase(HTTP_EDIT_FAILURE, CONFIRM_INVALID_MESSAGE, "confirm", {
         ...E2E_LIKE_INPUT,
         confirm: "X",
     }),
+    ErrorFlagCase(HTTP_FILE_ERROR, TRAN_LOOKUP_FAILED_MESSAGE, "acct_id", E2E_LIKE_INPUT),
     ErrorFlagCase(HTTP_RECORD_CHANGED, DUPLICATE_TRAN_ID_MESSAGE, "acct_id", E2E_LIKE_INPUT),
     ErrorFlagCase(HTTP_FILE_ERROR, ADD_FAILED_MESSAGE, "acct_id", E2E_LIKE_INPUT),
-    ErrorFlagCase(HTTP_OK, CONFIRM_PROMPT_MESSAGE, "confirm", { ...E2E_LIKE_INPUT, confirm: "" }),
+    ConfirmPromptCase({ ...E2E_LIKE_INPUT, confirm: "" }),
 ];
 
 // An error body names its one failing field, as COTRN02C edits in first-failure mode.
@@ -444,6 +566,13 @@ async function WaitUntilIdle(): Promise<void> {
 function ExpectScreenValues(values: AddScreenValues): void {
     for (const name of FIELD_NAMES) {
         expect(InputOf(name)).toHaveValue(values[name]);
+    }
+}
+
+// Exactly the fields the answer names in field_errors read as invalid; every other is valid.
+function ExpectMarkedFields(fieldErrors: readonly AddInputName[]): void {
+    for (const name of FIELD_NAMES) {
+        expect(InputOf(name)).toHaveAttribute("aria-invalid", String(fieldErrors.includes(name)));
     }
 }
 
@@ -579,6 +708,7 @@ it.each(LITERAL_CASES)(
         expect(InputOf("acct_id")).toHaveValue(literalCase.input.acct_id);
         expect(InputOf("amount")).toHaveValue(literalCase.input.amount);
         expect(InputOf(literalCase.cursorField)).toHaveFocus();
+        ExpectMarkedFields(literalCase.fieldErrors);
     },
 );
 

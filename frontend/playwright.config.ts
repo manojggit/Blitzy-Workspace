@@ -42,13 +42,19 @@ export default defineConfig({
     retries: 0,
     timeout: TEST_TIMEOUT_MS,
     expect: { timeout: EXPECT_TIMEOUT_MS },
-    reporter: [["list"], ["html", { open: "never", outputFolder: "playwright-report" }]],
+    // No HTML report: it stores every step title, and Playwright titles a fill with the typed
+    // value, so it would hold the sign-on passwords of every test, passing ones included.
+    reporter: [["list"]],
+    // Playwright's working files. Global setup's teardown copies each failed test's screenshot
+    // and video from here to blitzy/screenshots and blitzy/screen_recordings.
     outputDir: "test-results",
     use: {
         // Must use host 127.0.0.1, like the API origin, or the SameSite=Lax session cookie is
         // not sent; global setup checks that both hosts match.
         baseURL: process.env.CARDDEMO_E2E_BASE_URL,
-        trace: "retain-on-failure",
+        // Tracing stays off: a trace records the sign-on request body and every fill value, so
+        // it would store the passwords. The screenshot and video show the password field masked.
+        trace: "off",
         screenshot: "only-on-failure",
         video: "retain-on-failure",
     },

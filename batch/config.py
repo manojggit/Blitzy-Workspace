@@ -12,8 +12,9 @@ CARDDEMO_ASCII_DIR and CARDDEMO_OUTPUT_DIR, and nothing else, so batch runs with
 unset. Field names are the environment-variable names, identical to backend/.env.example,
 docker-compose.yml and backend/app/core/config.py. Values come from the process environment,
 which overrides backend/.env (app.core.paths.ENV_FILE), which overrides the defaults below; when
-that file is absent, as in containers, the environment alone applies. The env-file handling is
-inherited from CommonSettings and is not repeated here.
+that file is absent, as in containers, the environment alone applies. Batch imports no backend
+configuration (app.core.config): the file location and path resolution come from
+app.core.paths (ENV_FILE, ResolveRepoPath), and the settings class is declared here.
 
 Every directory method returns an absolute path: an absolute setting is used unchanged and a
 relative one resolves under the repository root, never the working directory. The methods do
@@ -21,24 +22,59 @@ not create directories; the writers create what they need.
 """
 
 from pathlib import Path
+from typing import Literal
 
-from app.core.config import CommonSettings
-from app.core.paths import ResolveRepoPath
+from app.core.paths import ENV_FILE, ResolveRepoPath
 from app.seed.image_reader import ENCODING_ASCII, ENCODING_EBCDIC
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 GDG_SUBDIRECTORY = "gdg"
 STATEMENTS_SUBDIRECTORY = "statements"
 
 
-class BatchSettings(CommonSettings):
+class BatchSettings(BaseSettings):
     """Settings of every batch command: the database URL, data directories and output root.
 
-    Inherits APP_ENV, SYNC_DATABASE_URL (required), CARDDEMO_EBCDIC_DIR, BCRYPT_ROUNDS,
-    IsProduction() and EbcdicDir() from CommonSettings.
+    Replaces the values every batch job took from its JCL: the runtime mode, the sync database
+    connection that stands in for the VSAM catalog, the EBCDIC and ASCII seed-image
+    directories, the output root of the generation archives and statements, and the cost of
+    the password hashes that replace the plaintext USRSEC passwords jcl/DUSRSECJ.jcl loaded.
+    Building it raises pydantic.ValidationError when SYNC_DATABASE_URL is unset or a value is
+    invalid; it declares no SECRET_KEY, so it never needs one.
     """
 
+    # extra="ignore": the backend's lines in the shared backend/.env, such as SECRET_KEY,
+    # DATABASE_URL or TEST_*, are harmless. env_ignore_empty: an empty value such as
+    # "CARDDEMO_OUTPUT_DIR=" in the process environment or in backend/.env is skipped like an
+    # unset one, so the next lower-priority source with a nonempty value supplies the setting.
+    # hide_input_in_errors: a ValidationError never echoes a rejected value or the database
+    # URL with its password.
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+        env_ignore_empty=True,
+        case_sensitive=True,
+        hide_input_in_errors=True,
+    )
+
+    APP_ENV: Literal["local", "test", "production"] = "local"
+    # repr=False and exclude=True keep the database password out of repr(), str(), log records
+    # and model_dump output.
+    SYNC_DATABASE_URL: str = Field(repr=False, exclude=True)
+    CARDDEMO_EBCDIC_DIR: str = "data/EBCDIC"
+    BCRYPT_ROUNDS: int = Field(default=12, ge=4, le=31)
     CARDDEMO_ASCII_DIR: str = "data/ASCII"
     CARDDEMO_OUTPUT_DIR: str = "var/batch-output"
+
+    def IsProduction(self) -> bool:
+        """Return True when APP_ENV is production."""
+        return self.APP_ENV == "production"
+
+    def EbcdicDir(self) -> Path:
+        """Return the directory of the EBCDIC seed images (CARDDEMO_EBCDIC_DIR), absolute."""
+        return ResolveRepoPath(self.CARDDEMO_EBCDIC_DIR)
 
     def AsciiDir(self) -> Path:
         """Return the directory of the ASCII seed images (CARDDEMO_ASCII_DIR), absolute."""

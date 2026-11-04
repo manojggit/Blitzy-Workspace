@@ -4,8 +4,11 @@ Replaces: CARDFILE, CVACT02Y
 
 jcl/CARDFILE.jcl deletes and redefines the CARDDATA KSDS, KEYS(16 0) RECORDSIZE(150 150), then
 REPROs AWS.M2.CARDDEMO.CARDDATA.PS into it; ReplaceTable does both in one transaction. The
-CLCIFIL and OPCIFIL CEMT close and open are superseded by the batch window batch/cli.py holds
-around the command. The CARDAIX KEYS(11 16) define, path and BLDINDEX of STEP40-STEP60 need no
+command runs inside the BatchWindow that batch/cli.py holds around every command, but cards.cards
+is not one of the app.core.locks WINDOW_TABLES: the CLCIFIL and OPCIFIL CEMT close and open of
+CARDDAT and CARDAIX have no counterpart, and online card access (CCLI, CCDL, CCUP) stays open
+during the load. Online reads see the cards as committed before or after that transaction, never a
+partial replace. The CARDAIX KEYS(11 16) define, path and BLDINDEX of STEP40-STEP60 need no
 counterpart: the permanent index ix_cards_acct_id (Alembic 0003) replaces the alternate index,
 and PostgreSQL maintains it as rows are inserted. Each 150-byte CARD-RECORD becomes one row as
 decoded; the generated card_num_sort column is filled by the database. The deferred foreign key

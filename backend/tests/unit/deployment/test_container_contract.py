@@ -17,10 +17,11 @@ no database, network or Docker engine. These tests pin:
   working directory, the uvicorn command on the port Compose publishes, and no secret in an
   ENV, ARG or COPY;
 - the Compose wiring: db alone in the default profile, loopback-only ports, db credentials
-  defaulting to the backend/.env.example values, credential-free database URLs on host db with
-  the role, password and database passed as PGUSER, PGPASSWORD and PGDATABASE, the read-only
-  seed mount, the batch output mount, every variable a settings field, no SECRET_KEY, and the
-  start order db healthy, migrator completed, backend healthy, frontend;
+  defaulting to the backend/.env.example values, database URLs on host db and its container
+  port carrying the db's POSTGRES_USER, POSTGRES_PASSWORD and POSTGRES_DB expressions, which
+  resolve to the backend/.env.example role, password and database, the read-only seed mount,
+  the batch output mount, every variable a settings field, no SECRET_KEY, and the start order
+  db healthy, migrator completed, backend healthy, frontend;
 - the frontend image: NEXT_PUBLIC_API_URL declared as a build argument before npm run build,
   and set by Compose to the backend's published origin, the frontend/.env.local.example value.
 
@@ -96,6 +97,8 @@ ROOT_CONTEXT_EXCLUDED = (
     "backend/carddemo_backend.egg-info/PKG-INFO",
     "backend/.pytest_cache/README.md",
     "backend/.ruff_cache/CACHEDIR.TAG",
+    "backend/.hypothesis/unicode_data/15.1.0/charmap.json.gz",
+    "batch/.hypothesis/constants/163b62afdb8d9345",
     "backend/.coverage",
 )
 # Paths relative to frontend/, the frontend build context.
@@ -173,16 +176,10 @@ POSTGRES_URL_PARTS = (
     ("POSTGRES_PASSWORD", "password"),
     ("POSTGRES_DB", "database"),
 )
-# libpq / asyncpg variable of a backend-image service, and the db variable it must repeat.
-PG_VARIABLE_PAIRS = (
-    ("PGUSER", "POSTGRES_USER"),
-    ("PGPASSWORD", "POSTGRES_PASSWORD"),
-    ("PGDATABASE", "POSTGRES_DB"),
-)
-DATABASE_URL_DRIVERS = (
-    ("DATABASE_URL", "postgresql+asyncpg"),
-    ("SYNC_DATABASE_URL", "postgresql+psycopg2"),
-)
+DATABASE_URL_DRIVERS = {
+    "DATABASE_URL": "postgresql+asyncpg",
+    "SYNC_DATABASE_URL": "postgresql+psycopg2",
+}
 SEED_DIRECTORIES = (
     ("CARDDEMO_EBCDIC_DIR", "/app/data/EBCDIC"),
     ("CARDDEMO_ASCII_DIR", "/app/data/ASCII"),
@@ -549,10 +546,14 @@ def DependencyConditions(service):
 
 
 def KnownVariableNames():
-    """Return every name a backend-image service may set: a settings field or a PG* name."""
+    """Return every name a backend-image service may set: a field of a settings class."""
     settingsFields = (Settings.model_fields, MigrationSettings.model_fields)
-    pgVariables = {pgVariable for pgVariable, _ in PG_VARIABLE_PAIRS}
-    return set().union(*settingsFields, BatchSettings.model_fields, pgVariables)
+    return set().union(*settingsFields, BatchSettings.model_fields)
+
+
+def ResolveUnsetVariables(composeText):
+    """Return composeText with each ${NAME:-default} resolved as Compose does with NAME unset."""
+    return DEFAULTED_VARIABLE_PATTERN.sub(r"\g<default>", composeText)
 
 
 def DockerignoreCases(ignoreName, contextPaths, expectedExcluded):
@@ -848,28 +849,25 @@ def test_backend_image_service_reads_backend_env_file(composeServices, serviceNa
 
 
 @pytest.mark.parametrize("serviceName", BACKEND_IMAGE_SERVICES)
-@pytest.mark.parametrize(("variableName", "driverName"), DATABASE_URL_DRIVERS)
-def test_database_urls_name_db_without_credentials(
-    composeServices, serviceName, variableName, driverName
+@pytest.mark.parametrize("variableName", sorted(DATABASE_URL_DRIVERS))
+def test_database_urls_carry_db_credentials_on_host_db(
+    composeServices, exampleDatabaseUrl, serviceName, variableName
 ):
-    """The database URLs name the driver, host db and its port, and carry no credential."""
+    """The URLs carry db's POSTGRES_* expressions on host db and default to .env.example's."""
+    driverName = DATABASE_URL_DRIVERS[variableName]
+    dbService = composeServices[DB_SERVICE]
+    dbEnvironment = ServiceEnvironment(dbService)
+    dbPort = ContainerPort(dbService)
     urlText = ServiceEnvironment(composeServices[serviceName])[variableName]
-    databaseUrl = ParseDatabaseUrl(urlText, variableName)
-    assert databaseUrl.drivername == driverName
-    assert databaseUrl.host == DB_SERVICE
-    assert str(databaseUrl.port) == ContainerPort(composeServices[DB_SERVICE])
-    assert (databaseUrl.username, databaseUrl.password, databaseUrl.database) == (None,) * 3
-
-
-@pytest.mark.parametrize("serviceName", BACKEND_IMAGE_SERVICES)
-@pytest.mark.parametrize(("pgVariable", "postgresVariable"), PG_VARIABLE_PAIRS)
-def test_pg_variables_repeat_db_credentials(
-    composeServices, serviceName, pgVariable, postgresVariable
-):
-    """PGUSER, PGPASSWORD and PGDATABASE repeat the db's POSTGRES_* expressions exactly."""
-    serviceEnvironment = ServiceEnvironment(composeServices[serviceName])
-    dbEnvironment = ServiceEnvironment(composeServices[DB_SERVICE])
-    assert serviceEnvironment[pgVariable] == dbEnvironment[postgresVariable]
+    assert urlText == (
+        f"{driverName}://{dbEnvironment['POSTGRES_USER']}:{dbEnvironment['POSTGRES_PASSWORD']}"
+        f"@{DB_SERVICE}:{dbPort}/{dbEnvironment['POSTGRES_DB']}"
+    )
+    databaseUrl = ParseDatabaseUrl(ResolveUnsetVariables(urlText), variableName)
+    assert (databaseUrl.drivername, databaseUrl.host) == (driverName, DB_SERVICE)
+    assert str(databaseUrl.port) == dbPort
+    for _, urlPart in POSTGRES_URL_PARTS:
+        assert getattr(databaseUrl, urlPart) == getattr(exampleDatabaseUrl, urlPart)
 
 
 @pytest.mark.parametrize("serviceName", BACKEND_IMAGE_SERVICES)
@@ -889,7 +887,7 @@ def test_seed_directories_lie_on_read_only_data_mount(
 
 @pytest.mark.parametrize("serviceName", BACKEND_IMAGE_SERVICES)
 def test_environment_keys_are_settings_fields(composeServices, serviceName):
-    """Every variable migrator and backend set is a settings field or a PG* connection name."""
+    """Every variable migrator and backend set is a field of a settings class they build."""
     serviceEnvironment = ServiceEnvironment(composeServices[serviceName])
     assert set(serviceEnvironment) - KnownVariableNames() == set()
 

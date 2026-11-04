@@ -1,9 +1,10 @@
 // Screen tests: BMS COCRDUP, program COCRDUPC (CCUP), page /cards/update.
 // Sources: bms/COCRDUP.bms and cpy-bms/COCRDUP.CPY (labels, LENGTHs, the FKEYS and FKEYSC
 // legend); cbl/COCRDUPC.cbl (the AID check and 0000-MAIN dispatch, 3300-SETUP-SCREEN-ATTRS); the
-// literals, states and statuses of backend/app/services/cards/cocrdupc.py, copied verbatim. The
-// expiry group and the ERRMSG descriptions are covered by CardUpdateFields.test.tsx, and the
-// entry fetch's abort and remount lifecycle by CardUpdateCancellation.test.tsx.
+// literals, states, statuses and error bodies of backend/app/services/cards/cocrdupc.py, copied
+// verbatim. The expiry group, the ERRMSG descriptions and the both-keys-blank "No input received"
+// are covered by CardUpdateFields.test.tsx, and the entry fetch's abort and remount lifecycle by
+// CardUpdateCancellation.test.tsx.
 import { ThemeProvider } from "@mui/material/styles";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
@@ -35,6 +36,9 @@ import {
 import type { SessionContextValue } from "@/lib/session";
 
 type CardFieldName = keyof CardScreenFields;
+
+// ACCTSID and CARDSID: the keys 1210 and 1220 edit, as a key screen shows them.
+type CardKeyFields = Pick<CardScreenFields, "acct_id" | "card_num">;
 
 // The CCUP error body: the four legacy keys beside the screen the page keeps the state machine on.
 type CardErrorBody = LegacyErrorResponse &
@@ -91,6 +95,30 @@ interface LiteralCase {
     status: number;
     cardScreen: CardScreen;
     expectedAlerts: readonly ShownAlert[];
+}
+
+// The fields a refusal marks (field_errors) and the one it puts the cursor on (cursor_field).
+interface FlaggedFields {
+    fieldErrors: readonly CardFieldName[];
+    cursorField: CardFieldName;
+}
+
+// A key edit or CARDDAT read refused with the DETAILS_NOT_FETCHED key screen: the literal and its
+// status, the keys the body echoes (CARDSID masked), and the keys the page shows afterwards.
+interface KeyRefusalCase extends FlaggedFields {
+    text: string;
+    status: number;
+    echoedKeys: CardKeyFields;
+    shownKeys: CardKeyFields;
+}
+
+// The screen a refused key leaves: the literal over its state's information line, the flagged
+// fields, and the values shown.
+interface ExpectedRefusal {
+    text: string;
+    state: UpdateScreenState;
+    flagged: FlaggedFields;
+    shownFields: Readonly<CardScreenFields>;
 }
 
 interface ExitCase {
@@ -154,6 +182,14 @@ const TEST_ACCOUNT_ID = "00000000004";
 const PAN_PATTERN = /\d{16}/;
 const MASKED_CARD_NUMBER = "*".repeat(12) + "4312";
 const TYPED_CARD_NUMBER = "0".repeat(12) + "1234";
+// Keys 1210-EDIT-ACCOUNT and 1220-EDIT-CARD refuse: not 11 digits, not 16 digits.
+const INVALID_ACCOUNT_TEXT = "ABC";
+const INVALID_CARD_TEXT = "12AB";
+// security.MaskCardNumber shows twelve asterisks before the last four characters of CARDSID.
+const CARD_MASK = "*".repeat(12);
+const CARD_MASK_VISIBLE_LENGTH = 4;
+// 3300-SETUP-SCREEN-ATTRS shows '*' in a blank failing detail field (cocrdupc.BLANK_FIELD_MARKER).
+const BLANK_FIELD_MARKER = "*";
 const TEST_EMBOSSED_NAME = "TEST CARD HOLDER";
 const EDITED_EMBOSSED_NAME = "EDITED CARD HOLDER";
 const REFRESHED_EMBOSSED_NAME = "REFRESHED CARD HOLDER";
@@ -163,11 +199,12 @@ const ADOPTED_SCREEN_TOKEN = "screen-token-3";
 const MENU_ROUTE = "/menu";
 const READ_OPTIONS = { signal: expect.any(AbortSignal) };
 
-// The statuses cocrdupc.py raises: edit failures and no change, a changed record, a record lock
-// and a failed rewrite.
+// The statuses cocrdupc.py raises: edit failures and no change, a card not found, a changed
+// record, a record lock, and a failed rewrite or CARDDAT read.
 const HTTP_OK = 200;
 const HTTP_EDIT_FAILURE = 400;
 const HTTP_UNAUTHORIZED = 401;
+const HTTP_NOT_FOUND = 404;
 const HTTP_RECORD_CHANGED = 409;
 const HTTP_RECORD_LOCKED = 423;
 const HTTP_FILE_ERROR = 503;
@@ -177,7 +214,9 @@ const SCREEN_TITLE = "Update Credit Card Details";
 const TRANSACTION_LINE = "Tran: CCUP";
 const PROGRAM_LINE = "Prog: COCRDUPC";
 
-// WS-RETURN-MSG literals of cocrdupc.py, and the key edits it shares with cocrdslc.py.
+// WS-RETURN-MSG literals of cocrdupc.py, and the key edits and file-error text it shares with
+// cocrdslc.py.
+const MSG_CARD_NAME_NOT_PROVIDED = "Card name not provided";
 const MSG_CARD_NAME_ALPHA = "Card name can only contain alphabets and spaces";
 const MSG_CARD_STATUS = "Card Active Status must be Y or N";
 const MSG_EXPIRY_MONTH = "Card expiry month must be between 1 and 12";
@@ -185,6 +224,12 @@ const MSG_EXPIRY_YEAR = "Invalid card expiry year";
 const MSG_NO_CHANGES = "No change detected with respect to values fetched.";
 const MSG_ACCOUNT_NOT_PROVIDED = "Account number not provided";
 const MSG_CARD_NOT_PROVIDED = "Card number not provided";
+const MSG_ACCOUNT_FILTER = "ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER";
+const MSG_CARD_FILTER = "CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER";
+const MSG_CARD_NOT_FOUND = "Did not find cards for this search condition";
+// cocrdslc.BuildFileErrorMessage("READ", "CARDDAT", 17, 0): READ in X(8), CARDDAT in X(9).
+const MSG_CARDDAT_READ_ERROR =
+    "File Error: READ     on CARDDAT   returned RESP 000000017 ,RESP2 000000000";
 const MSG_LOCK_FAILED = "Could not lock record for update";
 const MSG_RECORD_CHANGED = "Record changed by some one else. Please review";
 const MSG_UPDATE_FAILED = "Update of record failed";
@@ -704,6 +749,106 @@ const MULTIPLE_ERROR_SCREEN: CardScreen = BuildCardScreen(UpdateScreenState.CHAN
     fields: { ...TEST_FIELDS, embossed_name: "TEST CARD 2", expiry_year: "1949" },
 });
 
+// 1230-EDIT-NAME on a cleared name: CHANGES_NOT_OK, and '*' in the blank name it flags.
+const NAME_FLAGGED: FlaggedFields = {
+    fieldErrors: ["embossed_name"],
+    cursorField: "embossed_name",
+};
+const NAME_NOT_PROVIDED_FIELDS: Readonly<CardScreenFields> = {
+    ...TEST_FIELDS,
+    embossed_name: BLANK_FIELD_MARKER,
+};
+const NAME_NOT_PROVIDED_SCREEN: CardScreen = BuildCardScreen(UpdateScreenState.CHANGES_NOT_OK, {
+    message: MSG_CARD_NAME_NOT_PROVIDED,
+    fields: { ...NAME_NOT_PROVIDED_FIELDS },
+    screen_token: NEXT_SCREEN_TOKEN,
+    field_errors: [...NAME_FLAGGED.fieldErrors],
+    cursor_field: NAME_FLAGGED.cursorField,
+});
+
+// 1210 and 1220 flag each key they refuse; a NOTFND read flags both keys and any other READ
+// response the account (lines 1395-1406). The cursor goes to the first flagged key.
+const ACCOUNT_FLAGGED: FlaggedFields = { fieldErrors: ["acct_id"], cursorField: "acct_id" };
+const CARD_FLAGGED: FlaggedFields = { fieldErrors: ["card_num"], cursorField: "card_num" };
+const BOTH_KEYS_FLAGGED: FlaggedFields = { fieldErrors: KEY_FIELD_NAMES, cursorField: "acct_id" };
+
+const VALID_TYPED_KEYS: CardKeyFields = { acct_id: TEST_ACCOUNT_ID, card_num: TYPED_CARD_NUMBER };
+const FETCHED_KEYS: CardKeyFields = { acct_id: TEST_ACCOUNT_ID, card_num: MASKED_CARD_NUMBER };
+// A card list selection hands over its account and an opaque card_ref, never a card number.
+const LIST_ENTRY_KEYS: CardKeyFields = { acct_id: TEST_ACCOUNT_ID, card_num: "" };
+const NO_KEYS: CardKeyFields = { acct_id: "", card_num: "" };
+
+function MaskedCardText(cardText: string): string {
+    return CARD_MASK + cardText.slice(-CARD_MASK_VISIBLE_LENGTH);
+}
+
+// A not-fetched ENTER on typed keys: the body echoes them with CARDSID masked, and the page keeps
+// them as typed.
+function TypedKeyRefusal(
+    text: string,
+    status: number,
+    flagged: FlaggedFields,
+    typedKeys: CardKeyFields,
+): KeyRefusalCase {
+    const echoedKeys = { ...typedKeys, card_num: MaskedCardText(typedKeys.card_num) };
+    return { text, status, ...flagged, echoedKeys, shownKeys: typedKeys };
+}
+
+// A card list selection whose entry fetch is refused: the page keeps the account the list handed
+// over and a blank CARDSID, whatever keys the body echoes.
+function EntryFetchRefusal(
+    text: string,
+    status: number,
+    flagged: FlaggedFields,
+    echoedKeys: CardKeyFields,
+): KeyRefusalCase {
+    return { text, status, ...flagged, echoedKeys, shownKeys: LIST_ENTRY_KEYS };
+}
+
+// F12 from SHOW_DETAILS refused: the page leaves the fetched state, so it shows the keys the body
+// echoes.
+function CancelRefusal(
+    text: string,
+    status: number,
+    flagged: FlaggedFields,
+    echoedKeys: CardKeyFields,
+): KeyRefusalCase {
+    return { text, status, ...flagged, echoedKeys, shownKeys: echoedKeys };
+}
+
+// 1210 or 1220 refuses a typed key (400); the 9100 read of valid keys finds no card (404) or
+// fails (503).
+const TYPED_KEY_REFUSAL_CASES: readonly KeyRefusalCase[] = [
+    TypedKeyRefusal(MSG_ACCOUNT_FILTER, HTTP_EDIT_FAILURE, ACCOUNT_FLAGGED, {
+        ...VALID_TYPED_KEYS,
+        acct_id: INVALID_ACCOUNT_TEXT,
+    }),
+    TypedKeyRefusal(MSG_CARD_FILTER, HTTP_EDIT_FAILURE, CARD_FLAGGED, {
+        ...VALID_TYPED_KEYS,
+        card_num: INVALID_CARD_TEXT,
+    }),
+    TypedKeyRefusal(MSG_ACCOUNT_FILTER, HTTP_EDIT_FAILURE, BOTH_KEYS_FLAGGED, {
+        acct_id: INVALID_ACCOUNT_TEXT,
+        card_num: INVALID_CARD_TEXT,
+    }),
+    TypedKeyRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, BOTH_KEYS_FLAGGED, VALID_TYPED_KEYS),
+    TypedKeyRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ACCOUNT_FLAGGED, VALID_TYPED_KEYS),
+];
+
+// An invalid or expired card_ref (404: the list's account echoed, no card), and a failed CARDDAT
+// read of the card it names (503: its masked number echoed).
+const ENTRY_FETCH_REFUSAL_CASES: readonly KeyRefusalCase[] = [
+    EntryFetchRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, BOTH_KEYS_FLAGGED, LIST_ENTRY_KEYS),
+    EntryFetchRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ACCOUNT_FLAGGED, FETCHED_KEYS),
+];
+
+// RereadCard's failed CARDDAT read echoes the held keys (503); an invalid or expired card_ref
+// path (BindStateToPath, 404) echoes none, so neither the card nor the token shows.
+const CANCEL_REFUSAL_CASES: readonly KeyRefusalCase[] = [
+    CancelRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ACCOUNT_FLAGGED, FETCHED_KEYS),
+    CancelRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, BOTH_KEYS_FLAGGED, NO_KEYS),
+];
+
 function ShowsHeaderAndLegend(): void {
     RenderKeyScreen();
     expect(screen.getByRole("heading", { level: 1, name: SCREEN_TITLE })).toBeInTheDocument();
@@ -886,6 +1031,108 @@ async function MarksEveryFailingField(): Promise<void> {
     expect(screen.queryByText(MSG_EXPIRY_YEAR)).not.toBeInTheDocument();
 }
 
+// The DETAILS_NOT_FETCHED key screen a refused key edit or read answers with: the keys echoed,
+// the details blank, a fresh not-fetched screen_token, and no card held.
+function KeyRefusalScreen(refusalCase: KeyRefusalCase): CardScreen {
+    return BuildCardScreen(UpdateScreenState.DETAILS_NOT_FETCHED, {
+        fields: { ...BLANK_FIELDS, ...refusalCase.echoedKeys },
+        screen_token: NEXT_SCREEN_TOKEN,
+        card_ref: "",
+        message: refusalCase.text,
+        field_errors: [...refusalCase.fieldErrors],
+        cursor_field: refusalCase.cursorField,
+    });
+}
+
+// The literal in red over the state's information line; exactly the flagged fields in error and
+// the cursor on cursor_field; the values shown, protected as the state protects them.
+function ExpectRefusalScreen({ text, state, flagged, shownFields }: ExpectedRefusal): void {
+    expect(ShownAlerts()).toEqual([
+        [text, "error"],
+        [INFO_BY_STATE[state], "info"],
+    ]);
+    for (const fieldCase of FIELD_CASES) {
+        const input = InputOf(fieldCase.name);
+        const isFlagged = flagged.fieldErrors.includes(fieldCase.name);
+        expect(input).toHaveAttribute("aria-invalid", String(isFlagged));
+        expect(input).toHaveValue(shownFields[fieldCase.name]);
+    }
+    expect(InputOf(flagged.cursorField)).toHaveFocus();
+    ExpectOnlyEditable(EDITABLE_NAMES_BY_STATE[state]);
+}
+
+// The key screen under the key prompt: only the keys typable, the details blank.
+function ExpectKeyRefusalScreen(refusalCase: KeyRefusalCase): void {
+    ExpectRefusalScreen({
+        text: refusalCase.text,
+        state: UpdateScreenState.DETAILS_NOT_FETCHED,
+        flagged: refusalCase,
+        shownFields: { ...BLANK_FIELDS, ...refusalCase.shownKeys },
+    });
+}
+
+// The cleared name travels blank; 3300 shows '*' in it, flagged, under the change prompt.
+async function FlagsClearedCardName(): Promise<void> {
+    const user = await RenderFromList(UpdateScreenState.SHOW_DETAILS);
+    await user.clear(InputOf("embossed_name"));
+    QueueUpdateOutcome(HTTP_EDIT_FAILURE, NAME_NOT_PROVIDED_SCREEN);
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectUpdateRequest(TEST_CARD_REF, {
+        action: UpdateAction.ENTER,
+        screen_token: FIRST_SCREEN_TOKEN,
+        fields: { ...PickFields(TEST_FIELDS, DETAIL_FIELD_NAMES), embossed_name: "" },
+    });
+    ExpectRefusalScreen({
+        text: MSG_CARD_NAME_NOT_PROVIDED,
+        state: UpdateScreenState.CHANGES_NOT_OK,
+        flagged: NAME_FLAGGED,
+        shownFields: NAME_NOT_PROVIDED_FIELDS,
+    });
+}
+
+// The path is CARDSID as typed and the request carries both typed keys.
+async function RefusesTypedKeys(refusalCase: KeyRefusalCase): Promise<void> {
+    const { acct_id: acctText, card_num: cardText } = refusalCase.shownKeys;
+    const user = RenderKeyScreen();
+    await TypeKeys(user, acctText, cardText);
+    QueueUpdateOutcome(refusalCase.status, KeyRefusalScreen(refusalCase));
+    await PressFunctionKey(user, ENTER_KEY);
+    expect(mockUpdateCard).toHaveBeenCalledTimes(1);
+    ExpectUpdateRequest(cardText, {
+        action: UpdateAction.ENTER,
+        screen_token: "",
+        fields: { acct_id: acctText, card_num: cardText },
+    });
+    ExpectKeyRefusalScreen(refusalCase);
+}
+
+// The selection is fetched once by its card_ref and the list's account; nothing is written.
+async function RefusesEntryFetch(refusalCase: KeyRefusalCase): Promise<void> {
+    mockSearchParams = new URLSearchParams({ cardRef: TEST_CARD_REF, acctId: TEST_ACCOUNT_ID });
+    const refusal = ErrorBodyOf(KeyRefusalScreen(refusalCase));
+    mockFetchCardForEdit.mockRejectedValueOnce(BuildAxiosError(refusalCase.status, refusal));
+    RenderScreen();
+    await WaitForIdle();
+    expect(mockFetchCardForEdit.mock.calls).toEqual([
+        [TEST_CARD_REF, TEST_ACCOUNT_ID, READ_OPTIONS],
+    ]);
+    expect(mockUpdateCard).not.toHaveBeenCalled();
+    ExpectKeyRefusalScreen(refusalCase);
+}
+
+// F12 sends cancel by the card_ref under the held screen_token, with the four detail inputs.
+async function RefusesCancel(refusalCase: KeyRefusalCase): Promise<void> {
+    const user = await RenderFromList(UpdateScreenState.SHOW_DETAILS);
+    QueueUpdateOutcome(refusalCase.status, KeyRefusalScreen(refusalCase));
+    await PressFunctionKey(user, CANCEL_KEY);
+    ExpectUpdateRequest(TEST_CARD_REF, {
+        action: UpdateAction.CANCEL,
+        screen_token: FIRST_SCREEN_TOKEN,
+        fields: PickFields(TEST_FIELDS, DETAIL_FIELD_NAMES),
+    });
+    ExpectKeyRefusalScreen(refusalCase);
+}
+
 async function ExitsToMainMenu(exitCase: ExitCase): Promise<void> {
     const user = await RenderFromEntry(exitCase.entry);
     await PressFunctionKey(user, EXIT_KEY, exitCase.method);
@@ -1013,6 +1260,27 @@ describe("COCRDUPC message-line literals on /cards/update", () => {
 
     it("COCRDUPC flags every failing detail field and puts the cursor on cursor_field", () =>
         MarksEveryFailingField());
+
+    it("COCRDUPC 400 shows Card name not provided and '*' in the flagged cleared name", () =>
+        FlagsClearedCardName());
+});
+
+// Each refusal answers with the DETAILS_NOT_FETCHED key screen, which the page adopts.
+describe("COCRDUPC key edit and CARDDAT read refusals on /cards/update", () => {
+    it.each(TYPED_KEY_REFUSAL_CASES)(
+        "COCRDUPC ENTER on typed keys: $status $text flags $fieldErrors",
+        (refusalCase) => RefusesTypedKeys(refusalCase),
+    );
+
+    it.each(ENTRY_FETCH_REFUSAL_CASES)(
+        "COCRDUPC card list entry fetch: $status $text flags $fieldErrors",
+        (refusalCase) => RefusesEntryFetch(refusalCase),
+    );
+
+    it.each(CANCEL_REFUSAL_CASES)(
+        "COCRDUPC F12 from SHOW_DETAILS: $status $text flags $fieldErrors",
+        (refusalCase) => RefusesCancel(refusalCase),
+    );
 });
 
 // F3 returns to the main menu whichever screen opened the page, as the page and

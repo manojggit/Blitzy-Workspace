@@ -11,6 +11,12 @@ RunStandaloneJob (job) and RunStandaloneLoad (load). batch/cli.py calls each ins
 window, after run_ledger.ClassifyInterruptedRuns and gdg.ReconcileCatalog, and exits with the
 status it returns: 0 and 4 continue the chain, 8 or above stops it, as COND=(4,LT) did.
 
+A step's generations are published by FinishStep once its runner has returned with the final
+transaction committed, outside InvokeRunner's runner-failure mapping. A publication error, or a
+generation found LOST, ends the step with EXIT_FAILURE and stops the chain while the step stays
+COMPLETED: the next command's ReconcileCatalog completes the publication, and a LOST generation
+blocks its cycle, which never completes, until seed-all or run-all --new-cycle abandons it.
+
 Runners are named by module path and imported only when a step runs. Loaders and jobs import
 job_context, run_ledger and gdg, so importing them here would form a cycle, would load every
 job for `carddemo-batch --help`, and would keep a test's monkeypatched RunLoader or RunJob from
@@ -59,6 +65,10 @@ PER_WRITE_REFUSED_STATES = (run_ledger.STEP_FAILED, run_ledger.STEP_INTERRUPTED)
 # progress at INFO, so subprocess tests can look for it in the output.
 NO_OPEN_CYCLE_MESSAGE = "NO OPEN CYCLE; RUN run-all OR seed-all"
 UNKNOWN_STEP_TEMPLATE = "UNKNOWN STEP: {name}"
+NEW_CYCLE_START_REFUSED_TEMPLATE = (
+    "A NEW CYCLE STARTS AT STEP 1, NOT STEP {stepNo} {jobName}; --start-at RESUMES ONLY AN"
+    " OPEN CYCLE"
+)
 UNKNOWN_JOB_TEMPLATE = "UNKNOWN JOB: {name}"
 UNKNOWN_LOADER_TEMPLATE = "UNKNOWN LOADER: {name}"
 OCCURRENCE_NOT_ALLOWED_TEMPLATE = "--occurrence APPLIES TO tran-backup ONLY, NOT {name}"
@@ -69,6 +79,8 @@ PER_WRITE_REFUSED_TEMPLATE = (
 )
 STEP_SKIPPED_TEMPLATE = "STEP {stepNo} {jobName} ALREADY COMPLETED IN CYCLE {cycleId}; SKIPPED"
 STEP_ENDED_TEMPLATE = "STEP {stepNo} {jobName} ENDED RC={exitCode}"
+# A load made with no OPEN cycle has no step, so its line names the run, as its STARTED line does.
+LOAD_ENDED_TEMPLATE = "RUN {runId} {jobName} ENDED RC={exitCode}; NO CYCLE STEP"
 RETURNED_FAILURE_TEMPLATE = "{jobName} RETURNED RC={exitCode} INSTEAD OF RAISING JobFailure"
 # The database and file errors a runner did not map to JobFailure itself.
 DATABASE_ERROR_TEMPLATE = (
@@ -76,6 +88,11 @@ DATABASE_ERROR_TEMPLATE = (
 )
 FILE_ERROR_TEMPLATE = "{jobName}: FILE ERROR {errorClass} ERRNO {errnoName}"
 UNKNOWN_CODE = "UNKNOWN"
+# A database or file error publishing the generation of a run that has already committed.
+PUBLICATION_ERROR_TEMPLATE = (
+    "STEP {stepNo} {ioError} WHILE PUBLISHING ITS GENERATION; THE STEP STAYS COMPLETED AND THE"
+    " NEXT COMMAND RECONCILES THE GENERATION"
+)
 
 
 @dataclass(frozen=True)
@@ -198,6 +215,7 @@ CHAIN: tuple[ChainStep, ...] = (
     ChainStep(17, JOB_DEFINITIONS["statement-gen"], DURABILITY_FILES_ONLY),
     ChainStep(18, JOB_DEFINITIONS["tran-index"], DURABILITY_ATOMIC),
 )
+FIRST_STEP = CHAIN[0]
 FINAL_STEP = CHAIN[-1]
 
 # The loader steps, 1-5 and 7-12, which seed-all runs.
@@ -252,11 +270,21 @@ def OpenCycleId(context: JobContext) -> int | None:
         return run_ledger.FindOpenCycle(connection)
 
 
-def LogStepEnded(step: ChainStep, exitCode: int) -> None:
-    """Log a step's exit status: at INFO when the chain continues, at ERROR when it stops."""
-    message = STEP_ENDED_TEMPLATE.format(
-        stepNo=step.stepNo, jobName=step.job.LegacyName(), exitCode=exitCode
-    )
+def LogStepEnded(stepContext: JobContext, step: ChainStep, exitCode: int) -> None:
+    """Log a run's exit status: at INFO when the chain continues, at ERROR when it stops.
+
+    A run of a cycle step names the run's step number. A load made with no OPEN cycle, whose
+    history row has no cycle and no step, names its run instead, as its STARTED line does.
+    """
+    jobName = step.job.LegacyName()
+    if stepContext.cycleId is None or stepContext.stepNo is None:
+        message = LOAD_ENDED_TEMPLATE.format(
+            runId=stepContext.runId, jobName=jobName, exitCode=exitCode
+        )
+    else:
+        message = STEP_ENDED_TEMPLATE.format(
+            stepNo=stepContext.stepNo, jobName=jobName, exitCode=exitCode
+        )
     if exitCode >= CHAIN_STOP_THRESHOLD:
         LOGGER.error(message)
     else:
@@ -287,21 +315,46 @@ def HandleFailure(stepContext: JobContext, step: ChainStep, exitCode: int, messa
 
     A status below CHAIN_STOP_THRESHOLD, which a runner must never fail with, is recorded as
     EXIT_FAILURE so the chain still stops. The catalog is then reconciled, which deletes any
-    .part file a rolled-back atomic step left behind.
+    .part file a rolled-back atomic step left behind, and the run's ENDED line is logged.
     """
     failureExitCode = exitCode if exitCode >= CHAIN_STOP_THRESHOLD else EXIT_FAILURE
     LOGGER.error(message)
     run_ledger.RecordFailure(stepContext, stepContext.runId, failureExitCode)
     gdg.ReconcileCatalog(stepContext)
-    LogStepEnded(step, failureExitCode)
+    LogStepEnded(stepContext, step, failureExitCode)
     return failureExitCode
+
+
+def PublishStepGenerations(stepContext: JobContext, step: ChainStep) -> int:
+    """Publish the generations of a committed run; return EXIT_OK, or EXIT_FAILURE to stop.
+
+    The run and its step stay COMPLETED either way, so no failure is recorded. A database or
+    file error leaves the generation COMMITTED for the next command's ReconcileCatalog, and a
+    generation found LOST blocks the OPEN cycle until seed-all or run-all --new-cycle. Either
+    stops the chain, so no later step resolves an older generation in its place.
+    """
+    try:
+        gdg.PublishRunGenerations(stepContext)
+        gdg.CheckNoLostGenerations(stepContext)
+    except (DBAPIError, OSError) as error:
+        message = PUBLICATION_ERROR_TEMPLATE.format(
+            stepNo=step.stepNo, ioError=DescribeIoError(step, error)
+        )
+        LOGGER.error(message)
+        return EXIT_FAILURE
+    except gdg.LostGenerationError as error:
+        LOGGER.error(error.message)
+        return EXIT_FAILURE
+    return EXIT_OK
 
 
 def FinishStep(stepContext: JobContext, step: ChainStep, result: JobResult) -> int:
     """Complete a run whose runner returned, publish its generations and return its status.
 
     FinishIfRunning finishes per-write and files-only runs and is a no-op for an atomic runner
-    that already finished inside its own transaction.
+    that already finished inside its own transaction. Publication then runs once, after that
+    commit: a generation it does not publish makes the status EXIT_FAILURE, while the run and
+    its step stay COMPLETED. The run's ENDED line is logged last.
     """
     if result.exitCode >= CHAIN_STOP_THRESHOLD:
         message = RETURNED_FAILURE_TEMPLATE.format(
@@ -309,9 +362,9 @@ def FinishStep(stepContext: JobContext, step: ChainStep, result: JobResult) -> i
         )
         return HandleFailure(stepContext, step, result.exitCode, message)
     run_ledger.FinishIfRunning(stepContext, result)
-    gdg.PublishRunGenerations(stepContext)
-    LogStepEnded(step, result.exitCode)
-    return result.exitCode
+    exitCode = max(result.exitCode, PublishStepGenerations(stepContext, step))
+    LogStepEnded(stepContext, step, exitCode)
+    return exitCode
 
 
 def IoFailureExitCode(step: ChainStep) -> int:
@@ -339,17 +392,37 @@ def InvokeRunner(stepContext: JobContext, step: ChainStep) -> int:
     except (DBAPIError, OSError) as error:
         message = DescribeIoError(step, error)
         return HandleFailure(stepContext, step, IoFailureExitCode(step), message)
-    # Outside the exception mapping: the runner has returned, so an error finishing or
-    # publishing the run is no step failure. The next command's ClassifyInterruptedRuns and
-    # ReconcileCatalog recover the RUNNING row and the COMMITTED generation.
+    # Outside the exception mapping: the runner has returned with its writes committed, so
+    # neither finishing nor publishing the run is a step failure. FinishStep reports a
+    # publication error or a LOST generation itself, leaving the step COMPLETED; an error
+    # finishing a RUNNING run propagates, for the next command's ClassifyInterruptedRuns.
     return FinishStep(stepContext, step, result)
+
+
+def RefusedByFinancialReload(context: JobContext, step: ChainStep) -> bool:
+    """Log and return True while the step's loader would undo later steps of the OPEN cycle.
+
+    run_ledger.CheckFinancialReload refuses the accounts, transactions and tran-cat-balances
+    loaders while a later step that writes their table is COMPLETED, FAILED or INTERRUPTED in
+    the OPEN cycle. Nothing overrides the refusal, --force included.
+    """
+    refusal = run_ledger.CheckFinancialReload(context, step.job.name)
+    if refusal is None:
+        return False
+    LOGGER.error(refusal)
+    return True
 
 
 def ExecuteStep(context: JobContext, step: ChainStep) -> int:
     """Start a run of the step, committed RUNNING before the runner starts, and run it.
 
-    A load made with no OPEN cycle is recorded with no cycle and no step number.
+    Every execution of a step, by run-all, job or load, passes through here, so a financial
+    reload the OPEN cycle refuses returns EXIT_FAILURE first, having written no run and no row,
+    even when run-all forces it with --start-at and --force. A load made with no OPEN cycle is
+    recorded with no cycle and no step number.
     """
+    if RefusedByFinancialReload(context, step):
+        return EXIT_FAILURE
     stepNo = step.stepNo if context.cycleId is not None else None
     runStart = run_ledger.RunStart(
         context.cycleId, stepNo, step.job.LegacyName(), run_ledger.BuildRunParams(context)
@@ -408,9 +481,13 @@ def ProcessStep(context: JobContext, step: ChainStep, forced: bool) -> int:
 
 
 def CompleteCycleIfDone(context: JobContext) -> None:
-    """Mark the context's cycle COMPLETED once its final step, TRANIDX, is COMPLETED."""
+    """Mark the context's cycle COMPLETED once its final step, TRANIDX, is COMPLETED.
+
+    A cycle with a LOST generation stays OPEN, so it stays blocked until seed-all or
+    run-all --new-cycle abandons it.
+    """
     finalState = run_ledger.StepState(context, context.cycleId, FINAL_STEP.stepNo)
-    if finalState == run_ledger.STEP_COMPLETED:
+    if finalState == run_ledger.STEP_COMPLETED and not gdg.FindLostGenerations(context):
         run_ledger.CompleteCycle(context)
 
 
@@ -435,10 +512,15 @@ def ParseStartAt(startAt: str) -> tuple[ChainStep, ...]:
     """Return the candidate start steps --start-at names: a step number 1-18, or a job name.
 
     A job name or legacy alias matches in any letter case; TRANBKP names both its steps.
-    Raises KeyError for anything else, before any cycle is opened or abandoned.
+    Raises KeyError for anything else, before any cycle is opened or abandoned. A number is
+    bounded to the digits of the last step, leading zeros aside, before int() converts it, so
+    a number of any length is refused the same way.
     """
     if startAt.isascii() and startAt.isdigit():
-        stepNo = int(startAt)
+        significantDigits = startAt.lstrip("0")
+        if len(significantDigits) > len(str(run_ledger.CHAIN_STEP_COUNT)):
+            raise KeyError(startAt)
+        stepNo = int(significantDigits or "0")
         if stepNo not in run_ledger.CHAIN_STEP_NUMBERS:
             raise KeyError(startAt)
         return (CHAIN[stepNo - 1],)
@@ -480,6 +562,27 @@ def RefusedByLostGenerations(context: JobContext) -> bool:
         LOGGER.error(error.message)
         return True
     return False
+
+
+def RefusedByNewCycleStart(
+    context: JobContext, newCycle: bool, candidates: tuple[ChainStep, ...] | None
+) -> bool:
+    """Log and return True when --start-at names a later step for a cycle run-all would open.
+
+    A new cycle, from --new-cycle or because none is OPEN, always starts from the loaders. Every
+    step of it is PENDING, so its start step would be the first candidate, and only step 1 may
+    be. Checked before ChainCycle, a refusal abandons and opens no cycle.
+    """
+    if candidates is None or candidates[0].stepNo == FIRST_STEP.stepNo:
+        return False
+    if not newCycle and OpenCycleId(context) is not None:
+        return False
+    startStep = candidates[0]
+    message = NEW_CYCLE_START_REFUSED_TEMPLATE.format(
+        stepNo=startStep.stepNo, jobName=startStep.job.LegacyName()
+    )
+    LOGGER.error(message)
+    return True
 
 
 def ChainCycle(context: JobContext, newCycle: bool) -> int:
@@ -524,6 +627,8 @@ def RunChain(context: JobContext, options: ChainOptions) -> int:
             LOGGER.error(UNKNOWN_STEP_TEMPLATE.format(name=PrintableText(options.startAt)))
             return EXIT_FAILURE
     if not options.newCycle and RefusedByLostGenerations(context):
+        return EXIT_FAILURE
+    if RefusedByNewCycleStart(context, options.newCycle, candidates):
         return EXIT_FAILURE
     cycleContext = replace(context, cycleId=ChainCycle(context, options.newCycle))
     steps, forcedStepNo = PlanChainSteps(cycleContext, candidates, options.force)
@@ -593,18 +698,19 @@ def RunStandaloneJob(context: JobContext, request: JobRequest) -> int:
 
 
 def RunStandaloneLoad(context: JobContext, loaderName: str) -> int:
-    """Run one loader for load, in the OPEN cycle if any (Technical Specification 0.6.8)."""
+    """Run one loader for load, in the OPEN cycle if any (Technical Specification 0.6.8).
+
+    An unknown loader and a LOST generation are refused here; a financial reload the OPEN cycle
+    refuses is refused by ExecuteStep, as it is when run-all reaches the loader's step.
+    """
     definition = FindNamedDefinition(loaderName, LOADER_JOB_NAMES)
     if definition is None:
         LOGGER.error(UNKNOWN_LOADER_TEMPLATE.format(name=PrintableText(loaderName)))
         return EXIT_FAILURE
     if RefusedByLostGenerations(context):
         return EXIT_FAILURE
-    refusal = run_ledger.CheckFinancialReload(context, definition.name)
-    if refusal is not None:
-        LOGGER.error(refusal)
-        return EXIT_FAILURE
-    # A replace-load gives the same state every time, so it executes whatever its step's state,
-    # and it never opens, closes or abandons a cycle.
+    # A replace-load gives the same state every time, so it executes whatever its step's state
+    # unless ExecuteStep refuses a financial reload, and it never opens, closes or abandons a
+    # cycle.
     loadContext = replace(context, cycleId=OpenCycleId(context))
     return ExecuteStep(loadContext, StepsForJob(definition)[0])

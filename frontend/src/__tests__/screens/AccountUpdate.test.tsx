@@ -726,6 +726,136 @@ const EDITED_TEST_AMOUNTS: Readonly<Partial<AccountScreenFields>> = {
     curr_cycle_debit: "+           .00",
 };
 
+// One part of WS-EDIT-DATE-CCYYMMDD, which COACTUPC fills from a date's three inputs.
+type DatePart = "year" | "month" | "day";
+
+// One CSUTLDPY failure: its suffix, the parts keyed over the fetched date, and the parts it flags
+// in FIELD_ORDER (year, month, day).
+interface DateEditSuffixCase {
+    suffix: string;
+    keyedParts: Readonly<Partial<Record<DatePart, string>>>;
+    flaggedParts: readonly DatePart[];
+}
+
+// One edited date: the label coactupc.py puts before the suffix, and the input of each part.
+interface DateFieldGroup {
+    label: string;
+    partNames: Readonly<Record<DatePart, AccountFieldName>>;
+}
+
+const DATE_PARTS: readonly DatePart[] = ["year", "month", "day"];
+
+// Every reachable EDIT-DATE-CCYYMMDD suffix (cpy/CSUTLDPY.cpy), each keyed over a valid fetched
+// date. A year, month or day failure flags its own part, a 30- or 31-day failure the month and
+// day, a leap-year failure every part.
+const DATE_EDIT_SUFFIX_CASES: readonly DateEditSuffixCase[] = [
+    {
+        suffix: " : Year must be supplied.",
+        keyedParts: { year: "" },
+        flaggedParts: ["year"],
+    },
+    {
+        suffix: " must be 4 digit number.",
+        keyedParts: { year: "20A5" },
+        flaggedParts: ["year"],
+    },
+    {
+        suffix: " : Century is not valid.",
+        keyedParts: { year: "1814" },
+        flaggedParts: ["year"],
+    },
+    {
+        suffix: " : Month must be supplied.",
+        keyedParts: { month: "" },
+        flaggedParts: ["month"],
+    },
+    {
+        suffix: ": Month must be a number between 1 and 12.",
+        keyedParts: { month: "13" },
+        flaggedParts: ["month"],
+    },
+    {
+        suffix: " : Day must be supplied.",
+        keyedParts: { day: "" },
+        flaggedParts: ["day"],
+    },
+    {
+        suffix: ":day must be a number between 1 and 31.",
+        keyedParts: { day: "32" },
+        flaggedParts: ["day"],
+    },
+    {
+        suffix: ":Cannot have 31 days in this month.",
+        keyedParts: { month: "04", day: "31" },
+        flaggedParts: ["month", "day"],
+    },
+    {
+        suffix: ":Cannot have 30 days in this month.",
+        keyedParts: { month: "02", day: "30" },
+        flaggedParts: ["month", "day"],
+    },
+    {
+        suffix: ":Not a leap year.Cannot have 29 days in this month.",
+        keyedParts: { year: "2023", month: "02", day: "29" },
+        flaggedParts: ["year", "month", "day"],
+    },
+];
+
+// EDIT-DATE-OF-BIRTH runs only on a date EDIT-DATE-CCYYMMDD passes; a date not before today flags
+// every part. The trailing space is in the source.
+const BIRTH_DATE_FUTURE_CASE: DateEditSuffixCase = {
+    suffix: ":cannot be in the future ",
+    keyedParts: { year: "2099" },
+    flaggedParts: ["year", "month", "day"],
+};
+
+const BIRTH_DATE_GROUP: DateFieldGroup = {
+    label: "Date of Birth",
+    partNames: { year: "dob_year", month: "dob_month", day: "dob_day" },
+};
+
+// The four dates 1200-EDIT-MAP-INPUTS edits, in its order.
+const DATE_FIELD_GROUPS: readonly DateFieldGroup[] = [
+    {
+        label: "Open Date",
+        partNames: { year: "open_year", month: "open_month", day: "open_day" },
+    },
+    {
+        label: "Expiry Date",
+        partNames: { year: "expiration_year", month: "expiration_month", day: "expiration_day" },
+    },
+    {
+        label: "Reissue Date",
+        partNames: { year: "reissue_year", month: "reissue_month", day: "reissue_day" },
+    },
+    BIRTH_DATE_GROUP,
+];
+
+// One CSUTLDPY suffix under one date's label: the parts keyed and flagged mapped to its inputs.
+function DateEditCase(group: DateFieldGroup, suffixCase: DateEditSuffixCase): FieldEditCase {
+    const keyedFields: Partial<AccountScreenFields> = {};
+    for (const part of DATE_PARTS) {
+        const value = suffixCase.keyedParts[part];
+        if (value !== undefined) {
+            keyedFields[group.partNames[part]] = value;
+        }
+    }
+    return {
+        message: group.label + suffixCase.suffix,
+        keyedFields,
+        fieldErrors: suffixCase.flaggedParts.map((part) => group.partNames[part]),
+    };
+}
+
+// Every reachable date literal: each EDIT-DATE-CCYYMMDD suffix under each of the four labels,
+// then the EDIT-DATE-OF-BIRTH one.
+const DATE_FIELD_EDIT_CASES: readonly FieldEditCase[] = [
+    ...DATE_FIELD_GROUPS.flatMap((group) =>
+        DATE_EDIT_SUFFIX_CASES.map((suffixCase) => DateEditCase(group, suffixCase)),
+    ),
+    DateEditCase(BIRTH_DATE_GROUP, BIRTH_DATE_FUTURE_CASE),
+];
+
 // Every reachable field-edit suffix and every edited label, the AAP 0.6.9 pinned cases included.
 const FIELD_EDIT_CASES: readonly FieldEditCase[] = [
     // 1220-EDIT-YESNO: supplied (not a space or zero), then upper-case Y or N.
@@ -749,64 +879,7 @@ const FIELD_EDIT_CASES: readonly FieldEditCase[] = [
         keyedFields: { primary_holder_ind: "y" },
         fieldErrors: ["primary_holder_ind"],
     },
-    // EDIT-DATE-CCYYMMDD (cpy/CSUTLDPY.cpy) under each date's label: a 30- or 31-day failure flags
-    // the month and day, a leap-year failure every part. EDIT-DATE-OF-BIRTH, run only on a valid
-    // date, also flags every part.
-    {
-        message: "Open Date : Year must be supplied.",
-        keyedFields: { open_year: "" },
-        fieldErrors: ["open_year"],
-    },
-    {
-        message: "Open Date : Century is not valid.",
-        keyedFields: { open_year: "1814" },
-        fieldErrors: ["open_year"],
-    },
-    {
-        message: "Open Date:Cannot have 31 days in this month.",
-        keyedFields: { open_month: "04", open_day: "31" },
-        fieldErrors: ["open_month", "open_day"],
-    },
-    {
-        message: "Expiry Date must be 4 digit number.",
-        keyedFields: { expiration_year: "20A5" },
-        fieldErrors: ["expiration_year"],
-    },
-    {
-        message: "Expiry Date : Day must be supplied.",
-        keyedFields: { expiration_day: "" },
-        fieldErrors: ["expiration_day"],
-    },
-    {
-        message: "Expiry Date:Cannot have 30 days in this month.",
-        keyedFields: { expiration_month: "02", expiration_day: "30" },
-        fieldErrors: ["expiration_month", "expiration_day"],
-    },
-    {
-        message: "Reissue Date : Month must be supplied.",
-        keyedFields: { reissue_month: "" },
-        fieldErrors: ["reissue_month"],
-    },
-    {
-        message: "Reissue Date:day must be a number between 1 and 31.",
-        keyedFields: { reissue_day: "32" },
-        fieldErrors: ["reissue_day"],
-    },
-    {
-        message: "Reissue Date:Not a leap year.Cannot have 29 days in this month.",
-        keyedFields: { reissue_year: "2023", reissue_month: "02", reissue_day: "29" },
-        fieldErrors: ["reissue_year", "reissue_month", "reissue_day"],
-    },
-    {
-        message: "Date of Birth: Month must be a number between 1 and 12.",
-        keyedFields: { dob_month: "13" },
-        fieldErrors: ["dob_month"],
-    },
-    {
-        message: "Date of Birth:cannot be in the future ",
-        keyedFields: { dob_year: "2099" },
-        fieldErrors: ["dob_year", "dob_month", "dob_day"],
-    },
+    ...DATE_FIELD_EDIT_CASES,
     // 1250-EDIT-SIGNED-9V2: supplied, then TEST-NUMVAL-C. WS-EDIT-VARIABLE-NAME X(25) cuts the
     // label; "Credit Limit is not valid" is the first OUTCOME_CASES case.
     {
@@ -1110,16 +1183,12 @@ interface ReadFailureCase {
     message: string;
 }
 
+// The read failures that keep the empty key screen: no customer was read.
 const READ_FAILURE_CASES: readonly ReadFailureCase[] = [
     {
         source: "9200-GETCARDXREF-BYACCT NOTFND",
         status: HTTP_NOT_FOUND,
         message: "Account:00000000099 not found in Cross ref file.  Resp:000000013  Reas:0000",
-    },
-    {
-        source: "9300-GETACCTDATA-BYACCT NOTFND",
-        status: HTTP_NOT_FOUND,
-        message: "Account:00000000099 not found in Acct Master file.Resp:000000013  Reas:0000",
     },
     {
         source: "9400-GETCUSTDATA-BYCUST NOTFND",
@@ -1132,20 +1201,50 @@ const READ_FAILURE_CASES: readonly ReadFailureCase[] = [
         message: "File Error: READ     on CXACAIX   returned RESP 000000019 ,RESP2 000000060",
     },
     {
-        source: "ACCTDAT IOERR",
-        status: HTTP_FILE_ERROR,
-        message: "File Error: READ     on ACCTDAT   returned RESP 000000017 ,RESP2 000000000",
-    },
-    {
         source: "CUSTDAT IOERR",
         status: HTTP_FILE_ERROR,
         message: "File Error: READ     on CUSTDAT   returned RESP 000000017 ,RESP2 000000000",
     },
 ];
+// 9300-GETACCTDATA-BYACCT never sets DID-NOT-FIND-ACCT-IN-ACCTDAT, so 9000-READ-ACCT still reads
+// the customer, and 2000-DECIDE-ACTION sets ACUP-SHOW-DETAILS once FOUND-CUST-IN-MASTER holds.
+const ACCOUNT_READ_FAILURE_CASES: readonly ReadFailureCase[] = [
+    {
+        source: "9300-GETACCTDATA-BYACCT NOTFND",
+        status: HTTP_NOT_FOUND,
+        message: "Account:00000000099 not found in Acct Master file.Resp:000000013  Reas:0000",
+    },
+    {
+        source: "ACCTDAT IOERR",
+        status: HTTP_FILE_ERROR,
+        message: "File Error: READ     on ACCTDAT   returned RESP 000000017 ,RESP2 000000000",
+    },
+];
 // The file errors name no key, so they also stand for a failed F12 re-read of the fetched account.
-const READ_FILE_ERROR_CASES: readonly ReadFailureCase[] = READ_FAILURE_CASES.filter(
-    (readCase) => readCase.status === HTTP_FILE_ERROR,
+const READ_FILE_ERROR_CASES: readonly ReadFailureCase[] = [
+    ...READ_FAILURE_CASES,
+    ...ACCOUNT_READ_FAILURE_CASES,
+].filter((readCase) => readCase.status === HTTP_FILE_ERROR);
+
+// The account record the failed 9300 left unread shows blank, its five amounts zero as
+// +ZZZ,ZZZ,ZZZ.99 edits them; the customer fields show the CUSTDAT record 9400 read, the
+// customer READ_FAILURE_ACCOUNT_ID's cross-reference names.
+const ZERO_SCREEN_AMOUNT = "+           .00";
+const READ_FAILURE_CUSTOMER_ID = "000000099";
+const CUSTOMER_FIELD_NAMES: readonly AccountFieldName[] = ALL_FIELD_NAMES.slice(
+    ALL_FIELD_NAMES.indexOf("cust_id"),
 );
+const UNREAD_ACCOUNT_FIELDS: Readonly<AccountScreenFields> = {
+    ...BlankFields(),
+    ...PickFields(TEST_FIELDS, CUSTOMER_FIELD_NAMES),
+    acct_id: READ_FAILURE_ACCOUNT_ID,
+    credit_limit: ZERO_SCREEN_AMOUNT,
+    cash_credit_limit: ZERO_SCREEN_AMOUNT,
+    curr_balance: ZERO_SCREEN_AMOUNT,
+    curr_cycle_credit: ZERO_SCREEN_AMOUNT,
+    curr_cycle_debit: ZERO_SCREEN_AMOUNT,
+    cust_id: READ_FAILURE_CUSTOMER_ID,
+};
 
 // No catch-all handler is registered (AAP 0.6.5): an unexpected error is Starlette's plain-text
 // 500, which the page shows as the ABEND-ROUTINE text (CSMSG02Y ABEND-MSG).
@@ -1311,29 +1410,86 @@ function ExpectReadFailureShown(readCase: ReadFailureCase): void {
     ExpectEditable("acct_id", true);
 }
 
-// 1210-EDIT-ACCOUNT passes the ?acctId= key, then its read fails.
-async function ShowsEntryFetchFailure(readCase: ReadFailureCase): Promise<void> {
+// ACCOUNT_READ_FAILURE_CASES: the SHOW_DETAILS screen over the customer the read found, with a
+// screen_token for it. FLG-ACCTFILTER-NOT-OK flags the key, which 3300 now protects.
+function AccountReadFailureScreen(readCase: ReadFailureCase): AccountScreen {
+    return BuildAccountScreen(UpdateScreenState.SHOW_DETAILS, {
+        fields: { ...UNREAD_ACCOUNT_FIELDS },
+        screen_token: ADOPTED_SCREEN_TOKEN,
+        message: readCase.message,
+        field_errors: [...KEY_FIELD_NAMES],
+        cursor_field: "acct_id",
+    });
+}
+
+// The page adopts the body's screen: its values, the details open and the key flagged.
+function ExpectAccountReadFailureShown(readCase: ReadFailureCase): void {
+    ExpectFailureShown({
+        message: readCase.message,
+        infoMessage: INFO_PROMPT_FOR_CHANGES,
+        fieldErrors: KEY_FIELD_NAMES,
+    });
+    expect(FieldValuesShown()).toEqual(UNREAD_ACCOUNT_FIELDS);
+    expect(EditableFieldNames()).toEqual(DETAIL_FIELD_NAMES);
+}
+
+// The state machine goes on from the adopted SHOW_DETAILS token: ENTER sends it with every open
+// detail as shown.
+async function SendsAdoptedDetailsOnEnter(user: UserEvent): Promise<void> {
+    QueueUpdateOutcome(HTTP_OK, BuildAccountScreen(UpdateScreenState.SHOW_DETAILS));
+    await PressFunctionKey(user, ENTER_KEY);
+    ExpectUpdateRequest(READ_FAILURE_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: ADOPTED_SCREEN_TOKEN,
+        fields: PickFields(UNREAD_ACCOUNT_FIELDS, DETAIL_FIELD_NAMES),
+    });
+}
+
+// 1210-EDIT-ACCOUNT passes the ?acctId= key, then its read fails with the status and screen given.
+async function FailEntryFetch(status: number, failureScreen: AccountScreen): Promise<UserEvent> {
     mockSearchParams = new URLSearchParams({ acctId: READ_FAILURE_ACCOUNT_ID });
-    const errorBody = BuildErrorBody(ReadFailureScreen(readCase));
-    mockFetchAccountForEdit.mockRejectedValueOnce(BuildAxiosError(readCase.status, errorBody));
-    RenderScreen();
+    const errorBody = BuildErrorBody(failureScreen);
+    mockFetchAccountForEdit.mockRejectedValueOnce(BuildAxiosError(status, errorBody));
+    const user = RenderScreen();
     await WaitForIdle();
     expect(mockFetchAccountForEdit).toHaveBeenCalledWith(READ_FAILURE_ACCOUNT_ID, READ_OPTIONS);
-    ExpectReadFailureShown(readCase);
+    return user;
 }
 
 // ENTER on the empty key screen with the key typed reads the same chain.
-async function ShowsKeyEnterFailure(readCase: ReadFailureCase): Promise<void> {
+async function FailKeyEnter(status: number, failureScreen: AccountScreen): Promise<UserEvent> {
     const user = await RenderInState(UpdateScreenState.DETAILS_NOT_FETCHED);
     await user.type(InputOf("acct_id"), READ_FAILURE_ACCOUNT_ID);
-    QueueUpdateOutcome(readCase.status, ReadFailureScreen(readCase));
+    QueueUpdateOutcome(status, failureScreen);
     await PressFunctionKey(user, ENTER_KEY);
     ExpectUpdateRequest(READ_FAILURE_ACCOUNT_ID, {
         action: UpdateAction.ENTER,
         screen_token: "",
         fields: { acct_id: READ_FAILURE_ACCOUNT_ID },
     });
+    return user;
+}
+
+async function ShowsEntryFetchFailure(readCase: ReadFailureCase): Promise<void> {
+    await FailEntryFetch(readCase.status, ReadFailureScreen(readCase));
     ExpectReadFailureShown(readCase);
+}
+
+async function ShowsKeyEnterFailure(readCase: ReadFailureCase): Promise<void> {
+    await FailKeyEnter(readCase.status, ReadFailureScreen(readCase));
+    ExpectReadFailureShown(readCase);
+}
+
+async function ShowsEntryFetchAccountReadFailure(readCase: ReadFailureCase): Promise<void> {
+    const user = await FailEntryFetch(readCase.status, AccountReadFailureScreen(readCase));
+    ExpectAccountReadFailureShown(readCase);
+    await SendsAdoptedDetailsOnEnter(user);
+}
+
+async function ShowsKeyEnterAccountReadFailure(readCase: ReadFailureCase): Promise<void> {
+    const user = await FailKeyEnter(readCase.status, AccountReadFailureScreen(readCase));
+    ExpectAccountReadFailureShown(readCase);
+    await SendsAdoptedDetailsOnEnter(user);
 }
 
 // F12 re-reads the token's account; CancelReadFailureOutcome keeps the provisional SHOW_DETAILS
@@ -2421,6 +2577,17 @@ describe("COACTUPC /accounts/update read failures", () => {
     it.each(READ_FILE_ERROR_CASES)(
         "COACTUPC F12 re-read shows the $source text and keeps SHOW_DETAILS",
         ShowsCancelReadFailure,
+    );
+});
+
+describe("COACTUPC /accounts/update account read failures with the customer found", () => {
+    it.each(ACCOUNT_READ_FAILURE_CASES)(
+        "COACTUPC ?acctId= fetch shows the $source text in SHOW_DETAILS",
+        ShowsEntryFetchAccountReadFailure,
+    );
+    it.each(ACCOUNT_READ_FAILURE_CASES)(
+        "COACTUPC ENTER on the key screen shows the $source text in SHOW_DETAILS",
+        ShowsKeyEnterAccountReadFailure,
     );
 });
 

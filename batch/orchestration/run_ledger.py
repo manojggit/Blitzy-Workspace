@@ -13,14 +13,18 @@ Commit points (Section 0.7.2):
 - FinishRun writes the final run status and the step state on the caller's connection, so both
   commit together: inside the step's own transaction for atomic steps (FinishAtomicRun), and
   after the step's last write for per-write and files-only steps (FinishIfRunning).
-- RecordFailure commits FAILED in its own transaction after the failure.
+- RecordFailure commits FAILED in its own transaction after the failure, for a run still RUNNING
+  and its step together. A run already COMPLETED, or otherwise no longer RUNNING, keeps its
+  status and its step its state, so a committed completion is never overwritten FAILED.
 - ClassifyInterruptedRuns reclassifies the RUNNING rows a dead process left behind.
 
 This module is the single source of the ledger's value constants, which gdg and batch_chain
 import; it imports neither of them, because gdg imports this module and batch_chain imports both.
-Ledger timestamps are the database's now(), never the batch Clock: they are run metadata and are
-excluded from reconciliation. Every statement is a SQLAlchemy Core construct with bound
-parameters, and database errors propagate for batch_chain and the CLI to map to exit statuses.
+Ledger timestamps come from the database clock, never the batch Clock: they are run metadata and
+are excluded from reconciliation. Finish times are clock_timestamp(), the moment the statement
+runs: an atomic run finishes inside the step's own transaction, where now() would give the time
+that transaction began. Every statement is a SQLAlchemy Core construct with bound parameters,
+and database errors propagate for batch_chain and the CLI to map to exit statuses.
 """
 
 from __future__ import annotations
@@ -101,10 +105,12 @@ UNBOUND_CYCLE_MESSAGE = "the job context is not bound to a cycle"
 CYCLE_OPENED_LOG = "CYCLE %d OPENED BY %s"
 CYCLE_ABANDONED_LOG = "CYCLE %d ABANDONED"
 CYCLE_COMPLETED_LOG = "CYCLE %d COMPLETED"
-RUN_STARTED_LOG = "RUN %d STEP %s %s STARTED"
+RUN_STARTED_LOG = "RUN %d STEP %d %s STARTED"
+RUN_STARTED_LOAD_LOG = "RUN %d %s STARTED; NO CYCLE STEP"
 RUN_SKIPPED_LOG = "RUN %d STEP %d %s SKIPPED; STEP ALREADY COMPLETED"
 INTERRUPTED_STEP_LOG = "RUN %d STEP %d %s INTERRUPTED; STEP NOW %s"
 INTERRUPTED_LOAD_LOG = "RUN %d %s INTERRUPTED; NO CYCLE STEP"
+FAILURE_NOT_RECORDED_LOG = "RUN %d IS %s, NOT RUNNING; FAILURE NOT RECORDED"
 
 RUNNING_ROWS_STATEMENT = (
     select(JOB_RUNS.c.run_id, JOB_RUNS.c.cycle_id, JOB_RUNS.c.step_no, JOB_RUNS.c.job_name)
@@ -309,7 +315,8 @@ def BuildRunParams(context: JobContext) -> dict[str, object]:
 def StartRun(context: JobContext, runStart: RunStart) -> int:
     """Record a RUNNING run, committed before the step starts (Section 0.7.2); return its id.
 
-    The step's state is left as it stands: there is no RUNNING step state.
+    The step's state is left as it stands: there is no RUNNING step state. The STARTED line
+    names the run's cycle step, or, for a load made with no OPEN cycle, says it has none.
     """
     statement = (
         insert(JOB_RUNS)
@@ -325,7 +332,10 @@ def StartRun(context: JobContext, runStart: RunStart) -> int:
     )
     with context.engine.begin() as connection:
         runId = connection.execute(statement).scalar_one()
-    LOGGER.info(RUN_STARTED_LOG, runId, runStart.stepNo, runStart.jobName)
+    if runStart.cycleId is None or runStart.stepNo is None:
+        LOGGER.info(RUN_STARTED_LOAD_LOG, runId, runStart.jobName)
+    else:
+        LOGGER.info(RUN_STARTED_LOG, runId, runStart.stepNo, runStart.jobName)
     return runId
 
 
@@ -342,7 +352,7 @@ def FinishRun(connection: Connection, runFinish: RunFinish) -> None:
             status=RUN_COMPLETED,
             exit_code=runFinish.exitCode,
             counts=runFinish.counts,
-            finished_at=func.now(),
+            finished_at=func.clock_timestamp(),
         )
     )
     connection.execute(runStatement)
@@ -354,9 +364,11 @@ def FinishRun(connection: Connection, runFinish: RunFinish) -> None:
 
 
 def FinishAtomicRun(connection: Connection, context: JobContext, result: JobResult) -> None:
-    """Finish the run as the last statement of an atomic step's own transaction.
+    """Finish the run inside an atomic step's own transaction, or a producer's final one.
 
-    A context with no started run, as unit tests build, records nothing.
+    A GDG producer calls it inside its gdg.NewGeneration block, so the generation's COMMITTED
+    row follows it as the transaction's final write. A context with no started run, as unit
+    tests build, records nothing.
     """
     if not context.IsLedgered():
         return
@@ -380,19 +392,35 @@ def FinishIfRunning(context: JobContext, result: JobResult) -> bool:
     return True
 
 
-def RecordFailure(context: JobContext, runId: int, exitCode: int) -> None:
-    """Record the run FAILED and its step FAILED, in their own transaction after the failure."""
+def ReadRunStatus(connection: Connection, runId: int) -> str | None:
+    """Return one run's status, or None when no batch.job_runs row has that id."""
+    statement = select(JOB_RUNS.c.status).where(RunKey(runId))
+    return connection.execute(statement).scalar_one_or_none()
+
+
+def RecordFailure(context: JobContext, runId: int, exitCode: int) -> bool:
+    """Record a RUNNING run FAILED and its step FAILED, in their own transaction after the failure.
+
+    Returns whether the failure was recorded. Only a run still RUNNING moves, and its step moves
+    with it. A run that is no longer RUNNING, such as one whose runner committed COMPLETED and then
+    raised while publishing, keeps its status and its step its state: the committed work is
+    never marked FAILED, so it is never retried or refused as if it had not completed. A warning
+    names the run and the status it kept.
+    """
     CheckFailureExitCode(exitCode)
     runStatement = (
         update(JOB_RUNS)
-        .where(RunKey(runId))
-        .values(status=RUN_FAILED, exit_code=exitCode, finished_at=func.now())
+        .where(and_(RunKey(runId), JOB_RUNS.c.status == RUN_RUNNING))
+        .values(status=RUN_FAILED, exit_code=exitCode, finished_at=func.clock_timestamp())
     )
     with context.engine.begin() as connection:
-        connection.execute(runStatement)
+        if connection.execute(runStatement).rowcount == 0:
+            LOGGER.warning(FAILURE_NOT_RECORDED_LOG, runId, ReadRunStatus(connection, runId))
+            return False
         if context.cycleId is not None and context.stepNo is not None:
             stepStatement = SetStepStatement(context.cycleId, context.stepNo, STEP_FAILED, runId)
             connection.execute(stepStatement)
+    return True
 
 
 def RecordSkip(context: JobContext, stepNo: int, jobName: str) -> int:
@@ -408,7 +436,7 @@ def RecordSkip(context: JobContext, stepNo: int, jobName: str) -> int:
             status=RUN_SKIPPED,
             exit_code=EXIT_OK,
             started_at=func.now(),
-            finished_at=func.now(),
+            finished_at=func.clock_timestamp(),
         )
         .returning(JOB_RUNS.c.run_id)
     )
@@ -450,7 +478,7 @@ def ReclassifyRun(connection: Connection, row: Row) -> None:
     runStatement = (
         update(JOB_RUNS)
         .where(RunKey(row.run_id))
-        .values(status=RUN_INTERRUPTED, finished_at=func.now())
+        .values(status=RUN_INTERRUPTED, finished_at=func.clock_timestamp())
     )
     connection.execute(runStatement)
     if row.cycle_id is None or row.step_no is None:

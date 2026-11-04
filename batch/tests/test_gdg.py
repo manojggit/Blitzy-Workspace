@@ -31,7 +31,7 @@ from sqlalchemy import Engine, func, insert, select, update
 from sqlalchemy.engine import RowMapping
 
 from batch.jobs import posttran
-from batch.orchestration import gdg, run_ledger
+from batch.orchestration import batch_chain, gdg, run_ledger
 from batch.orchestration.job_context import (
     EXIT_ABEND,
     EXIT_FAILURE,
@@ -75,10 +75,19 @@ SCRATCH_BASE_IDS = [base.name for base in SCRATCH_BASES]
 POSTTRAN_STEP = 13
 INTCALC_STEP = 14
 COMBTRAN_STEP = 16
+COMBTRAN_JCL_NAME = "COMBTRAN"
 # The steps the seeded cycle still has to run before COMBTRAN: TRANBKP twice, POSTTRAN, INTCALC.
 STEPS_BEFORE_COMBTRAN = (6, POSTTRAN_STEP, INTCALC_STEP, 15)
 RUN_ALL_ARGUMENTS = ("run-all", "--as-of", FIXED_AS_OF_TEXT)
 NEW_CYCLE_ARGUMENTS = ("run-all", "--new-cycle", "--as-of", FIXED_AS_OF_TEXT)
+NEW_CYCLE_AT_COMBTRAN_ARGUMENTS = (
+    "run-all",
+    "--new-cycle",
+    "--start-at",
+    COMBTRAN_JCL_NAME,
+    "--as-of",
+    FIXED_AS_OF_TEXT,
+)
 COMB_TRAN_ARGUMENTS = ("job", "comb-tran")
 POST_TRAN_ARGUMENTS = ("job", "post-tran", "--as-of", FIXED_AS_OF_TEXT)
 LOAD_TRAN_TYPES_ARGUMENTS = ("load", "tran-types")
@@ -251,6 +260,24 @@ def AssertBlockedByLostGeneration(arguments: Sequence[str], lostText: str) -> No
     outcome = InvokeCli(arguments)
     assert outcome.exitCode == EXIT_FAILURE, outcome.output
     assert lostText in outcome.output
+
+
+def AssertNewCycleStartAtRefused(engine: Engine, lostGeneration: int, runCountBefore: int) -> None:
+    """Run run-all --new-cycle --start-at COMBTRAN and check it exits 12, changing nothing.
+
+    A new cycle starts from the loaders, so it may not start at COMBTRAN and resolve the blocked
+    cycle's archives. The refusal precedes the abandonment: SYSTRAN(lostGeneration) stays LOST,
+    the cycle stays OPEN, and the run count is still runCountBefore.
+    """
+    outcome = InvokeCli(NEW_CYCLE_AT_COMBTRAN_ARGUMENTS)
+    refusal = batch_chain.NEW_CYCLE_START_REFUSED_TEMPLATE.format(
+        stepNo=COMBTRAN_STEP, jobName=COMBTRAN_JCL_NAME
+    )
+    assert outcome.exitCode == EXIT_FAILURE, outcome.output
+    assert refusal in outcome.output
+    assert CatalogStates(engine, gdg.SYSTRAN.name) == {lostGeneration: run_ledger.GDG_LOST}
+    assert CycleStatuses(engine) == [run_ledger.CYCLE_OPEN]
+    assert CountJobRuns(engine) == runCountBefore
 
 
 def AssertNewCycleRebuildsCombined(engine: Engine, outputDir: Path) -> None:
@@ -468,7 +495,7 @@ def test_rolled_back_caller_transaction_leaves_orphan_part_for_reconcile(
 def test_lost_generation_blocks_cycle_until_new_cycle(
     jobContext: JobContext, outputDir: Path
 ) -> None:
-    """A LOST SYSTRAN(0) refuses run-all and job comb-tran until run-all --new-cycle."""
+    """A LOST SYSTRAN(0) refuses run-all and job comb-tran until run-all --new-cycle from step 1."""
     engine = jobContext.engine
     systranRow = StopChainAfterStep15(engine)
     lostGeneration = systranRow["generation"]
@@ -480,7 +507,7 @@ def test_lost_generation_blocks_cycle_until_new_cycle(
     assert CatalogStates(engine, gdg.SYSTRAN.name) == {lostGeneration: run_ledger.GDG_LOST}
     AssertBlockedByLostGeneration(RUN_ALL_ARGUMENTS, lostText)
     AssertBlockedByLostGeneration(COMB_TRAN_ARGUMENTS, lostText)
-    assert CountJobRuns(engine) == runCountBefore
+    AssertNewCycleStartAtRefused(engine, lostGeneration, runCountBefore)
 
     AssertNewCycleRebuildsCombined(engine, outputDir)
     assert CycleStatuses(engine) == [run_ledger.CYCLE_ABANDONED, run_ledger.CYCLE_COMPLETED]

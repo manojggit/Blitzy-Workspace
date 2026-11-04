@@ -293,9 +293,20 @@ backend and frontend never read them.
     (`core/database.GetSession`) for the reads that lock nothing. Every record write runs in its
     own write unit, so commit placement follows [Write durability](#write-durability), not the
     session.
-- **Identity.** Every route except `POST /auth/login` and the health probes resolves the caller
-    from the session cookie, and its role guard admits or refuses it
-    ([Identity and trust](#identity-and-trust)).
+- **Identity.** Each route belongs to one of three classes
+    ([Identity and trust](#identity-and-trust)):
+    - **Public.** `POST /auth/login` reads no cookie, and is the only exemption from
+        `core/middleware.OriginGuard`. `POST /auth/logout` reads no identity and needs no
+        session, but like every `POST`, `PUT` and `DELETE` it needs an allow-listed `Origin`
+        ([CSRF and CORS](#csrf-and-cors)). The health probes and, when enabled, the API
+        documentation are public too
+        ([Health probes and API documentation](#health-probes-and-api-documentation)).
+    - **Signed on, any role.** `GET /auth/me` resolves the caller from the session cookie
+        through `core/dependencies.GetAuthenticatedContext`, which runs `GetCurrentUser` and no
+        role guard: a missing, expired or invalid cookie gives 401, and every user type passes.
+    - **Role-guarded.** Every other `/api/v1` route resolves the caller the same way, with the
+        same 401, and its `RequireAdmin` or `RequireRegular` guard then admits the caller or
+        refuses it with 403 ([Effective role](#effective-role)).
 - **Parameter objects.** Grouped inputs keep every signature at four parameters or fewer:
     `PostingInput`, `AccountUpdateRequest`, `ReportQuery`, `JobContext` and `RecordLayout`, among
     others.
@@ -443,8 +454,9 @@ Who is identified, and what each caller may supply:
 - **Frontend.** After sign-on it reads `GET /api/v1/auth/me` (in `src/lib/session.tsx`) only to
     choose the menu and fill the header.
 - **Backend.** The token's claims `sub` (the user ID) and `typ` (the user type) are read from
-    `security.users` at login, and verified on every request by
-    `core/dependencies.GetCurrentUser`. No other request body, query parameter or header field is
+    `security.users` at login, and verified by `core/dependencies.GetCurrentUser` on every request
+    that needs a user: `GET /auth/me` and every role-guarded route
+    ([Request flow](#request-flow)). No other request body, query parameter or header field is
     read as identity or role.
 - **Batch.** There is no application user. Batch connects with the `SYNC_DATABASE_URL`
     credentials and reads only its command parameters: `--run-date`, `--daily-file`,
@@ -464,11 +476,12 @@ Who is identified, and what each caller may supply:
     - The browser sends it on every API call (`withCredentials`) and on the CSV and PDF export
         downloads, which are same-site because both origins use the host `127.0.0.1`.
 - **Logout.** `POST /auth/logout` clears the cookie and returns
-    `Thank you for using CardDemo application...`.
+    `Thank you for using CardDemo application...`. It needs no session, so repeating it is
+    harmless, but it needs an allow-listed `Origin` ([CSRF and CORS](#csrf-and-cors)).
 - **Fail closed.** `core/config.Settings` refuses to start when `SECRET_KEY` is blank or shorter
     than 32 characters.
-- **Claims and expiry.** The claims are `sub`, `typ`, `iat` and `exp`. A missing, expired or
-    invalid cookie gives 401.
+- **Claims and expiry.** The claims are `sub`, `typ`, `iat` and `exp`. On a request that needs a
+    user, a missing, expired or invalid cookie gives 401.
 - **Token lifetime.** The user type in the token holds for the token's lifetime, as the COMMAREA
     did for a CICS session. Changing or deleting a user takes effect at that user's next login.
 

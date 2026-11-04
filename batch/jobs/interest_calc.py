@@ -12,10 +12,11 @@ job never writes transactions.transactions, which COMBTRAN loads from SYSTRAN, n
 balances. docs/batch.md ("Step 14: INTCALC", "INTCALC: interest calculation") transcribes this.
 
 Durability: each account rewrite commits in its own transaction as it is made, as RECOVERY(NONE)
-VSAM does, so an abend leaves the earlier rewrites in place. The SYSTRAN generation's COMMITTED
-catalog row and the run's completion share one final transaction, committed after the last
-rewrite, and the generation is published once that has committed. An abend deletes the .part
-file and catalogs nothing, as DISP=(NEW,CATLG,DELETE) does.
+VSAM does, so an abend leaves the earlier rewrites in place. The run's completion and then the
+SYSTRAN generation's COMMITTED catalog row, the job's final database write, share one final
+transaction, committed after the last rewrite; the chain (batch_chain) publishes the generation
+once that has committed. An abend deletes the .part file and catalogs nothing, as
+DISP=(NEW,CATLG,DELETE) does.
 
 Exit statuses: EXIT_OK, or JobFailure with EXIT_ABEND (9999-ABEND-PROGRAM, CEE3ABD 999) when an
 account, its cross-reference or the DEFAULT disclosure group is missing, a rewrite finds no
@@ -89,7 +90,12 @@ CATEGORY_BALANCE_FETCH_BATCH_SIZE = 500
 # The DISPLAY texts of the mainline and its paragraphs.
 START_LOG = "START OF EXECUTION OF PROGRAM %s"
 END_LOG = "END OF EXECUTION OF PROGRAM %s: %d RECORDS, %d INTEREST TRANSACTIONS, %d REWRITES"
-RECORD_LOG = "TRAN-CAT-BAL-RECORD %s %s %04d %s"
+# DISPLAY TRAN-CAT-BAL-RECORD (line 193), each field after its CVTRA01Y name: run together or
+# joined by spaces, the key and balance digits would form one chain of 16 or more digits, which
+# the log masking filter hides but its last four.
+RECORD_LOG = (
+    "TRAN-CAT-BAL-RECORD TRANCAT-ACCT-ID=%s TRANCAT-TYPE-CD=%s TRANCAT-CD=%04d TRAN-CAT-BAL=%s"
+)
 GROUP_MISSING_LOG = "DISCLOSURE GROUP RECORD MISSING"
 TRY_DEFAULT_LOG = "TRY WITH DEFAULT GROUP CODE"
 ACCOUNT_NOT_FOUND_TEMPLATE = "ACCOUNT NOT FOUND: {acctId}"
@@ -161,7 +167,7 @@ def RunJob(context: JobContext) -> JobResult:
     """Run INTCALC: write SYSTRAN(+1) and rewrite the accounts with their interest (step 14).
 
     Returns EXIT_OK with the record, interest-transaction and rewrite counts, once the final
-    transaction has recorded the run COMPLETED and the generation is published. Raises
+    transaction has recorded the run COMPLETED and cataloged the generation COMMITTED. Raises
     JobFailure with EXIT_ABEND on any abend: the rewrites committed before it stay, and no
     SYSTRAN generation is cataloged.
     """
@@ -170,7 +176,9 @@ def RunJob(context: JobContext) -> JobResult:
         result = CalculateInterest(context)
     except ABEND_ERRORS as error:
         raise AbendProgram((DescribeAbend(error),)) from error
-    gdg.PublishRunGenerations(context)
+    # No publication here: the run is already COMPLETED, so the chain (batch_chain.FinishStep)
+    # publishes the COMMITTED generation outside its runner-failure mapping, and a publication
+    # error there leaves the step COMPLETED for the next command's gdg.ReconcileCatalog.
     counts = result.counts
     LOGGER.info(
         END_LOG,
@@ -185,14 +193,16 @@ def RunJob(context: JobContext) -> JobResult:
 def CalculateInterest(context: JobContext) -> JobResult:
     """The mainline, lines 180-232: open the files, process every balance, close the files.
 
-    The SYSTRAN catalog row and the run completion commit together on finalConnection, after
-    the last account rewrite has committed in its own unit (Technical Specification 0.7.2).
+    The run completion and the SYSTRAN catalog row commit together on finalConnection, after
+    the last account rewrite has committed in its own unit (Technical Specification 0.7.2). The
+    completion runs inside the generation block, so the COMMITTED row, inserted as the block
+    exits, is the final write, and a failure there or in the close discards the .part file.
     """
     with context.engine.connect() as finalConnection:
         with gdg.NewGeneration(context, gdg.SYSTRAN, connection=finalConnection) as systranWriter:
             state = ProcessCategoryBalances(context, systranWriter)
-        result = BuildInterestResult(state)
-        run_ledger.FinishAtomicRun(finalConnection, context, result)
+            result = BuildInterestResult(state)
+            run_ledger.FinishAtomicRun(finalConnection, context, result)
         finalConnection.commit()
     return result
 

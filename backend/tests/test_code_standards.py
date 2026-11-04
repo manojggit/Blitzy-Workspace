@@ -132,6 +132,9 @@ FRAMEWORK_METHOD_NAMES = frozenset(
         # pydantic and pydantic-settings.
         "settings_customise_sources",
         "model_post_init",
+        # Click Command.make_context and Command.invoke.
+        "make_context",
+        "invoke",
         # pytest xunit-style setup and teardown.
         "setup_method",
         "teardown_method",

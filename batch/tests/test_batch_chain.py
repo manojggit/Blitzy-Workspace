@@ -1,26 +1,30 @@
 """Chain order, exit policy, resume, failure, rerun and interruption of the 18-step batch chain.
 
 Pins batch/orchestration/batch_chain.py and run_ledger.py to the Technical Specification,
-Section 0.6.8: the dependency graph and step table, cycles and step identity, and the skip,
-resume, failure and force rules. The chain replaces the CardDemo job chains of
-scheduler/CardDemo.ca7 and scheduler/CardDemo.controlm and the COND=(4,LT) condition-code
-chaining of jcl/TRANBKP.jcl STEP10: a step ending 0 or 4 lets the chain continue, 8 or above
-stops it, and run-all exits with the highest status of the steps it ran. The steps exercised
-beyond the loaders are TRANBKP (jcl/TRANBKP.jcl), POSTTRAN (jcl/POSTTRAN.jcl, cbl/CBTRN02C.cbl),
-INTCALC (jcl/INTCALC.jcl), COMBTRAN (jcl/COMBTRAN.jcl), CREASTMT (jcl/CREASTMT.JCL) and TRANIDX
-(jcl/TRANIDX.jcl).
+Section 0.6.8: the dependency graph and step table, cycles and step identity, the skip,
+resume, failure and force rules, and the publication of a producer step's generation after its
+commit, whose error or LOST outcome stops the chain with the step still COMPLETED. The chain
+replaces the CardDemo job chains of scheduler/CardDemo.ca7 and scheduler/CardDemo.controlm and
+the COND=(4,LT) condition-code chaining of jcl/TRANBKP.jcl STEP10: a step ending 0 or 4 lets
+the chain continue, 8 or above stops it, and run-all exits with the highest status of the steps
+it ran. The steps exercised beyond the loaders are TRANBKP (jcl/TRANBKP.jcl), POSTTRAN
+(jcl/POSTTRAN.jcl, cbl/CBTRN02C.cbl), INTCALC (jcl/INTCALC.jcl), COMBTRAN (jcl/COMBTRAN.jcl),
+CREASTMT (jcl/CREASTMT.JCL) and TRANIDX (jcl/TRANIDX.jcl).
 
 Every case starts from the Alembic seed: the SEED cycle OPEN, steps 1-5 and 7-12 COMPLETED. The
 carddemo-batch commands run in process, so failure injections apply; the SIGKILL case runs the
 CLI as a subprocess and is marked slow. A clean run is judged against the committed oracle
-fixtures (accounts after INTCALC, category balances after POSTTRAN, TRANSACT.COMBINED(0) and the
-transactions COMBTRAN reloads), so no case runs a second, reference chain.
+fixtures, so no case runs a second, reference chain: accounts after INTCALC, category balances
+after POSTTRAN, the generations COMBTRAN resolves (TRANSACT.BKUP(0) = tranbkp_run2_bkup.dat,
+SYSTRAN(0) = intcalc_systran.dat), the TRANSACT.COMBINED(0) it writes and the transactions it
+reloads.
 
 Injected failures are scoped with pytest.MonkeyPatch.context() rather than monkeypatch.undo():
 the outputDir fixture sets CARDDEMO_OUTPUT_DIR through the same monkeypatch, and undoing it
 would send every later command's archives to the repository's var/batch-output.
 """
 
+import errno
 import hashlib
 from dataclasses import dataclass
 from decimal import Decimal
@@ -28,6 +32,7 @@ from pathlib import Path
 
 import pytest
 from app.models import (
+    CYCLES,
     GDG_GENERATIONS,
     JOB_RUNS,
     Account,
@@ -137,11 +142,31 @@ RERUN_COMMANDS: dict[int, tuple[str, ...]] = {
 }
 FORCED_TRAN_BACKUP_COMMAND = (*RERUN_COMMANDS[FIRST_TRANBKP_STEP], "--force")
 START_AT_POSTTRAN_VALUES = ("13", "post-tran", "POSTTRAN", "posttran", "PostTran")
+# One digit more than Python 3.13 converts with int() by default (int max-str-digits is 4300).
+OVERLONG_STEP_DIGITS = 4301
+UNKNOWN_START_AT_VALUES = [
+    pytest.param("0", id="step-0"),
+    pytest.param(str(FINAL_STEP + 1), id="step-after-last"),
+    pytest.param("NOPE", id="unknown-name"),
+    pytest.param("1" * OVERLONG_STEP_DIGITS, id="4301-digits"),
+]
+# The refusal's text up to the operator's value, which the log may mask or escape.
+UNKNOWN_STEP_PREFIX = batch_chain.UNKNOWN_STEP_TEMPLATE.format(name="")
+TRACEBACK_HEADER = "Traceback (most recent call last)"
 
 # --- Clean-run fixtures and outputs --------------------------------------------------------------
 CLEAN_ACCOUNTS_CSV = EXPECTED_DIR / "intcalc_accounts.csv"
 CLEAN_CATEGORY_BALANCES_CSV = EXPECTED_DIR / "posttran_tcatbal.csv"
 CLEAN_COMBINED_DAT = EXPECTED_DIR / "combtran_combined.dat"
+CLEAN_BACKUP_DAT = EXPECTED_DIR / "tranbkp_run2_bkup.dat"
+CLEAN_SYSTRAN_DAT = EXPECTED_DIR / "intcalc_systran.dat"
+# Each generation a clean chain leaves as (0), with its fixture: the step 15 backup and the
+# INTCALC SYSTRAN that COMBTRAN resolves, then the TRANSACT.COMBINED it writes from them.
+CLEAN_GENERATION_FIXTURES = (
+    (gdg.TRANSACT_BKUP.name, CLEAN_BACKUP_DAT),
+    (gdg.SYSTRAN.name, CLEAN_SYSTRAN_DAT),
+    (gdg.TRANSACT_COMBINED.name, CLEAN_COMBINED_DAT),
+)
 TRANSACTION_LAYOUT_NAME = "TRANSACTION"
 STATEMENTS_DIRECTORY_NAME = "statements"
 # Each statement file and its fixture; the file name is also its line-only oracle layout.
@@ -158,6 +183,33 @@ RELOAD_MARKER_AMOUNT = Decimal("1.00")
 POSTING_WAIT_SECONDS = 180
 WINDOW_RELEASE_SECONDS = 30
 XMIN_COLUMN = "xmin"
+
+# --- Publication after a producer step's commit --------------------------------------------------
+INTCALC_STEP = 14
+COMBTRAN_STEP = 16
+# The generation each producer step writes in a run-all from the seed, whose catalog is empty:
+# its base and generation number. Steps 6 and 15 write the first two TRANSACT.BKUP generations.
+PRODUCED_GENERATIONS: dict[int, tuple[gdg.GdgBase, int]] = {
+    FIRST_TRANBKP_STEP: (gdg.TRANSACT_BKUP, 1),
+    POSTTRAN_STEP: (gdg.DALYREJS, 1),
+    INTCALC_STEP: (gdg.SYSTRAN, 1),
+    SECOND_TRANBKP_STEP: (gdg.TRANSACT_BKUP, 2),
+    COMBTRAN_STEP: (gdg.TRANSACT_COMBINED, 1),
+}
+PRODUCER_STEPS = tuple(PRODUCED_GENERATIONS)
+# Each base's PUBLISHED generations after a clean chain from the seed: one per producer step.
+CLEAN_GENERATION_COUNTS = {
+    gdg.TRANSACT_BKUP.name: 2,
+    gdg.DALYREJS.name: 1,
+    gdg.SYSTRAN.name: 1,
+    gdg.TRANSACT_COMBINED.name: 1,
+}
+PLACE_GENERATION_FILE_NAME = "PlaceGenerationFile"
+# The rename failure injected after a producer step's commit. Its text must never be logged.
+INJECTED_PUBLICATION_ERRNO = errno.EIO
+INJECTED_PUBLICATION_REASON = "injected rename failure"
+# The commands a LOST generation of the OPEN cycle refuses before executing any step.
+LOST_BLOCKED_COMMANDS = (("run-all",), RERUN_COMMANDS[COMBTRAN_STEP])
 
 
 # --- Value types ---------------------------------------------------------------------------------
@@ -282,18 +334,37 @@ def ChainOutcomeSnapshot(engine: Engine, outputDir: Path) -> ChainSnapshot:
 
 
 # --- The clean-run reference ---------------------------------------------------------------------
+def CleanGenerationDifferences(connection: Connection, outputDir: Path) -> list[str]:
+    """Return how each CLEAN_GENERATION_FIXTURES (0) generation differs from its fixture.
+
+    Each generation is resolved over PUBLISHED catalog rows and compared byte for byte after
+    removing the "\\n" terminators; one that is not published is reported missing. Every message
+    is prefixed with its base and relative generation, for example "SYSTRAN(0): ".
+    """
+    differences = []
+    for baseName, fixturePath in CLEAN_GENERATION_FIXTURES:
+        generationPath = compare.LatestPublishedGeneration(connection, baseName, outputDir)
+        generationDifferences = compare.CompareFixedWidthFiles(
+            generationPath, fixturePath, TRANSACTION_LAYOUT_NAME
+        )
+        differences.extend(f"{baseName}(0): {difference}" for difference in generationDifferences)
+    return differences
+
+
 def CleanChainDifferences(connection: Connection, outputDir: Path) -> list[str]:
-    """Return how the database and TRANSACT.COMBINED(0) differ from a clean chain's fixtures."""
-    combinedPath = compare.LatestPublishedGeneration(
-        connection, gdg.TRANSACT_COMBINED.name, outputDir
-    )
+    """Return how the database and the (0) generations differ from a clean chain's fixtures.
+
+    The generations are TRANSACT.BKUP(0) and SYSTRAN(0), which COMBTRAN resolves, and the
+    TRANSACT.COMBINED(0) it writes from them; the tables are accounts, category balances and
+    the transactions COMBTRAN reloads.
+    """
     combinedRecords = compare.ReadFixedWidthRecords(CLEAN_COMBINED_DAT)
     return [
         *compare.CompareTableWithCsv(connection, legacy_oracle.ACCOUNTS_TABLE, CLEAN_ACCOUNTS_CSV),
         *compare.CompareTableWithCsv(
             connection, legacy_oracle.CATEGORY_BALANCES_TABLE, CLEAN_CATEGORY_BALANCES_CSV
         ),
-        *compare.CompareFixedWidthFiles(combinedPath, CLEAN_COMBINED_DAT, TRANSACTION_LAYOUT_NAME),
+        *CleanGenerationDifferences(connection, outputDir),
         *compare.CompareTableWithRecords(
             connection, legacy_oracle.TRANSACTIONS_TABLE, combinedRecords, TRANSACTION_LAYOUT_NAME
         ),
@@ -303,9 +374,11 @@ def CleanChainDifferences(connection: Connection, outputDir: Path) -> list[str]:
 def AssertCleanChainResult(engine: Engine, outputDir: Path) -> None:
     """Assert the outcome a clean chain over the sample data has, from the committed fixtures.
 
-    Accounts equal intcalc_accounts.csv, category balances posttran_tcatbal.csv,
-    TRANSACT.COMBINED(0) equals combtran_combined.dat byte for byte, and transactions holds
-    exactly the COMBINED records: their count first, then every field.
+    Accounts equal intcalc_accounts.csv and category balances posttran_tcatbal.csv. COMBTRAN's
+    inputs, TRANSACT.BKUP(0) and SYSTRAN(0), equal tranbkp_run2_bkup.dat and
+    intcalc_systran.dat, and its output TRANSACT.COMBINED(0) equals combtran_combined.dat, each
+    byte for byte. transactions holds exactly the COMBINED records: their count first, then
+    every field.
     """
     with engine.connect() as connection:
         differences = CleanChainDifferences(connection, outputDir)
@@ -356,6 +429,14 @@ def RunStatus(engine: Engine, runId: int) -> str:
 def StepStates(engine: Engine, stepNumbers: range | tuple[int, ...]) -> dict[int, str]:
     """Return the state of each step in the current cycle, keyed by step number."""
     return {stepNo: StepRow(engine, stepNo)["state"] for stepNo in stepNumbers}
+
+
+def AssertCyclesAtSeed(environment: BatchEnvironment) -> None:
+    """Assert batch.cycles still holds exactly the seed's rows: no cycle opened or abandoned."""
+    with environment.engine.connect() as connection:
+        currentRows = ReadModelRows(connection, CYCLES)
+    seedRows = environment.snapshot.tableRows[CYCLES.fullname]
+    assert RowsByPrimaryKey(currentRows, CYCLES) == RowsByPrimaryKey(seedRows, CYCLES)
 
 
 # --- Table contents ------------------------------------------------------------------------------
@@ -631,6 +712,154 @@ def AssertPostingStateMatchesOracle(engine: Engine, expected: legacy_oracle.Orac
     assert actual.transactions == expected.transactions
 
 
+# --- Publication scenarios -----------------------------------------------------------------------
+def IsProducedGeneration(finalPath: Path, stepNo: int) -> bool:
+    """Return whether finalPath is the final file of the generation step stepNo writes."""
+    base, generation = PRODUCED_GENERATIONS[stepNo]
+    fileName = gdg.GENERATION_FILE_TEMPLATE.format(generation=generation)
+    return (finalPath.parent.name, finalPath.name) == (base.name, fileName)
+
+
+def InjectPublicationFailure(monkeypatch: pytest.MonkeyPatch, stepNo: int) -> None:
+    """Make the first publication of step stepNo's generation fail with EIO before its rename.
+
+    It fails after the step has committed, so the catalog row stays COMMITTED and the .part file
+    in place, as a failed rename leaves them. Every other generation publishes unchanged.
+    """
+    originalPlace = gdg.PlaceGenerationFile
+    failedPaths: list[Path] = []
+
+    def FailingPlace(finalPath: Path, expectedSha256: str) -> str:
+        if IsProducedGeneration(finalPath, stepNo) and not failedPaths:
+            failedPaths.append(finalPath)
+            raise OSError(INJECTED_PUBLICATION_ERRNO, INJECTED_PUBLICATION_REASON)
+        return originalPlace(finalPath, expectedSha256)
+
+    monkeypatch.setattr(gdg, PLACE_GENERATION_FILE_NAME, FailingPlace)
+
+
+def InjectLostPublication(monkeypatch: pytest.MonkeyPatch, stepNo: int) -> None:
+    """Delete step stepNo's generation file and its .part as publication comes to place them.
+
+    The step has committed, so publication finds neither file and marks the row LOST.
+    """
+    originalPlace = gdg.PlaceGenerationFile
+
+    def LosingPlace(finalPath: Path, expectedSha256: str) -> str:
+        if IsProducedGeneration(finalPath, stepNo):
+            gdg.PartPath(finalPath).unlink(missing_ok=True)
+            finalPath.unlink(missing_ok=True)
+        return originalPlace(finalPath, expectedSha256)
+
+    monkeypatch.setattr(gdg, PLACE_GENERATION_FILE_NAME, LosingPlace)
+
+
+def ProducedGenerationState(engine: Engine, stepNo: int) -> str:
+    """Return the catalog state of the generation step stepNo writes in a run-all from the seed."""
+    base, generation = PRODUCED_GENERATIONS[stepNo]
+    statement = select(GDG_GENERATIONS.c.state).where(
+        GDG_GENERATIONS.c.base_name == base.name, GDG_GENERATIONS.c.generation == generation
+    )
+    with engine.connect() as connection:
+        return connection.execute(statement).scalar_one()
+
+
+def PublicationErrorMessage(stepNo: int) -> str:
+    """Return the ERROR line the chain logs for the publication failure injected at stepNo."""
+    ioError = batch_chain.FILE_ERROR_TEMPLATE.format(
+        jobName=EXPECTED_LEGACY_ORDER[stepNo - 1],
+        errorClass=OSError.__name__,
+        errnoName=errno.errorcode[INJECTED_PUBLICATION_ERRNO],
+    )
+    return batch_chain.PUBLICATION_ERROR_TEMPLATE.format(stepNo=stepNo, ioError=ioError)
+
+
+def LostGenerationMessage(stepNo: int, cycleId: int) -> str:
+    """Return the message naming step stepNo's generation LOST in cycleId, with the recovery."""
+    base, generation = PRODUCED_GENERATIONS[stepNo]
+    return gdg.LOST_GENERATION_TEMPLATE.format(
+        base=base.name, generation=generation, cycleId=cycleId
+    )
+
+
+def FailPublicationInRunAll(stepNo: int, environment: BatchEnvironment) -> None:
+    """Run run-all from the seed with step stepNo's publication failing once after its commit.
+
+    The error is reported by class and errno symbol, never by its text.
+    """
+    with pytest.MonkeyPatch.context() as failurePatch:
+        InjectPublicationFailure(failurePatch, stepNo)
+        outcome = RunAll(environment)
+    assert outcome.exitCode == EXIT_FAILURE, outcome.output
+    assert PublicationErrorMessage(stepNo) in outcome.output
+    assert INJECTED_PUBLICATION_REASON not in outcome.output
+
+
+def LoseGenerationInRunAll(stepNo: int, environment: BatchEnvironment) -> str:
+    """Run run-all from the seed with step stepNo's generation lost before it is published.
+
+    Returns the message naming the LOST generation, which the run-all logged.
+    """
+    with pytest.MonkeyPatch.context() as lossPatch:
+        InjectLostPublication(lossPatch, stepNo)
+        outcome = RunAll(environment)
+    lostMessage = LostGenerationMessage(stepNo, StepRow(environment.engine, stepNo)["cycle_id"])
+    assert outcome.exitCode == EXIT_FAILURE, outcome.output
+    assert lostMessage in outcome.output
+    return lostMessage
+
+
+def AssertChainStoppedAtCompletedStep(
+    stepNo: int, environment: BatchEnvironment, generationState: str
+) -> None:
+    """Assert the chain stopped at step stepNo, which with its run stayed COMPLETED.
+
+    Its generation is in generationState, no later step has a run, and the cycle is OPEN.
+    """
+    engine = environment.engine
+    stepRow = StepRow(engine, stepNo)
+    assert stepRow["state"] == run_ledger.STEP_COMPLETED
+    assert RunStatus(engine, stepRow["last_run_id"]) == run_ledger.RUN_COMPLETED
+    assert ProducedGenerationState(engine, stepNo) == generationState
+    assert max(run["step_no"] for run in NewRuns(environment)) == stepNo
+    assert stepRow["cycle_status"] == run_ledger.CYCLE_OPEN
+
+
+def ResumedExitCode(stepNo: int) -> int:
+    """Return the status of the run-all that resumes after step stepNo completed.
+
+    It executes POSTTRAN, which rejects sample records, only when step stepNo precedes it.
+    """
+    if stepNo < POSTTRAN_STEP:
+        return EXIT_REJECTS
+    return EXIT_OK
+
+
+def ResumeAfterPublicationFailure(stepNo: int, environment: BatchEnvironment) -> None:
+    """Run run-all unforced and assert it publishes, skips step stepNo and finishes the chain.
+
+    The command's catalog recovery publishes the COMMITTED generation before any step runs.
+    """
+    engine = environment.engine
+    outcome = RunAll(environment)
+    assert outcome.exitCode == ResumedExitCode(stepNo), outcome.output
+    assert ProducedGenerationState(engine, stepNo) == run_ledger.GDG_PUBLISHED
+    assert CountJobRuns(engine, stepNo, run_ledger.RUN_SKIPPED) == 1
+    assert CountJobRuns(engine, stepNo, run_ledger.RUN_COMPLETED) == 1
+    assert StepRow(engine, FINAL_STEP)["cycle_status"] == run_ledger.CYCLE_COMPLETED
+
+
+def AssertRefusedByLostGeneration(
+    arguments: tuple[str, ...], environment: BatchEnvironment, lostMessage: str
+) -> None:
+    """Assert a command exits 12 naming the LOST generation and records no run."""
+    runCount = len(NewRuns(environment))
+    outcome = InvokeCli(arguments)
+    assert outcome.exitCode == EXIT_FAILURE, outcome.output
+    assert lostMessage in outcome.output
+    assert len(NewRuns(environment)) == runCount
+
+
 # --- Order and shared definitions ----------------------------------------------------------------
 def test_chain_has_18_steps_in_legacy_order_with_durability_classes() -> None:
     durabilityByStep = {step.stepNo: step.durability for step in batch_chain.CHAIN}
@@ -733,6 +962,19 @@ def test_start_at_tranbkp_resolves_first_incomplete_occurrence(
     AssertCleanChainResult(batchEnvironment.engine, batchEnvironment.outputDir)
 
 
+@pytest.mark.parametrize("startAt", UNKNOWN_START_AT_VALUES)
+def test_start_at_refuses_unknown_step_before_any_cycle_change(
+    startAt: str, batchEnvironment: BatchEnvironment
+) -> None:
+    """An unknown --start-at, a number of any length included, exits 12 and changes nothing."""
+    outcome = RunAll(batchEnvironment, "--start-at", startAt)
+    assert outcome.exitCode == EXIT_FAILURE, outcome.output
+    assert UNKNOWN_STEP_PREFIX in outcome.output
+    assert TRACEBACK_HEADER not in outcome.output
+    assert NewRuns(batchEnvironment) == []
+    AssertCyclesAtSeed(batchEnvironment)
+
+
 # --- Failure at every step, reruns and force -----------------------------------------------------
 @pytest.mark.parametrize("stepNo", CHAIN_STEP_NUMBERS, ids=StepId)
 def test_injected_failure_at_each_step_then_rerun_reaches_clean_result(
@@ -791,6 +1033,38 @@ def test_files_only_creastmt_failure_is_retried_by_next_run_all(
     assert retriedRun.exitCode == EXIT_OK, retriedRun.output
     assert StepRow(engine, CREASTMT_STEP)["state"] == run_ledger.STEP_COMPLETED
     assert StatementDifferences(outputDir) == []
+    AssertCleanChainResult(engine, outputDir)
+
+
+# --- Publication after the step's commit ---------------------------------------------------------
+@pytest.mark.parametrize("stepNo", PRODUCER_STEPS, ids=StepId)
+def test_publication_error_after_commit_keeps_step_completed_and_next_run_all_skips_it(
+    stepNo: int, batchEnvironment: BatchEnvironment
+) -> None:
+    engine, outputDir = batchEnvironment.engine, batchEnvironment.outputDir
+    FailPublicationInRunAll(stepNo, batchEnvironment)
+    AssertChainStoppedAtCompletedStep(stepNo, batchEnvironment, run_ledger.GDG_COMMITTED)
+    ResumeAfterPublicationFailure(stepNo, batchEnvironment)
+    # The step never ran again: no second posting or interest, and no empty newer TRANSACT.BKUP
+    # in place of the archive COMBTRAN resolves.
+    assert ChainOutcomeSnapshot(engine, outputDir).generationCounts == CLEAN_GENERATION_COUNTS
+    AssertCleanChainResult(engine, outputDir)
+
+
+def test_generation_lost_in_publication_stops_chain_and_blocks_cycle_until_new_cycle(
+    batchEnvironment: BatchEnvironment,
+) -> None:
+    engine, outputDir = batchEnvironment.engine, batchEnvironment.outputDir
+    lostMessage = LoseGenerationInRunAll(POSTTRAN_STEP, batchEnvironment)
+    AssertChainStoppedAtCompletedStep(POSTTRAN_STEP, batchEnvironment, run_ledger.GDG_LOST)
+    laterSteps = range(INTCALC_STEP, FINAL_STEP + 1)
+    assert StepStates(engine, laterSteps) == dict.fromkeys(laterSteps, run_ledger.STEP_PENDING)
+    for arguments in LOST_BLOCKED_COMMANDS:
+        AssertRefusedByLostGeneration(arguments, batchEnvironment, lostMessage)
+    recovery = RunAll(batchEnvironment, "--new-cycle")
+    assert recovery.exitCode == EXIT_REJECTS, recovery.output
+    assert ProducedGenerationState(engine, POSTTRAN_STEP) == run_ledger.GDG_ABANDONED
+    assert StepRow(engine, FINAL_STEP)["cycle_status"] == run_ledger.CYCLE_COMPLETED
     AssertCleanChainResult(engine, outputDir)
 
 

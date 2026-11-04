@@ -25,7 +25,7 @@ only." suffix of 1230/1240, which no PERFORM reaches.
 import json
 import secrets
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
@@ -37,6 +37,7 @@ import pytest_asyncio
 from sqlalchemy import Engine, text
 
 from app.core.errors import FileIoError, LegacyMessageError, RecordLockError
+from app.core.locks import FileNotOpenError
 from app.core.security import (
     SCREEN_STATE_HKDF_INFO,
     DecodeScreenToken,
@@ -44,6 +45,7 @@ from app.core.security import (
     EncodeScreenToken,
 )
 from app.repositories.account_repository import AccountRepository
+from app.repositories.card_xref_repository import CardXrefRepository
 from app.repositories.customer_repository import CustomerRepository
 from app.schemas.accounts import AccountScreen, AccountScreenFields, AccountUpdateRequest
 from app.schemas.common import UpdateAction, UpdateScreenState
@@ -60,6 +62,8 @@ REGULAR_USER_TYPE = "U"
 # LIT-ACCTFILENAME and LIT-CUSTFILENAME.
 ACCOUNT_FILE = "ACCTDAT"
 CUSTOMER_FILE = "CUSTDAT"
+# LIT-CARDXREFNAME-ACCT-PATH, the cross-reference by account that 9200-GETCARDXREF-BYACCT reads.
+XREF_ACCOUNT_PATH = "CXACAIX"
 # The AccountScreenFields attributes the cursor and field_errors name most often.
 ACCOUNT_ID_FIELD = "acct_id"
 STATUS_FIELD = "active_status"
@@ -98,6 +102,26 @@ MSG_NO_INPUT_RECEIVED = "No input received"
 MSG_ACCOUNT_KEY_INVALID = "Account Number if supplied must be a 11 digit Non-Zero Number"
 # The 9200-GETCARDXREF-BYACCT NOTFND builder (RESP 13, RESP2 0), cut to WS-RETURN-MSG X(75).
 MSG_XREF_NOT_FOUND = "Account:00000000099 not found in Cross ref file.  Resp:000000013  Reas:0000"
+# The 9300-GETACCTDATA-BYACCT and 9400-GETCUSTDATA-BYCUST NOTFND builders (lines 3723-3733,
+# 3773-3783) for account 00000000016 and its customer 000000016, cut to X(75) the same way.
+MSG_ACCOUNT_NOT_FOUND = (
+    "Account:00000000016 not found in Acct Master file.Resp:000000013  Reas:0000"
+)
+MSG_CUSTOMER_NOT_FOUND = (
+    "CustId:000000016 not found in customer master.Resp: 000000013  REAS:0000000"
+)
+# The 9200, 9300 and 9400 WHEN OTHER texts (lines 3686, 3736, 3785): WS-FILE-ERROR-MESSAGE
+# (lines 389-408), 'READ' in X(8) and the file in X(9), cut to X(75) and right-trimmed. The
+# batch window's CXACAIX answers NOTOPEN (RESP 19, RESP2 60); IOERR is RESP 17, RESP2 0.
+MSG_XREF_WINDOW_CLOSED = (
+    "File Error: READ     on CXACAIX   returned RESP 000000019 ,RESP2 000000060"
+)
+MSG_ACCOUNT_READ_ERROR = (
+    "File Error: READ     on ACCTDAT   returned RESP 000000017 ,RESP2 000000000"
+)
+MSG_CUSTOMER_READ_ERROR = (
+    "File Error: READ     on CUSTDAT   returned RESP 000000017 ,RESP2 000000000"
+)
 # The NO-CHANGES-DETECTED, lock, changed and failed 88 texts that 1205 and 9600 set.
 MSG_NO_CHANGES = "No change detected with respect to values fetched."
 MSG_LOCK_ACCOUNT = "Could not lock account record for update"
@@ -239,6 +263,31 @@ EXPECTED_FETCHED_FIELDS = MappingProxyType(
         "phone_num_1_area": "631",
     }
 )
+# The account fields 3202 shows after an ACCTDAT READ that failed (lines 2793-2825): the
+# ACCOUNT-RECORD no READ filled, blank, each amount zero edited by +ZZZ,ZZZ,ZZZ.99. ACCTSIDO shows
+# the key, CC-ACCT-ID (line 2708).
+UNREAD_ACCOUNT_AMOUNT_SHOWN = "+           .00"
+UNREAD_ACCOUNT_FIELDS = MappingProxyType(
+    {
+        "acct_id": EDIT_ACCOUNT_ID,
+        "active_status": "",
+        "open_year": "",
+        "open_month": "",
+        "open_day": "",
+        "credit_limit": UNREAD_ACCOUNT_AMOUNT_SHOWN,
+        "expiration_year": "",
+        "expiration_month": "",
+        "expiration_day": "",
+        "cash_credit_limit": UNREAD_ACCOUNT_AMOUNT_SHOWN,
+        "reissue_year": "",
+        "reissue_month": "",
+        "reissue_day": "",
+        "curr_balance": UNREAD_ACCOUNT_AMOUNT_SHOWN,
+        "curr_cycle_credit": UNREAD_ACCOUNT_AMOUNT_SHOWN,
+        "group_id": "",
+        "curr_cycle_debit": UNREAD_ACCOUNT_AMOUNT_SHOWN,
+    }
+)
 # UT with ZIP 84390 is a VALID-US-STATE-ZIP-CD2-COMBO (UT84), so every edit of the fetched screen
 # passes; VT84 is not one.
 VALID_BASELINE = MappingProxyType({"addr_state_cd": "UT"})
@@ -280,6 +329,26 @@ SELECT_ACCOUNT_SQL = text("SELECT * FROM accounts.accounts WHERE acct_id = :acct
 SELECT_CUSTOMER_SQL = text("SELECT * FROM customers.customers WHERE cust_id = :custId")
 UPDATE_BALANCE_SQL = text(
     "UPDATE accounts.accounts SET curr_balance = :balance WHERE acct_id = :acctId"
+)
+# Another connection's row lock on the customer, refused with SQLSTATE 55P03 instead of waiting.
+LOCK_CUSTOMER_NOWAIT_SQL = text(
+    "SELECT 1 FROM customers.customers WHERE cust_id = :custId FOR UPDATE NOWAIT"
+)
+# The constraint refuses only customer 000000016 with the state UT that SAVE_CHANGES submits; no
+# seeded customer is in UT, and NOT VALID skips checking the stored rows. A lock still held when
+# it is added or dropped fails the statement after lock_timeout instead of hanging the run.
+DDL_LOCK_TIMEOUT_SQL = text("SET LOCAL lock_timeout = '5s'")
+ADD_REWRITE_CHECK_SQL = text(
+    "ALTER TABLE customers.customers ADD CONSTRAINT ck_test_customer_rewrite_rejected"
+    " CHECK (cust_id <> '000000016' OR addr_state_cd <> 'UT') NOT VALID"
+)
+DROP_REWRITE_CHECK_SQL = text(
+    "ALTER TABLE customers.customers DROP CONSTRAINT IF EXISTS ck_test_customer_rewrite_rejected"
+)
+# LogFileCondition's record when the constraint refuses the CUSTDAT UPDATE (SQLSTATE 23514).
+CUSTOMER_REWRITE_REFUSED_LOG = (
+    "Transaction CAUP REWRITE on CUSTDAT returned RESP:17 REAS:0"
+    " (cause CheckViolationError, SQLSTATE 23514)"
 )
 
 # --- Screen token forgery ------------------------------------------------------------------------
@@ -426,6 +495,18 @@ def KeyFailure(httpStatus: int, message: str) -> ExpectedScreen:
         (ACCOUNT_ID_FIELD,),
         ACCOUNT_ID_FIELD,
         DETAILS_NOT_FETCHED,
+    )
+
+
+def UnreadAccountFailure(httpStatus: int, message: str) -> ExpectedScreen:
+    """SHOW_DETAILS after an ACCTDAT read failure with the customer found, the key flagged."""
+    return ExpectedScreen(
+        httpStatus,
+        message,
+        INFO_PROMPT_FOR_CHANGES,
+        (ACCOUNT_ID_FIELD,),
+        ACCOUNT_ID_FIELD,
+        SHOW_DETAILS,
     )
 
 
@@ -628,6 +709,17 @@ def SetAccountBalance(syncEngine: Engine, acctId: str, balance: Decimal) -> None
         connection.execute(UPDATE_BALANCE_SQL, {"balance": balance, "acctId": acctId})
 
 
+def LockCustomerRowWithoutWaiting(syncEngine: Engine, custId: str) -> int:
+    """Lock the customers.customers row of ``custId`` on a new connection; return rows locked.
+
+    FOR UPDATE NOWAIT raises SQLSTATE 55P03 at once while another transaction, such as a
+    CUSTDAT write unit left open, still holds the row lock. The lock ends at this commit.
+    """
+    with syncEngine.begin() as connection:
+        lockedRows = connection.execute(LOCK_CUSTOMER_NOWAIT_SQL, {"custId": custId}).all()
+    return len(lockedRows)
+
+
 def RewrittenAccount(accountRow: Mapping[str, Any], creditLimit: Decimal) -> dict[str, Any]:
     """Return the account after an F5 that changed only the credit limit.
 
@@ -750,6 +842,124 @@ async def AssertEditFailureCase(scenario: UpdateScenario, fieldCase: FieldCase) 
     AssertRowsUnchanged(scenario)
 
 
+# --- Read failure stubs: the CICS file conditions of 9000-READ-ACCT ------------------------------
+async def CloseXrefPath(self: CardXrefRepository, acctId: str) -> dict[str, Any] | None:
+    """CXACAIX READ answering NOTOPEN (RESP 19, RESP2 60): the batch window has closed it."""
+    raise FileNotOpenError(XREF_ACCOUNT_PATH)
+
+
+async def MissAccount(self: AccountRepository, acctId: str) -> dict[str, Any] | None:
+    """ACCTDAT READ answering NOTFND (RESP 13), which xref.card_xref's foreign key rules out."""
+    return None
+
+
+async def MissCustomer(self: CustomerRepository, custId: str) -> dict[str, Any] | None:
+    """CUSTDAT READ answering NOTFND (RESP 13), which xref.card_xref's foreign key rules out."""
+    return None
+
+
+async def FailAccountRead(self: AccountRepository, acctId: str) -> dict[str, Any] | None:
+    """ACCTDAT READ answering IOERR (RESP 17)."""
+    raise FileIoError(ACCOUNT_FILE)
+
+
+async def FailCustomerRead(self: CustomerRepository, custId: str) -> dict[str, Any] | None:
+    """CUSTDAT READ answering IOERR (RESP 17), after the cross-reference names the customer."""
+    raise FileIoError(CUSTOMER_FILE)
+
+
+class ReadStub(NamedTuple):
+    """A 9000-READ-ACCT read replaced by a stub; every read not replaced runs on the seed."""
+
+    repositoryClass: type
+    methodName: str
+    stub: Callable[..., Any]
+
+
+class ReadFailureCase(NamedTuple):
+    """The reads of account 16 replaced by stubs, and the screen its edit fetch is answered with.
+
+    ``expectedFields`` builds the fields that screen shows from the screen fetched before the
+    stubs were installed.
+    """
+
+    readStubs: tuple[ReadStub, ...]
+    expected: ExpectedScreen
+    expectedFields: Callable[[AccountScreen], dict[str, str]]
+
+
+def KeyScreenFieldsOf(fetched: AccountScreen) -> dict[str, str]:
+    """3201-SHOW-INITIAL-VALUES: ACCTSID shows the key, every detail field is blank."""
+    return AccountScreenFields(acct_id=EDIT_ACCOUNT_ID).model_dump()
+
+
+def UnreadAccountFieldsOf(fetched: AccountScreen) -> dict[str, str]:
+    """3202 after an ACCTDAT failure: the customer as fetched, the unread account's fields blank."""
+    return {**fetched.fields.model_dump(), **UNREAD_ACCOUNT_FIELDS}
+
+
+def KeyScreenCase(
+    readStubs: tuple[ReadStub, ...], httpStatus: int, message: str
+) -> ReadFailureCase:
+    """A read failure answered on the DETAILS_NOT_FETCHED key screen."""
+    return ReadFailureCase(readStubs, KeyFailure(httpStatus, message), KeyScreenFieldsOf)
+
+
+def UnreadAccountCase(
+    readStubs: tuple[ReadStub, ...], httpStatus: int, message: str
+) -> ReadFailureCase:
+    """An ACCTDAT read failure with the customer found, answered in SHOW_DETAILS."""
+    return ReadFailureCase(
+        readStubs, UnreadAccountFailure(httpStatus, message), UnreadAccountFieldsOf
+    )
+
+
+XREF_PATH_CLOSED_STUB = ReadStub(CardXrefRepository, "GetXrefByAccount", CloseXrefPath)
+ACCOUNT_MISSING_STUB = ReadStub(AccountRepository, "GetAccount", MissAccount)
+CUSTOMER_MISSING_STUB = ReadStub(CustomerRepository, "GetCustomer", MissCustomer)
+ACCOUNT_IOERR_STUB = ReadStub(AccountRepository, "GetAccount", FailAccountRead)
+CUSTOMER_IOERR_STUB = ReadStub(CustomerRepository, "GetCustomer", FailCustomerRead)
+# 9000-READ-ACCT (lines 3608-3649). A CXACAIX failure ends the chain; an ACCTDAT failure does not
+# (line 3719 is commented out), so CUSTDAT is still read: its NOTFND keeps a message already set
+# (IF WS-RETURN-MSG-OFF) and its WHEN OTHER replaces it. Only the CXACAIX and ACCTDAT failures
+# set FLG-ACCTFILTER-NOT-OK; the key is the cursor and the one field listed either way.
+# A NORMAL CUSTDAT read sets FOUND-CUST-IN-MASTER (line 3765), and 2000-DECIDE-ACTION then sets
+# ACUP-SHOW-DETAILS (lines 2577-2578): after an ACCTDAT failure 9500 stores the customer and the
+# ACCOUNT-RECORD the failed READ never filled, and 3202 shows them under PROMPT-FOR-CHANGES.
+# Without a customer read the screen stays DETAILS_NOT_FETCHED and 3201 shows the key alone.
+ACCOUNT_MISSING_CASE = UnreadAccountCase(
+    (ACCOUNT_MISSING_STUB,), HTTP_NOT_FOUND, MSG_ACCOUNT_NOT_FOUND
+)
+ACCOUNT_IOERR_CASE = UnreadAccountCase(
+    (ACCOUNT_IOERR_STUB,), HTTP_FILE_ERROR, MSG_ACCOUNT_READ_ERROR
+)
+READ_FAILURE_CASES = [
+    KeyScreenCase((XREF_PATH_CLOSED_STUB,), HTTP_FILE_ERROR, MSG_XREF_WINDOW_CLOSED),
+    ACCOUNT_MISSING_CASE,
+    KeyScreenCase((CUSTOMER_MISSING_STUB,), HTTP_NOT_FOUND, MSG_CUSTOMER_NOT_FOUND),
+    ACCOUNT_IOERR_CASE,
+    KeyScreenCase((CUSTOMER_IOERR_STUB,), HTTP_FILE_ERROR, MSG_CUSTOMER_READ_ERROR),
+    KeyScreenCase(
+        (ACCOUNT_MISSING_STUB, CUSTOMER_IOERR_STUB), HTTP_FILE_ERROR, MSG_CUSTOMER_READ_ERROR
+    ),
+    KeyScreenCase(
+        (ACCOUNT_MISSING_STUB, CUSTOMER_MISSING_STUB), HTTP_NOT_FOUND, MSG_ACCOUNT_NOT_FOUND
+    ),
+]
+READ_FAILURE_CASE_IDS = [
+    "cxacaix-notopen",
+    "acctdat-notfnd",
+    "custdat-notfnd",
+    "acctdat-ioerr",
+    "custdat-ioerr",
+    "acctdat-notfnd-then-custdat-ioerr",
+    "acctdat-notfnd-then-custdat-notfnd",
+]
+# The ACCTDAT failures whose customer is found: their SHOW_DETAILS token is pressed on.
+UNREAD_ACCOUNT_CASES = [ACCOUNT_MISSING_CASE, ACCOUNT_IOERR_CASE]
+UNREAD_ACCOUNT_CASE_IDS = ["acctdat-notfnd", "acctdat-ioerr"]
+
+
 # --- Repository failure stubs: the CICS file conditions of 9600-WRITE-PROCESSING -----------------
 async def RefuseAccountLock(self: AccountRepository, unit: object, acctId: str) -> None:
     """ACCTDAT READ UPDATE answering RECORDBUSY (RESP 101)."""
@@ -759,13 +969,6 @@ async def RefuseAccountLock(self: AccountRepository, unit: object, acctId: str) 
 async def RefuseCustomerLock(self: CustomerRepository, unit: object, custId: str) -> None:
     """CUSTDAT READ UPDATE answering RECORDBUSY (RESP 101), after the account is locked."""
     raise RecordLockError(CUSTOMER_FILE)
-
-
-async def FailCustomerRewrite(
-    self: CustomerRepository, unit: object, values: Mapping[str, Any]
-) -> None:
-    """CUSTDAT REWRITE answering IOERR (RESP 17), after the ACCTDAT unit has committed."""
-    raise FileIoError(CUSTOMER_FILE)
 
 
 # --- Screen token forgers ------------------------------------------------------------------------
@@ -826,6 +1029,27 @@ async def ScenarioFixture(onlineContext: Any, syncEngine: Engine) -> UpdateScena
     )
 
 
+@pytest.fixture(name="rejectCustomerRewrite")
+def RejectCustomerRewriteFixture(restoreSeedState: None, syncEngine: Engine) -> Iterator[None]:
+    """Yield nothing while a CHECK constraint refuses the customer row SAVE_CHANGES submits.
+
+    The real CUSTDAT UPDATE then fails in PostgreSQL with SQLSTATE 23514. ALTER TABLE needs an
+    ACCESS EXCLUSIVE lock, which an online context's open read transaction blocks, so a test
+    requests this fixture before ``scenario``: the constraint is added before any context reads
+    customers.customers and dropped after the contexts close, before restoreSeedState restores
+    the tables.
+    """
+    with syncEngine.begin() as connection:
+        connection.execute(DDL_LOCK_TIMEOUT_SQL)
+        connection.execute(ADD_REWRITE_CHECK_SQL)
+    try:
+        yield
+    finally:
+        with syncEngine.begin() as connection:
+            connection.execute(DDL_LOCK_TIMEOUT_SQL)
+            connection.execute(DROP_REWRITE_CHECK_SQL)
+
+
 class LockCase(NamedTuple):
     """A READ UPDATE of 9600-WRITE-PROCESSING replaced by a stub, and the literal answered."""
 
@@ -855,6 +1079,17 @@ RECORD_CHANGED_SCREEN = ExpectedScreen(
 def AmountCaseId(amountCase: AmountCase) -> str:
     """Return the pytest id of an AmountCase: the Credit Limit text as keyed."""
     return amountCase.rawText
+
+
+async def FetchWithReadStubs(
+    scenario: UpdateScenario, monkeypatch: pytest.MonkeyPatch, readFailureCase: ReadFailureCase
+) -> LegacyMessageError:
+    """Install the case's read stubs, fetch account 16, and return the error it is answered with."""
+    for readStub in readFailureCase.readStubs:
+        monkeypatch.setattr(readStub.repositoryClass, readStub.methodName, readStub.stub)
+    with pytest.raises(LegacyMessageError) as excInfo:
+        await FetchAccountForEdit(scenario.context, EDIT_ACCOUNT_ID)
+    return excInfo.value
 
 
 async def SaveExpectingError(scenario: UpdateScenario) -> LegacyMessageError:
@@ -887,6 +1122,39 @@ async def test_fetch_answers_the_key_edit_or_not_found_literal(onlineContext, ke
     with pytest.raises(LegacyMessageError) as excInfo:
         await FetchAccountForEdit(onlineContext, keyCase.keyText)
     AssertErrorScreen(excInfo.value, keyCase.expected)
+
+
+@pytest.mark.parametrize("readFailureCase", READ_FAILURE_CASES, ids=READ_FAILURE_CASE_IDS)
+async def test_fetch_read_failure_answers_its_file_literal_and_writes_nothing(
+    scenario, monkeypatch, readFailureCase
+):
+    """A CXACAIX, ACCTDAT or CUSTDAT READ that is not NORMAL: 9000's message, nothing written.
+
+    A customer found after an ACCTDAT failure is shown in SHOW_DETAILS beside the blank account
+    fields; every other failure shows the key alone, so the next ENTER fetches afresh.
+    """
+    error = await FetchWithReadStubs(scenario, monkeypatch, readFailureCase)
+    AssertErrorScreen(error, readFailureCase.expected)
+    assert error.Body()["fields"] == readFailureCase.expectedFields(scenario.screen)
+    AssertRowsUnchanged(scenario)
+
+
+@pytest.mark.parametrize("readFailureCase", UNREAD_ACCOUNT_CASES, ids=UNREAD_ACCOUNT_CASE_IDS)
+async def test_enter_on_unread_account_screen_compares_with_its_token(
+    scenario, monkeypatch, readFailureCase
+):
+    """The SHOW_DETAILS token of an ACCTDAT failure carries the before-image its screen shows.
+
+    ENTER with the fields sent back unchanged runs 1205-COMPARE-OLD-NEW against that token, so
+    the blank account and the fetched customer are no change; nothing is written.
+    """
+    error = await FetchWithReadStubs(scenario, monkeypatch, readFailureCase)
+    shown = ScreenOfError(error)
+    enterRequest = PressKey(shown, UpdateAction.ENTER)
+    noChange = await ExpectScreenError(scenario.context, EDIT_ACCOUNT_ID, enterRequest)
+    AssertErrorScreen(noChange, NO_CHANGE_SCREEN)
+    assert noChange.Body()["fields"] == shown.fields.model_dump()
+    AssertRowsUnchanged(scenario)
 
 
 async def test_enter_without_token_edits_the_keyed_account_id(onlineContext):
@@ -1119,15 +1387,26 @@ async def test_record_changed_since_fetch_shows_the_fresh_record(scenario):
     assert ReadCustomerRow(scenario.syncEngine, EDIT_CUSTOMER_ID) == scenario.customerRow
 
 
-@pytest.mark.usefixtures("restoreSeedState")
-async def test_failed_customer_rewrite_keeps_the_committed_account_change(scenario, monkeypatch):
-    """RECOVERY(NONE): the ACCTDAT REWRITE stands when the CUSTDAT REWRITE fails (4062-4100)."""
-    monkeypatch.setattr(CustomerRepository, "UpdateCustomer", FailCustomerRewrite)
+@pytest.mark.usefixtures("restoreSeedState", "rejectCustomerRewrite")
+async def test_failed_customer_rewrite_keeps_the_committed_account_change(scenario, caplog):
+    """RECOVERY(NONE): the ACCTDAT REWRITE stands when the CUSTDAT REWRITE fails (4062-4100).
+
+    A CHECK constraint refuses the customer row, so the real CUSTDAT UPDATE fails after the
+    ACCTDAT unit has committed. SQLSTATE 23514 is IOERR (RESP 17) on CUSTDAT, the CUSTDAT unit
+    is rolled back and its row lock released, and the customer row stays as it was.
+    """
+    caplog.set_level("WARNING", logger=coactupc.LOGGER.name)
     error = await SaveExpectingError(scenario)
     AssertErrorScreen(error, SaveFailure(HTTP_FILE_ERROR, MSG_UPDATE_FAILED))
+    loggedConditions = [
+        (logRecord.name, logRecord.levelname, logRecord.getMessage())
+        for logRecord in caplog.records
+    ]
+    assert loggedConditions == [(coactupc.LOGGER.name, "ERROR", CUSTOMER_REWRITE_REFUSED_LOG)]
     savedAccount = ReadAccountRow(scenario.syncEngine, EDIT_ACCOUNT_ID)
     assert savedAccount == RewrittenAccount(scenario.accountRow, SAVED_CREDIT_LIMIT)
     assert ReadCustomerRow(scenario.syncEngine, EDIT_CUSTOMER_ID) == scenario.customerRow
+    assert LockCustomerRowWithoutWaiting(scenario.syncEngine, EDIT_CUSTOMER_ID) == 1
 
 
 @pytest.mark.parametrize("fieldCase", LOW_FICO_CASES, ids=["credit-limit-only", "fico-corrected"])

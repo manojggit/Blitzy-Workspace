@@ -13,13 +13,17 @@ and 0.9.4 (runtime verification), define it:
   letter case, and the run history records the job under its JCL name.
 - Malformed --run-date, --occurrence and --as-of values are usage errors, exit 2, and record no
   run.
+- A usage error never shows a typed 16-digit card number unmasked (Section 0.6.5).
 - A relative CARDDEMO_EBCDIC_DIR or CARDDEMO_OUTPUT_DIR resolves against the repository root,
   whatever directory the command starts in.
+- A database error before any step, such as an unmigrated database's missing relation, exits
+  12 with one DATABASE ERROR line naming its classes and SQLSTATE, and no traceback.
 
 The database tests start from the restored seed state of the batchEnvironment fixture, where
 the Alembic seed cycle is OPEN with steps 1-5 and 7-12 COMPLETED.
 """
 
+import re
 import secrets
 import shutil
 import subprocess
@@ -32,9 +36,10 @@ from pathlib import Path
 import pytest
 from app.core.paths import REPO_ROOT
 from app.models import JOB_RUNS, Account, Transaction, TransactionType
-from sqlalchemy import Engine, Table, select, update
+from sqlalchemy import Engine, Table, select, text, update
 
-from batch.orchestration.job_context import EXIT_OK, EXIT_REJECTS
+from batch.orchestration import run_ledger
+from batch.orchestration.job_context import EXIT_FAILURE, EXIT_OK, EXIT_REJECTS, JobContext
 from batch.tests.conftest import (
     BACKEND_DIR,
     CLI_TIMEOUT_SECONDS,
@@ -43,6 +48,7 @@ from batch.tests.conftest import (
     BatchEnvironment,
     CountJobRuns,
     InvokeCli,
+    IsBatchWindowHeld,
     RunCli,
 )
 from batch.tests.reconciliation import compare
@@ -136,6 +142,63 @@ ENTRY_INDENT = "  "
 USAGE_ERROR_EXIT = 2
 NO_SUCH_COMMAND_TEXT = "No such command"
 INVALID_VALUE_TEMPLATE = "Invalid value for '{optionName}'"
+# A 16-digit operand, assembled at run time so no card-number literal sits in the source, and
+# the form the log masking gives it: twelve asterisks and the last four digits.
+TYPED_CARD_NUMBER = "4000" + "1234" * 3
+MASKED_CARD_NUMBER = "*" * 12 + TYPED_CARD_NUMBER[-4:]
+# A 16-digit operand that starts with 0, as every sample card number does: int() would drop the
+# zero, leaving a 15-digit run that the 16-digit masking does not recognise.
+ZERO_LED_CARD_NUMBER = "0" + TYPED_CARD_NUMBER[:-1]
+UNMASKED_CARD_NUMBER_PATTERN = re.compile(r"(?<![0-9])[0-9]{16}(?![0-9])")
+NO_SUCH_MASKED_COMMAND = f"No such command '{MASKED_CARD_NUMBER}'."
+# Each usage error that receives an operand, with the text it shows and the operand typed: the
+# masked operand where Click repeats it, and the option name where only the option's rule is
+# shown.
+CARD_NUMBER_USAGE_CASES = (
+    pytest.param((TYPED_CARD_NUMBER,), NO_SUCH_MASKED_COMMAND, TYPED_CARD_NUMBER, id="command"),
+    pytest.param(
+        ("job", TYPED_CARD_NUMBER), NO_SUCH_MASKED_COMMAND, TYPED_CARD_NUMBER, id="job-name"
+    ),
+    pytest.param(
+        ("load", TYPED_CARD_NUMBER), NO_SUCH_MASKED_COMMAND, TYPED_CARD_NUMBER, id="loader-name"
+    ),
+    pytest.param(
+        ("--" + TYPED_CARD_NUMBER,),
+        f"No such option: --{MASKED_CARD_NUMBER}",
+        TYPED_CARD_NUMBER,
+        id="option",
+    ),
+    pytest.param(
+        ("run-all", TYPED_CARD_NUMBER),
+        f"Got unexpected extra argument(s) ({MASKED_CARD_NUMBER})",
+        TYPED_CARD_NUMBER,
+        id="extra-argument",
+    ),
+    pytest.param(
+        ("load", "accounts", "--encoding", TYPED_CARD_NUMBER),
+        f"'{MASKED_CARD_NUMBER}' is not one of",
+        TYPED_CARD_NUMBER,
+        id="encoding",
+    ),
+    pytest.param(
+        ("run-all", "--as-of", TYPED_CARD_NUMBER),
+        INVALID_VALUE_TEMPLATE.format(optionName="--as-of"),
+        TYPED_CARD_NUMBER,
+        id="as-of",
+    ),
+    pytest.param(
+        ("job", "interest-calc", "--run-date", TYPED_CARD_NUMBER),
+        INVALID_VALUE_TEMPLATE.format(optionName="--run-date"),
+        TYPED_CARD_NUMBER,
+        id="run-date",
+    ),
+    pytest.param(
+        ("job", "tran-backup", "--occurrence", ZERO_LED_CARD_NUMBER),
+        INVALID_VALUE_TEMPLATE.format(optionName="--occurrence"),
+        ZERO_LED_CARD_NUMBER,
+        id="occurrence",
+    ),
+)
 
 # --- Chain steps, run history and generations ----------------------------------------------------
 ACCOUNTS_STEP = 1
@@ -168,6 +231,14 @@ RELATIVE_OUTPUT_PREFIX = "batch-test-"
 OUTPUT_TOKEN_BYTES = 4
 # Written over a loaded text column, so only a reload brings back the fixture's values.
 DISTURBED_TEXT = "DISTURBED"
+
+# --- Database errors outside the steps -----------------------------------------------------------
+CLASSIFY_INTERRUPTED_RUNS_NAME = "ClassifyInterruptedRuns"
+# No migration creates this relation, so PostgreSQL rejects the query as an unmigrated database
+# rejects the prelude's first query of batch.job_runs.
+MISSING_RELATION_STATEMENT = text("SELECT 1 FROM batch.no_such_table")
+UNDEFINED_TABLE_ERROR_LINE = "DATABASE ERROR ProgrammingError (UndefinedTable) SQLSTATE 42P01"
+TRACEBACK_TEXT = "Traceback"
 
 
 @dataclass(frozen=True)
@@ -275,6 +346,16 @@ def RemoveTreeIfPresent(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def QueryMissingRelation(context: JobContext) -> int:
+    """Stand in for ClassifyInterruptedRuns, failing as it does on an unmigrated database.
+
+    PostgreSQL rejects the query with UndefinedTable, SQLSTATE 42P01, which SQLAlchemy raises
+    as ProgrammingError: a DBAPIError that is not an OperationalError.
+    """
+    with context.engine.connect() as connection:
+        return connection.execute(MISSING_RELATION_STATEMENT).scalar_one()
+
+
 @pytest.fixture(name="relativeOutputDir")
 def RelativeOutputDir(
     batchEnvironment: BatchEnvironment, monkeypatch: pytest.MonkeyPatch
@@ -308,7 +389,11 @@ def test_help_lists_run_all_seed_all_job_and_load() -> None:
 def test_job_and_load_help_list_every_documented_name(
     group: str, expectedNames: tuple[str, ...]
 ) -> None:
-    """job --help and load --help list every documented name, in chain order, and no alias."""
+    """job --help and load --help list every documented name, in documented order, and no alias.
+
+    The documented order is the JOB_NAMES / LOADER_NAMES tuples, which mirror batch_chain's
+    PROCESSING_JOB_NAMES / LOADER_JOB_NAMES.
+    """
     outcome = RunCli([group, HELP_OPTION])
     assert outcome.exitCode == EXIT_OK, outcome.output
     assert ListedCommands(outcome.output) == list(expectedNames)
@@ -451,6 +536,25 @@ def test_as_of_with_microseconds_is_accepted_and_truncated(
     assert PostedProcTimestamps(batchEnvironment.engine) == {TRUNCATED_AS_OF}
 
 
+@pytest.mark.parametrize(("arguments", "shownText", "typedCardNumber"), CARD_NUMBER_USAGE_CASES)
+def test_usage_error_never_shows_a_typed_card_number(
+    arguments: tuple[str, ...], shownText: str, typedCardNumber: str
+) -> None:
+    """A usage error exits 2 and shows a 16-digit operand only masked (Section 0.6.5).
+
+    Click prints it before ConfigureLogging installs the masking filter, so the top-level group
+    masks it: a repeated operand reads as twelve asterisks and its last four digits, and the
+    --as-of, --run-date and --occurrence rules do not repeat the value at all. The digits the
+    mask hides never appear, not even as the shorter run int() leaves of a zero-led operand.
+    """
+    hiddenDigits = typedCardNumber.lstrip("0")[:-4]
+    outcome = InvokeCli(arguments)
+    assert outcome.exitCode == USAGE_ERROR_EXIT, outcome.output
+    assert UNMASKED_CARD_NUMBER_PATTERN.search(outcome.output) is None, outcome.output
+    assert hiddenDigits not in outcome.output, outcome.output
+    assert shownText in outcome.output
+
+
 # --- Phase 4: working-directory independence (Section 0.7.3) -------------------------------------
 @pytest.mark.parametrize("workingDir", [FRONTEND_DIR, BACKEND_DIR], ids=["frontend", "backend"])
 def test_load_tran_types_subprocess_from_frontend_and_backend_dirs(
@@ -490,3 +594,23 @@ def test_relative_output_dir_resolves_against_repo_root(
     assert generationPath.is_relative_to(expectedOutputRoot / GDG_DIRECTORY)
     assert not (BACKEND_DIR / relativeOutputDir).exists()
     assert LatestStepRun(batchEnvironment.engine, TRAN_BACKUP_FIRST_STEP)["job_name"] == "TRANBKP"
+
+
+# --- Phase 5: database errors outside the steps (Section 0.6.8) ----------------------------------
+def test_prelude_database_error_exits_12_naming_classes_and_sqlstate(
+    batchEnvironment: BatchEnvironment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prelude query an unmigrated database rejects gives one ERROR line and exit 12.
+
+    The line names the wrapper class, the driver class and the SQLSTATE only, through the
+    masked logging path rather than a traceback. No run is recorded, and the window is released.
+    """
+    engine = batchEnvironment.engine
+    runsBefore = CountJobRuns(engine)
+    monkeypatch.setattr(run_ledger, CLASSIFY_INTERRUPTED_RUNS_NAME, QueryMissingRelation)
+    outcome = InvokeCli(["run-all"])
+    assert outcome.exitCode == EXIT_FAILURE, outcome.output
+    assert UNDEFINED_TABLE_ERROR_LINE in outcome.output
+    assert TRACEBACK_TEXT not in outcome.output
+    assert CountJobRuns(engine) == runsBefore
+    assert not IsBatchWindowHeld(engine)

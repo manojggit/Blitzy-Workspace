@@ -148,10 +148,14 @@ The 18 steps, with generation datasets and statement files as dotted edges:
 
 ```mermaid
 flowchart TD
-    S01[1 ACCTFILE] --> S02[2 CARDFILE] --> S03[3 CUSTFILE] --> S04[4 XREFFILE] --> S05[5 TRANFILE]
-    S05 --> S06[6 TRANBKP occurrence 1] --> S07[7 TRANTYPE] --> S08[8 TRANCATG] --> S09[9 DISCGRP]
-    S09 --> S10[10 TCATBALF] --> S11[11 DUSRSECJ] --> S12[12 DALYTRAN staging] --> S13[13 POSTTRAN]
-    S13 --> S14[14 INTCALC] --> S15[15 TRANBKP occurrence 2] --> S16[16 COMBTRAN]
+    S01[1 ACCTFILE] --> S02[2 CARDFILE] --> S03[3 CUSTFILE]
+    S03 --> S04[4 XREFFILE] --> S05[5 TRANFILE]
+    S05 --> S06[6 TRANBKP occurrence 1] --> S07[7 TRANTYPE]
+    S07 --> S08[8 TRANCATG] --> S09[9 DISCGRP]
+    S09 --> S10[10 TCATBALF] --> S11[11 DUSRSECJ]
+    S11 --> S12[12 DALYTRAN staging] --> S13[13 POSTTRAN]
+    S13 --> S14[14 INTCALC] --> S15[15 TRANBKP occurrence 2]
+    S15 --> S16[16 COMBTRAN]
     S16 --> S17[17 CREASTMT] --> S18[18 TRANIDX]
     S13 -.-> R1[(DALYREJS generation)]
     S14 -.-> R2[(SYSTRAN generation)]
@@ -194,8 +198,8 @@ it can return:
 | 17 | CREASTMT | `batch/jobs/statement_gen/creastmt.py` | Files only; overwrite | 0, 16 |
 | 18 | TRANIDX | `batch/jobs/tranidx.py` | Same result on every run | 0, 12 |
 
-A command can also exit 12 before any step runs, when it is refused
-([Exit statuses](#exit-statuses)).
+A command can also exit 12 before any step runs, when it is refused, or after a producer step
+has committed, when its generation cannot be published ([Exit statuses](#exit-statuses)).
 
 ### Steps 1–5 and 7–11: loaders
 
@@ -324,8 +328,17 @@ Status 12 is returned when:
 - a rerun of a `FAILED` or `INTERRUPTED` per-write step is refused;
 - a financial reload is refused ([Financial reloads](#financial-reloads));
 - the `OPEN` cycle has a `LOST` generation ([Lost generations](#lost-generations));
+- publishing a step's generation after the step has committed fails while renaming the file,
+    updating the catalog row or applying retention ([Publication](#publication));
+- publishing a step's generation after the step has committed finds it `LOST`
+    ([Lost generations](#lost-generations));
 - the batch window is not available ([Batch window](#batch-window));
+- outside a step, the database cannot be reached (`DATABASE NOT AVAILABLE`), or it rejects a
+    statement the command does not map itself, as an unmigrated database does
+    (`DATABASE ERROR`, naming only the error classes and the SQLSTATE);
 - `job` runs with no `OPEN` cycle;
+- `run-all --start-at` names an unknown step, or a step after step 1 for a new cycle
+    ([Resume](#resume));
 - `load init-users` runs with `APP_ENV=production`.
 
 Status 16 is returned when:
@@ -375,7 +388,9 @@ Commit points:
 - The run's final status and its `cycle_steps` state commit together. For atomic steps this
     happens in the step's own transaction; for per-write steps (POSTTRAN, INTCALC), after the
     step's last write.
-- `FAILED` commits in its own transaction after the failure.
+- `FAILED` commits in its own transaction after the failure. A failure to publish a generation
+    after the step has committed is not a step failure: the run and step stay `COMPLETED`
+    ([Publication](#publication)).
 - A run left `RUNNING` by a dead process is reclassified at the next command, so failures and any
     partial per-write effects stay visible.
 
@@ -413,6 +428,20 @@ an empty newest BKUP generation, and COMBTRAN keeps resolving the right `(0)`.
 - `run-all` with an `OPEN` cycle runs, in order, every step not yet `COMPLETED` in it.
 - `--start-at STEP` runs from that step on, skipping completed ones. `STEP` is a step number or a
     job name; for TRANBKP, the name means its first incomplete occurrence.
+- `--start-at` resumes the `OPEN` cycle only. A new cycle, from `--new-cycle` or because no cycle
+    is `OPEN`, always starts from the loaders at step 1 ([Cycles](#cycles)), so it accepts only
+    `--start-at 1` or its job name. Any later step is refused before a cycle is abandoned or
+    opened: the command changes nothing and exits 12 with the message below. The message is one
+    line, with one space after the semicolon; the sample wraps it there:
+
+```text
+A NEW CYCLE STARTS AT STEP 1, NOT STEP STEP_NUMBER JCL_NAME;
+--start-at RESUMES ONLY AN OPEN CYCLE
+```
+
+`STEP_NUMBER` and `JCL_NAME` are the start step's number and legacy JCL name, such as `13` and
+`POSTTRAN`; for TRANBKP the start step is step 6. An unknown `STEP` exits 12 with
+`UNKNOWN STEP: STEP` before any cycle changes.
 
 ### Failure
 
@@ -427,7 +456,7 @@ an empty newest BKUP generation, and COMBTRAN keeps resolving the right `(0)`.
 
 `--force` executes the start step whatever its state, `COMPLETED` included, and is never applied
 implicitly. It adds a history row, and on success sets the step `COMPLETED` with `last_run_id`
-pointing to the new run.
+pointing to the new run. It never overrides the [financial-reload refusal](#financial-reloads).
 
 ### Standalone commands
 
@@ -455,16 +484,21 @@ Three loaders, ACCTFILE, TCATBALF and TRANFILE, replace tables that later steps 
 | `transactions` | `transactions.transactions` | 6 and 15 TRANBKP, 13 POSTTRAN, 16 COMBTRAN |
 
 While any of those later steps in the `OPEN` cycle is `COMPLETED`, `FAILED` or `INTERRUPTED`, the
-load changes nothing and exits 12 with this message:
+load changes nothing and exits 12 with the message below. The message is one line, with one
+space after the semicolon; the sample wraps it there:
 
 ```text
-RELOAD REFUSED: <table> WAS CHANGED BY STEPS <n…> OF CYCLE <id>; RUN seed-all OR run-all --new-cycle
+RELOAD REFUSED: TABLE_NAME WAS CHANGED BY STEPS STEP_NUMBERS OF CYCLE CYCLE_ID;
+RUN seed-all OR run-all --new-cycle
 ```
 
-`<table>` is the table above, `<n…>` lists the step numbers in that state, and `<id>` is the
-`OPEN` cycle's `cycle_id`. `--force` does not override the refusal. Reloading would otherwise
-restore seed balances while the cycle still records posting as done, leaving posted transactions
-whose balance effects had vanished.
+`TABLE_NAME` is the schema-qualified table from the table above, such as `accounts.accounts`.
+`STEP_NUMBERS` lists the table's later steps that are in one of those states, in ascending order
+and separated by commas without spaces, such as `13,14`. `CYCLE_ID` is the `OPEN` cycle's
+`cycle_id`. The refusal applies whichever command runs the loader: `load`, or `run-all` when it
+reaches the loader's step, `--start-at` with `--force` included. `--force` does not override the
+refusal. Reloading would otherwise restore seed balances while the cycle still records posting as
+done, leaving posted transactions whose balance effects had vanished.
 
 All other loads execute in any state, because no later step writes their tables: users, cards,
 customers, the cross-reference, transaction types and categories, disclosure groups, and the
@@ -500,15 +534,47 @@ Publishing a generation takes these steps:
 
 Generation references `(0)` and `(-n)` count only `PUBLISHED` rows.
 
+The four producer jobs (TRANBKP, POSTTRAN, INTCALC and COMBTRAN) take steps 1 and 2: the
+`COMMITTED` row commits in the transaction that records the run `COMPLETED`. They never publish.
+Once the step has committed, `batch_chain.FinishStep` takes steps 3 and 4 and applies retention,
+once per step, through `gdg.PublishRunGenerations`. A failure there cannot undo the committed
+step, so its run and step stay `COMPLETED`:
+
+- When renaming the file, updating the catalog row or applying retention fails with a file or
+    database error, the chain stops with exit 12. The next command's `gdg.ReconcileCatalog()`
+    completes the publication ([Recovery](#recovery)), and `run-all` then skips the completed
+    step and resumes at the next one.
+- When neither the final file nor its `.part` file matches the catalog hash, the row becomes
+    `LOST`. The chain stops with exit 12 naming the generation, and the cycle is not completed
+    ([Lost generations](#lost-generations)).
+
 The module's interface:
 
-- `NewGeneration(context, base, lrecl)`: a context manager that writes the `.part` file, records
-    `COMMITTED`, then renames the file and sets the row `PUBLISHED`.
-- `ResolveGeneration(base, relative)`: resolves `(0)` or `(-n)`, counting `PUBLISHED` rows only.
-    It refuses a base with a `LOST` row in the `OPEN` cycle.
-- `RollOff(base, limit=5)`: applies retention.
-- `ReconcileCatalog()`: completes or condemns interrupted publications, then completes
+- `NewGeneration(context, base, connection=None)`: a context manager that yields the writer of
+    a new `(+1)` generation of `base` and writes its `.part` file. On a normal exit it fsyncs the
+    file and inserts the `COMMITTED` row; an exception inside the block deletes the `.part` file
+    and catalogs nothing. `connection` decides when the row commits and who publishes it:
+    - With the caller's `connection`, the row joins the caller's transaction and stays
+        `COMMITTED` until `PublishRunGenerations` runs after that transaction commits. Every chain
+        producer passes its connection, and `batch_chain.FinishStep` calls
+        `PublishRunGenerations`.
+    - Without a connection, the row commits in a transaction of its own, and the generation is
+        published, and retention applied, as soon as the block exits.
+- `PublishRunGenerations(context)`: takes steps 3 and 4 for every `COMMITTED` generation of the
+    context's run, marking a row `LOST` when no file matches its hash, then applies retention to
+    each base that gained a generation. With no started run it does nothing.
+- `ResolveGeneration(context, base, relative=0)`: resolves `(0)`, the default, or `(-n)`,
+    counting `PUBLISHED` rows only. It refuses a base with a `LOST` row in the `OPEN` cycle.
+- `RollOff(context, base, limit=GDG_LIMIT)`: applies retention, rolling off every `PUBLISHED`
+    generation older than the newest `limit`. `GDG_LIMIT` is 5, the `LIMIT 5` above.
+- `ReconcileCatalog(context)`: completes or condemns interrupted publications, then completes
     interrupted retention for every base.
+
+`context` is the command's `JobContext` (`batch/orchestration/job_context.py`): the job engine,
+the settings, the clock and the run's identity. `base` is a `GdgBase`, one of `gdg.TRANSACT_BKUP`,
+`gdg.DALYREJS`, `gdg.SYSTRAN` and `gdg.TRANSACT_COMBINED`. Its `name`, `lrecl` and `scratch`
+fields hold the base name, its LRECL and its LISTCAT attribute, so the record length travels with
+the base and no call takes it separately.
 
 ### Recovery
 
@@ -529,11 +595,19 @@ An interruption between publication and retention, or between `ROLLED_OFF` and t
 the file, is therefore completed by the next command. Each step finds nothing to do once the
 catalog is consistent, so running it again changes nothing.
 
+A publication that failed after its step committed ([Publication](#publication)) leaves a
+`COMMITTED` row or an unfinished retention. The next command completes it the same way, before it
+schedules any step, and `run-all` then skips the `COMPLETED` step.
+
 ### Lost generations
 
 - While the `OPEN` cycle has any `LOST` generation, every command exits 12 naming it before
     executing anything. This covers `run-all` (resume or `--start-at`), `job`, `load` and
     `--force`.
+- A generation found `LOST` while the chain publishes a committed step's generations
+    ([Publication](#publication)) stops the chain at once with exit 12 naming it. The step stays
+    `COMPLETED`, and the cycle is not completed: it stays blocked until `seed-all` or
+    `run-all --new-cycle`.
 - The block exists because the producer's effects cannot be repeated. TRANBKP has already deleted
     the archived rows; POSTTRAN, INTCALC and COMBTRAN have already written their effects. A skip,
     or a `(0)` resolution, would also silently use an older generation.
@@ -610,14 +684,17 @@ own window. Alembic migrations do not take the window; they run with the backend
 
 The repositories for `WINDOW_TABLES` (`transactions.transactions`, `xref.card_xref` for the
 `CCXREF` and `CXACAIX` paths, `accounts.accounts` and `security.users`) call
-`locks.EnterOnlineWindow(request)` before their first statement in a request:
+`locks.EnterOnlineWindow(request, fileName)` before their first statement in a request.
+`request` is the FastAPI request, and `fileName` is the legacy CICS file the statement addresses
+(`TRANSACT`, `CCXREF`, `CXACAIX`, `ACCTDAT` or `USRSEC`), which a refusal names:
 
 - On the first call, it checks out one connection for the request and runs
-    `SELECT pg_try_advisory_lock_shared(BATCH_WINDOW_LOCK)`. A granted lock is held for the whole
-    request and released by `locks.LeaveOnlineWindow`.
-- When the lock is refused, the repository raises `FileNotOpenError(file, resp=19, resp2=60)`, so
-    each service reaches the `WHEN OTHER` branch of the program it ports, with that program's
-    literal.
+    `SELECT pg_try_advisory_lock_shared(BATCH_WINDOW_LOCK)`; later calls reuse a granted or
+    refused outcome without a query. A granted lock is held for the whole request and released by
+    `locks.LeaveOnlineWindow(request)` in the request dependency's `finally`.
+- When the lock is refused, `EnterOnlineWindow` raises `FileNotOpenError(fileName)` (RESP 19,
+    RESP2 60) through the repository, so each service reaches the `WHEN OTHER` branch of the
+    program it ports, with that program's literal.
 - A shared request that would queue behind a waiting batch request is refused at once. New online
     access fails while the window is closing, and in-flight requests finish, as a CEMT close waits
     for current users.
@@ -912,8 +989,8 @@ Replace `LOADER_NAME` with a name from this table. Each legacy JCL name is accep
 | `init-users` | `DUSRSECJ` | 11 | No |
 | `daily-transactions` | `DALYTRAN` | 12 | No |
 
-A financial reload is refused while later steps of the `OPEN` cycle have written its table
-([Financial reloads](#financial-reloads)).
+A financial reload is refused while later steps of the `OPEN` cycle have written its table,
+whether `load` or `run-all` runs it ([Financial reloads](#financial-reloads)).
 
 To load the accounts from the ASCII image instead of the EBCDIC one:
 
@@ -936,7 +1013,7 @@ Each option configures the commands or steps named:
 | Option | Applies to | Meaning |
 |---|---|---|
 | `--new-cycle` | `run-all` | Abandon any `OPEN` cycle and run steps 1–18 in a new cycle |
-| `--start-at STEP` | `run-all` | Run from `STEP` on, skipping completed steps |
+| `--start-at STEP` | `run-all` | Resume the `OPEN` cycle from `STEP`, skipping completed steps |
 | `--force` | `run-all`, `job` | Execute the start step whatever its state |
 | `--occurrence` | `job tran-backup` | `1` for step 6, `2` for step 15 |
 | `--run-date DATE` | INTCALC, step 14 | The 10-character `PARM-DATE`; default `2022071800` |
@@ -949,6 +1026,10 @@ Each option configures the commands or steps named:
 `2022-07-18T00:00:00`. `PATH` and `DIRECTORY` are file-system paths; a relative one is resolved
 against the repository root. The default daily image is
 `CARDDEMO_EBCDIC_DIR/AWS.M2.CARDDEMO.DALYTRAN.PS`.
+
+`--start-at` resumes only an `OPEN` cycle. A new cycle, from `--new-cycle` or because no cycle is
+`OPEN`, always starts at step 1, so a later `STEP` exits 12 and changes nothing
+([Resume](#resume)).
 
 ### Configuration
 
@@ -995,6 +1076,9 @@ To retry a failed atomic step, rerun the chain; it resumes at the first step not
 ```bash
 .venv/bin/carddemo-batch run-all
 ```
+
+The same command finishes a publication that failed after its step committed: the catalog is
+reconciled first ([Recovery](#recovery)), and the committed step is skipped.
 
 To recover from a failed or interrupted per-write step (POSTTRAN or INTCALC) by restoring from the
 loaders in a new cycle:

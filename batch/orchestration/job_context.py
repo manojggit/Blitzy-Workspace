@@ -46,16 +46,17 @@ RUN_DATE_LENGTH = 10
 SUPPORTED_ENCODINGS = (ENCODING_EBCDIC, ENCODING_ASCII)
 # TRANBKP runs twice in a cycle: occurrence 1 is chain step 6 and occurrence 2 is step 15.
 SUPPORTED_OCCURRENCES = (1, 2)
+# The refusal states the rule only, never the value: a mistyped card number is not repeated.
+OCCURRENCE_RULE_MESSAGE = (
+    f"--occurrence must be {SUPPORTED_OCCURRENCES[0]} or {SUPPORTED_OCCURRENCES[1]}"
+)
 
 
 def _CheckRunDate(runDate: str) -> None:
     """Refuse a --run-date that is not exactly RUN_DATE_LENGTH printable ASCII characters."""
     isPrintableAscii = isinstance(runDate, str) and runDate.isascii() and runDate.isprintable()
     if not isPrintableAscii or len(runDate) != RUN_DATE_LENGTH:
-        raise ValueError(
-            f"--run-date must be exactly {RUN_DATE_LENGTH} printable ASCII characters,"
-            f" got {runDate!r}"
-        )
+        raise ValueError(f"--run-date must be exactly {RUN_DATE_LENGTH} printable ASCII characters")
 
 
 def _CheckEncoding(encoding: str) -> None:
@@ -69,10 +70,7 @@ def _CheckEncoding(encoding: str) -> None:
 def _CheckOccurrence(occurrence: int | None) -> None:
     """Refuse an --occurrence that names neither TRANBKP occurrence."""
     if occurrence is not None and occurrence not in SUPPORTED_OCCURRENCES:
-        firstOccurrence, secondOccurrence = SUPPORTED_OCCURRENCES
-        raise ValueError(
-            f"--occurrence must be {firstOccurrence} or {secondOccurrence}, got {occurrence!r}"
-        )
+        raise ValueError(OCCURRENCE_RULE_MESSAGE)
 
 
 def _PathText(path: Path | None) -> str | None:

@@ -19,12 +19,14 @@ committed fixtures, never from the code under test.
 """
 
 import itertools
+import logging
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from app.core.logging import PanMaskingFilter
 from app.models import GDG_GENERATIONS, DailyTransaction, Transaction
 from app.services.transactions import cbtrn02c
 from sqlalchemy import Engine, Table, delete, func, insert, select
@@ -83,6 +85,9 @@ DALYREJS_LRECL = legacy_oracle.DALYREJS_LRECL
 # WS-VALIDATION-FAIL-REASON 9(04) follows the 350-byte REJECT-TRAN-DATA (lines 176-182).
 REASON_SLICE = slice(legacy_oracle.TRANSACTION_LRECL, legacy_oracle.TRANSACTION_LRECL + 4)
 PART_FILE_PATTERN = "*.part"
+# DISPLAY 'TCATBAL record not found for key : ' FD-TRAN-CAT-KEY '.. Creating.' (lines 476-477).
+TCATBAL_CREATE_PREFIX = "TCATBAL record not found for key : "
+TCATBAL_CREATE_SUFFIX = ".. Creating."
 
 # --- Inputs and frozen values --------------------------------------------------------------------
 EBCDIC_DIR = TESTS_DIR.parents[1] / "data" / "EBCDIC"
@@ -95,6 +100,7 @@ FORMAT_SPACE = legacy_oracle.FORMAT_SPACE
 # The 150th staged record fails before it changes anything (AAP 0.6.12): records 1-149 stay.
 FAILURE_RECORD_NUMBER = 150
 VALIDATION_FUNCTION_NAME = "ValidateDailyTransaction"
+CREATE_TCATBAL_FUNCTION_NAME = "CreateCategoryBalance"
 INJECTED_STATEMENT = "INJECTED"
 INJECTED_IO_MESSAGE = "injected I/O error"
 
@@ -465,3 +471,51 @@ def test_posttran_rejects_reach_dalyrejs_with_reason_trailer(
     assert [record[REASON_SLICE] for record in rejects] == EXPECTED_REJECT_REASONS
     assert PostedTableDifferences(engine, expected.state) == []
     assert CountRows(engine, Transaction.__table__) == 0
+
+
+# --- The TCATBAL create display through log masking ----------------------------------------------
+def MaskedPosttranMessages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return each captured posttran record's message after the batch log masking filter."""
+    maskingFilter = PanMaskingFilter()
+    posttranRecords = [record for record in caplog.records if record.name == posttran.LOGGER.name]
+    for record in posttranRecords:
+        maskingFilter.filter(record)
+    return [record.getMessage() for record in posttranRecords]
+
+
+@pytest.mark.parametrize(
+    ("balanceKey", "expectedKeyText"),
+    [
+        pytest.param(
+            ("00000000001", "01", 1),
+            "TRANCAT-ACCT-ID=00000000001 TRANCAT-TYPE-CD=01 TRANCAT-CD=0001",
+            id="first-sample-key",
+        ),
+        pytest.param(
+            ("99999999999", "1", 9999),
+            "TRANCAT-ACCT-ID=99999999999 TRANCAT-TYPE-CD=1  TRANCAT-CD=9999",
+            id="widest-digits-space-padded-type",
+        ),
+    ],
+)
+def test_tcatbal_create_display_keeps_its_key_readable_through_log_masking(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    balanceKey: tuple[str, str, int],
+    expectedKeyText: str,
+) -> None:
+    """2700-UPDATE-TCATBAL's INVALID KEY display names each key field and survives masking.
+
+    Run together, the 17 key digits would be one chain the masking filter hides but its last
+    four, so every account would log alike. WriteCategoryBalance runs with the create stubbed
+    out, so no database is needed; its line must pass the filter whole, the account 9(11), type
+    X(02) and category 9(04) each after its CVTRA01Y name, between the legacy literals.
+    """
+    acctId, typeCd, catCd = balanceKey
+    balanceRow = {"acct_id": acctId, "tran_type_cd": typeCd, "tran_cat_cd": catCd}
+    effects = cbtrn02c.PostingEffects(balanceRow, True, {}, {})
+    monkeypatch.setattr(posttran, CREATE_TCATBAL_FUNCTION_NAME, lambda *arguments: None)
+    caplog.set_level(logging.INFO, logger=posttran.LOGGER.name)
+    posttran.WriteCategoryBalance(None, effects, 1)
+    expectedLine = TCATBAL_CREATE_PREFIX + expectedKeyText + TCATBAL_CREATE_SUFFIX
+    assert MaskedPosttranMessages(caplog) == [expectedLine]

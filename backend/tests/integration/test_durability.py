@@ -21,11 +21,18 @@ Afterwards the first write is committed, the second is absent, no row lock is le
 the same app still serves a request. The control cases send the same requests unpatched and
 commit both writes, which shows the patches cause those outcomes. Clients, the test database
 and the seed restore are the fixtures of tests/conftest.py.
+
+CancelAtGate cancels and reaps the request task on every exit, so the request's units and its
+batch-window lock are released before the test goes on or fails. Two cases check this where
+arranging the experiment fails: a save hanging short of the gate with both rows locked, and a
+request ending before the gate. A third cancels CancelAtGate itself once, while it awaits the
+gate or while it reaps, and checks the same before that cancellation propagates.
 """
 
 import asyncio
 import functools
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
@@ -150,9 +157,34 @@ LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 UNLOCK_TIMEOUT_SECONDS = 10.0
 UNLOCK_POLL_SECONDS = 0.1
 GATE_TIMEOUT_SECONDS = 30.0
+REAP_TIMEOUT_SECONDS = 30.0
+# The gate wait of the case whose request hangs short of the gate, so CancelAtGate times out;
+# long enough for the save to reach its account rewrite first.
+SHORT_GATE_TIMEOUT_SECONDS = 5.0
+# How long a cancelled save of the own-cancellation case takes to clean up, still holding its
+# customer row lock and its batch-window lock; long enough to outlast an unawaited reap.
+SLOW_CLEANUP_SECONDS = 1.0
+# Every advisory lock held or awaited in this test database: the batch window and the TRAN-ID
+# allocation keys, and the login throttle's check markers.
+ADVISORY_LOCK_COUNT_SQL = (
+    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'"
+    " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
+
+# --- How a request task ended, as CancelAtGate reports it ----------------------------------------
+REQUEST_CANCELLED_OUTCOME = "was cancelled"
+REQUEST_RAISED_OUTCOME = "raised {error!r}"
+REQUEST_ANSWERED_OUTCOME = "answered {status}: {text}"
+CONNECTION_REFUSED_TEXT = "the test transport refused the connection"
 
 # --- Failure messages ----------------------------------------------------------------------------
 GATE_NOT_REACHED_MESSAGE = "the request never reached the patched second write"
+GATE_NOT_REACHED_OUTCOME_MESSAGE = GATE_NOT_REACHED_MESSAGE + "; the request {outcome}"
+REQUEST_NOT_CANCELLED_MESSAGE = "the request reached the gate but was not cancelled; it {outcome}"
+TASKS_NOT_REAPED_MESSAGE = "tasks still running after their cancellation was awaited: {tasks!r}"
+TASKS_LEFT_RUNNING_MESSAGE = "tasks left running after CancelAtGate ended: {tasks!r}"
+HELPER_NOT_CANCELLED_MESSAGE = "CancelAtGate did not end by its own cancellation: {task!r}"
+FIRST_WRITE_NOT_REACHED_MESSAGE = "the save never reached its account rewrite with both rows locked"
 TERMINATION_UNCONFIRMED_MESSAGE = "server process {backendPid} did not exit within the timeout"
 ROW_STILL_LOCKED_MESSAGE = "{table} row {key!r} is still locked after the request ended"
 
@@ -253,6 +285,12 @@ def IsRowUnlocked(syncEngine: Engine, probeSql: str, key: str) -> bool:
     return True
 
 
+def CountAdvisoryLocks(syncEngine: Engine) -> int:
+    """Return how many advisory locks the sessions of this test database hold or await."""
+    with syncEngine.connect() as connection:
+        return connection.scalar(text(ADVISORY_LOCK_COUNT_SQL))
+
+
 async def WaitUntilRowUnlocked(syncEngine: Engine, table: str, key: str) -> None:
     """Wait until the ``table`` row ``key`` is unlocked, probing every 0.1 s; fail after 10 s.
 
@@ -301,6 +339,26 @@ def HangingCall(gate: Gate) -> RepositoryCall:
     return HangBeforeWrite
 
 
+def SlowlyCancelledCall(gate: Gate, cleanupStarted: asyncio.Event) -> RepositoryCall:
+    """Return a write method that signals ``gate``, hangs, and cleans up slowly once cancelled.
+
+    Its cleanup sets ``cleanupStarted`` and then takes SLOW_CLEANUP_SECONDS inside the write
+    unit, so the cancelled request keeps its row lock and its batch-window lock that long.
+    """
+
+    async def HangThenCleanUpSlowly(
+        repository: Any, unit: AsyncConnection, values: Mapping[str, Any]
+    ) -> None:
+        gate.reached.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanupStarted.set()
+            await asyncio.sleep(SLOW_CLEANUP_SECONDS)
+
+    return HangThenCleanUpSlowly
+
+
 async def AwaitResponse(requestCall: RequestCall, gate: Gate) -> httpx.Response:
     """Send the request and return its response, once the second write's backend has ended."""
     response = await requestCall()
@@ -308,25 +366,85 @@ async def AwaitResponse(requestCall: RequestCall, gate: Gate) -> httpx.Response:
     return response
 
 
+async def WaitThroughCancellation(
+    tasks: set[asyncio.Task[Any]], timeoutSeconds: float
+) -> tuple[set[asyncio.Task[Any]], asyncio.CancelledError | None]:
+    """Wait until ``tasks`` have ended or ``timeoutSeconds`` have passed, even when cancelled.
+
+    A cancellation of the caller does not end the wait: it is caught, and the wait goes on
+    until the same deadline. Return the tasks still running and the last cancellation caught,
+    or None, for the caller to re-raise once it is done with the tasks.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeoutSeconds
+    runningTasks, cancellation = set(tasks), None
+    while runningTasks and loop.time() < deadline:
+        try:
+            _, runningTasks = await asyncio.wait(runningTasks, timeout=deadline - loop.time())
+        except asyncio.CancelledError as error:
+            cancellation = error
+    return runningTasks, cancellation
+
+
+async def CancelAndReap(tasks: Collection[asyncio.Task[Any]]) -> set[asyncio.Task[Any]]:
+    """Cancel ``tasks``, wait until each has ended, and return those still running after that.
+
+    The wait gives up after REAP_TIMEOUT_SECONDS. asyncio.wait raises neither a task's
+    exception nor its cancellation, and a cancellation of the caller during the wait does not
+    cut it short (WaitThroughCancellation). The exception of every task that ended without
+    being cancelled is retrieved, so asyncio never reports it as unretrieved. Only then, once
+    the tasks have ended or the wait has given up, is that cancellation of the caller re-raised.
+    """
+    for task in tasks:
+        task.cancel()
+    runningTasks, cancellation = await WaitThroughCancellation(set(tasks), REAP_TIMEOUT_SECONDS)
+    for task in set(tasks) - runningTasks:
+        if not task.cancelled():
+            task.exception()
+    if cancellation is not None:
+        raise cancellation
+    return runningTasks
+
+
+def DescribeRequestOutcome(requestTask: asyncio.Task[httpx.Response]) -> str:
+    """Return how the ended ``requestTask`` finished: cancelled, raised, or answered."""
+    if requestTask.cancelled():
+        return REQUEST_CANCELLED_OUTCOME
+    error = requestTask.exception()
+    if error is not None:
+        return REQUEST_RAISED_OUTCOME.format(error=error)
+    response = requestTask.result()
+    return REQUEST_ANSWERED_OUTCOME.format(status=response.status_code, text=response.text)
+
+
 async def CancelAtGate(requestCall: RequestCall, gate: Gate) -> None:
     """Send the request as a task, cancel it once it hangs at the second write, then reap it.
 
-    The wait gives up after 30 s, or as soon as the request ends without reaching the gate.
+    The wait gives up after GATE_TIMEOUT_SECONDS, or as soon as the request ends without
+    reaching the gate. On every exit, a cancellation of this call included, the request task
+    and the gate waiter are both cancelled and awaited until they have ended, before this
+    returns, fails or propagates the cancellation. A cancellation of this call that arrives
+    during that reap does not cut it short: it is re-raised only once both tasks have ended,
+    or once the reap has given up after REAP_TIMEOUT_SECONDS. So the request's write units
+    have rolled back and its batch-window lock is released by then, and how the request ended
+    has been retrieved. A request that never reached the gate fails the test with that outcome.
     """
     requestTask = asyncio.create_task(requestCall())
     reachedWaiter = asyncio.create_task(gate.reached.wait())
-    finished, _ = await asyncio.wait(
-        {requestTask, reachedWaiter},
-        timeout=GATE_TIMEOUT_SECONDS,
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    if reachedWaiter not in finished:
-        reachedWaiter.cancel()
-        requestTask.cancel()
-        pytest.fail(GATE_NOT_REACHED_MESSAGE)
-    requestTask.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await requestTask
+    try:
+        await asyncio.wait(
+            {requestTask, reachedWaiter},
+            timeout=GATE_TIMEOUT_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        runningTasks = await CancelAndReap((requestTask, reachedWaiter))
+    if runningTasks:
+        pytest.fail(TASKS_NOT_REAPED_MESSAGE.format(tasks=runningTasks))
+    outcome = DescribeRequestOutcome(requestTask)
+    if not gate.reached.is_set():
+        pytest.fail(GATE_NOT_REACHED_OUTCOME_MESSAGE.format(outcome=outcome))
+    assert requestTask.cancelled(), REQUEST_NOT_CANCELLED_MESSAGE.format(outcome=outcome)
 
 
 INTERRUPTIONS = [
@@ -398,6 +516,57 @@ async def AssertSameAppStillServes(client: httpx.AsyncClient) -> None:
     assert response.status_code == HTTP_OK, response.text
 
 
+async def RefusedRequest() -> httpx.Response:
+    """Stand in for a request whose connection is refused before the app is reached."""
+    raise httpx.ConnectError(CONNECTION_REFUSED_TEXT)
+
+
+def GateNotReachedPattern(outcome: str) -> str:
+    """Return the pytest.raises pattern of CancelAtGate's failure reporting ``outcome``."""
+    return re.escape(GATE_NOT_REACHED_OUTCOME_MESSAGE.format(outcome=outcome))
+
+
+def AssertNoTaskLeft(tasksBefore: set[asyncio.Task[Any]]) -> None:
+    """Assert that every task of the running loop that is not in ``tasksBefore`` has ended."""
+    leftTasks = asyncio.all_tasks() - tasksBefore
+    assert not leftTasks, TASKS_LEFT_RUNNING_MESSAGE.format(tasks=leftTasks)
+
+
+async def AssertRequestReaped(
+    syncEngine: Engine,
+    client: httpx.AsyncClient,
+    tasksBefore: set[asyncio.Task[Any]],
+    custId: str,
+) -> None:
+    """Assert at once, with no wait, that CancelAtGate reaped the sample account's CAUP save.
+
+    No task beyond ``tasksBefore`` is left running, neither the account row nor the row of
+    customer ``custId`` is locked, no advisory lock is held or awaited, and ``client``'s app
+    still serves.
+    """
+    AssertNoTaskLeft(tasksBefore)
+    assert IsRowUnlocked(syncEngine, LOCKABLE_TABLES[ACCOUNTS_TABLE_NAME], SAMPLE_ACCOUNT_ID)
+    assert IsRowUnlocked(syncEngine, LOCKABLE_TABLES[CUSTOMERS_TABLE_NAME], custId)
+    assert CountAdvisoryLocks(syncEngine) == 0
+    await AssertSameAppStillServes(client)
+
+
+# Requests that end before the gate: the CAUP fetch answers without reaching any write, and a
+# refused connection raises. Each comes with the outcome CancelAtGate must report.
+ENDED_REQUESTS = [
+    pytest.param(
+        lambda client: functools.partial(client.get, EditPath(SAMPLE_ACCOUNT_ID)),
+        REQUEST_ANSWERED_OUTCOME.format(status=HTTP_OK, text=""),
+        id="answered",
+    ),
+    pytest.param(
+        lambda client: RefusedRequest,
+        REQUEST_RAISED_OUTCOME.format(error=httpx.ConnectError(CONNECTION_REFUSED_TEXT)),
+        id="raised",
+    ),
+]
+
+
 # --- CAUP (COACTUPC): between the ACCTDAT commit and the CUSTDAT rewrite -------------------------
 @pytest.mark.parametrize("interruption", INTERRUPTIONS)
 async def test_caup_account_write_survives_interrupted_customer_unit(
@@ -442,6 +611,82 @@ async def test_cb00_payment_transaction_survives_interrupted_account_rewrite(
     assert ReadAccountState(syncEngine, SAMPLE_ACCOUNT_ID)["curr_balance"] == SEED_BALANCE
     await WaitUntilRowUnlocked(syncEngine, ACCOUNTS_TABLE_NAME, SAMPLE_ACCOUNT_ID)
     await AssertSameAppStillServes(interruptibleClient)
+
+
+# --- CancelAtGate itself: a request that never reaches the gate ----------------------------------
+async def test_cancel_at_gate_reaps_a_save_hanging_short_of_the_gate(
+    interruptibleClient, syncEngine, monkeypatch
+):
+    """A save hanging at its account rewrite, both rows locked, is reaped before the failure.
+
+    Checked at once, with no wait: the failure reports the cancellation, no task is left
+    running, neither row lock nor any advisory lock survives, and the same app still serves.
+    """
+    custId = MakeAccountEditable(syncEngine, SAMPLE_ACCOUNT_ID)
+    saveBody = await ValidatedAccountSave(interruptibleClient, SAMPLE_ACCOUNT_ID, ACCOUNT_CHANGES)
+    gate, firstWriteGate = Gate(), Gate()
+    monkeypatch.setattr(CustomerRepository, "UpdateCustomer", HangingCall(gate))
+    monkeypatch.setattr(AccountRepository, "UpdateAccount", HangingCall(firstWriteGate))
+    monkeypatch.setitem(globals(), "GATE_TIMEOUT_SECONDS", SHORT_GATE_TIMEOUT_SECONDS)
+    saveCall = functools.partial(
+        interruptibleClient.put, AccountPath(SAMPLE_ACCOUNT_ID), json=saveBody
+    )
+    cancelledPattern = GateNotReachedPattern(REQUEST_CANCELLED_OUTCOME)
+    tasksBefore = asyncio.all_tasks()
+    with pytest.raises(pytest.fail.Exception, match=cancelledPattern):
+        await CancelAtGate(saveCall, gate)
+    assert firstWriteGate.reached.is_set(), FIRST_WRITE_NOT_REACHED_MESSAGE
+    await AssertRequestReaped(syncEngine, interruptibleClient, tasksBefore, custId)
+
+
+@pytest.mark.parametrize(("requestCallOf", "expectedOutcome"), ENDED_REQUESTS)
+async def test_cancel_at_gate_reports_a_request_ending_short_of_the_gate(
+    interruptibleClient, monkeypatch, requestCallOf, expectedOutcome
+):
+    """A request that ends before the gate fails the test at once, with how it ended.
+
+    The gate waiter is reaped as well, so no task is left running.
+    """
+    gate = Gate()
+    monkeypatch.setattr(CustomerRepository, "UpdateCustomer", HangingCall(gate))
+    tasksBefore = asyncio.all_tasks()
+    with pytest.raises(pytest.fail.Exception, match=GateNotReachedPattern(expectedOutcome)):
+        await CancelAtGate(requestCallOf(interruptibleClient), gate)
+    AssertNoTaskLeft(tasksBefore)
+
+
+# --- CancelAtGate itself: one cancellation of the helper, at the gate wait or during the reap ----
+@pytest.mark.parametrize("cancelWhileReaping", [False, True], ids=["awaiting-gate", "reaping"])
+async def test_cancel_at_gate_reaps_the_save_before_its_own_cancellation_propagates(
+    interruptibleClient, syncEngine, monkeypatch, cancelWhileReaping
+):
+    """One cancellation of CancelAtGate ends it only after the cancelled save has cleaned up.
+
+    The save hangs at its customer rewrite and, once cancelled, cleans up for
+    SLOW_CLEANUP_SECONDS with its customer row and batch-window locks held. The helper is
+    cancelled while it awaits a gate the save never sets, or while it reaps the save after the
+    gate. Checked with no wait as soon as the helper ends: it ended by that cancellation, and
+    the save was reaped.
+    """
+    custId = MakeAccountEditable(syncEngine, SAMPLE_ACCOUNT_ID)
+    saveBody = await ValidatedAccountSave(interruptibleClient, SAMPLE_ACCOUNT_ID, ACCOUNT_CHANGES)
+    callGate, cleanupStarted = Gate(), asyncio.Event()
+    slowCall = SlowlyCancelledCall(callGate, cleanupStarted)
+    monkeypatch.setattr(CustomerRepository, "UpdateCustomer", slowCall)
+    saveCall = functools.partial(
+        interruptibleClient.put, AccountPath(SAMPLE_ACCOUNT_ID), json=saveBody
+    )
+    helperGate = callGate if cancelWhileReaping else Gate()
+    cancelSignal = cleanupStarted if cancelWhileReaping else callGate.reached
+    tasksBefore = asyncio.all_tasks()
+    helperTask = asyncio.create_task(CancelAtGate(saveCall, helperGate))
+    try:
+        await asyncio.wait_for(cancelSignal.wait(), GATE_TIMEOUT_SECONDS)
+    finally:
+        helperTask.cancel()
+        await asyncio.wait({helperTask}, timeout=REAP_TIMEOUT_SECONDS)
+    assert helperTask.cancelled(), HELPER_NOT_CANCELLED_MESSAGE.format(task=helperTask)
+    await AssertRequestReaped(syncEngine, interruptibleClient, tasksBefore, custId)
 
 
 # --- Controls: the same requests with no interruption commit both writes ------------------------

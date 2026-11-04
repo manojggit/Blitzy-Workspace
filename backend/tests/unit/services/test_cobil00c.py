@@ -5,8 +5,10 @@ CSDAT01Y, as ported by app.services.billpay.cobil00c.PayBill.
 
 PROCESS-ENTER-KEY (lines 154-244) edits in first-failure mode: a blank ACTIDIN (lines 159-164),
 then CONFIRM (lines 173-191, checked before the account is read), then READ-ACCTDAT-FILE NOTFND
-and WHEN OTHER (lines 359-371), then a balance not above zero (lines 197-205). A blank CONFIRM
-asks for confirmation with CURBAL (lines 236-240); N or n clears the screen (lines 177-180).
+and WHEN OTHER (lines 359-371), then a balance not above zero (lines 197-205). ACTIDIN has no
+digit edit (line 170), so a nonnumeric or short account ID is read as keyed and is NOTFND.
+A blank CONFIRM asks for confirmation with CURBAL (lines 236-240); N or n clears the screen
+(lines 177-180).
 Y or y pays the whole balance (lines 210-235): MOVE ACCT-CURR-BAL TO TRAN-AMT stores the
 S9(10)V99 balance into S9(09)V99, the BILL PAYMENT - ONLINE record is written with TRAN-ID
 highest + 1, and the COMPUTE and REWRITE always follow the WRITE, so the last literal set is
@@ -43,6 +45,12 @@ SEED_CARD_NUM = "2988091353094312"
 SEED_BALANCE = Decimal("40.00")
 UNKNOWN_ACCT_ID = "00000000099"
 BLANK_ACCT_ID = "           "
+# ACTIDIN is never digit-checked or zero-padded: MOVE ACTIDINI TO ACCT-ID (line 170) keys
+# READ-ACCTDAT-FILE (lines 343-372) with the text as keyed, so each of these is NOTFND.
+NONNUMERIC_ACCT_ID = "ABCDEFGHIJK"
+MIXED_ACCT_ID = "0000000000A"
+SHORT_ACCT_ID = "4"
+TEN_DIGIT_ACCT_ID = "0000000004"
 REGULAR_USER_TYPE = "U"
 FIXED_TIMESTAMP = datetime(2022, 7, 18, 10, 11, 12)
 
@@ -129,6 +137,12 @@ EDIT_CASES = [
     EditCase("", "Y", HTTP_EDIT_FAILURE, ACCT_ID_EMPTY_MESSAGE, CURSOR_ACCT_ID),
     EditCase(BLANK_ACCT_ID, "Y", HTTP_EDIT_FAILURE, ACCT_ID_EMPTY_MESSAGE, CURSOR_ACCT_ID),
     EditCase(UNKNOWN_ACCT_ID, "Y", HTTP_NOT_FOUND, ACCOUNT_NOT_FOUND_MESSAGE, CURSOR_ACCT_ID),
+    EditCase(NONNUMERIC_ACCT_ID, "Y", HTTP_NOT_FOUND, ACCOUNT_NOT_FOUND_MESSAGE, CURSOR_ACCT_ID),
+    EditCase(MIXED_ACCT_ID, "Y", HTTP_NOT_FOUND, ACCOUNT_NOT_FOUND_MESSAGE, CURSOR_ACCT_ID),
+    EditCase(SHORT_ACCT_ID, "Y", HTTP_NOT_FOUND, ACCOUNT_NOT_FOUND_MESSAGE, CURSOR_ACCT_ID),
+    EditCase(TEN_DIGIT_ACCT_ID, "Y", HTTP_NOT_FOUND, ACCOUNT_NOT_FOUND_MESSAGE, CURSOR_ACCT_ID),
+    # A blank CONFIRM also performs READ-ACCTDAT-FILE (line 184), so NOTFND precedes the prompt.
+    EditCase(NONNUMERIC_ACCT_ID, "", HTTP_NOT_FOUND, ACCOUNT_NOT_FOUND_MESSAGE, CURSOR_ACCT_ID),
     EditCase(SEED_ACCT_ID, "X", HTTP_EDIT_FAILURE, INVALID_CONFIRM_MESSAGE, CURSOR_CONFIRM),
     # The CONFIRM EVALUATE runs before READ-ACCTDAT-FILE, so an unknown account is not reached.
     EditCase(UNKNOWN_ACCT_ID, "X", HTTP_EDIT_FAILURE, INVALID_CONFIRM_MESSAGE, CURSOR_CONFIRM),
@@ -137,6 +151,11 @@ EDIT_CASE_IDS = [
     "empty-acct-id-400",
     "spaces-acct-id-400",
     "unknown-acct-id-404",
+    "nonnumeric-acct-id-404",
+    "mixed-acct-id-404",
+    "short-acct-id-404",
+    "ten-digit-acct-id-404",
+    "nonnumeric-acct-id-before-the-prompt-404",
     "invalid-confirm-400",
     "invalid-confirm-before-account-read-400",
 ]
@@ -217,7 +236,7 @@ async def BillPayScenarioFixture(
 # --- PROCESS-ENTER-KEY edits: first failure only, nothing written ------------------------------
 @pytest.mark.parametrize("editCase", EDIT_CASES, ids=EDIT_CASE_IDS)
 async def test_edit_failure_is_sent_before_any_write(scenario, editCase):
-    """Blank ACTIDIN, NOTFND and an invalid CONFIRM: the literal, status and cursor only."""
+    """Blank ACTIDIN, NOTFND for unknown and malformed keys, and an invalid CONFIRM."""
     accountBefore = ReadAccount(scenario.syncEngine, SEED_ACCT_ID)
     error = await PayExpectingError(scenario, editCase.acctId, editCase.confirm)
     expectedOutcome = (editCase.message, editCase.httpStatus, editCase.cursorField)

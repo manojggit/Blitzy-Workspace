@@ -10,6 +10,9 @@ The service is called directly, never over HTTP, against the migrated and seeded
 - the CCUP-CHANGE-ACTION state machine of 0000-MAIN and 2000-DECIDE-ACTION (lines 517-1022),
   where F5 is valid only once changes are validated, F12 only once details are fetched, and
   the no-change compare (lines 680-692) runs before every detail edit;
+- 9100-GETCARD-BYACCTCARD WHEN OTHER (lines 1402-1411), which flags the account and shows the
+  READ/CARDDAT WS-FILE-ERROR-MESSAGE (lines 133-152): a 503 on the key screen, whether the
+  read is the fetch or the F12 re-read;
 - 9200-WRITE-PROCESSING and 9300-CHECK-CHANGE-IN-REC (lines 1420-1511), which rewrite the
   name as entered, the status and the new year and month with the before-image day, and keep
   the CVV.
@@ -78,6 +81,13 @@ LOCK_FAILED_MESSAGE = "Could not lock record for update"
 RECORD_CHANGED_MESSAGE = "Record changed by some one else. Please review"
 UPDATE_FAILED_MESSAGE = "Update of record failed"
 NO_MESSAGE = ""
+# 9100 WHEN OTHER (lines 1402-1411) fills WS-FILE-ERROR-MESSAGE (lines 133-152): 'READ' in
+# ERROR-OPNAME X(8), LIT-CARDFILENAME in ERROR-FILE X(9), and IOERR's RESP 17 and RESP2 0 in
+# ERROR-RESP and ERROR-RESP2 X(10), nine digits and a space each. The 80-byte group is cut to
+# WS-RETURN-MSG X(75), whose trailing space is not shown.
+READ_FILE_ERROR_MESSAGE = (
+    "File Error: READ     on CARDDAT   returned RESP 000000017 ,RESP2 000000000"
+)
 
 # --- WS-INFO-MSG 88 levels (lines 157-171) -------------------------------------------------------
 DETAILS_SHOWN_INFO = "Details of selected card shown above"
@@ -198,6 +208,14 @@ NOT_FOUND_REFUSAL = ExpectedRefusal(
     CARD_NOT_FOUND_MESSAGE,
     PROMPT_FOR_KEYS_INFO,
     BOTH_KEY_FIELDS,
+    ACCT_ID_FIELD,
+    UpdateScreenState.DETAILS_NOT_FETCHED,
+)
+READ_FILE_ERROR_REFUSAL = ExpectedRefusal(
+    HTTP_FILE_ERROR,
+    READ_FILE_ERROR_MESSAGE,
+    PROMPT_FOR_KEYS_INFO,
+    (ACCT_ID_FIELD,),
     ACCT_ID_FIELD,
     UpdateScreenState.DETAILS_NOT_FETCHED,
 )
@@ -367,6 +385,28 @@ async def RaiseFileIo(
     raise FileIoError(CARD_FILE_NAME)
 
 
+async def RaiseReadFileIo(repository: CardRepository, cardNum: str) -> None:
+    """Stand in for the 9100 READ of CARDDAT answering IOERR."""
+    raise FileIoError(CARD_FILE_NAME)
+
+
+async def FetchForEditReadRefusal(
+    scenario: CardScenario, monkeypatch: pytest.MonkeyPatch
+) -> LegacyMessageError:
+    """Open the seed card with typed keys while its READ answers IOERR; return the refusal."""
+    monkeypatch.setattr(CardRepository, "GetCard", RaiseReadFileIo)
+    return await FetchRefusal(scenario.context, SEED_CARD_NUM, SEED_ACCT_ID)
+
+
+async def RereadReadRefusal(
+    scenario: CardScenario, monkeypatch: pytest.MonkeyPatch
+) -> LegacyMessageError:
+    """Fetch the seed card, then press F12 while its re-read answers IOERR; return the refusal."""
+    fetched = await FetchCardScreen(scenario.context, SEED_CARD_NUM, SEED_ACCT_ID)
+    monkeypatch.setattr(CardRepository, "GetCard", RaiseReadFileIo)
+    return await SendRefusedKey(scenario, WithCardChanges(fetched, {}, UpdateAction.CANCEL))
+
+
 # --- 1230-1260 detail edits (lines 806-944) ----------------------------------------------------
 class FieldEditCase(NamedTuple):
     """One detail value 1230-1260 refuse, its literal, its field and the value then shown.
@@ -494,6 +534,20 @@ async def test_fetch_of_missing_card_is_not_found(cardScenario):
     refusal = await FetchRefusal(cardScenario.context, MISSING_CARD_NUM, SEED_ACCT_ID)
     body = AssertRefusal(refusal, NOT_FOUND_REFUSAL)
     assert body["fields"][ACCT_ID_FIELD] == SEED_ACCT_ID
+
+
+@pytest.mark.parametrize(
+    "readEntry",
+    [FetchForEditReadRefusal, RereadReadRefusal],
+    ids=["fetch-for-edit", "f12-reread"],
+)
+async def test_card_read_error_shows_file_error_on_key_screen(cardScenario, monkeypatch, readEntry):
+    """A CARDDAT READ ending WHEN OTHER: 503 WS-FILE-ERROR-MESSAGE, account flagged, no write."""
+    refusal = await readEntry(cardScenario, monkeypatch)
+    body = AssertRefusal(refusal, READ_FILE_ERROR_REFUSAL)
+    shownKeys = (body["fields"][ACCT_ID_FIELD], body["fields"][CARD_NUM_FIELD])
+    assert shownKeys == (SEED_ACCT_ID, MASKED_SEED_CARD_NUM)
+    AssertSeedRowUnchanged(cardScenario)
 
 
 # --- CCUP-CHANGE-ACTION state machine (lines 517-1022) -----------------------------------------

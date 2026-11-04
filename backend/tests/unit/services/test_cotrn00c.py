@@ -20,8 +20,9 @@ code-page-037 byte order. Expected values are typed from these lines:
 - S or s on a row routes to the Transaction View before the search key is read (lines 185-195);
     another code sets ``Invalid selection. Valid value is S`` (line 199) and the list is browsed
     on, a 400 whose body carries the browsed page;
-- a TRANSACT file condition, the batch window's NOTOPEN included, is the 503
-    ``Unable to lookup transaction...`` with a lower-case ``t`` (line 615).
+- a TRANSACT file condition on the forward or the backward browse, the batch window's NOTOPEN
+    and an IOERR included, is the 503 ``Unable to lookup transaction...`` with a lower-case
+    ``t`` (lines 615, 649 and 683).
 
 Every response puts the cursor on the search field (MOVE -1 TO TRNIDINL), and the service writes
 nothing: after each call TRANSACT holds exactly the 25 posted records. Each case calls
@@ -39,7 +40,7 @@ import pytest
 from sqlalchemy import Engine, text
 
 from app.core import messages
-from app.core.errors import LegacyMessageError
+from app.core.errors import FileIoError, LegacyMessageError
 from app.core.locks import FileNotOpenError
 from app.repositories.transaction_repository import TransactionRepository
 from app.schemas.common import Direction
@@ -418,3 +419,23 @@ async def test_transact_file_condition_answers_unable_to_lookup_transaction(
     assert raised.value.Body() == StandardBody(TRAN_LOOKUP_FAILED_MESSAGE)
     notOpenBrowse.assert_awaited_once()
     assert StoredTranIds(syncEngine) == postedTransactions
+
+
+@pytest.mark.usefixtures("postedTransactions")
+@pytest.mark.parametrize("conditionType", [FileIoError, FileNotOpenError], ids=["ioerr", "notopen"])
+async def test_transact_file_condition_on_the_backward_browse_answers_unable_to_lookup_transaction(
+    makeOnlineContext, syncEngine, monkeypatch, conditionType
+):
+    """IOERR, or the batch window's NOTOPEN, on F7's STARTBR/READPREV browse is a 503."""
+    context = await makeOnlineContext(REGULAR_USER_TYPE)
+    secondPage = await ShowSecondPage(context)
+    storedTranIds = StoredTranIds(syncEngine)
+    backwardBrowse = AsyncMock(side_effect=conditionType(TRANSACTION_FILE_NAME))
+    monkeypatch.setattr(TransactionRepository, "BrowseBackward", backwardBrowse)
+    with pytest.raises(LegacyMessageError) as raised:
+        await cotrn00c.ListTransactions(context, F7Query(secondPage))
+    assert RowIds(secondPage) == storedTranIds[SECOND_PAGE_ROWS]
+    assert raised.value.httpStatus == FILE_ERROR_STATUS
+    assert raised.value.Body() == StandardBody(TRAN_LOOKUP_FAILED_MESSAGE)
+    backwardBrowse.assert_awaited_once_with(secondPage.first_key, limit=PAGE_ROWS)
+    assert StoredTranIds(syncEngine) == storedTranIds

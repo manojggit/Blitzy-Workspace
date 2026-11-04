@@ -32,13 +32,13 @@ import contextlib
 import secrets
 from collections.abc import Awaitable, Callable, Iterator
 from typing import NamedTuple
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import Engine, text
 
 from app.core import messages
-from app.core.errors import LegacyMessageError
+from app.core.errors import FileIoError, LegacyMessageError
 from app.core.locks import FileNotOpenError
 from app.core.security import HashPassword
 from app.repositories.user_repository import UserRepository
@@ -99,6 +99,9 @@ PARTIAL_SEARCH_KEY = "ADMIN00"
 SEARCH_FIRST_USER_ID = "ADMIN001"
 # Digits sort last in EBCDIC and 9 is the highest digit, so no user ID is at or after this key.
 UNMATCHED_SEARCH_KEY = "99999999"
+# The first added ZZ user: Z sorts after every other letter, so fewer than 11 user IDs are at or
+# after it and its browse reaches ENDFILE before the look-ahead READNEXT.
+END_OF_FILE_SEARCH_KEY = EXTRA_USER_IDS[0]
 BLANK_SEARCH_KEYS = ["", "        "]
 USER_FILE_NAME = "USRSEC"
 
@@ -397,21 +400,32 @@ SELECTION_ROUTES = [
     SelectionRoute("d", DELETE_ROUTE),
 ]
 SELECTION_ROUTE_IDS = ["U", "u", "D", "d"]
+# A U or D code keyed with no search key, and with one whose browse would show another page.
+SELECTION_SEARCH_KEYS = [NO_KEY, EXACT_SEARCH_KEY]
+SELECTION_SEARCH_KEY_IDS = ["no-search", "with-search"]
 
 
+@pytest.mark.usefixtures("mixedUsers")
+@pytest.mark.parametrize("searchKey", SELECTION_SEARCH_KEYS, ids=SELECTION_SEARCH_KEY_IDS)
 @pytest.mark.parametrize("selectionRoute", SELECTION_ROUTES, ids=SELECTION_ROUTE_IDS)
 async def test_update_or_delete_code_routes_to_the_selected_user(
-    mixedUsers, makeOnlineContext, syncEngine, selectionRoute
+    makeOnlineContext, syncEngine, selectionRoute, searchKey
 ):
-    """U or u transfers to the update screen and D or d to the delete screen."""
+    """U or u transfers to the update screen and D or d to the delete screen.
+
+    The XCTL (lines 189-209) ends the task before the search key is moved to SEC-USR-ID, so a
+    keyed search key is never browsed: the selection takes precedence over the search.
+    """
     firstPage = await ListPage(makeOnlineContext, UserListQuery())
-    request = UserSelectionRequest(selections=ShownSelections(firstPage, selectionRoute.code))
-    with NoUserWrites(syncEngine):
+    selections = ShownSelections(firstPage, selectionRoute.code)
+    request = UserSelectionRequest(selections=selections, search_user_id=searchKey)
+    with NoUserWrites(syncEngine), patch.object(UserRepository, "BrowseForward") as browseForward:
         selected = await SelectOnPage(makeOnlineContext, request)
     assert SELECTED_USER_ID in RowIds(firstPage)
     assert selected.route == selectionRoute.expectedRoute
     assert (selected.rows, selected.page) == ([], ENTRY_PAGE)
     assert (selected.message, selected.cursor_field) == (NO_MESSAGE, None)
+    browseForward.assert_not_awaited()
 
 
 async def test_invalid_code_is_refused_with_the_browsed_page(
@@ -429,6 +443,75 @@ async def test_invalid_code_is_refused_with_the_browsed_page(
         EDIT_FAILURE_STATUS,
     )
     assert raised.value.Body() == RefusalBody(INVALID_SELECTION_MESSAGE) | pageKeys
+
+
+async def test_invalid_code_with_a_search_is_refused_with_the_page_from_the_search_key(
+    mixedUsers, makeOnlineContext, syncEngine
+):
+    """Any other code keeps its literal over the page browsed from the search key: a 400.
+
+    The search key, not the first key shown, is moved to SEC-USR-ID after the selection (lines
+    218-228): page 1 starts at ADMIN001, inclusive, and its look-ahead row keeps the literal.
+    """
+    firstPage = await ListPage(makeOnlineContext, UserListQuery())
+    searchPage = await ListPage(makeOnlineContext, UserListQuery(searchUserId=EXACT_SEARCH_KEY))
+    selections = ShownSelections(firstPage, INVALID_SELECTION_CODE)
+    request = UserSelectionRequest(selections=selections, search_user_id=EXACT_SEARCH_KEY)
+    with NoUserWrites(syncEngine), pytest.raises(LegacyMessageError) as raised:
+        await SelectOnPage(makeOnlineContext, request)
+    searchIndex = mixedUsers.index(EXACT_SEARCH_KEY)
+    searchedIds = mixedUsers[searchIndex : searchIndex + PAGE_ROWS]
+    assert len(mixedUsers) > searchIndex + PAGE_ROWS
+    assert RowIds(searchPage) == searchedIds
+    assert searchedIds != RowIds(firstPage)
+    pageKeys = {"rows": [row.model_dump() for row in searchPage.rows], "page": FIRST_PAGE}
+    pageKeys |= {"first_key": searchedIds[0], "last_key": searchedIds[-1]}
+    assert (raised.value.message, raised.value.httpStatus) == (
+        INVALID_SELECTION_MESSAGE,
+        EDIT_FAILURE_STATUS,
+    )
+    assert raised.value.Body() == RefusalBody(INVALID_SELECTION_MESSAGE) | pageKeys
+
+
+async def test_invalid_code_with_a_search_reaching_the_end_shows_the_bottom_literal(
+    mixedUsers, makeOnlineContext, syncEngine
+):
+    """READNEXT ENDFILE in the browse from the search key replaces the invalid-code literal.
+
+    ``You have reached the bottom of the page...`` overwrites WS-MESSAGE (lines 634-640), so the
+    answer is the page browsed from the search key, as page 1, with no route.
+    """
+    firstPage = await ListPage(makeOnlineContext, UserListQuery())
+    selections = ShownSelections(firstPage, INVALID_SELECTION_CODE)
+    request = UserSelectionRequest(selections=selections, search_user_id=END_OF_FILE_SEARCH_KEY)
+    with NoUserWrites(syncEngine):
+        selected = await SelectOnPage(makeOnlineContext, request)
+    searchedIds = mixedUsers[mixedUsers.index(END_OF_FILE_SEARCH_KEY) :]
+    assert len(searchedIds) <= PAGE_ROWS
+    assert not set(searchedIds) & set(RowIds(firstPage))
+    assert selected.route is None
+    AssertListPage(selected, searchedIds, FIRST_PAGE, REACHED_BOTTOM_MESSAGE)
+
+
+async def test_invalid_code_with_an_unmatched_search_rereads_the_shown_rows(
+    mixedUsers, makeOnlineContext, syncEngine
+):
+    """STARTBR NOTFND on the search key replaces the invalid-code literal with the top literal.
+
+    No row is read (lines 600-606), so the rows still shown are read again from the first key
+    shown, on page 1 with a blank last key and no route.
+    """
+    firstPage = await ListPage(makeOnlineContext, UserListQuery())
+    selections = ShownSelections(firstPage, INVALID_SELECTION_CODE)
+    request = UserSelectionRequest(selections=selections, search_user_id=UNMATCHED_SEARCH_KEY)
+    with NoUserWrites(syncEngine):
+        selected = await SelectOnPage(makeOnlineContext, request)
+    assert EbcdicKey(mixedUsers[-1]) < EbcdicKey(UNMATCHED_SEARCH_KEY)
+    assert selected.route is None
+    assert (RowIds(selected), selected.page) == (mixedUsers[:PAGE_ROWS], FIRST_PAGE)
+    assert (selected.first_key, selected.last_key) == (mixedUsers[0], NO_KEY)
+    assert selected.message == AT_TOP_OF_PAGE_MESSAGE
+    assert selected.cursor_field == SEARCH_CURSOR_FIELD
 
 
 class ForwardBrowsePress(NamedTuple):
@@ -478,3 +561,20 @@ async def test_file_condition_on_the_browse_is_unable_to_lookup_user(
     browseForward.assert_awaited_once_with(
         keyPress.startKey, inclusive=keyPress.inclusive, limit=PAGE_ROWS
     )
+
+
+@pytest.mark.usefixtures("mixedUsers")
+@pytest.mark.parametrize("conditionType", [FileIoError, FileNotOpenError], ids=["ioerr", "notopen"])
+async def test_file_condition_on_the_backward_browse_is_unable_to_lookup_user(
+    makeOnlineContext, syncEngine, monkeypatch, conditionType
+):
+    """IOERR, or the batch window's NOTOPEN, on F7's STARTBR/READPREV browse is a 503."""
+    firstPage = await ListPage(makeOnlineContext, UserListQuery())
+    secondPage = await ListPage(makeOnlineContext, NextPageQuery(firstPage))
+    browseBackward = AsyncMock(side_effect=conditionType(USER_FILE_NAME))
+    monkeypatch.setattr(UserRepository, "BrowseBackward", browseBackward)
+    with NoUserWrites(syncEngine):
+        refusal = await RefusedListPage(makeOnlineContext, PreviousPageQuery(secondPage))
+    assert secondPage.page == SECOND_PAGE
+    AssertRefusal(refusal, UNABLE_TO_LOOKUP_USER_MESSAGE, LOOKUP_ERROR_STATUS)
+    browseBackward.assert_awaited_once_with(secondPage.first_key, limit=PAGE_ROWS)

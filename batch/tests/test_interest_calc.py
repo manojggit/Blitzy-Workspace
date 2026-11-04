@@ -15,12 +15,14 @@ test reads the database it arranged into the oracle's state and runs legacy_orac
 on it, so each expectation comes from the independent oracle (Section 0.9.3).
 """
 
+import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from app.core.logging import PanMaskingFilter
 from app.models import GDG_GENERATIONS, Account, DisclosureGroup, TransactionCategoryBalance
 from sqlalchemy import ColumnElement, Engine, delete, func, insert, select, update
 from sqlalchemy.engine import Connection
@@ -78,6 +80,7 @@ ZEROED_CYCLE_FIELDS = dict.fromkeys(CYCLE_COLUMNS, ZERO_AMOUNT)
 ACCOUNT_IDS = tuple(f"{index:011d}" for index in range(1, 6))
 SYNTHETIC_CARD_NUM = "9000000000000001"
 SYNTHETIC_INTEREST = Decimal("1.23")
+INTEREST_RATE_FUNCTION_NAME = "ReadInterestRate"
 
 
 @dataclass(frozen=True)
@@ -556,3 +559,59 @@ def test_tran_id_suffix_wraps_from_999999_to_000000(
     assert [record[TRAN_ID_SLICE] for record in writer.records] == [
         DEFAULT_PARM_DATE + expectedSuffixText
     ]
+
+
+# --- The TRAN-CAT-BAL-RECORD display through log masking ----------------------------------------
+def MaskedIntcalcMessages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return each captured interest_calc record's message after the batch log masking filter."""
+    maskingFilter = PanMaskingFilter()
+    intcalcRecords = [
+        record for record in caplog.records if record.name == interest_calc.LOGGER.name
+    ]
+    for record in intcalcRecords:
+        maskingFilter.filter(record)
+    return [record.getMessage() for record in intcalcRecords]
+
+
+@pytest.mark.parametrize(
+    ("balance", "expectedLine"),
+    [
+        pytest.param(
+            CategoryBalance("00000000001", "01", 1, Decimal("1164.87")),
+            "TRAN-CAT-BAL-RECORD TRANCAT-ACCT-ID=00000000001 TRANCAT-TYPE-CD=01 TRANCAT-CD=0001"
+            " TRAN-CAT-BAL=1164.87",
+            id="first-sample-key",
+        ),
+        pytest.param(
+            CategoryBalance("99999999999", "02", 9999, Decimal("-999999999.99")),
+            "TRAN-CAT-BAL-RECORD TRANCAT-ACCT-ID=99999999999 TRANCAT-TYPE-CD=02 TRANCAT-CD=9999"
+            " TRAN-CAT-BAL=-999999999.99",
+            id="widest-fields-negative-balance",
+        ),
+    ],
+)
+def test_record_display_keeps_key_and_balance_readable_through_log_masking(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    balance: CategoryBalance,
+    expectedLine: str,
+) -> None:
+    """DISPLAY TRAN-CAT-BAL-RECORD (line 193) names each field and survives log masking.
+
+    Joined by spaces, the key and balance digits would be one chain of 16 or more digits, which
+    the masking filter hides but its last four. ProcessCategoryBalance runs with its account
+    already current and the rate read stubbed to 0, so no database is needed; its DEBUG line
+    must pass the filter whole, each field after its CVTRA01Y name.
+    """
+    monkeypatch.setattr(interest_calc, INTEREST_RATE_FUNCTION_NAME, lambda *arguments: ZERO_RATE)
+    caplog.set_level(logging.DEBUG, logger=interest_calc.LOGGER.name)
+    balanceRow = {
+        "acct_id": balance.acctId,
+        "tran_type_cd": balance.typeCd,
+        "tran_cat_cd": balance.catCd,
+        "balance": balance.balance,
+    }
+    state = interest_calc.InterestState(lastAcctId=balance.acctId)
+    files = interest_calc.InterestFiles(None, None, RecordingWriter())
+    interest_calc.ProcessCategoryBalance(files, state, balanceRow)
+    assert MaskedIntcalcMessages(caplog) == [expectedLine]

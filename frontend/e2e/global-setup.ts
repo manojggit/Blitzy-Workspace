@@ -6,14 +6,16 @@
 // Sources: jcl/ACCTFILE.jcl, jcl/DUSRSECJ.jcl (loaders); bms/COSGN00.bms, cbl/COSGN00C.cbl
 // (the sign-on screen the shared SignOn helper drives).
 //
-// Playwright runs the default export as globalSetup. Both specs import the named helpers, so
-// importing this module performs no I/O: its top level only defines constants and functions.
+// Playwright runs the default export as globalSetup, and the function it returns as the global
+// teardown that publishes failure evidence. Both specs import the named helpers, so importing
+// this module performs no I/O: its top level only defines constants and functions.
 // Every setting comes from frontend/.env.e2e, which playwright.config.ts loads; user IDs and
 // passwords are read from the environment only and never appear in messages.
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 
-import { expect, type Page } from "@playwright/test";
+import { expect, type FullConfig, type Page } from "@playwright/test";
 
 /** The repository root: frontend/e2e -> frontend -> root. Relative settings resolve here. */
 export const REPO_ROOT = path.resolve(__dirname, "..", "..");
@@ -73,17 +75,33 @@ export interface BatchRun {
     stderr: string;
 }
 
+// A variable's value, or undefined when it is unset or blank. An empty process value counts as
+// set, because process.loadEnvFile keeps it over the file, so it is treated as blank here.
+function ReadEnv(name: RequiredVariable): string | undefined {
+    const value = process.env[name];
+    if (value === undefined || value.trim() === "") {
+        return undefined;
+    }
+    return value;
+}
+
+// Names the missing variables, never a value: the values include passwords.
+function DescribeMissingVariables(names: readonly RequiredVariable[]): string {
+    const isSingle = names.length === 1;
+    return (
+        `Missing environment ${isSingle ? "variable" : "variables"} ${names.join(", ")}: copy ` +
+        `frontend/.env.e2e.example to frontend/.env.e2e and set ${isSingle ? "it" : "them"}.`
+    );
+}
+
 /**
  * The value of one .env.e2e variable. A missing or blank value fails with the variable's name
  * only: the values include passwords.
  */
 export function RequireEnv(name: RequiredVariable): string {
-    const value = process.env[name];
-    if (value === undefined || value.trim() === "") {
-        throw new Error(
-            `Missing environment variable ${name}: copy frontend/.env.e2e.example to ` +
-                "frontend/.env.e2e and set it.",
-        );
+    const value = ReadEnv(name);
+    if (value === undefined) {
+        throw new Error(DescribeMissingVariables([name]));
     }
     return value;
 }
@@ -171,16 +189,19 @@ export async function SignOn(page: Page, credentials: Credentials): Promise<void
 }
 
 /**
- * Asserts that the message line shows the exact legacy literal. The raw textContent keeps the
- * repeated and trailing blanks that the whitespace-normalising text matchers would hide.
+ * Asserts that the screen shows exactly one alert, whose text is exactly the legacy literal: a
+ * prefixed, extended or second message fails. The raw textContent keeps the repeated and
+ * trailing blanks that the whitespace-normalising text matchers would hide. Only alerts inside
+ * the main landmark count, because the Next.js route announcer is an alert outside it.
  */
 export async function ExpectMessage(page: Page, literal: string): Promise<void> {
+    const screenAlerts = page.getByRole("main").getByRole("alert");
     await expect
-        .poll(async () => (await page.getByRole("alert").allTextContents()).join("\n"), {
+        .poll(() => screenAlerts.allTextContents(), {
             message: `message line should show ${JSON.stringify(literal)}`,
             timeout: MESSAGE_TIMEOUT_MS,
         })
-        .toContain(literal);
+        .toEqual([literal]);
 }
 
 function Pause(milliseconds: number): Promise<void> {
@@ -220,8 +241,54 @@ async function IsBackendReady(readyUrl: URL): Promise<boolean> {
     }
 }
 
+// CARDDEMO_E2E_BASE_URL and CARDDEMO_E2E_API_URL are origins: a scheme, a host and an optional
+// port. Anything more is refused before any request is made, and no message repeats the value,
+// which could carry a user name or password.
+const ORIGIN_SCHEMES: readonly string[] = ["http:", "https:"];
+const ORIGIN_PATHNAME = "/";
+const ORIGIN_HINT = "set it to a scheme, host and port only, as in frontend/.env.e2e.example.";
+
+// The TypeError from new URL holds the raw value in its input property, so it is replaced by a
+// message naming the variable, never chained as a cause.
+function ParseEnvUrl(name: RequiredVariable): URL {
+    const value = RequireEnv(name);
+    try {
+        return new URL(value);
+    } catch (error) {
+        if (error instanceof TypeError) {
+            throw new Error(`${name} is not a valid URL: ${ORIGIN_HINT}`);
+        }
+        throw error;
+    }
+}
+
+function DescribeOriginProblem(url: URL): string | undefined {
+    if (!ORIGIN_SCHEMES.includes(url.protocol)) {
+        return "must use the http or https scheme";
+    }
+    if (url.username !== "" || url.password !== "") {
+        return "must not carry a user name or password";
+    }
+    if (url.pathname !== ORIGIN_PATHNAME) {
+        return "must not carry a path";
+    }
+    if (url.search !== "" || url.hash !== "") {
+        return "must not carry a query or fragment";
+    }
+    return undefined;
+}
+
+function RequireOrigin(name: RequiredVariable): URL {
+    const url = ParseEnvUrl(name);
+    const problem = DescribeOriginProblem(url);
+    if (problem !== undefined) {
+        throw new Error(`${name} ${problem}: ${ORIGIN_HINT}`);
+    }
+    return url;
+}
+
 async function WaitForBackendReady(): Promise<void> {
-    const readyUrl = new URL(READY_PATH, RequireEnv("CARDDEMO_E2E_API_URL"));
+    const readyUrl = new URL(READY_PATH, RequireOrigin("CARDDEMO_E2E_API_URL"));
     const deadline = Date.now() + READY_TIMEOUT_MS;
     while (Date.now() < deadline) {
         if (await IsBackendReady(readyUrl)) {
@@ -231,15 +298,17 @@ async function WaitForBackendReady(): Promise<void> {
     }
     const waitedSeconds = READY_TIMEOUT_MS / MILLISECONDS_PER_SECOND;
     throw new Error(
-        `Backend not ready at ${readyUrl.href} after ${waitedSeconds}` +
+        `Backend not ready at ${readyUrl.origin}${READY_PATH} after ${waitedSeconds}` +
             " s: start PostgreSQL (docker compose up -d db), run alembic upgrade head, and start" +
             ` uvicorn on ${readyUrl.host} (docs/README.md).`,
     );
 }
 
+// Reports every missing or blank variable in one run, so one edit of .env.e2e fixes them all.
 function ValidateEnvironment(): void {
-    for (const name of REQUIRED_VARIABLES) {
-        RequireEnv(name);
+    const missingNames = REQUIRED_VARIABLES.filter((name) => ReadEnv(name) === undefined);
+    if (missingNames.length > 0) {
+        throw new Error(DescribeMissingVariables(missingNames));
     }
 }
 
@@ -247,8 +316,8 @@ function ValidateEnvironment(): void {
 // only while both origins share one host; ports do not count. The templates use 127.0.0.1 for
 // both, because localhost is another site and may resolve to IPv6 first.
 function ValidateSharedHost(): void {
-    const pageHost = new URL(RequireEnv("CARDDEMO_E2E_BASE_URL")).hostname;
-    const apiHost = new URL(RequireEnv("CARDDEMO_E2E_API_URL")).hostname;
+    const pageHost = RequireOrigin("CARDDEMO_E2E_BASE_URL").hostname;
+    const apiHost = RequireOrigin("CARDDEMO_E2E_API_URL").hostname;
     if (pageHost !== apiHost) {
         throw new Error(
             `CARDDEMO_E2E_BASE_URL (host ${pageHost}) and CARDDEMO_E2E_API_URL (host ${apiHost})` +
@@ -269,9 +338,81 @@ function SeedSampleData(): void {
     }
 }
 
-export default async function GlobalSetup(): Promise<void> {
+/** Where one kind of failure evidence is published, by the extension Playwright gives it. */
+interface EvidenceDestination {
+    extension: string;
+    directory: string;
+}
+
+// Playwright keeps each failed test's screenshot (test-failed-N.png) and video (video.webm) at
+// the top of that test's own directory under the project's outputDir, and empties outputDir
+// when the next run starts. The copies are kept in the repository's evidence folders. Nothing
+// else is copied: error-context.md holds a page snapshot with the values typed into fields.
+const EVIDENCE_DESTINATIONS: readonly EvidenceDestination[] = [
+    { extension: ".png", directory: path.join(REPO_ROOT, "blitzy", "screenshots") },
+    { extension: ".webm", directory: path.join(REPO_ROOT, "blitzy", "screen_recordings") },
+];
+const EVIDENCE_PREFIX = "e2e-";
+const UNSAFE_FILE_NAME_CHARACTERS = /[^A-Za-z0-9._-]/g;
+
+// Playwright names each test's directory uniquely within a run, from the spec file, the test
+// title and the project, so the published name is stable across runs and a rerun of the same
+// test overwrites its earlier copy instead of piling up new ones.
+function PublishedName(testDirName: string, fileName: string): string {
+    const publishedName = `${EVIDENCE_PREFIX}${testDirName}-${fileName}`;
+    return publishedName.replace(UNSAFE_FILE_NAME_CHARACTERS, "-");
+}
+
+function PublishEvidenceFile(testDir: string, fileName: string): void {
+    const extension = path.extname(fileName);
+    const destination = EVIDENCE_DESTINATIONS.find((kind) => kind.extension === extension);
+    if (destination === undefined) {
+        return;
+    }
+    fs.mkdirSync(destination.directory, { recursive: true });
+    const publishedName = PublishedName(path.basename(testDir), fileName);
+    fs.copyFileSync(path.join(testDir, fileName), path.join(destination.directory, publishedName));
+}
+
+function PublishTestEvidence(testDir: string): void {
+    for (const entry of fs.readdirSync(testDir, { withFileTypes: true })) {
+        if (entry.isFile()) {
+            PublishEvidenceFile(testDir, entry.name);
+        }
+    }
+}
+
+// An outputDir that no test has written to does not exist, and holds nothing to publish.
+function PublishOutputDirEvidence(outputDir: string): void {
+    if (!fs.existsSync(outputDir)) {
+        return;
+    }
+    for (const entry of fs.readdirSync(outputDir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+            PublishTestEvidence(path.join(outputDir, entry.name));
+        }
+    }
+}
+
+// Each project's resolved outputDir, which honours the --output command-line option.
+function PublishFailureEvidence(config: FullConfig): void {
+    const outputDirs = new Set(config.projects.map((project) => project.outputDir));
+    for (const outputDir of outputDirs) {
+        PublishOutputDirEvidence(outputDir);
+    }
+}
+
+/**
+ * Validates the settings, waits for the backend and seeds the sample data. The returned
+ * function is Playwright's global teardown: once every test has finished, it copies each
+ * failed test's screenshots to blitzy/screenshots and videos to blitzy/screen_recordings.
+ */
+export default async function GlobalSetup(config: FullConfig): Promise<() => void> {
     ValidateEnvironment();
     ValidateSharedHost();
     await WaitForBackendReady();
     SeedSampleData();
+    return () => {
+        PublishFailureEvidence(config);
+    };
 }

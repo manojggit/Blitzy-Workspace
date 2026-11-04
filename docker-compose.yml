@@ -18,16 +18,16 @@
 # all local URLs use, so the session cookie and the CORS origin name the same site.
 
 # Shared by migrator and backend, overriding backend/.env: the database host is the db service
-# and the seed images are the read-only ./data mount. The URLs name only driver, host and port;
-# psycopg2 (libpq) and asyncpg take the role, password and database from PGUSER, PGPASSWORD and
-# PGDATABASE, so the raw POSTGRES_* values never pass through URL syntax, where a character
-# such as @, : or / would change how the URL parses.
+# and the seed images are the read-only ./data mount. The URLs carry the role, password and
+# database from the same POSTGRES_* expressions as db. Compose interpolates them verbatim into
+# URL syntax and cannot percent-encode them, so with the full profile each value must be URL-safe:
+# letters, digits, -, ., _ and ~ only. A backslash ending a line inside double quotes joins the
+# next line with no space, so each URL resolves to one string.
 x-backend-environment: &backend-environment
-    DATABASE_URL: postgresql+asyncpg://db:5432
-    SYNC_DATABASE_URL: postgresql+psycopg2://db:5432
-    PGUSER: ${POSTGRES_USER:-carddemo}
-    PGPASSWORD: ${POSTGRES_PASSWORD:-carddemo}
-    PGDATABASE: ${POSTGRES_DB:-carddemo}
+    DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-carddemo}\
+        :${POSTGRES_PASSWORD:-carddemo}@db:5432/${POSTGRES_DB:-carddemo}"
+    SYNC_DATABASE_URL: "postgresql+psycopg2://${POSTGRES_USER:-carddemo}\
+        :${POSTGRES_PASSWORD:-carddemo}@db:5432/${POSTGRES_DB:-carddemo}"
     CARDDEMO_EBCDIC_DIR: /app/data/EBCDIC
     CARDDEMO_ASCII_DIR: /app/data/ASCII
 
