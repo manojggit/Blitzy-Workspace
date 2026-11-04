@@ -9,12 +9,14 @@
 // CCUP state machine. The CCLI paging literals and the information lines arrive in message and
 // info_message of successful responses; filter, selection, key and field edit, not-found, lock,
 // record-changed and file-error outcomes reach the caller as a rejected call carrying the legacy
-// error body. No type has a card verification code, and a full card number appears only where
-// the user keyed it.
+// error body, which a CCLI selection error extends with the redisplayed list and a CCUP outcome
+// with its screen, in optional keys as their error models declare them. No type has a card
+// verification code, and a full card number appears only where the user keyed it.
 import {
     API_CLIENT,
     EncodePathKey,
     type Direction,
+    type LegacyErrorResponse,
     type PageState,
     type ReadOptions,
     type ScreenFeedback,
@@ -66,6 +68,12 @@ export interface CardListResponse extends PageState, ScreenFeedback {
     rows: CardListRow[];
 }
 
+// The GET /cards 400: a selection error adds the rows redisplayed from the first card, their page
+// keys and page number; a filter edit failure carries the legacy error keys alone.
+export interface CardListErrorResponse extends LegacyErrorResponse, PageState {
+    rows?: CardListRow[];
+}
+
 // One COCRDLI row as keyed: its card_ref token and its raw CRDSELn code.
 export interface CardSelectionRow {
     card_ref?: string;
@@ -86,6 +94,14 @@ export type CardSelectionAction = "view" | "update";
 export interface CardSelectionResponse extends ScreenFeedback {
     action: CardSelectionAction | null;
     card_ref: string;
+}
+
+// The POST /cards/selection 400: a selection error adds the redisplayed rows and their page keys
+// but no page number; a filter edit failure carries the legacy error keys alone.
+export interface CardSelectionErrorResponse extends LegacyErrorResponse {
+    rows?: CardListRow[];
+    first_key?: string;
+    last_key?: string;
 }
 
 // The COCRDSL screen: one card read by card number, its number masked.
@@ -117,6 +133,15 @@ export interface CardScreen extends ScreenFeedback {
     state: UpdateScreenState;
     screen_token: string;
     card_ref: string;
+}
+
+// The 400, 404, 409, 423 and 503 body of the edit fetch and the PUT: the legacy error keys plus
+// the screen the outcome sends back, without card_ref. The screen keys are optional, as their
+// Pydantic fields have defaults, though every such outcome carries them; none is ever null.
+export interface CardScreenErrorResponse extends LegacyErrorResponse {
+    fields?: CardScreenFields;
+    state?: UpdateScreenState;
+    screen_token?: string;
 }
 
 // One ENTER (enter), F5 (save) or F12 (cancel) on COCRDUP. The page sends only the inputs its

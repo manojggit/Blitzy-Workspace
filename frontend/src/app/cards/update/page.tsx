@@ -35,6 +35,7 @@ import {
     PROMPT_FOR_KEYS_INFO,
     UpdateCard,
     type CardScreen,
+    type CardScreenErrorResponse,
     type CardScreenFields,
     type CardUpdateRequest,
 } from "@/lib/api/cards";
@@ -46,7 +47,6 @@ import {
     ToScreenFeedback,
     UpdateAction,
     UpdateScreenState,
-    type LegacyErrorResponse,
     type MessageSeverity,
     type ScreenFeedback,
 } from "@/lib/apiClient";
@@ -200,9 +200,8 @@ interface ScreenStore {
     setters: ScreenSetters;
 }
 
-// The 4xx and 5xx CCUP bodies carry the screen beside the standard legacy keys.
-type CardErrorBody = LegacyErrorResponse &
-    Partial<Pick<CardScreen, "fields" | "state" | "screen_token">>;
+// The 400, 404, 409, 423 and 503 CCUP bodies carry the screen beside the standard legacy keys.
+type CardErrorBody = CardScreenErrorResponse;
 
 type CardRequest = () => Promise<CardScreen>;
 

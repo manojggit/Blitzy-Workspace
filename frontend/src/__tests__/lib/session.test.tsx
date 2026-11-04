@@ -1006,3 +1006,154 @@ it.each(ABANDONED_FIRST_READ_CASES)(
         expect(fetchAdminMenuMock).not.toHaveBeenCalled();
     },
 );
+
+// How the re-read of a page restored from the back/forward cache fails once the server's session
+// has ended, and how many of the sign-on navigations the session context makes itself.
+interface RestoredPageFailureCase {
+    caseName: string;
+    Answer: () => Promise<CurrentUserResponse>;
+    sessionRedirects: number;
+}
+
+// The user the re-read of a restored page answers, the page restored, and the main menu reads
+// that follow the re-read.
+interface RestoredPageUserCase {
+    caseName: string;
+    path: string;
+    user: CurrentUserResponse;
+    mainMenuReads: number;
+}
+
+// A page show that reads /auth/me no more than the provider's mount did.
+interface UnreadPageShowCase {
+    caseName: string;
+    path: string;
+    persisted: boolean;
+    BeforeShow: (view: RenderResult) => void;
+    reads: number;
+}
+
+// A 401 is the apiClient interceptor's to route, so the session context navigates only for a
+// failure nothing else routes. Either way the browser goes to sign-on once.
+const RESTORED_PAGE_FAILURE_CASES: readonly RestoredPageFailureCase[] = [
+    {
+        caseName: "a 401 the apiClient interceptor routes",
+        Answer: () => HandleResponseError(BuildResponseError(HTTP_UNAUTHORIZED)),
+        sessionRedirects: 0,
+    },
+    {
+        caseName: "no answer (ERR_NETWORK)",
+        Answer: () => Promise.reject(NETWORK_ERROR),
+        sessionRedirects: 1,
+    },
+];
+
+// A session still signed on is refreshed in place. As on the first mount, a page outside the
+// answered user's own menu tree reads that tree's menu, for the server's role guard to answer.
+const RESTORED_PAGE_USER_CASES: readonly RestoredPageUserCase[] = [
+    {
+        caseName: "the same user on CM00",
+        path: MAIN_MENU_ROUTE,
+        user: REGULAR_USER,
+        mainMenuReads: 0,
+    },
+    {
+        caseName: "the same user on CAVW",
+        path: ACCOUNT_VIEW_ROUTE,
+        user: REGULAR_USER,
+        mainMenuReads: 0,
+    },
+    {
+        caseName: "an admin signed on in another tab, on CAVW",
+        path: ACCOUNT_VIEW_ROUTE,
+        user: ADMIN_USER,
+        mainMenuReads: 1,
+    },
+];
+
+// An ordinary load's pageshow is left to the mount effect, a restored sign-on page has no user
+// before login, and a disposed provider no longer listens.
+const UNREAD_PAGE_SHOW_CASES: readonly UnreadPageShowCase[] = [
+    {
+        caseName: "an ordinary load's pageshow on CM00",
+        path: MAIN_MENU_ROUTE,
+        persisted: false,
+        BeforeShow: () => undefined,
+        reads: 1,
+    },
+    {
+        caseName: "the sign-on page restored from the back/forward cache",
+        path: SIGN_ON_ROUTE,
+        persisted: true,
+        BeforeShow: () => undefined,
+        reads: 0,
+    },
+    {
+        caseName: "CM00 restored after the provider is disposed",
+        path: MAIN_MENU_ROUTE,
+        persisted: true,
+        BeforeShow: (view) => {
+            view.unmount();
+        },
+        reads: 1,
+    },
+];
+
+// The pageshow event the browser fires whenever it shows a page: persisted is false for an
+// ordinary load and true for a page restored from its back/forward cache.
+async function DispatchPageShow(persisted: boolean): Promise<void> {
+    await act(async () => {
+        window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted }));
+    });
+}
+
+it.each(RESTORED_PAGE_FAILURE_CASES)(
+    "a page restored from the back/forward cache re-reads /auth/me; $caseName goes to sign-on",
+    async ({ Answer, sessionRedirects }) => {
+        window.history.replaceState(null, "", MAIN_MENU_ROUTE);
+        await RenderSignedOnSession(REGULAR_USER);
+        fetchCurrentUserMock.mockImplementationOnce(Answer);
+        await DispatchPageShow(true);
+        await WaitForSessionLoaded();
+        expect(fetchCurrentUserMock).toHaveBeenCalledTimes(2);
+        expect(ReadSignal(1).aborted).toBe(false);
+        expect(NavigationAttempts()).toBe(1);
+        expect(redirectToSignOnMock).toHaveBeenCalledTimes(sessionRedirects);
+        expect(ShownValue(USER_ID_TEST_ID)).toBe(NO_USER_SHOWN);
+        expect(LatestSession().currentUser).toBeNull();
+    },
+);
+
+it.each(RESTORED_PAGE_USER_CASES)(
+    "a page restored from the back/forward cache re-reads /auth/me and shows $caseName",
+    async ({ path, user, mainMenuReads }) => {
+        window.history.replaceState(null, "", path);
+        await RenderSignedOnSession(REGULAR_USER);
+        fetchCurrentUserMock.mockResolvedValue(user);
+        await DispatchPageShow(true);
+        await WaitForSessionLoaded();
+        expect(fetchCurrentUserMock).toHaveBeenCalledTimes(2);
+        expect(LatestSession().currentUser).toEqual(user);
+        expect(setHomeRouteMock).toHaveBeenLastCalledWith(user.next_route);
+        expect(fetchMainMenuMock).toHaveBeenCalledTimes(mainMenuReads);
+        expect(fetchAdminMenuMock).not.toHaveBeenCalled();
+        expect(redirectToSignOnMock).not.toHaveBeenCalled();
+        expect(NavigationAttempts()).toBe(0);
+    },
+);
+
+it.each(UNREAD_PAGE_SHOW_CASES)(
+    "$caseName reads /auth/me no more than the mount did and never navigates",
+    async ({ path, persisted, BeforeShow, reads }) => {
+        window.history.replaceState(null, "", path);
+        fetchCurrentUserMock.mockResolvedValue(REGULAR_USER);
+        const view = RenderSessionConsumer(CaptureSession);
+        await WaitForSessionLoaded();
+        BeforeShow(view);
+        await DispatchPageShow(persisted);
+        expect(fetchCurrentUserMock).toHaveBeenCalledTimes(reads);
+        expect(fetchMainMenuMock).not.toHaveBeenCalled();
+        expect(redirectToSignOnMock).not.toHaveBeenCalled();
+        expect(NavigationAttempts()).toBe(0);
+    },
+);

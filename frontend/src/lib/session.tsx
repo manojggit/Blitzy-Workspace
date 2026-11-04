@@ -18,6 +18,10 @@
 // the server refuses it with 403 and the apiClient interceptor returns the user to their own menu
 // with the server's message. RefreshSession reads /auth/me on every page and never navigates, so
 // its caller decides what a missing user means.
+//
+// A page the browser restores from its back/forward cache runs no effect and sends no request, so
+// the restore judges the session again exactly as the first mount does: a session that ended
+// meanwhile goes to sign-on instead of leaving the restored page an empty screen.
 import {
     createContext,
     useCallback,
@@ -301,6 +305,27 @@ function useClearSession(
     }, [setSessionState, readTracker]);
 }
 
+// A restore from the back/forward cache (pageshow with persisted set) runs no mount effect and
+// sends no request, so without this a page restored after a sign-off would never ask the server
+// and would stay an empty screen. The restore repeats the first mount's read; an ordinary load's
+// pageshow is left to the mount effect.
+function useRestoredPageRecheck(
+    setSessionState: Dispatch<SetStateAction<SessionState>>,
+    readTracker: SessionReadTracker,
+): void {
+    useEffect(() => {
+        const recheckRestoredPage = (event: PageTransitionEvent): void => {
+            if (event.persisted) {
+                void ReadSession(setSessionState, readTracker, MountUserLoader());
+            }
+        };
+        window.addEventListener("pageshow", recheckRestoredPage);
+        return () => {
+            window.removeEventListener("pageshow", recheckRestoredPage);
+        };
+    }, [setSessionState, readTracker]);
+}
+
 function useSessionState(): SessionContextValue {
     const [sessionState, setSessionState] = useState<SessionState>(LOADING_SESSION_STATE);
     const readTracker = useSessionReadTracker();
@@ -309,6 +334,7 @@ function useSessionState(): SessionContextValue {
     useEffect(() => {
         void ReadSession(setSessionState, readTracker, MountUserLoader());
     }, [readTracker]);
+    useRestoredPageRecheck(setSessionState, readTracker);
     return useMemo(
         () => ({ ...sessionState, RefreshSession: refreshSession, ClearSession: clearSession }),
         [sessionState, refreshSession, clearSession],

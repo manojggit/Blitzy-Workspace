@@ -249,10 +249,21 @@ For example, CT02 refuses an amount keyed as `50` with status 400 and this body:
 Some error bodies add keys beside the four:
 
 - The CAUP and CCUP update screens add the screen's `fields`, `state` and `screen_token`, so the
-    page can redisplay what was keyed.
-- The CCLI, CT00 and CU00 invalid-selection refusals add the redisplayed list page: `rows`, `page`,
-    `first_key` and `last_key`.
+    page can redisplay what was keyed. `AccountScreenErrorResponse` and `CardScreenErrorResponse`
+    declare them on the 400, 404 and 503 of each `/edit` fetch and on the 400, 404, 409, 423 and
+    503 of each `PUT`. Unlike a `CardScreen`, a CCUP error body carries no `card_ref`.
+- The CCLI selection refusals add the redisplayed `rows`, `first_key` and `last_key`, and on
+    `GET /api/v1/cards` only, `page`. `CardListErrorResponse` declares the 400 of that route, and
+    `CardSelectionErrorResponse` the 400 of `POST /api/v1/cards/selection`.
+- The CT00 invalid-selection refusal adds the browsed `rows`, `page`, `first_key`, `last_key` and
+    `search_cleared` (`TransactionSelectionErrorResponse`).
+- The CU00 invalid-selection refusal adds the browsed `rows`, `page`, `first_key` and `last_key`
+    (`UserSelectionErrorResponse`).
 - The 422 body adds `detail` ([Input limits](#input-limits)).
+
+These named models extend `LegacyErrorResponse`, the model of the four keys, and every key they
+add is optional: a CCLI filter-edit refusal and the CT00 non-numeric search refusal carry the four
+keys alone. Every 401 and 403 is declared as `LegacyErrorResponse`.
 
 | Status | Used for |
 |---|---|
@@ -314,7 +325,9 @@ The backend serves its generated OpenAPI document and two viewers:
 They are served when `ENABLE_API_DOCS` is true, or when it is unset and `APP_ENV` is not
 `production`. Otherwise each path returns 404, so a production deployment discloses no API
 surface by default. The document declares every status each operation can return, with the
-`LegacyErrorResponse` and `LegacyValidationErrorResponse` error models.
+`LegacyErrorResponse` and `LegacyValidationErrorResponse` error models. Some error statuses of
+CAUP, CCLI, CCUP, CT00 and CU00 instead reference an endpoint-specific model that extends
+`LegacyErrorResponse` ([Error contract](#error-contract)).
 
 ## Endpoint index
 
@@ -858,8 +871,9 @@ the SSN and the phone numbers in parts. Each field's maximum length is its BMS l
 `cust_id` and `addr_country_cd` are display-only in every state
 ([Screen state machine](#screen-state-machine)).
 
-Other outcomes, each with `acct_id` named and, unless stated, the key screen in state
-`DETAILS_NOT_FETCHED` with `info_message` `Enter or update id of account to update`:
+Other outcomes, each an `AccountScreenErrorResponse` with `acct_id` named and, unless stated,
+the key screen in state `DETAILS_NOT_FETCHED` with `info_message`
+`Enter or update id of account to update`:
 
 - 400 `No input received`: the key is blank.
 - 400 `Account Number if supplied must be a 11 digit Non-Zero Number`.
@@ -888,7 +902,7 @@ screen's state machine on the state that `screen_token` carries, and returns the
 | `fields` | `AccountScreenFields` | The screen's fields as keyed |
 
 The response is an `AccountScreen`: the four standard keys, `fields`, `state` and a new
-`screen_token`. Error bodies carry the same keys.
+`screen_token`. Error bodies (`AccountScreenErrorResponse`) carry the same keys.
 
 #### Screen state machine
 
@@ -1341,8 +1355,8 @@ Other outcomes:
 - 400 `ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER` (`acct_id`).
 - 400 `CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER` (`card_num`).
 - 400 `PLEASE SELECT ONLY ONE RECORD TO VIEW OR UPDATE`: more than one `S` or `U`.
-    `field_errors` names each selected row, such as `rows[0].selection`, and the body adds the
-    redisplayed `rows`, `page`, `first_key` and `last_key`.
+    `field_errors` names each selected row, such as `rows[0].selection`, and the body
+    (`CardListErrorResponse`) adds the redisplayed `rows`, `page`, `first_key` and `last_key`.
 - 400 `INVALID ACTION CODE`: a selection code other than `S`, `U` or blank, with the same
     redisplayed page.
 
@@ -1393,8 +1407,9 @@ page with the returned `card_ref`.
 Other outcomes:
 
 - 400 with the filter literals, `PLEASE SELECT ONLY ONE RECORD TO VIEW OR UPDATE` or
-    `INVALID ACTION CODE`, as for [`GET /api/v1/cards`](#get-apiv1cards), with the redisplayed
-    page.
+    `INVALID ACTION CODE`, as for [`GET /api/v1/cards`](#get-apiv1cards). The two selection
+    literals come with the redisplayed `rows`, `first_key` and `last_key`, but no `page`
+    (`CardSelectionErrorResponse`).
 - 404 `Did not find cards for this search condition`: the row's `card_ref` is invalid or expired.
 
 ### GET /api/v1/cards/{cardNum}
@@ -1502,7 +1517,7 @@ travels only in the encrypted before-image inside `screen_token`, and a save kee
 | `expiry_year` | 4 |
 
 Other outcomes are those of [`GET /api/v1/cards/{cardNum}`](#get-apiv1cardscardnum), each with
-the key screen in state `DETAILS_NOT_FETCHED`.
+the key screen in state `DETAILS_NOT_FETCHED` (`CardScreenErrorResponse`).
 
 ### PUT /api/v1/cards/{cardNum}
 
@@ -1749,9 +1764,9 @@ Other outcomes:
 
 - A non-blank code other than `S` or `s`, on a row whose `tran_id` is not blank, sets
     `Invalid selection. Valid value is S`, and the list is browsed again from `search_tran_id`. When
-    that literal stays, the answer is 400 with the browsed `rows`, `page`, `first_key`, `last_key`
-    and `search_cleared`. When the browse replaces it with a paging literal, the answer is a 200
-    list with `route` null.
+    that literal stays, the answer is 400 (`TransactionSelectionErrorResponse`) with the browsed
+    `rows`, `page`, `first_key`, `last_key` and `search_cleared`. When the browse replaces it with
+    a paging literal, the answer is a 200 list with `route` null.
 - 400 `Tran ID must be Numeric ...` (`search_tran_id`): no row was routed by `S` or `s`, and the
     search key is not numeric. On an empty file the answer is `You are at the top of the page...`
     instead.

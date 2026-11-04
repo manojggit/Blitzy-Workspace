@@ -29,6 +29,7 @@ import {
 import {
     ListCards,
     SelectCards,
+    type CardListErrorResponse,
     type CardListQuery,
     type CardListResponse,
     type CardListRow,
@@ -43,7 +44,6 @@ import {
     SeverityForOutcome,
     TakePendingMessage,
     ToScreenFeedback,
-    type LegacyErrorResponse,
     type MessageSeverity,
     type OutcomeFlags,
     type PageState,
@@ -160,13 +160,9 @@ const NO_MESSAGES: ScreenMessages = {
 };
 
 // A refused selection redisplays rows and page keys, and on GET /cards the page number after the
-// redisplay; a refused filter carries none of them.
-interface CardListErrorBody extends LegacyErrorResponse {
-    rows?: CardListRow[];
-    first_key?: string;
-    last_key?: string;
-    page?: number;
-}
+// redisplay; a refused filter carries none of them. The POST /cards/selection body,
+// CardSelectionErrorResponse, is the GET /cards body without page, so both read as this one.
+type CardListErrorBody = CardListErrorResponse;
 
 interface ScreenSetters {
     setList: Dispatch<SetStateAction<ListState>>;

@@ -33,6 +33,7 @@ import {
     type TransactionListResponse,
     type TransactionListRow,
     type TransactionSelection,
+    type TransactionSelectionErrorResponse,
     type TransactionSelectionResponse,
 } from "@/lib/api/transactions";
 import {
@@ -44,7 +45,6 @@ import {
     TakePendingMessage,
     ToAllowedRoute,
     ToScreenFeedback,
-    type LegacyErrorResponse,
     type MessageSeverity,
     type PageState,
     type ReadOptions,
@@ -124,10 +124,7 @@ interface ListScreen {
 // A 400 body: the four legacy keys, beside which an invalid selection code adds the page the
 // browse built and whether that browse blanked TRNIDIN. The non-numeric search key's body carries
 // the four keys only.
-interface ListRefusalBody extends LegacyErrorResponse, PageState {
-    rows?: TransactionListRow[];
-    search_cleared?: boolean;
-}
+type ListRefusalBody = TransactionSelectionErrorResponse;
 
 // Every request is offered the signal of the runner's current controller; only the
 // ListTransactions reads forward it, so the ENTER selection is never aborted.

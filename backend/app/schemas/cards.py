@@ -24,6 +24,7 @@ from app.schemas.common import (
     SCREEN_TOKEN_MAX_LENGTH,
     START_KEY_MAX_LENGTH,
     Direction,
+    LegacyErrorResponse,
     OpaqueToken,
     PageState,
     QueryModel,
@@ -139,13 +140,32 @@ class CardListResponse(PageState, ScreenFeedback):
     literals such as ``NO RECORDS FOUND FOR THIS SEARCH CONDITION.`` and
     ``NO MORE PAGES TO DISPLAY``;
     ``info_message`` carries ``TYPE S FOR DETAIL, U TO UPDATE ANY RECORD``. ``field_errors`` and
-    ``cursor_field`` name the failing filters ``acct_id`` and ``card_num``.
+    ``cursor_field`` name the failing filters ``acct_id`` and ``card_num``. A filter or
+    selection edit failure is never this model: it is the 400 ``CardListErrorResponse``.
     """
 
     rows: list[CardListRow] = Field(
         default_factory=list,
         max_length=CARD_LIST_PAGE_SIZE,
         description="The cards of the page, in card number order; at most 7.",
+    )
+
+
+class CardListErrorResponse(PageState, LegacyErrorResponse):
+    """The 400 of ``GET /cards`` (COCRDLIC, CCLI), with the page a selection error redisplays.
+
+    A selection error (2250-EDIT-ARRAY: more than one S or U, or any other code) redisplays the
+    list from the first card, so ``cocrdlic.SelectionError`` adds that page's ``rows``, ``page``,
+    ``first_key`` and ``last_key``, typed as ``CardListResponse`` types them, to the four
+    standard keys of ``LegacyErrorResponse``. A filter edit failure carries the four keys alone,
+    and the client keeps the rows it shows, so every added key has a default; none is ever null.
+    The 503 file error and the session refusals are declared as ``LegacyErrorResponse``.
+    """
+
+    rows: list[CardListRow] = Field(
+        default_factory=list,
+        max_length=CARD_LIST_PAGE_SIZE,
+        description="The cards of the redisplayed page, in card number order; at most 7.",
     )
 
 
@@ -189,18 +209,50 @@ class CardSelectionRequest(BaseModel):
 class CardSelectionResponse(ScreenFeedback):
     """Outcome of a COCRDLI selection, replacing COCRDLIC's XCTL to COCRDSLC or COCRDUPC.
 
-    A refused selection has no ``action``, and ``message`` carries
-    ``PLEASE SELECT ONLY ONE RECORD TO VIEW OR UPDATE`` or ``INVALID ACTION CODE``; the page
-    keeps its rows.
+    With no selection code there is no ``action``: the client re-reads the page. A refused
+    selection (``PLEASE SELECT ONLY ONE RECORD TO VIEW OR UPDATE`` or ``INVALID ACTION CODE``)
+    is never this model: it is the 400 ``CardSelectionErrorResponse``.
     """
 
     action: Literal["view", "update"] | None = Field(
         default=None,
-        description="view (S, COCRDSLC page) or update (U, COCRDUPC page); null when refused.",
+        description="view (S, COCRDSLC page) or update (U, COCRDUPC page); null for no selection.",
     )
     card_ref: str = Field(
         default="",
         description="The selected card's card_ref token, for the cardRef URL parameter.",
+    )
+
+
+class CardSelectionErrorResponse(LegacyErrorResponse):
+    """The 400 of ``POST /cards/selection`` (COCRDLIC, CCLI), with the redisplayed rows.
+
+    A selection error redisplays the list from the first card, so ``cocrdlic.SelectionError``
+    adds that page's ``rows``, ``first_key`` and ``last_key``, typed as ``CardListResponse``
+    types them, to the four standard keys of ``LegacyErrorResponse``. It adds no ``page``: the
+    client keeps the page number it shows. A filter edit failure carries the four keys alone,
+    so every added key has a default; none is ever null. The 404 of a stale ``card_ref``, the
+    503 file error and the session refusals are declared as ``LegacyErrorResponse``.
+    """
+
+    rows: list[CardListRow] = Field(
+        default_factory=list,
+        max_length=CARD_LIST_PAGE_SIZE,
+        description="The cards of the redisplayed page, in card number order; at most 7.",
+    )
+    first_key: str = Field(
+        default="",
+        description=(
+            "Opaque paging token of the redisplayed page, sent back as startKey with direction "
+            "backward (F7)."
+        ),
+    )
+    last_key: str = Field(
+        default="",
+        description=(
+            "Opaque paging token of the redisplayed page, sent back as startKey with direction "
+            "forward (F8)."
+        ),
     )
 
 
@@ -288,6 +340,40 @@ class CardScreen(ScreenFeedback):
     card_ref: str = Field(
         default="",
         description="The card_ref token of the card shown; empty before a card is fetched.",
+    )
+
+
+class CardScreenErrorResponse(LegacyErrorResponse):
+    """The error body of a CCUP outcome (COCRDUPC), with the COCRDUP screen it sends back.
+
+    Every 400, 404, 409, 423 and 503 of ``GET /cards/{cardNum}/edit`` and
+    ``PUT /cards/{cardNum}`` is built by ``cocrdupc.ScreenError``: the four standard keys of
+    ``LegacyErrorResponse`` plus the screen's ``fields``, ``state`` and ``screen_token``, typed
+    as ``CardScreen`` types them, so the page keeps the state machine running on the error. It
+    carries no ``card_ref``. The session and Origin refusals (401, 403) carry the four keys
+    alone and are declared as ``LegacyErrorResponse``. The screen keys have defaults, the empty
+    DETAILS_NOT_FETCHED key screen with no token, only so that a four-key body validates too;
+    none of them is ever null.
+    """
+
+    fields: CardScreenFields = Field(
+        default_factory=CardScreenFields,
+        description="The screen fields shown with the message; card_num is always masked.",
+    )
+    state: UpdateScreenState = Field(
+        default=UpdateScreenState.DETAILS_NOT_FETCHED,
+        description=(
+            "The screen state after the request, replacing CCUP-CHANGE-ACTION: for example "
+            "DETAILS_NOT_FETCHED after a key edit or read failure, CHANGES_NOT_OK after a field "
+            "edit failure, CHANGES_FAILED after 423 or the 503 rewrite failure."
+        ),
+    )
+    screen_token: str = Field(
+        default="",
+        description=(
+            "The new encrypted screen state, replacing the COCRDUPC COMMAREA; send it back "
+            "unchanged with the next request."
+        ),
     )
 
 

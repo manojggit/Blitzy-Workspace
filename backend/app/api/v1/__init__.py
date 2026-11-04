@@ -17,9 +17,14 @@ Modules:
 
 ``LegacyErrorResponses`` declares the legacy error body, ``LegacyErrorResponse``, for each
 non-2xx status a route lists in its ``responses=``, so the OpenAPI document describes every
-legacy outcome. The 422 body is declared app-wide as ``LegacyValidationErrorResponse`` by
-app.main. This package imports no router, settings or service, because importing any router
-module loads this file first.
+legacy outcome. Where a route's outcomes add keys beside the four standard ones, its router
+declares the subclass naming them, through ``model``, on exactly the statuses that can carry
+them, and LegacyErrorResponse on every other status: the CAUP and CCUP screens
+(``AccountScreenErrorResponse``, ``CardScreenErrorResponse``), the CCLI redisplayed list
+(``CardListErrorResponse``, ``CardSelectionErrorResponse``), and the CT00 and CU00 browsed
+page (``TransactionSelectionErrorResponse``, ``UserSelectionErrorResponse``). The 422 body is
+declared app-wide as ``LegacyValidationErrorResponse`` by app.main. This package imports no
+router, settings or service, because importing any router module loads this file first.
 
 ``LosslessKeyRoute`` is the route class of the routers whose path carries a raw screen key
 (accounts, cards, transactions, admin_users). A 3270 key may hold ``/``, which the client
@@ -62,10 +67,16 @@ ERROR_DESCRIPTIONS: dict[int, str] = {
 }
 
 
-def LegacyErrorResponses(*statusCodes: int) -> dict[int | str, dict[str, Any]]:
-    """Return the ``responses=`` entries declaring the legacy error body for each status."""
+def LegacyErrorResponses(
+    *statusCodes: int, model: type[LegacyErrorResponse] = LegacyErrorResponse
+) -> dict[int | str, dict[str, Any]]:
+    """Return the ``responses=`` entries declaring ``model`` as the error body of each status.
+
+    ``model`` is LegacyErrorResponse, or a subclass naming the keys some outcomes of a route
+    add beside the four standard ones; it is declared only on the statuses that can carry them.
+    """
     return {
-        status: {"model": LegacyErrorResponse, "description": ERROR_DESCRIPTIONS[status]}
+        status: {"model": model, "description": ERROR_DESCRIPTIONS[status]}
         for status in statusCodes
     }
 

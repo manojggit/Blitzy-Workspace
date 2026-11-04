@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from app.schemas.common import (
     SCREEN_TOKEN_MAX_LENGTH,
+    LegacyErrorResponse,
     MoneyAmount,
     OpaqueToken,
     ScreenFeedback,
@@ -301,10 +302,11 @@ class AccountScreenFields(BaseModel):
 class AccountScreen(ScreenFeedback):
     """The COACTUP screen of COACTUPC (CAUP), after the edit fetch and after every update.
 
-    It is returned on success and on edit failure alike, so the page renders each field
-    editable or read-only from ``state``, as the COACTUP attribute bytes did. ``field_errors``
-    lists every failing field in source edit order (all-field mode) and ``cursor_field`` the
-    first of them.
+    It is the 200 body; a 400, 404, 409, 423 or 503 outcome sends the same screen back in an
+    ``AccountScreenErrorResponse``, so the page renders each field editable or read-only from
+    ``state``, as the COACTUP attribute bytes did, whatever the status. ``field_errors`` lists
+    every failing field in source edit order (all-field mode) and ``cursor_field`` the first of
+    them.
     """
 
     fields: AccountScreenFields = Field(
@@ -320,6 +322,40 @@ class AccountScreen(ScreenFeedback):
             "Encrypted replacement of the COACTUPC COMMAREA: the state, the account key, the "
             "fetched before-image and, in CHANGES_OK_NOT_CONFIRMED, the validated new values. "
             "Send it back unchanged with the next request."
+        ),
+    )
+
+
+class AccountScreenErrorResponse(LegacyErrorResponse):
+    """The error body of a CAUP outcome (COACTUPC), with the COACTUP screen it sends back.
+
+    Every 400, 404, 409, 423 and 503 of ``GET /accounts/{acctId}/edit`` and
+    ``PUT /accounts/{acctId}`` is built by ``coactupc.RaiseScreenError``: the four standard keys
+    of ``LegacyErrorResponse`` plus the screen's ``fields``, ``state`` and ``screen_token``,
+    typed as ``AccountScreen`` types them, so the page keeps the state machine running on the
+    error. The session and Origin refusals (401, 403) carry the four keys alone and are
+    declared as ``LegacyErrorResponse``. The screen keys have defaults, the empty
+    DETAILS_NOT_FETCHED key screen with no token, only so that a four-key body validates too;
+    none of them is ever null.
+    """
+
+    fields: AccountScreenFields = Field(
+        default_factory=AccountScreenFields,
+        description="The COACTUP fields shown with the message, as the service formatted them.",
+    )
+    state: UpdateScreenState = Field(
+        default=UpdateScreenState.DETAILS_NOT_FETCHED,
+        description=(
+            "The screen state after the request, replacing ACUP-CHANGE-ACTION: for example "
+            "CHANGES_NOT_OK after a field edit failure, SHOW_DETAILS with the fresh records "
+            "after 409, CHANGES_FAILED after 423 or the 503 rewrite failure."
+        ),
+    )
+    screen_token: str = Field(
+        default="",
+        description=(
+            "The new encrypted screen state, replacing the COACTUPC COMMAREA; send it back "
+            "unchanged with the next request."
         ),
     )
 

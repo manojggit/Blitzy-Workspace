@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from app.schemas.common import (
     QUERY_PAGE_NUMBER,
     Direction,
+    LegacyErrorResponse,
     MoneyAmount,
     PageState,
     QueryModel,
@@ -212,9 +213,7 @@ class TransactionSelectionResponse(TransactionListResponse):
     A valid ``S`` selection sets ``route``, replacing the XCTL to COTRN01C, and leaves
     ``search_cleared`` false. Otherwise ``route`` is null and the inherited list fields carry
     the re-browsed page, its message and whether TRNIDIN was blanked. Neither edit failure is
-    this model. An invalid selection code the browsed page still shows is a 400 whose body adds
-    that page's ``rows``, ``page``, ``first_key``, ``last_key`` and ``search_cleared`` to the
-    four standard keys; a non-numeric search key is a 400 with the four keys only.
+    this model: both are the 400 ``TransactionSelectionErrorResponse``.
     """
 
     route: str | None = Field(
@@ -222,6 +221,32 @@ class TransactionSelectionResponse(TransactionListResponse):
         description=(
             "Frontend path of the Transaction View for a valid S selection, for example "
             "/transactions/view?tranId=TRAN_ID; null otherwise."
+        ),
+    )
+
+
+class TransactionSelectionErrorResponse(PageState, LegacyErrorResponse):
+    """The 400 of ``POST /transactions/selection`` (COTRN00C, CT00), with the browsed page.
+
+    ``Invalid selection. Valid value is S`` sets no ERR-FLG, so the list is still browsed from
+    the search key. When no paging literal replaces it, ``cotrn00c._InvalidSelectionRefusal``
+    adds that page's ``rows``, ``page``, ``first_key``, ``last_key`` and ``search_cleared``,
+    typed as ``TransactionListResponse`` types them, to the four standard keys of
+    ``LegacyErrorResponse``. ``Tran ID must be Numeric ...`` leaves the list unchanged and
+    carries the four keys alone, so every added key has a default; none is ever null. The 503
+    lookup failure and the session refusals are declared as ``LegacyErrorResponse``.
+    """
+
+    rows: list[TransactionListRow] = Field(
+        default_factory=list,
+        max_length=TRANSACTION_LIST_PAGE_SIZE,
+        description="The rows of the browsed page, in TRAN-ID (EBCDIC key) order; at most 10.",
+    )
+    search_cleared: bool = Field(
+        default=False,
+        description=(
+            "True when the browse blanked TRNIDIN (MOVE SPACE TO TRNIDINO), as every browse "
+            "after an invalid selection code does; the client then shows the search field empty."
         ),
     )
 

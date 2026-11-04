@@ -13,6 +13,7 @@ cd backend && ../.venv/bin/pytest tests/contract
 ```
 """
 
+import copy
 import dataclasses
 from collections.abc import Iterator
 from typing import Any
@@ -110,14 +111,17 @@ class ContractClients:
 
 @pytest.fixture(name="contractSchema")
 def ContractSchema(testApp: Any) -> Any:
-    """Return the schemathesis schema of the conftest's app, loaded from its /openapi.json.
+    """Return the schemathesis schema of the conftest's app, built from the document it serves.
 
-    CreateApp's lifespan connects nothing at startup, so loading through the ASGI app opens no
-    database connection outside the test's event loop. No path-parameter filter is registered:
-    schemathesis itself never generates "", ".", ".." or "/" as a path value, the values a URL
-    segment cannot carry to the declared operation.
+    FastAPI's /openapi.json route returns application.openapi(), so a copy of that document is
+    the served one, and copying keeps schemathesis from altering the app's cached document.
+    schemathesis.openapi.from_asgi is not used: it starts a second lifespan of testApp in
+    schemathesis's own event loop, whose exit would dispose of pooled connections the test's
+    loop opened. Only the conftest's lifespan disposes of the engine, in the loop that opened
+    them. No path-parameter filter is registered: schemathesis itself never generates "", ".",
+    ".." or "/" as a path value, the values a URL segment cannot carry to the declared operation.
     """
-    return schemathesis.openapi.from_asgi(OPENAPI_PATH, testApp)
+    return schemathesis.openapi.from_dict(copy.deepcopy(testApp.openapi()))
 
 
 @pytest.fixture(name="contractClients")
@@ -199,8 +203,12 @@ def ApiOperations(document: dict[str, Any]) -> Iterator[tuple[str, str, dict[str
 def IsLegacyErrorSchema(document: dict[str, Any], schemaRef: str | None) -> bool:
     """Return True when schemaRef is LegacyErrorResponse, or a component holding its four keys.
 
-    The CU00 invalid-selection 400 declares UserSelectionErrorResponse, which extends the
-    legacy error body with the re-browsed page, so the four keys decide rather than the name.
+    An endpoint-specific error model extends the legacy error body with the screen or list
+    state its page renders again: the re-browsed page of CU00's UserSelectionErrorResponse,
+    the rows and paging of CCLI's CardListErrorResponse and CardSelectionErrorResponse and of
+    CT00's TransactionSelectionErrorResponse, or the fields, state and screen_token of CAUP's
+    AccountScreenErrorResponse and CCUP's CardScreenErrorResponse. So the four keys decide,
+    not the name.
     """
     if schemaRef == LEGACY_ERROR_SCHEMA_REF:
         return True

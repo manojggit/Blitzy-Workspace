@@ -18,7 +18,7 @@ The routes are ``LosslessKeyRoute`` routes, so ``/{tranId}`` receives a TRAN-ID 
 as one value.
 """
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Path, Query
 
@@ -31,6 +31,7 @@ from app.schemas.transactions import (
     TransactionDetailResponse,
     TransactionListQuery,
     TransactionListResponse,
+    TransactionSelectionErrorResponse,
     TransactionSelectionRequest,
     TransactionSelectionResponse,
 )
@@ -46,6 +47,13 @@ TRAN_ID_PATH = Annotated[
     Path(description="Transaction ID as typed on the screen (up to 16 characters)."),
 ]
 REGULAR_CONTEXT = Annotated[OnlineContext, Depends(GetRegularContext)]
+
+# The invalid-selection 400 adds the browsed page to the legacy error body, so it declares its
+# own model; the non-numeric search 400 and the other statuses carry the legacy error body alone.
+SELECTION_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **LegacyErrorResponses(400, model=TransactionSelectionErrorResponse),
+    **LegacyErrorResponses(401, 403, 503),
+}
 
 ROUTER = APIRouter(prefix="/transactions", tags=["transactions"], route_class=LosslessKeyRoute)
 
@@ -78,12 +86,13 @@ async def ListTransactions(
     description=(
         "The first row with a selection code decides: S opens the Transaction View through "
         "route. Any other code sets the invalid-selection literal and the list is browsed "
-        "again from search_tran_id. When that literal stays, the answer is a 400 whose body "
-        "adds the browsed page's rows, page, first_key and last_key; when the browse replaces "
-        "it with a paging literal, the page is a 200. With any code but S, a non-numeric "
-        "search_tran_id is the four-key 400 'Tran ID must be Numeric ...'."
+        "again from search_tran_id. When that literal stays, the answer is a 400 "
+        "TransactionSelectionErrorResponse whose body adds the browsed page's rows, page, "
+        "first_key, last_key and search_cleared; when the browse replaces it with a paging "
+        "literal, the page is a 200. With any code but S, a non-numeric search_tran_id is the "
+        "four-key 400 'Tran ID must be Numeric ...'."
     ),
-    responses=LegacyErrorResponses(400, 401, 403, 503),
+    responses=SELECTION_RESPONSES,
 )
 async def SelectTransaction(
     selectionRequest: TransactionSelectionRequest, context: REGULAR_CONTEXT

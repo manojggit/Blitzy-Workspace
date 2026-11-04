@@ -43,8 +43,8 @@ HTTP_NOT_FOUND = 404
 HTTP_MALFORMED = 422
 
 # The error body of every legacy outcome (schemas.common.LegacyErrorResponse); the CAUP and
-# CCUP bodies also carry their screen (schemas.accounts.AccountScreen, schemas.cards.CardScreen),
-# both of which declare fields, info_message, state and screen_token.
+# CCUP bodies also carry their screen's fields, state and screen_token, as
+# schemas.accounts.AccountScreenErrorResponse and schemas.cards.CardScreenErrorResponse declare.
 LEGACY_ERROR_KEYS = frozenset({"message", "info_message", "field_errors", "cursor_field"})
 ACCOUNT_SCREEN_ERROR_KEYS = LEGACY_ERROR_KEYS | {"fields", "state", "screen_token"}
 CARD_SCREEN_ERROR_KEYS = ACCOUNT_SCREEN_ERROR_KEYS

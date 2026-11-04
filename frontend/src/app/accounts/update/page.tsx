@@ -34,6 +34,7 @@ import {
     FetchAccountForEdit,
     UpdateAccount,
     type AccountScreen,
+    type AccountScreenErrorResponse,
     type AccountScreenFields,
     type AccountUpdateRequest,
 } from "@/lib/api/accounts";
@@ -45,7 +46,6 @@ import {
     ToScreenFeedback,
     UpdateAction,
     UpdateScreenState,
-    type LegacyErrorResponse,
     type MessageSeverity,
     type ScreenFeedback,
 } from "@/lib/apiClient";
@@ -122,9 +122,8 @@ interface InFlightRequest {
     signal?: AbortSignal;
 }
 
-// The 4xx and 5xx CAUP bodies carry the screen beside the standard legacy keys.
-type AccountErrorBody = LegacyErrorResponse &
-    Partial<Pick<AccountScreen, "fields" | "state" | "screen_token">>;
+// The 400, 404, 409, 423 and 503 CAUP bodies carry the screen beside the standard legacy keys.
+type AccountErrorBody = AccountScreenErrorResponse;
 
 interface ActionContext {
     model: ScreenModel;

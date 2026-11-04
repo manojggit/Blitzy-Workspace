@@ -15,6 +15,7 @@ import {
     API_CLIENT,
     EncodePathKey,
     type Direction,
+    type LegacyErrorResponse,
     type MoneyAmount,
     type PageState,
     type ReadOptions,
@@ -74,6 +75,14 @@ export interface TransactionSelectionRequest {
 // A route for a valid S selection; null when the list keys carry the re-browsed page.
 export interface TransactionSelectionResponse extends TransactionListResponse {
     route?: string | null;
+}
+
+// The POST /transactions/selection 400: an invalid selection code adds the browsed page and
+// whether that browse blanked TRNIDIN; a non-numeric search key carries the legacy error keys
+// alone.
+export interface TransactionSelectionErrorResponse extends LegacyErrorResponse, PageState {
+    rows?: TransactionListRow[];
+    search_cleared?: boolean;
 }
 
 // The COTRN01 screen. The card number arrives masked, and both timestamps arrive as their stored

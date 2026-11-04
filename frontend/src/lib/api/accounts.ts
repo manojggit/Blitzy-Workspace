@@ -6,10 +6,12 @@
 // field; only the shared ScreenFeedback keys stay optional, as apiClient.ts defines them. Every
 // screen field travels as typed, never trimmed, padded, parsed or masked: the server runs the key
 // and field edits, the no-change check, the CAUP state machine and the save, and every legacy
-// outcome reaches the caller as a rejected call whose body LegacyErrorBody reads.
+// outcome reaches the caller as a rejected call whose body LegacyErrorBody reads; a CAUP outcome's
+// body is an AccountScreenErrorResponse, whose screen keys stay optional as its model declares.
 import {
     API_CLIENT,
     EncodePathKey,
+    type LegacyErrorResponse,
     type MoneyAmount,
     type ReadOptions,
     type ScreenFeedback,
@@ -110,6 +112,15 @@ export interface AccountScreen extends ScreenFeedback {
     fields: AccountScreenFields;
     state: UpdateScreenState;
     screen_token: string;
+}
+
+// The 400, 404, 409, 423 and 503 body of the edit fetch and the PUT: the legacy error keys plus
+// the screen the outcome sends back. The screen keys are optional, as their Pydantic fields have
+// defaults, though every such outcome carries them; none is ever null.
+export interface AccountScreenErrorResponse extends LegacyErrorResponse {
+    fields?: AccountScreenFields;
+    state?: UpdateScreenState;
+    screen_token?: string;
 }
 
 // One ENTER (enter), F5 (save) or F12 (cancel) on COACTUP. The page sends only the inputs its
