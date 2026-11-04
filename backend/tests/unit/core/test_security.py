@@ -73,11 +73,6 @@ SAMPLE_PAN = "4859452612877065"
 SAMPLE_SSN = "123456789"
 SAMPLE_USER_ID = "USER0001"
 SAMPLE_ACCT_ID = "00000000004"
-SAMPLE_SCREEN_STATE = {
-    "state": "SHOW_DETAILS",
-    "acct_id": SAMPLE_ACCT_ID,
-    "old": {"credit_limit": "1000.00"},
-}
 # A PIC X(16) card-number field holding only spaces.
 BLANK_FIELD = " " * 16
 NON_ASCII_CHARACTER = "\u00e9"
@@ -97,9 +92,20 @@ LOWER_CASE_ADMIN_TYPE = "a"
 SESSION_ALGORITHM = "HS256"
 SESSION_CLAIM_NAMES = frozenset({"sub", "typ", "iat", "exp"})
 SECONDS_PER_MINUTE = 60
-# The lifetime of hand-built session tokens, and how far short of or past its deadline a
-# Fernet token is issued.
+# The lifetime of hand-built session tokens.
 CLOCK_MARGIN_SECONDS = 60
+# How far short of or past its lifetime a Fernet token is issued: half the shortest lifetime
+# case, so even that case's accepted token has aged.
+FERNET_AGE_MARGIN_SECONDS = 30
+# The documented ACCESS_TOKEN_EXPIRE_MINUTES default.
+DEFAULT_LIFETIME_MINUTES = 60
+# ACCESS_TOKEN_EXPIRE_MINUTES values set explicitly. A lifetime fixed at the default's 3600
+# seconds instead of read from the setting fails the shorter cases.
+SESSION_LIFETIME_MINUTES = (
+    pytest.param(1, id="1_minute"),
+    pytest.param(7, id="7_minutes"),
+    pytest.param(DEFAULT_LIFETIME_MINUTES, id="default_60_minutes"),
+)
 
 LOCAL_APP_ENV = "local"
 TEST_APP_ENV = "test"
@@ -116,25 +122,50 @@ URL_SAFE_DIGITS = frozenset(URL_SAFE_ALPHABET)
 
 @dataclass(frozen=True)
 class FernetTokenKind:
-    """One Fernet navigation token kind: its codec, a sample payload and text it must hide."""
+    """One Fernet navigation token kind: its codec, its sample payload builder and hidden text."""
 
     encoder: Callable[[object, Settings], str]
     decoder: Callable[[str, Settings], object]
-    samplePayload: object
+    payloadBuilder: Callable[[], object]
     hiddenText: str
 
+    def NewPayload(self):
+        """Return a newly built sample payload, equal to every other and sharing no object."""
+        return self.payloadBuilder()
+
     def Encode(self, settings):
-        """Return a token of this kind carrying samplePayload under the key of settings."""
-        return self.encoder(self.samplePayload, settings)
+        """Return a token of this kind carrying a new sample payload under the key of settings."""
+        return self.EncodePayload(self.NewPayload(), settings)
+
+    def EncodePayload(self, payload, settings):
+        """Return a token of this kind carrying payload under the key of settings."""
+        return self.encoder(payload, settings)
 
     def Decode(self, tokenText, settings):
         """Return the payload of tokenText; raise InvalidToken when it is not valid."""
         return self.decoder(tokenText, settings)
 
 
-CARD_REF_KIND = FernetTokenKind(EncodeCardRef, DecodeCardRef, SAMPLE_PAN, SAMPLE_PAN)
+def BuildSampleCardNum():
+    """Return the card number a sample card_ref carries."""
+    return SAMPLE_PAN
+
+
+def BuildSampleScreenState():
+    """Return a new CAUP screen state: change action, account key and OLD-* before-image.
+
+    Every level is built anew, so a codec that changes one state in place changes no other.
+    """
+    return {
+        "state": "SHOW_DETAILS",
+        "acct_id": SAMPLE_ACCT_ID,
+        "old": {"credit_limit": "1000.00"},
+    }
+
+
+CARD_REF_KIND = FernetTokenKind(EncodeCardRef, DecodeCardRef, BuildSampleCardNum, SAMPLE_PAN)
 SCREEN_TOKEN_KIND = FernetTokenKind(
-    EncodeScreenToken, DecodeScreenToken, SAMPLE_SCREEN_STATE, SAMPLE_ACCT_ID
+    EncodeScreenToken, DecodeScreenToken, BuildSampleScreenState, SAMPLE_ACCT_ID
 )
 FERNET_TOKEN_KINDS = (
     pytest.param(CARD_REF_KIND, id="card_ref"),
@@ -157,15 +188,22 @@ def BuildDatabaseUrl(driverName, databasePassword):
     return f"postgresql+{driverName}://security_test:{databasePassword}@127.0.0.1/security_test"
 
 
-def BuildSettings(appEnv):
-    """Return backend Settings for appEnv with a generated SECRET_KEY and database password."""
+def BuildSettings(appEnv, lifetimeMinutes=None):
+    """Return backend Settings for appEnv with a generated SECRET_KEY and database password.
+
+    lifetimeMinutes sets ACCESS_TOKEN_EXPIRE_MINUTES; None leaves the setting at its default.
+    """
     databasePassword = secrets.token_urlsafe(DATABASE_PASSWORD_BYTES)
+    lifetimeSetting = {}
+    if lifetimeMinutes is not None:
+        lifetimeSetting["ACCESS_TOKEN_EXPIRE_MINUTES"] = lifetimeMinutes
     return Settings(
         _env_file=None,
         APP_ENV=appEnv,
         SECRET_KEY=secrets.token_urlsafe(SECRET_KEY_BYTES),
         DATABASE_URL=BuildDatabaseUrl("asyncpg", databasePassword),
         SYNC_DATABASE_URL=BuildDatabaseUrl("psycopg2", databasePassword),
+        **lifetimeSetting,
     )
 
 
@@ -258,6 +296,14 @@ def OtherKeySettings():
     return BuildSettings(TEST_APP_ENV)
 
 
+@pytest.fixture(name="lifetimeSettings")
+def LifetimeSettings(lifetimeMinutes):
+    """Return test-environment Settings whose ACCESS_TOKEN_EXPIRE_MINUTES is lifetimeMinutes."""
+    lifetimeSettings = BuildSettings(TEST_APP_ENV, lifetimeMinutes)
+    assert lifetimeSettings.ACCESS_TOKEN_EXPIRE_MINUTES == lifetimeMinutes
+    return lifetimeSettings
+
+
 @pytest.fixture(name="nestedHeaderToken")
 def NestedHeaderToken():
     """Return a token with the deeply nested header, an empty-object payload and no signature."""
@@ -303,13 +349,14 @@ def test_session_token_round_trip(userType, sessionSettings):
     assert sessionClaims == SessionClaims(userId=SAMPLE_USER_ID, userType=userType)
 
 
-def test_session_token_lifetime_matches_setting(sessionSettings):
-    sessionToken = IssueSessionToken(SAMPLE_USER_ID, REGULAR_USER_TYPE, sessionSettings)
+@pytest.mark.parametrize("lifetimeMinutes", SESSION_LIFETIME_MINUTES)
+def test_session_token_lifetime_matches_setting(lifetimeMinutes, lifetimeSettings):
+    sessionToken = IssueSessionToken(SAMPLE_USER_ID, REGULAR_USER_TYPE, lifetimeSettings)
     tokenClaims = jwt.decode(
-        sessionToken, sessionSettings.SECRET_KEY, algorithms=[SESSION_ALGORITHM]
+        sessionToken, lifetimeSettings.SECRET_KEY, algorithms=[SESSION_ALGORITHM]
     )
     assert set(tokenClaims) == SESSION_CLAIM_NAMES
-    assert tokenClaims["exp"] - tokenClaims["iat"] == SessionLifetimeSeconds(sessionSettings)
+    assert tokenClaims["exp"] - tokenClaims["iat"] == lifetimeMinutes * SECONDS_PER_MINUTE
     assert jwt.get_unverified_header(sessionToken)["alg"] == SESSION_ALGORITHM
 
 
@@ -413,12 +460,24 @@ def test_cookie_options_build_the_set_cookie_header(appEnv, secureExpected):
     assert ("Secure" in cookieAttributes) is secureExpected
 
 
+@pytest.mark.parametrize("lifetimeMinutes", SESSION_LIFETIME_MINUTES)
+def test_cookie_max_age_matches_setting(lifetimeMinutes, lifetimeSettings):
+    lifetimeSeconds = lifetimeMinutes * SECONDS_PER_MINUTE
+    cookieOptions = SessionCookieOptions(lifetimeSettings)
+    response = Response()
+    response.set_cookie(lifetimeSettings.SESSION_COOKIE_NAME, SAMPLE_USER_ID, **cookieOptions)
+    assert cookieOptions["max_age"] == lifetimeSeconds
+    assert f"Max-Age={lifetimeSeconds}" in response.headers["set-cookie"].split("; ")
+
+
 # --- Fernet navigation tokens: card_ref and screen_token -----------------------------------------
 @pytest.mark.parametrize("tokenKind", FERNET_TOKEN_KINDS)
 def test_fernet_token_round_trip(tokenKind, sessionSettings):
-    tokenText = tokenKind.Encode(sessionSettings)
+    encodedPayload = tokenKind.NewPayload()
+    tokenText = tokenKind.EncodePayload(encodedPayload, sessionSettings)
     assert tokenKind.hiddenText not in tokenText
-    assert tokenKind.Decode(tokenText, sessionSettings) == tokenKind.samplePayload
+    assert encodedPayload == tokenKind.NewPayload()
+    assert tokenKind.Decode(tokenText, sessionSettings) == tokenKind.NewPayload()
 
 
 @pytest.mark.parametrize("tokenKind", FERNET_TOKEN_KINDS)
@@ -451,15 +510,18 @@ def test_fernet_token_of_other_kind_is_refused(issuedKind, presentedKind, sessio
         presentedKind.Decode(issuedToken, sessionSettings)
 
 
+@pytest.mark.parametrize("lifetimeMinutes", SESSION_LIFETIME_MINUTES)
 @pytest.mark.parametrize("tokenKind", FERNET_TOKEN_KINDS)
-def test_fernet_token_expires_with_the_session(tokenKind, sessionSettings):
-    tokenLifetime = SessionLifetimeSeconds(sessionSettings)
-    youngToken = EncodeAtAge(tokenKind, sessionSettings, tokenLifetime - CLOCK_MARGIN_SECONDS)
-    expiredToken = EncodeAtAge(tokenKind, sessionSettings, tokenLifetime + CLOCK_MARGIN_SECONDS)
+def test_fernet_token_expires_with_the_session(tokenKind, lifetimeMinutes, lifetimeSettings):
+    tokenLifetime = lifetimeMinutes * SECONDS_PER_MINUTE
+    youngAge = tokenLifetime - FERNET_AGE_MARGIN_SECONDS
+    expiredAge = tokenLifetime + FERNET_AGE_MARGIN_SECONDS
+    youngToken = EncodeAtAge(tokenKind, lifetimeSettings, youngAge)
+    expiredToken = EncodeAtAge(tokenKind, lifetimeSettings, expiredAge)
     assert fernet.time is time
-    assert tokenKind.Decode(youngToken, sessionSettings) == tokenKind.samplePayload
+    assert tokenKind.Decode(youngToken, lifetimeSettings) == tokenKind.NewPayload()
     with pytest.raises(InvalidToken):
-        tokenKind.Decode(expiredToken, sessionSettings)
+        tokenKind.Decode(expiredToken, lifetimeSettings)
 
 
 @pytest.mark.parametrize("stateText", NON_OBJECT_STATE_TEXTS)

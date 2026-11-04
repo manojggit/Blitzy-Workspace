@@ -18,7 +18,8 @@ SECRET_KEY; and GetSettings builds Settings once until cache_clear().
 
 Every key and password is generated at run time with the secrets module. Variables change only
 through monkeypatch, so the bootstrap environment of tests/conftest.py is restored after each
-test, and backend/.env is never read (_env_file=None, or no env_file for GetSettings).
+test, and backend/.env is never read (_env_file=None, or no env_file for GetSettings). The
+log-record rendering gives the shared settings logger back with its level and handlers.
 """
 
 import io
@@ -84,17 +85,24 @@ def RenderAsDict(settingsObject):
 
 
 def RenderThroughLogRecord(settingsObject):
-    """Return what a logging handler writes for a record that formats settingsObject."""
+    """Return what a logging handler writes for a record that formats settingsObject.
+
+    The shared settings logger is given back with the level and handlers it had, and the
+    temporary handler is closed, even when logging the record fails.
+    """
     logStream = io.StringIO()
     logHandler = logging.StreamHandler(logStream)
     settingsLogger = logging.getLogger(SETTINGS_LOGGER_NAME)
-    settingsLogger.setLevel(logging.INFO)
-    settingsLogger.addHandler(logHandler)
+    originalLevel = settingsLogger.level
     try:
+        settingsLogger.setLevel(logging.INFO)
+        settingsLogger.addHandler(logHandler)
         settingsLogger.info("settings: %s", settingsObject)
+        return logStream.getvalue()
     finally:
         settingsLogger.removeHandler(logHandler)
-    return logStream.getvalue()
+        logHandler.close()
+        settingsLogger.setLevel(originalLevel)
 
 
 def LoginMaxAttemptsOutcome(attemptLimit, secretKey, databasePassword):
@@ -210,6 +218,26 @@ def ClearedSettingsCache():
     GetSettings.cache_clear()
 
 
+@pytest.fixture(name="warningSettingsLogger")
+def WarningSettingsLogger():
+    """Yield the settings logger at WARNING with one handler of its own, then restore it.
+
+    WARNING differs from the INFO level RenderThroughLogRecord logs at, and the extra handler
+    stands for one already attached, so a test sees whether the helper gives back both. At
+    teardown the logger gets back the level and handlers it had before the fixture ran.
+    """
+    settingsLogger = logging.getLogger(SETTINGS_LOGGER_NAME)
+    priorLevel = settingsLogger.level
+    priorHandlers = list(settingsLogger.handlers)
+    attachedHandler = logging.NullHandler()
+    settingsLogger.setLevel(logging.WARNING)
+    settingsLogger.addHandler(attachedHandler)
+    yield settingsLogger
+    settingsLogger.handlers = priorHandlers
+    settingsLogger.setLevel(priorLevel)
+    attachedHandler.close()
+
+
 @pytest.mark.parametrize(
     "renderSettings",
     [repr, str, Settings.model_dump_json, RenderAsDict, RenderThroughLogRecord],
@@ -222,6 +250,14 @@ def test_settings_renderings_omit_key_and_password(
     assert "BCRYPT_ROUNDS" in renderedText
     assert secretKey not in renderedText
     assert databasePassword not in renderedText
+
+
+def test_log_record_rendering_gives_back_the_logger_state(warningSettingsLogger, runtimeSettings):
+    handlersBefore = list(warningSettingsLogger.handlers)
+    renderedText = RenderThroughLogRecord(runtimeSettings)
+    assert "BCRYPT_ROUNDS" in renderedText
+    assert warningSettingsLogger.level == logging.WARNING
+    assert warningSettingsLogger.handlers == handlersBefore
 
 
 @pytest.mark.parametrize(

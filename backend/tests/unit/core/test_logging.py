@@ -420,16 +420,30 @@ def test_configure_logging_is_idempotent():
     assert countsAfterSecondCall == countsAfterFirstCall
 
 
-def AttachUvicornHandler(logger: logging.Logger) -> io.StringIO:
-    """Give a logger a handler as Uvicorn's default configuration does: no time, no filter.
+def AttachEarlierHandler(logger: logging.Logger) -> None:
+    """Give a logger a handler it already holds when Uvicorn's default configuration is applied.
 
-    The logger stops propagating and logs at INFO, as Uvicorn 0.34.0's LOGGING_CONFIG sets the
-    "uvicorn" and uvicorn.access loggers. Returns the stream the handler writes to.
+    The handler writes Uvicorn's no-time format, like one an earlier Uvicorn configuration in
+    the same process leaves behind.
+    """
+    earlierHandler = logging.StreamHandler(io.StringIO())
+    earlierHandler.setFormatter(logging.Formatter(UVICORN_DEFAULT_FORMAT))
+    logger.addHandler(earlierHandler)
+
+
+def AttachUvicornHandler(logger: logging.Logger) -> io.StringIO:
+    """Give a logger the one handler Uvicorn's default configuration gives it: no time, no filter.
+
+    Uvicorn 0.34.0 applies its LOGGING_CONFIG through logging.config.dictConfig, which removes
+    every handler a logger holds before adding its own, so this handler replaces any earlier
+    one; the isolatedLogging fixture puts the earlier ones back afterwards. The logger stops
+    propagating and logs at INFO, as that configuration sets the "uvicorn" and uvicorn.access
+    loggers. Returns the stream the handler writes to.
     """
     capturedOutput = io.StringIO()
     uvicornHandler = logging.StreamHandler(capturedOutput)
     uvicornHandler.setFormatter(logging.Formatter(UVICORN_DEFAULT_FORMAT))
-    logger.addHandler(uvicornHandler)
+    logger.handlers = [uvicornHandler]
     logger.propagate = False
     logger.setLevel(logging.INFO)
     return capturedOutput
@@ -441,10 +455,20 @@ def EmitUvicornLines(accessLogger: logging.Logger) -> None:
     EmitAccessRecord(accessLogger, PAN_REQUEST_PATH)
 
 
+@pytest.mark.parametrize(
+    "earlierHandlerPresent",
+    [
+        pytest.param(False, id="no-earlier-handler"),
+        pytest.param(True, id="earlier-handler"),
+    ],
+)
 @pytest.mark.usefixtures("isolatedLogging")
-def test_uvicorn_handlers_write_the_timestamped_line_format():
+def test_uvicorn_handlers_write_the_timestamped_line_format(earlierHandlerPresent):
     serverLogger = logging.getLogger(SERVER_LOGGER_NAME)
     accessLogger = logging.getLogger(ACCESS_LOGGER_NAME)
+    if earlierHandlerPresent:
+        AttachEarlierHandler(serverLogger)
+        AttachEarlierHandler(accessLogger)
     serverOutput = AttachUvicornHandler(serverLogger)
     accessOutput = AttachUvicornHandler(accessLogger)
     ConfigureLogging()
