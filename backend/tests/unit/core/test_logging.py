@@ -275,3 +275,22 @@ def test_configure_logging_is_idempotent():
     countsAfterSecondCall = (len(rootLogger.handlers), len(MaskingFiltersOf(accessLogger)))
     assert countsAfterFirstCall == (rootHandlerCountBefore + 1, 1)
     assert countsAfterSecondCall == countsAfterFirstCall
+
+
+@pytest.mark.usefixtures("isolatedLogging")
+def test_stdout_handler_follows_a_replaced_and_closed_stdout(monkeypatch):
+    # Click's CliRunner swaps in and closes a stdout for every in-process batch command.
+    ConfigureLogging()
+    applicationLogger = logging.getLogger(APPLICATION_LOGGER_NAME)
+    firstStdout, laterStdout, stderrOutput = io.StringIO(), io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderrOutput)
+    monkeypatch.setattr(sys, "stdout", firstStdout)
+    applicationLogger.info(CARD_MESSAGE, SAMPLE_PAN)
+    firstOutput = firstStdout.getvalue()
+    firstStdout.close()
+    monkeypatch.setattr(sys, "stdout", laterStdout)
+    applicationLogger.info(CARD_MESSAGE, SECOND_SAMPLE_PAN)
+    assert MASKED_PAN in firstOutput
+    assert MASKED_SECOND_PAN in laterStdout.getvalue()
+    assert SECOND_SAMPLE_PAN not in laterStdout.getvalue()
+    assert stderrOutput.getvalue() == ""

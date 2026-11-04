@@ -61,6 +61,7 @@ import sys
 import types
 import urllib.parse
 from collections.abc import Mapping
+from typing import TextIO
 
 PAN_RUN_PATTERN = re.compile(r"(?<![0-9])[0-9]{12}([0-9]{4})(?![0-9])")
 MASKED_PAN_REPLACEMENT = r"************\1"
@@ -577,9 +578,28 @@ class PanMaskingFilter(logging.Filter):
         return True
 
 
+class CurrentStdoutHandler(logging.StreamHandler):
+    """A stream handler that writes each record to sys.stdout as it stands at that moment.
+
+    A handler bound to the stream of its first configuration breaks once that stream is
+    swapped and closed, as Click's CliRunner does for every in-process carddemo-batch command:
+    each later record then fails, and logging prints the failure, with the exception chain the
+    record was logged in, to stderr. logging.lastResort resolves sys.stderr the same way.
+    """
+
+    def __init__(self) -> None:
+        # StreamHandler.__init__ would assign the stream, which this handler never stores.
+        logging.Handler.__init__(self)
+
+    @property
+    def stream(self) -> TextIO:
+        """Return the current sys.stdout."""
+        return sys.stdout
+
+
 def BuildStdoutHandler() -> logging.Handler:
     """Return the named stdout handler that masks every record it writes."""
-    stdoutHandler = logging.StreamHandler(sys.stdout)
+    stdoutHandler = CurrentStdoutHandler()
     stdoutHandler.name = HANDLER_NAME
     stdoutHandler.setFormatter(logging.Formatter(LOG_LINE_FORMAT))
     stdoutHandler.addFilter(PanMaskingFilter())
