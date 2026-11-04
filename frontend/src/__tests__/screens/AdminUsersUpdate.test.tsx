@@ -123,6 +123,15 @@ interface BlankExitCase {
     route: string;
 }
 
+// A same-route step between the two queries that select no user, and where F3 then returns.
+interface BlankArrivalSwitchCase {
+    from: string;
+    to: string;
+    fromQuery: string;
+    toQuery: string;
+    route: string;
+}
+
 type TriggerMode = "click" | "key";
 
 // [literal, HTTP status, message-line severity]; HTTP 200 is a resolved call.
@@ -185,6 +194,25 @@ const BLANK_EXIT_CASES: readonly BlankExitCase[] = [
         destination: "COUSR00C (/admin/users)",
         opener: "the list sent an empty userId",
         route: USER_LIST_ROUTE,
+    },
+];
+
+// A missing and an empty userId both select no user, yet each is an arrival of its own, because
+// only the empty one returns F3 to COUSR00C.
+const BLANK_ARRIVAL_SWITCH_CASES: readonly BlankArrivalSwitchCase[] = [
+    {
+        from: "no userId",
+        to: "an empty userId",
+        fromQuery: "",
+        toQuery: "userId=",
+        route: USER_LIST_ROUTE,
+    },
+    {
+        from: "an empty userId",
+        to: "no userId",
+        fromQuery: "userId=",
+        toQuery: "",
+        route: ADMIN_MENU_ROUTE,
     },
 ];
 
@@ -547,6 +575,37 @@ async function SettleQueuedWork(): Promise<void> {
     });
 }
 
+// A same-route push or history step to the given query string, which may carry no userId.
+function NavigateToQuery(view: ScreenView, query: string): void {
+    mockSearchParams = new URLSearchParams(query);
+    view.Rerender();
+}
+
+// Keys the User ID on USRIDIN and presses ENTER.
+async function KeyAndFetch(view: ScreenView, userIdText: string): Promise<void> {
+    await view.user.type(FieldInput(USER_ID_LABEL), userIdText);
+    await Trigger(view, FETCH_ACTION, "key");
+}
+
+// Opened under the given query, with TEST_USER_ID keyed and its record fetched by ENTER.
+async function RenderWithFetchedUser(query: string): Promise<ScreenView> {
+    mockSearchParams = new URLSearchParams(query);
+    mockFetchUser.mockResolvedValue(BuildUserDetail());
+    const view = RenderScreen();
+    await KeyAndFetch(view, TEST_USER_ID);
+    await screen.findByDisplayValue(FETCHED_LAST_NAME);
+    await WaitForIdle();
+    return view;
+}
+
+// A first entry that selected no user: every COUSR2A field blank and no message.
+function ExpectBlankEntry(): void {
+    for (const label of ALL_FIELD_LABELS) {
+        expect(FieldInput(label)).toHaveValue("");
+    }
+    expect(screen.queryByRole("alert")).toBeNull();
+}
+
 beforeEach(() => {
     mockSearchParams = new URLSearchParams();
     mockFetchUser.mockReset();
@@ -671,6 +730,48 @@ describe("COUSR02C history step back to the previously selected user", () => {
         ExpectLastFetchOf(TEST_USER_ID);
         expect(FieldInput(USER_ID_LABEL)).toHaveValue(TEST_USER_ID);
     });
+});
+
+// Neither arrival fetches, so the step shows only through the state the new entry starts with.
+describe("COUSR02C same-route step between a missing and an empty userId", () => {
+    it.each(BLANK_ARRIVAL_SWITCH_CASES)(
+        "COUSR02C from $from to $to re-enters blank; PF5 saves SPACES, PF3 goes to $route",
+        async ({ fromQuery, toQuery, route }) => {
+            const view = await RenderWithFetchedUser(fromQuery);
+            NavigateToQuery(view, toQuery);
+            ExpectBlankEntry();
+            ArrangeSaveOutcome(USER_ID_EMPTY_MESSAGE, HTTP_BAD_REQUEST);
+            await Trigger(view, SAVE_ACTION, "key");
+            await ExpectAlert(USER_ID_EMPTY_MESSAGE, "error");
+            await WaitForIdle();
+            expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+            expect(mockUpdateUser).toHaveBeenCalledWith(BLANK_USER_ID, BLANK_REQUEST);
+            await Trigger(view, SAVE_AND_EXIT_ACTION, "key");
+            await ExpectNavigationTo(route);
+            expect(mockUpdateUser).toHaveBeenLastCalledWith(BLANK_USER_ID, BLANK_REQUEST);
+            expect(mockFetchUser).toHaveBeenCalledTimes(1);
+        },
+    );
+});
+
+describe("COUSR02C late answer for a fetch in flight across a missing/empty userId step", () => {
+    it.each(BLANK_ARRIVAL_SWITCH_CASES)(
+        "COUSR02C from $from to $to aborts the ENTER fetch; its answer leaves the entry blank",
+        async ({ fromQuery, toQuery }) => {
+            mockSearchParams = new URLSearchParams(fromQuery);
+            const settleFetch = DeferNextFetch();
+            const view = RenderScreen();
+            await KeyAndFetch(view, TEST_USER_ID);
+            expect(mockFetchUser).toHaveBeenCalledTimes(1);
+            NavigateToQuery(view, toQuery);
+            expect(FetchSignal(0)?.aborted).toBe(true);
+            await act(async () => {
+                settleFetch(BuildUserDetail());
+            });
+            ExpectBlankEntry();
+            expect(screen.queryByRole("progressbar")).toBeNull();
+        },
+    );
 });
 
 describe("COUSR02C ENTER (PROCESS-ENTER-KEY)", () => {

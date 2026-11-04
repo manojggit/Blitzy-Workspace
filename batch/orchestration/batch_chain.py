@@ -561,6 +561,48 @@ def FirstIncompleteStep(context: JobContext) -> ChainStep | None:
     )
 
 
+def FirstRefusedStep(
+    context: JobContext, steps: tuple[ChainStep, ...], forcedStepNo: int | None
+) -> ChainStep | None:
+    """Return the first of the steps run-all must refuse in the context's cycle, or None.
+
+    That is a per-write step left FAILED or INTERRUPTED, other than the forced step. Its partial
+    effects survive only while no step runs before the refusal: an earlier TRANBKP would archive
+    and delete the postings a forced rerun has to start from.
+    """
+    stepStates = run_ledger.StepStates(context, context.cycleId)
+    return next(
+        (
+            step
+            for step in steps
+            if step.durability == DURABILITY_PER_WRITE
+            and step.stepNo != forcedStepNo
+            and stepStates[step.stepNo] in PER_WRITE_REFUSED_STATES
+        ),
+        None,
+    )
+
+
+def RefusedBeforeExecution(
+    context: JobContext, steps: tuple[ChainStep, ...], forcedStepNo: int | None
+) -> bool:
+    """Log and return True when run-all must refuse one of its steps before executing any.
+
+    The step refused is the first FirstRefusedStep finds. A financial loader that run-all would
+    execute before it is refused by the reload rule in its place, as run-all reaches the loader
+    first. Either way no step executes and no run is recorded.
+    """
+    refusedStep = FirstRefusedStep(context, steps, forcedStepNo)
+    if refusedStep is None:
+        return False
+    for step in steps[: steps.index(refusedStep)]:
+        decision = DecideStep(context, step, step.stepNo == forcedStepNo)
+        if decision == DECISION_EXECUTE and RefusedByFinancialReload(context, step):
+            return True
+    RefuseStep(context, refusedStep)
+    return True
+
+
 def RefusedByLostGenerations(context: JobContext) -> bool:
     """Log and return True while the OPEN cycle has a LOST generation, which blocks it."""
     try:
@@ -612,20 +654,30 @@ def PlanChainSteps(
     """Return the steps run-all processes and the one step --force applies to, if any.
 
     With --start-at the steps run from the start step on, and steps before it are not
-    considered. Without it every step is processed, so completed ones get SKIPPED rows, and
-    --force applies to the first step not yet COMPLETED, never implicitly to another.
+    considered. Without it every step is processed, so completed ones get SKIPPED rows. --force
+    without --start-at applies to the cycle's first FAILED or INTERRUPTED per-write step, run
+    from that step on as --start-at STEP --force runs it, so no earlier step runs over its
+    partial state; with none, to the first step not yet COMPLETED. It never applies implicitly.
     """
     if candidates is not None:
         start = ChooseOccurrence(cycleContext, candidates, None)
         return CHAIN[start.stepNo - 1 :], start.stepNo if force else None
     if not force:
         return CHAIN, None
+    refusedStep = FirstRefusedStep(cycleContext, CHAIN, None)
+    if refusedStep is not None:
+        return CHAIN[refusedStep.stepNo - 1 :], refusedStep.stepNo
     firstIncomplete = FirstIncompleteStep(cycleContext)
     return CHAIN, None if firstIncomplete is None else firstIncomplete.stepNo
 
 
 def RunChain(context: JobContext, options: ChainOptions) -> int:
-    """Run or resume the 18-step chain for run-all (Technical Specification 0.6.8)."""
+    """Run or resume the 18-step chain for run-all (Technical Specification 0.6.8).
+
+    A FAILED or INTERRUPTED per-write step among the planned steps, other than the forced one,
+    is refused before any step executes (RefusedBeforeExecution), so the refusal records no run
+    and changes nothing.
+    """
     candidates = None
     if options.startAt is not None:
         try:
@@ -639,6 +691,8 @@ def RunChain(context: JobContext, options: ChainOptions) -> int:
         return EXIT_FAILURE
     cycleContext = replace(context, cycleId=ChainCycle(context, options.newCycle))
     steps, forcedStepNo = PlanChainSteps(cycleContext, candidates, options.force)
+    if RefusedBeforeExecution(cycleContext, steps, forcedStepNo):
+        return EXIT_FAILURE
     return RunSteps(cycleContext, steps, forcedStepNo)
 
 

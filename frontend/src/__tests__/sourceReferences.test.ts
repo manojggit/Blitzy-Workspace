@@ -10,6 +10,11 @@ interface ExpectedSource {
     program: string;
 }
 
+interface ExpectedComponentSource {
+    fileName: string;
+    identifiers: readonly string[];
+}
+
 const SOURCE_ROOT = resolve(__dirname, "..");
 const APP_DIRECTORY = join(SOURCE_ROOT, "app");
 const COMPONENTS_DIRECTORY = join(SOURCE_ROOT, "components");
@@ -21,13 +26,39 @@ const REPLACES_LINE_PREFIX = "// Replaces:";
 const REPLACES_LINE_START_PATTERN = new RegExp(`^${REPLACES_LINE_PREFIX}`);
 const USE_CLIENT_DIRECTIVE_PATTERN = /^["']use client["'];?$/;
 const CODE_START_PATTERN = /^(import|export)\b/;
-const EXPECTED_SHARED_COMPONENTS = [
-    "ConfirmField.tsx",
-    "FunctionKeyBar.tsx",
-    "MessageLine.tsx",
-    "ScreenShell.tsx",
-    "SelectionTable.tsx",
+// Each component serves many maps, so it names BMS fields, maps and copybooks, never one program.
+const EXPECTED_COMPONENT_SOURCES: readonly ExpectedComponentSource[] = [
+    {
+        fileName: "ConfirmField.tsx",
+        identifiers: ["CONFIRM", "COTRN02", "COBIL00", "CORPT00"],
+    },
+    {
+        fileName: "FunctionKeyBar.tsx",
+        identifiers: ["ENTER", "F3", "F4", "F5", "F7", "F8", "F12"],
+    },
+    {
+        fileName: "MessageLine.tsx",
+        identifiers: ["ERRMSG", "INFOMSG", "CSMSG01Y", "CSMSG02Y"],
+    },
+    {
+        fileName: "ScreenShell.tsx",
+        identifiers: [
+            "TITLE01",
+            "TITLE02",
+            "TRNNAME",
+            "PGMNAME",
+            "CURDATE",
+            "CURTIME",
+            "COTTL01Y",
+            "CSDAT01Y",
+        ],
+    },
+    {
+        fileName: "SelectionTable.tsx",
+        identifiers: ["COCRDLI", "COTRN00", "COUSR00", "CRDSEL1", "SEL0001"],
+    },
 ];
+const EXPECTED_SHARED_COMPONENTS = EXPECTED_COMPONENT_SOURCES.map((source) => source.fileName);
 // Routes are relative to src/app, with "/" separators.
 const EXPECTED_SOURCES: readonly ExpectedSource[] = [
     { route: "signon", map: "COSGN00", program: "COSGN00C" },
@@ -131,4 +162,15 @@ describe("shared component source-reference headers (AAP 0.10.5)", () => {
         const firstHeaderLine = ReadHeaderBlock(join(COMPONENTS_DIRECTORY, fileName))[0] ?? "";
         expect(firstHeaderLine).toMatch(REPLACES_LINE_START_PATTERN);
     });
+
+    it.each(EXPECTED_COMPONENT_SOURCES)(
+        "components/$fileName header names its legacy source identifiers",
+        ({ fileName, identifiers }) => {
+            const headerText = ReadHeaderBlock(join(COMPONENTS_DIRECTORY, fileName)).join("\n");
+            const missingIdentifiers = identifiers.filter(
+                (identifier) => !ContainsWord(headerText, identifier),
+            );
+            expect({ fileName, missingIdentifiers }).toEqual({ fileName, missingIdentifiers: [] });
+        },
+    );
 });

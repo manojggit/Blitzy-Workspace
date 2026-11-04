@@ -69,10 +69,17 @@ interface UserFieldDefinition {
 }
 
 // COUSR1A in map order: the INITIAL label texts, the input LENGTHs and the hint text beside them.
+// The name, ID and type fields hold another user's record, so the browser never autofills them.
 const FIELD_DEFINITIONS: readonly UserFieldDefinition[] = [
-    { name: "first_name", label: "First Name:", maxLength: 20 },
-    { name: "last_name", label: "Last Name:", maxLength: 20 },
-    { name: "user_id", label: "User ID:", maxLength: 8, helperText: "(8 Char)" },
+    { name: "first_name", label: "First Name:", maxLength: 20, autoComplete: "off" },
+    { name: "last_name", label: "Last Name:", maxLength: 20, autoComplete: "off" },
+    {
+        name: "user_id",
+        label: "User ID:",
+        maxLength: 8,
+        helperText: "(8 Char)",
+        autoComplete: "off",
+    },
     // PASSWD carries the DRK attribute, so the keyed text is never shown. The autocomplete token
     // is the one the design-system mapping gives every password field (COSGN00, COUSR01, COUSR02).
     {
@@ -84,7 +91,13 @@ const FIELD_DEFINITIONS: readonly UserFieldDefinition[] = [
         autoComplete: "current-password",
     },
     // Free one-character text rather than a choice: COUSR01C stores any non-blank user type.
-    { name: "user_type", label: "User Type:", maxLength: 1, helperText: "(A=Admin, U=User)" },
+    {
+        name: "user_type",
+        label: "User Type:",
+        maxLength: 1,
+        helperText: "(A=Admin, U=User)",
+        autoComplete: "off",
+    },
 ];
 
 const EMPTY_FIELD_VALUES: UserFieldValues = {

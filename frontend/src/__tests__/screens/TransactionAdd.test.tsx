@@ -316,6 +316,17 @@ const COPIED_SCREEN: AddScreenValues = {
     confirm: "",
 };
 
+// F5 keyed with the card alone: the blank account sends VALIDATE-INPUT-KEY-FIELDS down the card
+// path, every other field blank, CONFIRMI included.
+const CARD_COPY_LAST_INPUT: AddScreenValues = { ...BLANK_SCREEN, card_num: KEYED_CARD_NUMBER };
+
+// KEYED_CARD_NUMBER as MaskCardNumber sends it back: twelve asterisks and its last four digits.
+const KEYED_CARD_MASKED = "************0004";
+
+// The screen the card-keyed F5 gets back: the account the CCXREF read resolved and the copied
+// data fields, beside the keyed card masked.
+const CARD_COPIED_SCREEN: AddScreenValues = { ...COPIED_SCREEN, card_num: KEYED_CARD_MASKED };
+
 // CONFIRMI WHEN 'Y' WHEN 'y' both add, so either character goes out exactly as keyed.
 const ENTER_CASES: readonly EnterCase[] = [
     { method: "button", confirm: "Y" },
@@ -350,6 +361,8 @@ const ADDED_RESPONSE = BuildAddResponse({
 });
 
 const COPIED_PROMPT_RESPONSE = BuildAddResponse({ fields: COPIED_SCREEN });
+
+const CARD_COPIED_PROMPT_RESPONSE = BuildAddResponse({ fields: CARD_COPIED_SCREEN });
 
 // A CT02 legacy error body holds exactly the four standard keys; the screen stays as keyed.
 function BuildErrorBody(overrides: Partial<LegacyErrorResponse> = {}): LegacyErrorResponse {
@@ -591,6 +604,20 @@ async function ShowConfirmPrompt(user: UserEvent): Promise<void> {
     expect(InputOf("card_num")).toHaveValue(SERVED_CARD_MASKED);
 }
 
+// F5 keyed with the card alone: the request carries the blank account and the card as keyed, and
+// the screen shows the resolved account, the copied fields and the card masked.
+async function CopyLastByCard(user: UserEvent, method: KeyMethod): Promise<void> {
+    await FillForm(user, CARD_COPY_LAST_INPUT);
+    await UseMapKey(user, "F5", method);
+    await ExpectAlert(CONFIRM_PROMPT_MESSAGE, "error");
+    expect(mockAddTransaction).toHaveBeenCalledTimes(1);
+    expect(mockAddTransaction).toHaveBeenCalledWith(
+        RequestOf(TransactionAddAction.COPY_LAST, CARD_COPY_LAST_INPUT),
+    );
+    ExpectScreenValues(CARD_COPIED_SCREEN);
+    expect(InputOf("confirm")).toHaveFocus();
+}
+
 beforeEach(() => {
     mockAddTransaction.mockReset();
     jest.spyOn(Date, "now").mockReturnValue(FIXED_NOW_MILLISECONDS);
@@ -693,6 +720,28 @@ it("COTRN02C ENTER after F5 sends the copied screen with the card as keyed", asy
         RequestOf(TransactionAddAction.ENTER, confirmedScreen),
     );
 });
+
+it.each(KEY_METHODS)(
+    "COTRN02C F5 by %s sends copy_last with the entered card and ENTER resends it as keyed",
+    async (method) => {
+        mockAddTransaction.mockResolvedValueOnce(CARD_COPIED_PROMPT_RESPONSE);
+        mockAddTransaction.mockResolvedValueOnce(ADDED_RESPONSE);
+        const user = RenderScreen();
+        await CopyLastByCard(user, method);
+        await KeyInto(user, "confirm", "Y");
+        await UseMapKey(user, "ENTER", "button");
+        await ExpectAlert(ADDED_MESSAGE, "success");
+        const confirmedScreen: AddScreenValues = {
+            ...CARD_COPIED_SCREEN,
+            card_num: KEYED_CARD_NUMBER,
+            confirm: "Y",
+        };
+        expect(mockAddTransaction).toHaveBeenCalledTimes(2);
+        expect(mockAddTransaction).toHaveBeenLastCalledWith(
+            RequestOf(TransactionAddAction.ENTER, confirmedScreen),
+        );
+    },
+);
 
 it.each(LITERAL_CASES)(
     "COTRN02C answers $status with $message as $severity, cursor on $cursorField",

@@ -140,6 +140,15 @@ interface NavigableView {
     Rerender: () => void;
 }
 
+// A same-route step between the two queries that select no user, and where F3 then returns.
+interface BlankArrivalSwitchCase {
+    from: string;
+    to: string;
+    fromQuery: string;
+    toQuery: string;
+    route: string;
+}
+
 const TEST_USER_ID = "TESTUSR1";
 // A second user COUSR00C can select, with details unlike the first user's.
 const OTHER_USER_ID = "TESTUSR2";
@@ -243,6 +252,25 @@ const BACK_ORIGINS: readonly Omit<BackCase, "method">[] = [
 const BACK_CASES: readonly BackCase[] = BACK_ORIGINS.flatMap((backOrigin) =>
     PRESS_METHODS.map((method) => ({ ...backOrigin, method })),
 );
+
+// A missing and an empty userId both select no user, yet each is an arrival of its own, because
+// only the empty one returns F3 to COUSR00C.
+const BLANK_ARRIVAL_SWITCH_CASES: readonly BlankArrivalSwitchCase[] = [
+    {
+        from: "no userId",
+        to: "an empty userId",
+        fromQuery: "",
+        toQuery: "userId=",
+        route: USER_LIST_PATH,
+    },
+    {
+        from: "an empty userId",
+        to: "no userId",
+        fromQuery: "userId=",
+        toQuery: "",
+        route: ADMIN_MENU_PATH,
+    },
+];
 
 // Every literal COUSR03C sends, with the status the backend answers it with and its BMS colour.
 const LITERAL_CASES: readonly LiteralCase[] = [
@@ -431,6 +459,20 @@ function NavigateToUser(view: NavigableView, userId: string): void {
     view.Rerender();
 }
 
+// Opened under the given query string, which may carry no userId, and the test changes later.
+function RenderAtQuery(query: string): NavigableView {
+    mockSearchParams = new URLSearchParams(query);
+    const user = userEvent.setup();
+    const { rerender } = render(<ScreenTree />);
+    return { user, Rerender: () => rerender(<ScreenTree />) };
+}
+
+// A same-route push or history step to the given query string, which may carry no userId.
+function NavigateToQuery(view: NavigableView, query: string): void {
+    mockSearchParams = new URLSearchParams(query);
+    view.Rerender();
+}
+
 // The next fetch or delete stays in flight until the returned function settles it with the
 // first user's record or the deleted literal.
 function DeferCall(call: ScreenCall): () => void {
@@ -577,6 +619,27 @@ async function SettleQueuedWork(): Promise<void> {
     });
 }
 
+// Keys the user ID on USRIDIN and presses ENTER.
+async function KeyAndFetch(user: UserEvent, userIdText: string): Promise<void> {
+    await user.type(screen.getByLabelText(USER_ID_LABEL), userIdText);
+    await PressKey(user, "ENTER");
+}
+
+// Opened under the given query, with TEST_USER_ID keyed and its record fetched by ENTER.
+async function RenderWithFetchedUser(query: string): Promise<NavigableView> {
+    const view = RenderAtQuery(query);
+    await KeyAndFetch(view.user, TEST_USER_ID);
+    await ExpectAlert(PRESS_PF5_MESSAGE, "info");
+    expect(ShownValues()).toEqual(FetchedValues(TEST_USER_ID));
+    return view;
+}
+
+// A first entry that selected no user: every COUSR3A field blank and no message.
+function ExpectBlankEntry(): void {
+    expect(ShownValues()).toEqual(EMPTY_SCREEN_VALUES);
+    expect(screen.queryByRole("alert")).toBeNull();
+}
+
 beforeEach(() => {
     mockSearchParams = new URLSearchParams();
     mockFetchUser.mockResolvedValue(BuildUserDetail());
@@ -689,6 +752,46 @@ describe("COUSR03C history step back to the previously selected user", () => {
         expect(mockFetchUser).toHaveBeenCalledTimes(3);
         ExpectLastFetchOf(TEST_USER_ID);
     });
+});
+
+// Neither arrival fetches, so the step shows only through the state the new entry starts with.
+describe("COUSR03C same-route step between a missing and an empty userId", () => {
+    it.each(BLANK_ARRIVAL_SWITCH_CASES)(
+        "COUSR03C from $from to $to re-enters blank; PF5 deletes SPACES, PF3 goes to $route",
+        async ({ fromQuery, toQuery, route }) => {
+            const view = await RenderWithFetchedUser(fromQuery);
+            NavigateToQuery(view, toQuery);
+            ExpectBlankEntry();
+            ArrangeRejection(HTTP_EDIT_FAILURE, BuildErrorBody({ message: USER_ID_EMPTY_MESSAGE }));
+            await PressFunction(view.user, "F5", "key");
+            await ExpectAlert(USER_ID_EMPTY_MESSAGE, "error");
+            expect(mockDeleteUser).toHaveBeenCalledTimes(1);
+            expect(mockDeleteUser).toHaveBeenCalledWith(BLANK_USER_ID);
+            await PressFunction(view.user, "F3", "key");
+            expect(mockRouterPush).toHaveBeenCalledTimes(1);
+            expect(mockRouterPush).toHaveBeenCalledWith(route);
+            expect(mockFetchUser).toHaveBeenCalledTimes(1);
+        },
+    );
+});
+
+describe("COUSR03C late answer for a fetch in flight across a missing/empty userId step", () => {
+    it.each(BLANK_ARRIVAL_SWITCH_CASES)(
+        "COUSR03C from $from to $to aborts the ENTER fetch; its answer leaves the entry blank",
+        async ({ fromQuery, toQuery }) => {
+            const settleFetch = DeferCall("fetch");
+            const view = RenderAtQuery(fromQuery);
+            await KeyAndFetch(view.user, TEST_USER_ID);
+            expect(mockFetchUser).toHaveBeenCalledTimes(1);
+            NavigateToQuery(view, toQuery);
+            expect(FetchSignal(0)?.aborted).toBe(true);
+            await act(async () => {
+                settleFetch();
+            });
+            ExpectBlankEntry();
+            expect(screen.queryByRole("progressbar")).toBeNull();
+        },
+    );
 });
 
 describe("COUSR03C first entry from COADM01C (no user selected)", () => {

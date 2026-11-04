@@ -82,6 +82,9 @@ interface FieldCase {
 // [ERRMSG literal, HTTP status, message-line severity, field the program moves -1 to].
 type OutcomeCase = readonly [string, number, MessageSeverity, UserFieldName];
 
+// [input, autocomplete token it renders].
+type AutoCompleteCase = readonly [UserFieldName, string];
+
 const ADMIN_MENU_ROUTE = "/admin";
 const TEST_USER_ID = "TESTUSR1";
 // A fresh random 8-character value per run (PASSWD LENGTH=8), so no password is in the test.
@@ -123,6 +126,16 @@ const FIELD_CASES: readonly FieldCase[] = [
 ];
 
 const FIELD_NAMES: readonly UserFieldName[] = FIELD_CASES.map((fieldCase) => fieldCase.name);
+
+// The admin keys another user's record, so autofill is off everywhere but PASSWD, which takes
+// the token the design-system mapping gives every password field.
+const AUTO_COMPLETE_CASES: readonly AutoCompleteCase[] = [
+    ["first_name", "off"],
+    ["last_name", "off"],
+    ["user_id", "off"],
+    ["password", "current-password"],
+    ["user_type", "off"],
+];
 
 // The legend ENTER=Add User  F3=Back  F4=Clear  F12=Exit: button names and physical keys.
 const LEGEND_KEYS: readonly LegendKey[] = ["ENTER", "F3", "F4", "F12"];
@@ -336,6 +349,13 @@ describe("COUSR01C BMS COUSR01 fields on /admin/users/add", () => {
             const expectedType = name === "password" ? "password" : "text";
             expect(FieldInput(name)).toHaveAttribute("type", expectedType);
         }
+    });
+});
+
+describe("COUSR01C BMS COUSR01 field autofill on /admin/users/add", () => {
+    it.each(AUTO_COMPLETE_CASES)("COUSR01C %s carries autocomplete '%s'", (name, token) => {
+        RenderScreen();
+        expect(FieldInput(name)).toHaveAttribute("autocomplete", token);
     });
 });
 

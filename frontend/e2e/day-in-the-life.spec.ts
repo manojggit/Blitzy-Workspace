@@ -120,10 +120,15 @@ const STEP_TITLES = {
     statement: `STATEMNT.PS for card ${CARD_NUMBER} lists the new transaction and totals`,
 } as const;
 
-// An optional sign, digits, a decimal point and exactly two decimals once the edit characters
-// are removed; the integer part may be blank, as Z(9).99- prints zero as ".00".
-const AMOUNT_PATTERN = /^(\d*)\.(\d{2})$/;
-const AMOUNT_EDIT_CHARACTERS = /[+\-$,\s]/g;
+// The whole trimmed amount text, matched before any digit is read. At most one sign: a leading
+// "+" or "-", which blanks may separate from the digits, or a trailing "-" directly after the
+// decimals, as the 9(9).99- and Z(9).99- pictures print a negative value. Those pictures print
+// a blank, never "+", for a positive value, so a trailing "+" is rejected, and the lookahead
+// rejects a leading sign together with a trailing "-". Then contiguous integer digits, blank
+// when Z(9).99- prints a zero integer part (".00"), one decimal point and exactly two decimals.
+// Groups: leading sign, integer digits, decimals, trailing sign.
+const AMOUNT_PATTERN = /^(?![+-].*-$)(?:([+-]) *)?(\d*)\.(\d{2})(-)?$/;
+const NEGATIVE_SIGN = "-";
 const CENTS_PER_UNIT = BigInt(100);
 const TRAILING_CR_PATTERN = /\r$/;
 const QUOTED_CELL_PATTERN = /^"(.*)"$/;
@@ -145,19 +150,20 @@ interface StatementTotals {
 }
 
 /**
- * Exact cents of an edited amount: a CSV decimal (40.00), the screen's text (40.00 or
- * +         40.00), or a statement picture, 9(9).99- (000000040.00 ) or Z(9).99- (       50.00 ,
- * and         .00  for zero). A sign may lead or trail. Anything else is rejected.
+ * Exact cents of an amount text, once whitespace around it is trimmed: a CSV or Account View
+ * decimal (40.00, -12.34), a sign-led screen amount (+         40.00), or a statement picture,
+ * 9(9).99- (000001945.87 , 000000040.00-) or Z(9).99- (       50.00 ,        47.88-, and
+ *          .00  for zero). AMOUNT_PATTERN gives the grammar; any other text, including a
+ * currency sign, grouping commas, embedded blanks or a repeated sign, is rejected.
  */
 function ParseAmountCents(text: string): bigint {
-    const trimmed = text.trim();
-    const isNegative = trimmed.startsWith("-") || trimmed.endsWith("-");
-    const match = AMOUNT_PATTERN.exec(trimmed.replace(AMOUNT_EDIT_CHARACTERS, ""));
+    const match = AMOUNT_PATTERN.exec(text.trim());
     if (match === null) {
         throw new Error(`Unrecognised amount text ${JSON.stringify(text)}`);
     }
-    const [, integerPart = "", fraction = ""] = match;
-    const cents = BigInt(integerPart || "0") * CENTS_PER_UNIT + BigInt(fraction);
+    const [, leadingSign, integerDigits = "", decimalDigits = "", trailingSign] = match;
+    const cents = BigInt(integerDigits || "0") * CENTS_PER_UNIT + BigInt(decimalDigits);
+    const isNegative = leadingSign === NEGATIVE_SIGN || trailingSign === NEGATIVE_SIGN;
     return isNegative ? -cents : cents;
 }
 
@@ -382,6 +388,79 @@ function VerifyStatement(): void {
         expectedTotals.totalCents + TRAN_AMOUNT_CENTS,
     );
 }
+
+interface AmountCase {
+    text: string;
+    cents: bigint;
+}
+
+// Every amount form the flow reads, with its exact cents: the fixture CSV and Account View
+// decimals, the sign-led screen amount, the ST-CURR-BAL 9(9).99- slice and the ST-TRANAMT and
+// ST-TOTAL-TRAMT Z(9).99- slice, with negatives in leading and trailing position and both zeros.
+const ACCEPTED_AMOUNT_CASES: readonly AmountCase[] = [
+    { text: "40.00", cents: BigInt(4000) },
+    { text: "1686.98", cents: BigInt(168698) },
+    { text: "-12.34", cents: BigInt(-1234) },
+    { text: "0.00", cents: BigInt(0) },
+    { text: "+         40.00", cents: BigInt(4000) },
+    { text: "-         40.00", cents: BigInt(-4000) },
+    { text: "+           .00", cents: BigInt(0) },
+    { text: "000001945.87 ", cents: BigInt(194587) },
+    { text: "000000040.00-", cents: BigInt(-4000) },
+    { text: "     1472.64 ", cents: BigInt(147264) },
+    { text: "       50.00 ", cents: BigInt(5000) },
+    { text: "       47.88-", cents: BigInt(-4788) },
+    { text: "         .05-", cents: BigInt(-5) },
+    { text: "         .00 ", cents: BigInt(0) },
+    { text: ".00", cents: BigInt(0) },
+];
+
+// Embedded, repeated, doubled or detached signs, a trailing "+", split digit groups, the wrong
+// number of decimals, no decimal point, blank text, a currency sign and a grouping comma.
+const REJECTED_AMOUNT_TEXTS: readonly string[] = [
+    "5-0.00",
+    "5 0.00",
+    "--50.00",
+    "+-50.00",
+    "+50.00-",
+    "-50.00-",
+    "50.00 -",
+    "50.00+",
+    "50 .00",
+    "50. 00",
+    "50.0",
+    "50.000",
+    "50",
+    ".",
+    "",
+    "   ",
+    "$50.00",
+    "5,0.00",
+];
+
+function ExpectAcceptedAmount(amountCase: AmountCase): void {
+    expect(ParseAmountCents(amountCase.text)).toBe(amountCase.cents);
+}
+
+function ExpectRejectedAmount(text: string): void {
+    expect(() => ParseAmountCents(text)).toThrow(
+        `Unrecognised amount text ${JSON.stringify(text)}`,
+    );
+}
+
+// Parsing cases with no page or browser. They run ahead of the flow, which this serial file
+// skips when a case fails, so the statement and balance checks never rest on a broken parser.
+function DeclareParseAmountCentsTests(): void {
+    for (const amountCase of ACCEPTED_AMOUNT_CASES) {
+        test(`accepts ${JSON.stringify(amountCase.text)} as ${amountCase.cents} cents`, () =>
+            ExpectAcceptedAmount(amountCase));
+    }
+    for (const text of REJECTED_AMOUNT_TEXTS) {
+        test(`rejects ${JSON.stringify(text)}`, () => ExpectRejectedAmount(text));
+    }
+}
+
+test.describe("ParseAmountCents", DeclareParseAmountCentsTests);
 
 // The flow changes the shared database and is not repeatable: a retry would be given TRAN-ID
 // 0000000000000002, and global setup reseeds only once per run.

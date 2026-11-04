@@ -583,18 +583,18 @@ function SelectedUserIdOf(queryValue: string): string {
     return Array.from(queryValue).slice(0, USER_ID_LENGTH).join("");
 }
 
-// Each arrival with another selected user is a fresh COUSR03C first entry, as every XCTL is, so
-// the screen state starts over whenever the userId query parameter changes. The discarded
-// screen's unmount aborts a fetch still in flight for the previous user, so its answer never
-// reaches the new one. The key is the raw query value, so every change of it re-enters.
+// Each arrival with another ?userId=, or with none, is a fresh COUSR03C first entry, as every
+// XCTL is, so the fields, the first-entry fetch and the F3 and F5 targets start over together.
+// The discarded screen's unmount aborts a fetch still in flight for the previous arrival, so its
+// answer never reaches the new one. A missing userId stays distinct from an empty one, because
+// only the latter returns F3 to the user list.
 function UserDeleteEntry() {
-    const searchParams = useSearchParams();
-    const userIdQueryValue = searchParams.get(USER_ID_QUERY_KEY) ?? "";
+    const userIdQueryValue = useSearchParams().get(USER_ID_QUERY_KEY);
     return (
         <UserDeleteScreen
-            key={userIdQueryValue}
-            selectedUserId={SelectedUserIdOf(userIdQueryValue)}
-            cameFromList={searchParams.has(USER_ID_QUERY_KEY)}
+            key={JSON.stringify([userIdQueryValue])}
+            selectedUserId={SelectedUserIdOf(userIdQueryValue ?? "")}
+            cameFromList={userIdQueryValue !== null}
         />
     );
 }

@@ -460,12 +460,23 @@ database is reached.
     recovery paths:
     - `seed-all` or `run-all --new-cycle`, to restore from the loaders;
     - `--force`, which reruns from the partial state as a legacy restart would.
+- `run-all` checks the steps it would process before it executes any of them. It refuses a
+    `FAILED` or `INTERRUPTED` per-write step that is not the forced step without executing a
+    step or recording a run, so nothing changes. An earlier `PENDING` step, such as TRANBKP
+    step 6 after `run-all --start-at POSTTRAN`, is therefore not run first: it would archive and
+    delete the partial postings. A financial loader that `run-all` would execute before that
+    step is refused by the [financial-reload rule](#financial-reloads) in its place.
 
 ### Force
 
 `--force` executes the start step whatever its state, `COMPLETED` included, and is never applied
 implicitly. It adds a history row, and on success sets the step `COMPLETED` with `last_run_id`
 pointing to the new run. It never overrides the [financial-reload refusal](#financial-reloads).
+
+`run-all --force` without `--start-at` applies to the `OPEN` cycle's first `FAILED` or
+`INTERRUPTED` per-write step, and resumes from it as `--start-at STEP --force` does, so the
+steps before it are not considered. With no such step, it applies to the first step not yet
+`COMPLETED`.
 
 ### Standalone commands
 
@@ -1114,7 +1125,8 @@ To continue instead from the partial state, as a legacy restart would:
 .venv/bin/carddemo-batch run-all --start-at STEP --force
 ```
 
-Replace `STEP` with the refused step, for example `POSTTRAN`.
+Replace `STEP` with the refused step, for example `POSTTRAN`. Plain `run-all --force` resumes from
+the same step, the cycle's first failed or interrupted per-write step ([Force](#force)).
 
 To clear a lost generation, which blocks every other command:
 
@@ -1274,8 +1286,13 @@ The orchestration rules above are pinned by these suites in `batch/tests/`:
         `job tran-backup --force` after a successful step 6. Each succeeds with one more history
         row, and `last_run_id` moves;
     - with a 20,000-record synthetic daily file, `SIGKILL` of the CLI once the first posted
-        transaction is visible. The next `run-all` marks the run `INTERRUPTED`, exits 12 and posts
-        nothing; `run-all --force` then posts from the partial state;
+        transaction is visible, both after `job tran-backup` has run step 6 and after
+        `run-all --start-at POSTTRAN` with step 6 `PENDING`. The next `run-all` marks the run
+        `INTERRUPTED`, exits 12, posts nothing and records no run; `run-all --force` then posts
+        from the partial state and leaves step 6 as it was;
+    - with step 6 `PENDING`, a POSTTRAN failure injected at record 150 of
+        `run-all --start-at POSTTRAN`. The next `run-all` exits 12, changes nothing and records no
+        run; `run-all --force` then reruns POSTTRAN from the partial state, without running step 6;
     - `SIGKILL` of the CLI during an atomic loader. The loader is retried and gives the clean
         result;
     - after a successful POSTTRAN, `load accounts` is refused and leaves the balances unchanged,

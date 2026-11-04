@@ -2,7 +2,15 @@
 // COTTL01Y, CSDAT01Y, CSMSG01Y, CSUSR01Y
 "use client";
 
-import { Alert, Paper, Stack, TextField, Typography } from "@mui/material";
+import {
+    Alert,
+    Paper,
+    Stack,
+    TextField,
+    Typography,
+    type SxProps,
+    type Theme,
+} from "@mui/material";
 import axios from "axios";
 import { useRouter } from "next/navigation";
 import {
@@ -48,6 +56,10 @@ const FIELD_ID_PREFIX = "signon-";
 
 const ERROR_SEVERITY = SeverityForOutcome({ isError: true, isCompletedWrite: false });
 const INFORMATION_SEVERITY = SeverityForOutcome({ isError: false, isCompletedWrite: false });
+
+// The sign-off notice's Paper insets its info Alert, so the two read as one card holding the
+// message rather than a shadow hugging the Alert's smaller corners.
+const THANK_YOU_NOTICE_STYLE: SxProps<Theme> = { p: 4 };
 
 type CredentialName = "user_id" | "password";
 
@@ -427,7 +439,7 @@ function CredentialFields({ form }: SignOnFormProps) {
 
 function ThankYouNotice({ text }: ThankYouNoticeProps) {
     return (
-        <Paper>
+        <Paper sx={THANK_YOU_NOTICE_STYLE}>
             <Alert severity="info">{text}</Alert>
         </Paper>
     );

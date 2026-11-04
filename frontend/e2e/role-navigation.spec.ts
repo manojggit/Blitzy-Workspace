@@ -7,12 +7,13 @@
 // with its menu's legacy "not installed" literal. The spec only reads data, so it does not depend
 // on day-in-the-life.spec.ts, and each test runs in a fresh browser context with its own session
 // cookie. Credentials come from frontend/.env.e2e through AdminUser() and RegularUser() only.
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Response } from "@playwright/test";
 
 import {
     AdminUser,
     ExpectMessage,
     RegularUser,
+    RequireEnv,
     SIGN_ON_ROUTE,
     SignOn,
     WaitForPath,
@@ -23,10 +24,33 @@ const MENU_ROUTE = "/menu";
 const ADMIN_ROUTE = "/admin";
 const ADMIN_USERS_ROUTE = "/admin/users";
 
-/** One installed menu option: its verbatim label and the page that replaces its program's XCTL. */
+/** The ScreenShell header of a BMS-map page: TRNNAME, PGMNAME and the map's screen title. */
+interface ScreenHeader {
+    tranId: string;
+    program: string;
+    title: string;
+}
+
+/** The roles of the controls that can hold the cursor when a screen is first sent. */
+type EntryControlRole = "textbox" | "button";
+
+/** The control that holds the cursor when the map is first sent, by role and exact name. */
+interface EntryControl {
+    role: EntryControlRole;
+    name: string;
+}
+
+/**
+ * One installed menu option: its verbatim label, the page that replaces its program's XCTL, and
+ * the screen that page shows once it is ready for input: its header, the exact name of its ENTER
+ * key button and its entry control.
+ */
 interface MenuOptionRoute {
     label: string;
     route: string;
+    header: ScreenHeader;
+    enterKeyName: string;
+    entryControl: EntryControl;
 }
 
 /** An option whose program is not installed, with the literal its menu answers. */
@@ -41,12 +65,39 @@ interface MenuSession {
     menuRoute: string;
 }
 
-// COADM02Y options 1-4, CDEMO-ADMIN-OPT-NAME with its trailing blanks trimmed.
+// COADM02Y options 1-4, CDEMO-ADMIN-OPT-NAME with its trailing blanks trimmed. Each screen is
+// its map's TRNNAME, PGMNAME and title, its legend's ENTER key as FunctionKeyBar names it, and
+// the field that holds the cursor on first send, by its BMS label: the map's IC field, or on
+// COUSR00 and COTRN00, whose maps mark none, the field the program's MOVE -1 points at.
 const ADMIN_OPTION_ROUTES: readonly MenuOptionRoute[] = [
-    { label: "User List (Security)", route: "/admin/users" },
-    { label: "User Add (Security)", route: "/admin/users/add" },
-    { label: "User Update (Security)", route: "/admin/users/update" },
-    { label: "User Delete (Security)", route: "/admin/users/delete" },
+    {
+        label: "User List (Security)",
+        route: "/admin/users",
+        header: { tranId: "CU00", program: "COUSR00C", title: "List Users" },
+        enterKeyName: "Continue (Enter)",
+        entryControl: { role: "textbox", name: "Search User ID:" },
+    },
+    {
+        label: "User Add (Security)",
+        route: "/admin/users/add",
+        header: { tranId: "CU01", program: "COUSR01C", title: "Add User" },
+        enterKeyName: "Add User (Enter)",
+        entryControl: { role: "textbox", name: "First Name:" },
+    },
+    {
+        label: "User Update (Security)",
+        route: "/admin/users/update",
+        header: { tranId: "CU02", program: "COUSR02C", title: "Update User" },
+        enterKeyName: "Fetch (Enter)",
+        entryControl: { role: "textbox", name: "Enter User ID:" },
+    },
+    {
+        label: "User Delete (Security)",
+        route: "/admin/users/delete",
+        header: { tranId: "CU03", program: "COUSR03C", title: "Delete User" },
+        enterKeyName: "Fetch (Enter)",
+        entryControl: { role: "textbox", name: "Enter User ID:" },
+    },
 ];
 
 // COADM02Y options 5 and 6: COTRTLIC and COTRTUPC, programs of the excluded Db2 extension.
@@ -60,18 +111,80 @@ const ADMIN_NOT_INSTALLED_OPTIONS = [
 // are concatenated.
 const ADMIN_NOT_INSTALLED_MESSAGE = "This option is not installed ...";
 
-// COMEN02Y options 1-10, CDEMO-MENU-OPT-NAME with its trailing blanks trimmed.
+// COMEN02Y options 1-10, CDEMO-MENU-OPT-NAME with its trailing blanks trimmed, with their
+// screens as for the admin options. CORPT00's IC is on the MONTHLY selector, which the page
+// renders as the first segment of its report-type choice.
 const MAIN_OPTION_ROUTES: readonly MenuOptionRoute[] = [
-    { label: "Account View", route: "/accounts/view" },
-    { label: "Account Update", route: "/accounts/update" },
-    { label: "Credit Card List", route: "/cards" },
-    { label: "Credit Card View", route: "/cards/view" },
-    { label: "Credit Card Update", route: "/cards/update" },
-    { label: "Transaction List", route: "/transactions" },
-    { label: "Transaction View", route: "/transactions/view" },
-    { label: "Transaction Add", route: "/transactions/add" },
-    { label: "Transaction Reports", route: "/reports/transactions" },
-    { label: "Bill Payment", route: "/billpay" },
+    {
+        label: "Account View",
+        route: "/accounts/view",
+        header: { tranId: "CAVW", program: "COACTVWC", title: "View Account" },
+        enterKeyName: "Search (Enter)",
+        entryControl: { role: "textbox", name: "Account Number :" },
+    },
+    {
+        label: "Account Update",
+        route: "/accounts/update",
+        header: { tranId: "CAUP", program: "COACTUPC", title: "Update Account" },
+        enterKeyName: "Process (Enter)",
+        entryControl: { role: "textbox", name: "Account Number :" },
+    },
+    {
+        label: "Credit Card List",
+        route: "/cards",
+        header: { tranId: "CCLI", program: "COCRDLIC", title: "List Credit Cards" },
+        enterKeyName: "Continue (Enter)",
+        entryControl: { role: "textbox", name: "Account Number    :" },
+    },
+    {
+        label: "Credit Card View",
+        route: "/cards/view",
+        header: { tranId: "CCDL", program: "COCRDSLC", title: "View Credit Card Detail" },
+        enterKeyName: "Search Cards (Enter)",
+        entryControl: { role: "textbox", name: "Account Number    :" },
+    },
+    {
+        label: "Credit Card Update",
+        route: "/cards/update",
+        header: { tranId: "CCUP", program: "COCRDUPC", title: "Update Credit Card Details" },
+        enterKeyName: "Process (Enter)",
+        entryControl: { role: "textbox", name: "Account Number    :" },
+    },
+    {
+        label: "Transaction List",
+        route: "/transactions",
+        header: { tranId: "CT00", program: "COTRN00C", title: "List Transactions" },
+        enterKeyName: "Continue (Enter)",
+        entryControl: { role: "textbox", name: "Search Tran ID:" },
+    },
+    {
+        label: "Transaction View",
+        route: "/transactions/view",
+        header: { tranId: "CT01", program: "COTRN01C", title: "View Transaction" },
+        enterKeyName: "Fetch (Enter)",
+        entryControl: { role: "textbox", name: "Enter Tran ID:" },
+    },
+    {
+        label: "Transaction Add",
+        route: "/transactions/add",
+        header: { tranId: "CT02", program: "COTRN02C", title: "Add Transaction" },
+        enterKeyName: "Continue (Enter)",
+        entryControl: { role: "textbox", name: "Enter Acct #:" },
+    },
+    {
+        label: "Transaction Reports",
+        route: "/reports/transactions",
+        header: { tranId: "CR00", program: "CORPT00C", title: "Transaction Reports" },
+        enterKeyName: "Continue (Enter)",
+        entryControl: { role: "button", name: "Monthly (Current Month)" },
+    },
+    {
+        label: "Bill Payment",
+        route: "/billpay",
+        header: { tranId: "CB00", program: "COBIL00C", title: "Bill Payment" },
+        enterKeyName: "Continue (Enter)",
+        entryControl: { role: "textbox", name: "Enter Acct ID:" },
+    },
 ];
 
 // COMEN02Y option 11: COPAUS0C, the program of the excluded authorization extension.
@@ -96,6 +209,28 @@ const ADMIN_ONLY_MESSAGE = "No access - Admin Only option... ";
 // The option-list landmark of both menus: "Main menu options" and "Admin menu options".
 const MENU_OPTIONS_LANDMARK_NAME = /menu options/i;
 
+// ScreenShell's busy bar, shown while any call of the screen is in flight.
+const BUSY_BAR_NAME = "Processing";
+
+// The FunctionKeyBar group that renders the map's PF-key legend.
+const FUNCTION_KEYS_GROUP_NAME = "Function keys";
+
+// The ScreenShell banner lines that carry TRNNAME and PGMNAME, each one text node.
+const TRAN_LINE_PATTERN = /^Tran:/;
+const PROGRAM_LINE_PATTERN = /^Prog:/;
+
+// The API answers that mean an option's screen did not open: no session or an expired one, the
+// role guard, or a server failure. A 400 or 404 is a legacy answer the open screen shows.
+const HTTP_UNAUTHORIZED = 401;
+const HTTP_FORBIDDEN = 403;
+const HTTP_SERVER_ERROR_MIN = 500;
+
+/** The refused API calls seen while a page is watched, and the call that stops watching it. */
+interface RefusalRecorder {
+    refusals: string[];
+    Stop: () => void;
+}
+
 async function SignOnAndLand(
     page: Page,
     credentials: Credentials,
@@ -117,11 +252,81 @@ async function ClickMenuOption(page: Page, label: string): Promise<void> {
     await page.getByRole("button", { name: label }).click();
 }
 
+// Names an option's screen in failure messages by its menu label and route.
+function DescribeScreen(option: MenuOptionRoute): string {
+    return `${option.label} screen (${option.route})`;
+}
+
+function IsRefusalStatus(status: number): boolean {
+    return (
+        status === HTTP_UNAUTHORIZED || status === HTTP_FORBIDDEN || status >= HTTP_SERVER_ERROR_MIN
+    );
+}
+
+// Watches the page's answers from the API origin. Each refusal is named by method, path and
+// status only, never by a query or body.
+function RecordApiRefusals(page: Page): RefusalRecorder {
+    const apiOrigin = new URL(RequireEnv("CARDDEMO_E2E_API_URL")).origin;
+    const refusals: string[] = [];
+    const recordResponse = (response: Response): void => {
+        const url = new URL(response.url());
+        if (url.origin === apiOrigin && IsRefusalStatus(response.status())) {
+            refusals.push(`${response.request().method()} ${url.pathname} ${response.status()}`);
+        }
+    };
+    page.on("response", recordResponse);
+    return { refusals, Stop: () => page.off("response", recordResponse) };
+}
+
+// The ScreenShell frame: the map's title as the one h1 of the main landmark, and the banner's
+// TRNNAME and PGMNAME lines, each matched whole.
+async function ExpectScreenHeader(
+    page: Page,
+    header: ScreenHeader,
+    screenName: string,
+): Promise<void> {
+    const heading = page.getByRole("main").getByRole("heading", { level: 1 });
+    await expect(heading, `${screenName}: title`).toHaveText(header.title);
+    const banner = page.getByRole("banner");
+    const tranLine = banner.getByText(TRAN_LINE_PATTERN);
+    await expect(tranLine, `${screenName}: transaction ID`).toHaveText(`Tran: ${header.tranId}`);
+    const programLine = banner.getByText(PROGRAM_LINE_PATTERN);
+    await expect(programLine, `${screenName}: program`).toHaveText(`Prog: ${header.program}`);
+}
+
+// The option's screen, ready for input: its header, the cursor on its entry control, no call in
+// flight and the ENTER key enabled. The path is read again last, so a refusal that redirects
+// after the screen rendered (401 to sign-on, 403 to the menu) still fails.
+async function ExpectScreenReady(page: Page, option: MenuOptionRoute): Promise<void> {
+    const screenName = DescribeScreen(option);
+    await WaitForPath(page, option.route);
+    await ExpectScreenHeader(page, option.header, screenName);
+    const { role, name } = option.entryControl;
+    const entryControl = page.getByRole("main").getByRole(role, { name, exact: true });
+    await expect(entryControl, `${screenName}: entry control focused`).toBeFocused();
+    const busyBar = page.getByRole("progressbar", { name: BUSY_BAR_NAME, exact: true });
+    await expect(busyBar, `${screenName}: no call in flight`).toHaveCount(0);
+    const enterKey = page
+        .getByRole("group", { name: FUNCTION_KEYS_GROUP_NAME, exact: true })
+        .getByRole("button", { name: option.enterKeyName, exact: true });
+    await expect(enterKey, `${screenName}: ENTER key enabled`).toBeEnabled();
+    const readyPath = new URL(page.url()).pathname;
+    expect(readyPath, `${screenName}: path once ready`).toBe(option.route);
+}
+
 // The menu is reached again by navigation rather than by the option page's F3, which can act on
-// its own screen first (COUSR02C's F3 saves pending changes). The session cookie persists.
+// its own screen first (COUSR02C's F3 saves pending changes). The session cookie persists. The
+// API answers are watched from the selection until the screen is ready, and any refusal fails
+// the test; a soft check, so a readiness failure it caused is reported beside it.
 async function OpenOptionAndReturn(session: MenuSession, option: MenuOptionRoute): Promise<void> {
-    await ClickMenuOption(session.page, option.label);
-    await WaitForPath(session.page, option.route);
+    const recorder = RecordApiRefusals(session.page);
+    try {
+        await ClickMenuOption(session.page, option.label);
+        await ExpectScreenReady(session.page, option);
+    } finally {
+        recorder.Stop();
+        expect.soft(recorder.refusals, `${DescribeScreen(option)}: API refusals`).toEqual([]);
+    }
     await ReturnToMenu(session);
 }
 
@@ -171,14 +376,11 @@ async function ExpectAdminTreeRefused(page: Page): Promise<void> {
     await ExpectMessage(page, ADMIN_ONLY_MESSAGE);
 }
 
-// The fixtures a test uses are read from its first parameter, which must stay destructured. The
-// bodies are named functions so each describe callback stays within the MK_Modernization Rule's
-// 20-line function limit, which counts the lines of nested callbacks.
+// The fixtures a test uses are read from its first parameter, which must stay destructured.
 interface PageFixtures {
     page: Page;
 }
 
-// Held apart only because the title is too long to share a line with test.step within 100 columns.
 const ADMIN_TREE_REFUSAL_STEP_TITLE =
     "Direct navigation to /admin/users returns to /menu with the admin-only literal";
 

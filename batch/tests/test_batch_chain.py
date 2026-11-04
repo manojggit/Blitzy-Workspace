@@ -26,12 +26,14 @@ would send every later command's archives to the repository's var/batch-output.
 
 import errno
 import hashlib
+import itertools
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from app.core.paths import REPO_ROOT
 from app.models import (
     CYCLES,
     GDG_GENERATIONS,
@@ -48,8 +50,11 @@ from app.models import (
     TransactionType,
     User,
 )
-from sqlalchemy import Connection, Engine, Table, Text, cast, column, func, select
+from app.services.transactions import cbtrn02c
+from sqlalchemy import Connection, Engine, Table, Text, cast, column, func, select, text
+from sqlalchemy.exc import OperationalError
 
+from batch.jobs import posttran
 from batch.orchestration import batch_chain, gdg, run_ledger
 from batch.orchestration.batch_window import WINDOW_CLOSED_LOG
 from batch.orchestration.job_context import (
@@ -120,6 +125,9 @@ FINAL_STEP = 18
 # After each step a run-all from the seed executes, the next one it executes. A failure injected
 # at that entry point stops the chain right after the step, having written nothing.
 NEXT_EXECUTED_STEP = {6: 13, 13: 14, 14: 15, 15: 16, 16: 17, 17: 18}
+# The lowest status COND=(4,LT) stops on. A literal, not the chain's own threshold, so the
+# boundary case fails if that threshold moves.
+LOWEST_STOPPING_EXIT_CODE = 8
 
 # The table each loader step replaces.
 LOADER_TABLES: dict[int, Table] = {
@@ -195,6 +203,30 @@ RELOAD_MARKER_AMOUNT = Decimal("1.00")
 POSTING_WAIT_SECONDS = 180
 WINDOW_RELEASE_SECONDS = 30
 XMIN_COLUMN = "xmin"
+# The client sessions on this test's database, other than the probe's own, that are not idle.
+# A killed CLI's job session can still be executing a TCATBAL UPDATE or its COMMIT after its
+# window session has gone; an idle session holds no transaction, so nothing of it can still
+# land. pg_stat_activity lists every database of the server, which sibling clones share.
+BUSY_SESSION_COUNT_STATEMENT = text(
+    "SELECT count(*) FROM pg_stat_activity"
+    " WHERE datname = current_database() AND backend_type = 'client backend'"
+    " AND pid <> pg_backend_pid() AND state <> 'idle'"
+)
+START_AT_POSTTRAN_OPTIONS = ("--start-at", "POSTTRAN")
+# Step 6's state and run count while it has never run: the seed leaves it PENDING with no run.
+FIRST_BACKUP_NEVER_RUN = (run_ledger.STEP_PENDING, 0)
+# Step 6's state and run count after job tran-backup ran it and a later run-all skipped it.
+FIRST_BACKUP_RUN_THEN_SKIPPED = (run_ledger.STEP_COMPLETED, 2)
+
+# --- Failed POSTTRAN over the sample daily file --------------------------------------------------
+SAMPLE_DAILY_PATH = legacy_oracle.ImagePath(
+    REPO_ROOT / "data" / "EBCDIC", legacy_oracle.DALYTRAN_IMAGE
+)
+# The 150th staged record fails before it changes anything, so records 1-149 stay posted.
+FAILING_DAILY_RECORD_NUMBER = 150
+VALIDATION_FUNCTION_NAME = "ValidateDailyTransaction"
+INJECTED_IO_STATEMENT = "INJECTED"
+INJECTED_IO_REASON = "injected I/O error"
 
 # --- Publication after a producer step's commit --------------------------------------------------
 INTCALC_STEP = 14
@@ -255,6 +287,33 @@ class TableContent:
 
     rowsByKey: dict[tuple[object, ...], dict[str, object]]
     rowVersions: list[str]
+
+
+@dataclass(frozen=True)
+class InterruptionStart:
+    """How the SIGKILL case reaches POSTTRAN from the seed, and the step 6 history it keeps.
+
+    backupCommand runs step 6 before the killed run-all, or is None to leave step 6 PENDING.
+    runAllOptions are the killed run-all's options. firstBackupHistory is step 6's state and
+    run count once the killed run-all has gone, which neither the refused nor the forced
+    run-all may change.
+    """
+
+    backupCommand: tuple[str, ...] | None
+    runAllOptions: tuple[str, ...]
+    firstBackupHistory: tuple[str, int]
+
+
+INTERRUPTION_STARTS = [
+    pytest.param(
+        InterruptionStart(RERUN_COMMANDS[FIRST_TRANBKP_STEP], (), FIRST_BACKUP_RUN_THEN_SKIPPED),
+        id="step-6-completed",
+    ),
+    pytest.param(
+        InterruptionStart(None, START_AT_POSTTRAN_OPTIONS, FIRST_BACKUP_NEVER_RUN),
+        id="step-6-pending",
+    ),
+]
 
 
 # --- Snapshots -----------------------------------------------------------------------------------
@@ -443,6 +502,17 @@ def StepStates(engine: Engine, stepNumbers: range | tuple[int, ...]) -> dict[int
     return {stepNo: StepRow(engine, stepNo)["state"] for stepNo in stepNumbers}
 
 
+def FirstBackupHistory(engine: Engine) -> tuple[str, int]:
+    """Return step 6's state in the current cycle and its number of runs, SKIPPED ones included."""
+    return StepRow(engine, FIRST_TRANBKP_STEP)["state"], CountJobRuns(engine, FIRST_TRANBKP_STEP)
+
+
+def BackupGenerationCount(engine: Engine) -> int:
+    """Return the number of PUBLISHED TRANSACT.BKUP generations."""
+    with engine.connect() as connection:
+        return PublishedGenerationCounts(connection)[gdg.TRANSACT_BKUP.name]
+
+
 def AssertCyclesAtSeed(environment: BatchEnvironment) -> None:
     """Assert batch.cycles still holds exactly the seed's rows: no cycle opened or abandoned."""
     with environment.engine.connect() as connection:
@@ -576,9 +646,11 @@ def FailStep(stepNo: int, environment: BatchEnvironment) -> None:
 def AssertPerWriteRefused(stepNo: int, environment: BatchEnvironment, state: str) -> None:
     """Assert run-all refuses a FAILED or INTERRUPTED per-write step by name and changes nothing.
 
-    No balance, category balance, transaction, generation or statement moves.
+    No step executes before the refusal: no run, not even a SKIPPED one, is recorded, and no
+    balance, category balance, transaction, generation or statement moves.
     """
     snapshotBefore = ChainOutcomeSnapshot(environment.engine, environment.outputDir)
+    runCountBefore = len(NewRuns(environment))
     outcome = RunAll(environment)
     stepRow = StepRow(environment.engine, stepNo)
     refusal = batch_chain.PER_WRITE_REFUSED_TEMPLATE.format(
@@ -590,6 +662,7 @@ def AssertPerWriteRefused(stepNo: int, environment: BatchEnvironment, state: str
     assert outcome.exitCode == EXIT_FAILURE, outcome.output
     assert refusal in outcome.output
     assert stepRow["state"] == state
+    assert len(NewRuns(environment)) == runCountBefore
     assert ChainOutcomeSnapshot(environment.engine, environment.outputDir) == snapshotBefore
 
 
@@ -688,19 +761,68 @@ def StageSyntheticDailyFile(environment: BatchEnvironment) -> Path:
     return dailyPath
 
 
-def KillRunAllDuringPosttran(environment: BatchEnvironment) -> None:
-    """SIGKILL a run-all subprocess once POSTTRAN has posted, and wait for its window to close.
+def HasBusySession(engine: Engine) -> bool:
+    """Return whether another client session on the engine's database is not idle."""
+    with engine.connect() as connection:
+        return connection.execute(BUSY_SESSION_COUNT_STATEMENT).scalar_one() > 0
+
+
+def KillRunAllDuringPosttran(environment: BatchEnvironment, runAllOptions: tuple[str, ...]) -> None:
+    """SIGKILL a run-all subprocess once POSTTRAN has posted, and wait for its sessions to settle.
 
     PostgreSQL rolls back the killed process's open transaction and releases its batch window
-    when its connections drop; the writes POSTTRAN already committed stay.
+    when its connections drop; the writes POSTTRAN already committed stay. The window session
+    can end while the job session still executes a write or its COMMIT, so the wait lasts until
+    no other session on the test database is busy either.
     """
     engine = environment.engine
-    process = StartCli(["run-all", "--as-of", environment.asOfText])
+    process = StartCli(["run-all", *runAllOptions, "--as-of", environment.asOfText])
     try:
         WaitUntil(lambda: HasPostedTransaction(engine), POSTING_WAIT_SECONDS, "a posting")
     finally:
         KillProcess(process)
     WaitUntil(lambda: not IsBatchWindowHeld(engine), WINDOW_RELEASE_SECONDS, "the window release")
+    WaitUntil(lambda: not HasBusySession(engine), WINDOW_RELEASE_SECONDS, "the killed sessions")
+
+
+def InterruptPosttran(environment: BatchEnvironment, start: InterruptionStart) -> None:
+    """Reach POSTTRAN from the seed as start sets out, and SIGKILL the run-all once it posts."""
+    if start.backupCommand is not None:
+        outcome = InvokeCli(start.backupCommand)
+        assert outcome.exitCode == EXIT_OK, outcome.output
+    KillRunAllDuringPosttran(environment, start.runAllOptions)
+
+
+def InjectIoErrorAtValidation(monkeypatch: pytest.MonkeyPatch, recordNumber: int) -> None:
+    """Make POSTTRAN's recordNumber-th 1500-VALIDATE-TRAN raise an I/O error.
+
+    The validation runs once per staged record, before the record writes anything, so records
+    before it stay posted. The OperationalError is POSTTRAN's 9999-ABEND-PROGRAM, exit 16.
+    posttran binds the function by name, so both bindings are replaced.
+    """
+    originalValidate = cbtrn02c.ValidateDailyTransaction
+    callNumbers = itertools.count(1)
+
+    def FailingValidate(postingInput: cbtrn02c.PostingInput) -> cbtrn02c.RejectOutcome | None:
+        if next(callNumbers) == recordNumber:
+            raise OperationalError(INJECTED_IO_STATEMENT, {}, OSError(INJECTED_IO_REASON))
+        return originalValidate(postingInput)
+
+    monkeypatch.setattr(cbtrn02c, VALIDATION_FUNCTION_NAME, FailingValidate)
+    monkeypatch.setattr(posttran, VALIDATION_FUNCTION_NAME, FailingValidate)
+
+
+def FailPosttranAtRecord(environment: BatchEnvironment, recordNumber: int) -> None:
+    """Run run-all --start-at POSTTRAN from the seed with an I/O error at record recordNumber.
+
+    POSTTRAN abends with exit 16, leaving step 13 FAILED and step 6 PENDING with no run.
+    """
+    with pytest.MonkeyPatch.context() as injection:
+        InjectIoErrorAtValidation(injection, recordNumber)
+        outcome = RunAll(environment, *START_AT_POSTTRAN_OPTIONS)
+    assert outcome.exitCode == EXIT_ABEND, outcome.output
+    assert StepRow(environment.engine, POSTTRAN_STEP)["state"] == run_ledger.STEP_FAILED
+    assert FirstBackupHistory(environment.engine) == FIRST_BACKUP_NEVER_RUN
 
 
 def ReadOracleState(engine: Engine) -> legacy_oracle.OracleState:
@@ -714,6 +836,13 @@ def AssertKilledPosttranInterrupted(environment: BatchEnvironment) -> None:
     stepRow = StepRow(environment.engine, POSTTRAN_STEP)
     assert RunStatus(environment.engine, stepRow["last_run_id"]) == run_ledger.RUN_INTERRUPTED
     assert CountJobRuns(environment.engine, POSTTRAN_STEP) == 1
+
+
+def OraclePosting(engine: Engine, dailyRecords: list[str]) -> legacy_oracle.PosttranOutcome:
+    """Return the oracle's POSTTRAN of dailyRecords over the database's state, at the DB2 clock."""
+    return legacy_oracle.RunPosttran(
+        ReadOracleState(engine), dailyRecords, legacy_oracle.DB2_CLOCK_TEXT
+    )
 
 
 def AssertPostingStateMatchesOracle(engine: Engine, expected: legacy_oracle.OracleState) -> None:
@@ -913,8 +1042,12 @@ def test_run_all_from_alembic_seed_runs_only_steps_6_and_13_to_18_and_exits_4(
 
 @pytest.mark.parametrize(
     ("failingStepNo", "injectedExitCode"),
-    [(SECOND_TRANBKP_STEP, EXIT_FAILURE), (POSTTRAN_STEP + 1, EXIT_ABEND)],
-    ids=["step-15-rc12", "step-14-rc16"],
+    [
+        (POSTTRAN_STEP + 1, LOWEST_STOPPING_EXIT_CODE),
+        (SECOND_TRANBKP_STEP, EXIT_FAILURE),
+        (POSTTRAN_STEP + 1, EXIT_ABEND),
+    ],
+    ids=["step-14-rc8", "step-15-rc12", "step-14-rc16"],
 )
 def test_chain_continues_after_exit_4_and_stops_at_8_or_more(
     failingStepNo: int,
@@ -1070,6 +1203,28 @@ def test_files_only_creastmt_failure_is_retried_by_next_run_all(
     AssertCleanChainResult(engine, outputDir)
 
 
+def test_failed_posttran_with_step_6_pending_is_refused_then_forced_from_partial_state(
+    batchEnvironment: BatchEnvironment,
+) -> None:
+    """Neither the refused nor the forced run-all runs step 6, which would archive the postings."""
+    engine = batchEnvironment.engine
+    dailyRecords = legacy_oracle.ReadDailyRecords(SAMPLE_DAILY_PATH)
+    expectedPartial = OraclePosting(engine, dailyRecords[: FAILING_DAILY_RECORD_NUMBER - 1])
+    FailPosttranAtRecord(batchEnvironment, FAILING_DAILY_RECORD_NUMBER)
+    AssertPostingStateMatchesOracle(engine, expectedPartial.state)
+    AssertPerWriteRefused(POSTTRAN_STEP, batchEnvironment, run_ledger.STEP_FAILED)
+    # A legacy restart re-reads DALYTRAN from record 1, so the first record already posted
+    # abends on its duplicate TRANSACT WRITE.
+    expected = OraclePosting(engine, dailyRecords)
+    assert expected.exitCode == EXIT_ABEND
+    backupCountBefore = BackupGenerationCount(engine)
+    forcedRun = RunAll(batchEnvironment, "--force")
+    assert forcedRun.exitCode == expected.exitCode, forcedRun.output
+    AssertPostingStateMatchesOracle(engine, expected.state)
+    assert FirstBackupHistory(engine) == FIRST_BACKUP_NEVER_RUN
+    assert BackupGenerationCount(engine) == backupCountBefore
+
+
 # --- Publication after the step's commit ---------------------------------------------------------
 @pytest.mark.parametrize("stepNo", PRODUCER_STEPS, ids=StepId)
 def test_publication_error_after_commit_keeps_step_completed_and_next_run_all_skips_it(
@@ -1104,13 +1259,13 @@ def test_generation_lost_in_publication_stops_chain_and_blocks_cycle_until_new_c
 
 # --- SIGKILL of a per-write step -----------------------------------------------------------------
 @pytest.mark.slow
+@pytest.mark.parametrize("interruptionStart", INTERRUPTION_STARTS)
 def test_sigkilled_posttran_is_interrupted_refused_then_forced_from_partial_state(
-    batchEnvironment: BatchEnvironment,
+    interruptionStart: InterruptionStart, batchEnvironment: BatchEnvironment
 ) -> None:
     engine = batchEnvironment.engine
     dailyPath = StageSyntheticDailyFile(batchEnvironment)
-    assert InvokeCli(RERUN_COMMANDS[FIRST_TRANBKP_STEP]).exitCode == EXIT_OK
-    KillRunAllDuringPosttran(batchEnvironment)
+    InterruptPosttran(batchEnvironment, interruptionStart)
     partialState = ReadOracleState(engine)
     assert partialState.transactions
     AssertPerWriteRefused(POSTTRAN_STEP, batchEnvironment, run_ledger.STEP_INTERRUPTED)
@@ -1125,3 +1280,4 @@ def test_sigkilled_posttran_is_interrupted_refused_then_forced_from_partial_stat
     assert forcedRun.exitCode == expected.exitCode, forcedRun.output
     assert RunStatus(engine, posttranRunId) == run_ledger.RUN_FAILED
     AssertPostingStateMatchesOracle(engine, expected.state)
+    assert FirstBackupHistory(engine) == interruptionStart.firstBackupHistory

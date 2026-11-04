@@ -644,6 +644,9 @@ describe("COSGN00C pending sign-off message on /signon", () => {
 
 // MUI marks every Paper, the Alert's own root included, as MuiPaper-root.
 const PAPER_CLASS = "MuiPaper-root";
+// The notice's Paper insets the Alert on the 4 dp grid, so its shadow and corners frame the
+// Alert instead of hugging it edge to edge.
+const NOTICE_INSET_STYLE = { padding: CARD_DEMO_THEME.spacing(4) };
 
 interface SignOffPathCase {
     name: string;
@@ -678,6 +681,7 @@ describe("COSGN00C sign-off notice on /signon", () => {
             await WaitForIdle();
             const notice = screen.getByRole("alert");
             expect(notice.parentElement).toHaveClass(PAPER_CLASS);
+            expect(notice.parentElement).toHaveStyle(NOTICE_INSET_STYLE);
             expect(notice).not.toHaveAttribute("id", MESSAGE_LINE_ERROR_ID);
             expect(document.getElementById(MESSAGE_LINE_ERROR_ID)).toBeNull();
             const keyBar = screen.getByRole("group", { name: FUNCTION_KEY_GROUP });
