@@ -21,7 +21,8 @@ and 0.9.4 (runtime verification), define it:
   12 with one DATABASE ERROR line naming its classes and SQLSTATE, and no traceback. A file
   error there, such as a directory where catalog recovery expects a generation file or an orphan
   .part, exits 12 with one FILE ERROR line naming its class, errno symbol and path, the path's
-  non-printable characters escaped and its card number masked.
+  non-printable characters escaped and its card number masked. So does a missing --daily-file
+  or --source-dir, in its one INPUT IMAGE NOT FOUND line, and any runner's failure message.
 
 The database tests start from the restored seed state of the batchEnvironment fixture, where
 the Alembic seed cycle is OPEN with steps 1-5 and 7-12 COMPLETED.
@@ -40,11 +41,21 @@ from pathlib import Path
 import pytest
 from app.core.paths import REPO_ROOT
 from app.models import JOB_RUNS, Account, Transaction, TransactionType
+from app.seed.image_reader import SAMPLE_IMAGE_NAMES
 from sqlalchemy import Engine, Table, select, text, update
 
 from batch import cli
+from batch.loaders import trantype
+from batch.loaders.replace_loader import IMAGE_NOT_FOUND_TEMPLATE
 from batch.orchestration import run_ledger
-from batch.orchestration.job_context import EXIT_FAILURE, EXIT_OK, EXIT_REJECTS, JobContext
+from batch.orchestration.job_context import (
+    EXIT_FAILURE,
+    EXIT_OK,
+    EXIT_REJECTS,
+    JobContext,
+    JobFailure,
+    JobResult,
+)
 from batch.tests.conftest import (
     BACKEND_DIR,
     CLI_TIMEOUT_SECONDS,
@@ -288,6 +299,43 @@ FORGED_LOG_TEXT = "ERROR forged-recovery-success"
 HOSTILE_PART_FILE = f"G0050\n{FORGED_LOG_TEXT} {TYPED_CARD_NUMBER}\r\x1b[31m.dat.part"
 SHOWN_HOSTILE_PART_FILE = f"G0050\\n{FORGED_LOG_TEXT} {MASKED_CARD_NUMBER}\\r\\x1b[31m.dat.part"
 RAW_CONTROL_CHARACTERS = ("\r", "\x1b")
+# A missing --daily-file or --source-dir whose name holds the same hostile text, and the name as
+# a failure line shows it.
+HOSTILE_IMAGE_NAME = f"missing\n{FORGED_LOG_TEXT} {TYPED_CARD_NUMBER}\r\x1b[31m"
+SHOWN_HOSTILE_IMAGE_NAME = f"missing\\n{FORGED_LOG_TEXT} {MASKED_CARD_NUMBER}\\r\\x1b[31m"
+TRAN_TYPES_DATASET = "transaction_types"
+# A runner failure whose message names such a path, as batch_chain.HandleFailure receives it.
+HOSTILE_FAILURE_MESSAGE = f"TRANTYPE FAILED ON {HOSTILE_IMAGE_NAME}"
+SHOWN_HOSTILE_FAILURE_MESSAGE = f"TRANTYPE FAILED ON {SHOWN_HOSTILE_IMAGE_NAME}"
+
+
+@dataclass(frozen=True)
+class MissingImageCase:
+    """A load given a missing image path: its loader, the option naming the path, its dataset,
+    and what the loader appends to that path: the image name to a --source-dir, nothing to a
+    --daily-file, which is the image itself."""
+
+    loaderName: str
+    optionName: str
+    dataset: str
+    appendedName: str = ""
+
+
+MISSING_IMAGE_CASES = (
+    pytest.param(
+        MissingImageCase("daily-transactions", "--daily-file", "daily_transactions"),
+        id="daily-file",
+    ),
+    pytest.param(
+        MissingImageCase(
+            "tran-types",
+            "--source-dir",
+            TRAN_TYPES_DATASET,
+            "/" + SAMPLE_IMAGE_NAMES[TRAN_TYPES_DATASET].ebcdicName,
+        ),
+        id="source-dir",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -751,3 +799,60 @@ def test_prelude_file_error_escapes_control_characters_and_masks_card_number_in_
     assert TRACEBACK_TEXT not in outcome.output, shownOutput
     assert CountJobRuns(engine) == runsBefore
     assert not IsBatchWindowHeld(engine)
+
+
+def AssertHostileTextShownOnOneLine(output: str, lineEnd: str) -> None:
+    """Assert the forged text sits on exactly one line, which ends with lineEnd, and that no
+    line starts with it and no control character or card number of the hostile text is raw.
+
+    Failure messages show the output through ascii(), so no raw escape reaches the terminal.
+    """
+    shownOutput = ascii(output)
+    outputLines = output.splitlines()
+    forgedLines = [line for line in outputLines if FORGED_LOG_TEXT in line]
+    assert len(forgedLines) == 1, shownOutput
+    assert forgedLines[0].endswith(lineEnd), shownOutput
+    assert not any(line.startswith(FORGED_LOG_TEXT) for line in outputLines), shownOutput
+    assert not any(character in output for character in RAW_CONTROL_CHARACTERS), shownOutput
+    assert TYPED_CARD_NUMBER not in output, shownOutput
+    assert TRACEBACK_TEXT not in output, shownOutput
+
+
+@pytest.mark.parametrize("missingCase", MISSING_IMAGE_CASES)
+def test_missing_image_path_is_shown_escaped_and_masked_on_one_line(
+    batchEnvironment: BatchEnvironment, tmp_path: Path, missingCase: MissingImageCase
+) -> None:
+    """A missing --daily-file or --source-dir exits 12 with one INPUT IMAGE NOT FOUND line.
+
+    The path's name holds a line feed before forged ERROR text, a card number, a carriage
+    return and an ANSI escape, so a path shown verbatim would split the line and forge another.
+    The line ends with the path instead, each control character escaped and the card number
+    masked, and the window is released.
+    """
+    hostilePath = tmp_path / HOSTILE_IMAGE_NAME
+    outcome = InvokeCli(["load", missingCase.loaderName, missingCase.optionName, str(hostilePath)])
+    assert outcome.exitCode == EXIT_FAILURE, ascii(outcome.output)
+    shownPath = f"{tmp_path}/{SHOWN_HOSTILE_IMAGE_NAME}{missingCase.appendedName}"
+    lineEnd = IMAGE_NOT_FOUND_TEMPLATE.format(dataset=missingCase.dataset, path=shownPath)
+    AssertHostileTextShownOnOneLine(outcome.output, lineEnd)
+    assert not IsBatchWindowHeld(batchEnvironment.engine)
+
+
+def test_runner_failure_message_is_logged_with_its_control_characters_escaped(
+    batchEnvironment: BatchEnvironment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """batch_chain.HandleFailure logs a runner's JobFailure text as one line, exit 12.
+
+    A runner's message can name a path an operator or a directory listing chose, so its line
+    feed, carriage return and ANSI escape are escaped and its card number masked, whichever
+    runner built it.
+    """
+
+    def FailingRunner(context: JobContext) -> JobResult:
+        raise JobFailure(EXIT_FAILURE, HOSTILE_FAILURE_MESSAGE)
+
+    monkeypatch.setattr(trantype, "RunLoader", FailingRunner)
+    outcome = InvokeCli(["load", "tran-types"])
+    assert outcome.exitCode == EXIT_FAILURE, ascii(outcome.output)
+    AssertHostileTextShownOnOneLine(outcome.output, SHOWN_HOSTILE_FAILURE_MESSAGE)
+    assert not IsBatchWindowHeld(batchEnvironment.engine)

@@ -17,6 +17,14 @@ parse stops either mode with a ValueError naming its source, never repeating its
 Online runs never log bound parameters or result rows (see RunMigrationsOnline), and stop
 connecting after CONNECT_TIMEOUT_SECONDS unless the URL carries its own connect_timeout.
 
+A database error raised while the revisions run (a DBAPIError, such as the IntegrityError of a
+duplicate card number in the seed images) never reaches the console as itself: its DETAIL
+quotes the offending key. Once the migration transaction has rolled back, the error is
+re-raised from None as an Alembic CommandError carrying only MIGRATION_DATABASE_ERROR_MESSAGE:
+the wrapper and driver classes, the SQLSTATE and the violated constraint. ``alembic upgrade``
+then prints one ``FAILED:`` line and exits non-zero, and a harness that supplies its own
+connection receives the same CommandError (see RunMigrationsOnConnection).
+
 A harness may also set ``config.attributes["connection"]`` to an open ``Connection``, which is
 used as given and left open, and ``config.attributes["configure_logger"] = False`` to keep its
 own logging configuration. Otherwise the ini file's logger levels apply and every record is
@@ -29,8 +37,10 @@ import logging
 from collections.abc import Mapping
 from logging.config import fileConfig
 
+from alembic.util import CommandError
 from sqlalchemy import Engine, create_engine, pool
 from sqlalchemy.engine import URL, Connection
+from sqlalchemy.exc import DBAPIError
 
 from alembic import context
 from app.core.config import MigrationSettings, ParseDatabaseUrl
@@ -53,6 +63,14 @@ SYNC_URL_SETTING = "SYNC_DATABASE_URL"
 # within this many seconds instead of hanging it.
 CONNECT_TIMEOUT_ARGUMENT = "connect_timeout"
 CONNECT_TIMEOUT_SECONDS = 10
+# A database error of the revisions is reported by these names only, never by its own text:
+# the driver's DETAIL line quotes the offending key, such as a seeded card number, and the
+# statement text can carry other row values.
+MIGRATION_DATABASE_ERROR_MESSAGE = (
+    "MIGRATION FAILED: DATABASE ERROR {errorClass} ({driverClass}) SQLSTATE {sqlState}"
+    " ON CONSTRAINT {constraintName}; NO REVISION OF THIS RUN WAS COMMITTED"
+)
+UNKNOWN_DIAGNOSTIC = "UNKNOWN"
 
 
 def ResolveDatabaseUrl() -> URL | None:
@@ -172,11 +190,48 @@ def ConfigureContext(connection: Connection) -> None:
     )
 
 
+def DiagnosticText(value: object) -> str:
+    """Return ``value`` when it is a non-empty string, otherwise UNKNOWN_DIAGNOSTIC."""
+    if isinstance(value, str) and value:
+        return value
+    return UNKNOWN_DIAGNOSTIC
+
+
+def SanitizedDatabaseError(error: DBAPIError) -> CommandError:
+    """Return the CommandError that reports ``error`` by MIGRATION_DATABASE_ERROR_MESSAGE.
+
+    The message names the wrapper and driver classes, the driver's SQLSTATE (``pgcode``) and the
+    violated constraint (``diag.constraint_name``), each UNKNOWN_DIAGNOSTIC when the driver gives
+    none. It never holds str(error), the DETAIL, the statement, its parameters or the URL.
+    """
+    driverError = error.orig
+    driverClass = UNKNOWN_DIAGNOSTIC if driverError is None else type(driverError).__name__
+    diagnostics = getattr(driverError, "diag", None)
+    failureMessage = MIGRATION_DATABASE_ERROR_MESSAGE.format(
+        errorClass=type(error).__name__,
+        driverClass=driverClass,
+        sqlState=DiagnosticText(getattr(driverError, "pgcode", None)),
+        constraintName=DiagnosticText(getattr(diagnostics, "constraint_name", None)),
+    )
+    return CommandError(failureMessage)
+
+
 def RunMigrationsOnConnection(connection: Connection) -> None:
-    """Run the pending revisions on ``connection`` inside the migration transaction."""
+    """Run the pending revisions on ``connection`` inside the migration transaction.
+
+    A DBAPIError of a revision, such as the IntegrityError of a duplicate key in the sample
+    seed, is caught only after the ``begin_transaction`` block has exited, so Alembic has
+    already rolled its transaction back. A connection that arrives inside its owner's
+    transaction gets no transaction of Alembic's, and that owner rolls it back. The error is
+    re-raised from None as SanitizedDatabaseError's CommandError: the Alembic CLI prints that
+    as one ``FAILED:`` line, and no traceback chains the original's text.
+    """
     ConfigureContext(connection)
-    with context.begin_transaction():
-        context.run_migrations()
+    try:
+        with context.begin_transaction():
+            context.run_migrations()
+    except DBAPIError as error:
+        raise SanitizedDatabaseError(error) from None
 
 
 def OfflineTarget() -> dict[str, str | URL]:
@@ -239,7 +294,9 @@ def RunMigrationsOnline() -> None:
     SuppressEngineStatementLogging runs first, after the ini file's logging configuration
     has reset the engine logger, so no statement, parameter or row log record is created on
     either connection. A harness connection is left open for its owner. The engine built from
-    the resolved URL holds no pooled connection after the run and is disposed of.
+    the resolved URL holds no pooled connection after the run and is disposed of. On both
+    connections a database error of the revisions reaches the caller as the sanitized
+    CommandError of RunMigrationsOnConnection, after the rollback.
     """
     SuppressEngineStatementLogging()
     harnessConnection = CONFIG.attributes.get("connection")

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+from app.core.logging import PrintableText
 from jinja2 import TemplateError
 from sqlalchemy.exc import DBAPIError
 
@@ -188,8 +189,15 @@ def DescribeInputs() -> str:
 
 
 def DescribeOutputs(statementsDir: Path) -> str:
-    """Return the STEP040 output DD names with the files they are written to."""
-    return ", ".join(f"{ddName}={statementsDir / fileName}" for ddName, fileName in OUTPUT_DATASETS)
+    """Return the STEP040 output DD names with the files they are written to.
+
+    The paths come from CARDDEMO_OUTPUT_DIR, so each is shown with every non-printable
+    character escaped and the log line stays one line.
+    """
+    return ", ".join(
+        f"{ddName}={PrintableText(statementsDir / fileName)}"
+        for ddName, fileName in OUTPUT_DATASETS
+    )
 
 
 def WriteStatements(context: JobContext, statementsDir: Path) -> StatementCounts:
@@ -280,14 +288,14 @@ def RecoverInterruptedPublication(statementsDir: Path) -> None:
     if not os.path.lexists(markerPath):
         RemoveStaleFiles(statementsDir, BackupPath)
         return
-    LOGGER.warning(ROLLBACK_LOG, markerPath)
+    LOGGER.warning(ROLLBACK_LOG, PrintableText(markerPath))
     RollBackPublication(statementsDir)
 
 
 def RemoveStaleFiles(statementsDir: Path, pathOf: Callable[[Path, str], Path]) -> None:
     """Delete the work files at pathOf that an interrupted run left, logging each one."""
     for stalePath in RemoveWorkFiles(statementsDir, pathOf):
-        LOGGER.warning(STALE_FILE_LOG, stalePath)
+        LOGGER.warning(STALE_FILE_LOG, PrintableText(stalePath))
 
 
 def RemoveWorkFiles(statementsDir: Path, pathOf: Callable[[Path, str], Path]) -> list[Path]:
@@ -412,7 +420,7 @@ def RestoreTarget(statementsDir: Path, fileName: str) -> None:
     if not os.path.lexists(backupPath):
         if os.path.lexists(targetPath):
             targetPath.unlink()
-            LOGGER.warning(UNPUBLISHED_FILE_LOG, targetPath)
+            LOGGER.warning(UNPUBLISHED_FILE_LOG, PrintableText(targetPath))
         return
     if os.path.lexists(targetPath) and os.path.samestat(os.lstat(backupPath), os.lstat(targetPath)):
         return
@@ -421,7 +429,7 @@ def RestoreTarget(statementsDir: Path, fileName: str) -> None:
     stagingPath = TemporaryPath(statementsDir, fileName)
     os.link(backupPath, stagingPath, follow_symlinks=False)
     os.replace(stagingPath, targetPath)
-    LOGGER.warning(RESTORED_FILE_LOG, targetPath, backupPath)
+    LOGGER.warning(RESTORED_FILE_LOG, PrintableText(targetPath), PrintableText(backupPath))
 
 
 def SyncDirectory(directory: Path) -> None:

@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-from app.core.logging import ConfigureLogging, MaskSensitiveText
+from app.core.logging import ConfigureLogging, MaskSensitiveText, PrintableText
 from app.seed.image_reader import ENCODING_ASCII, ENCODING_EBCDIC
 from pydantic import ValidationError
 from sqlalchemy import Engine
@@ -57,7 +57,6 @@ from batch.orchestration.batch_chain import (
     FindJobDefinition,
     JobRequest,
     ParseStartAt,
-    PrintableText,
     RunChain,
     RunSeedAll,
     RunStandaloneJob,
@@ -86,9 +85,10 @@ LOGGER = logging.getLogger(__name__)
 # example a missing relation in an unmigrated database: its wrapper class, driver class and
 # SQLSTATE, UNKNOWN_CODE standing in for either one the driver did not supply. FILE ERROR names
 # a file error that no step mapped, for example a directory where catalog recovery expects a
-# generation file or an orphan .part: its class, its errno symbol (UNKNOWN_CODE when it has
-# none) and the path it names, the one the operator repairs, but never the OS error text. The
-# path is shown with every non-printable character escaped, so it stays on the one line.
+# generation file or an orphan .part, or the gdg.ManagedDirectoryError of a gdg or base
+# directory that is a symbolic link, never followed: its class, its errno symbol (UNKNOWN_CODE
+# when it has none) and the path it names, the one the operator repairs, but never the OS error
+# text. The path is shown with every non-printable character escaped, so it stays on one line.
 DATABASE_UNAVAILABLE_MESSAGE = "DATABASE NOT AVAILABLE"
 DATABASE_ERROR_MESSAGE = "DATABASE ERROR"
 FILE_ERROR_MESSAGE = "FILE ERROR"

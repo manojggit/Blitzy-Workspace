@@ -65,6 +65,13 @@ log, which its default configuration writes to stderr, is written to stdout inst
 handlers write the stdout handler's LOG_LINE_FORMAT, so its access and server lines carry the
 timestamp that application and batch lines carry, and the logs can be ordered together.
 
+Masking never removes a line break or a terminal escape. Batch and the migrations therefore pass
+text the program did not write, such as a file name found in a directory, a configured or
+operator-given path or an operator's typed name, through PrintableText before it joins a log
+line or a failure message: every non-printable character, a line feed, carriage return, ESC,
+U+2028 or lone surrogate included, is shown as its Python escape, so the text stays on its one
+line and forges no other. Masking then runs on the escaped text as on any other.
+
 This module imports only the standard library, so batch and the backend can both call
 ConfigureLogging() without any settings in the environment.
 """
@@ -264,6 +271,19 @@ LOG_LINE_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 # timestamped form and can be ordered together. A formatter keeps no per-record state.
 LOG_LINE_FORMATTER = logging.Formatter(LOG_LINE_FORMAT)
 TRACEBACK_FORMATTER = logging.Formatter()
+
+
+def PrintableText(value: object) -> str:
+    """Return str(value) for a log line, each non-printable character shown as its escape.
+
+    A character str.isprintable() refuses becomes the text between the quotes of its repr,
+    such as \\n, \\r, \\x1b, \\u2028 or \\udcff. Printable text, a backslash included, is kept,
+    so escaping the result again changes nothing. Display only: the value itself, such as the
+    path a caller opens, is never changed.
+    """
+    return "".join(
+        character if character.isprintable() else repr(character)[1:-1] for character in str(value)
+    )
 
 
 def MaskPanRuns(text: str) -> str:

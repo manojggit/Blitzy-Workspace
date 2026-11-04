@@ -34,6 +34,7 @@ from io import BufferedReader
 from pathlib import Path
 from typing import NamedTuple
 
+from app.core.logging import PrintableText
 from app.core.paths import ResolveRepoPath
 from app.utils.record_layouts import DecodeRecord, RecordLayout
 
@@ -89,11 +90,17 @@ class ImageFormatError(ValueError):
     """A seed image that cannot be read, framed or decoded; loaders map it to exit 12.
 
     recordNumber is the 1-based record number, or 0 for a problem with the whole file such as
-    a missing file or a size that is not a multiple of the LRECL.
+    a missing file or a size that is not a multiple of the LRECL. The message, str(error), is
+    "<path>: record <recordNumber>: <reason>" with each non-printable character of the path and
+    the reason shown as its escape by PrintableText, so an operator-chosen path or a reason
+    quoting record text stays on one line of a log or traceback and emits no terminal control.
+    The path, recordNumber and reason attributes keep the values given, for opening the file
+    and rebuilding the error.
     """
 
     def __init__(self, path: str | Path, recordNumber: int, reason: str) -> None:
-        super().__init__(f"{path}: record {recordNumber}: {reason}")
+        shownPath, shownReason = PrintableText(path), PrintableText(reason)
+        super().__init__(f"{shownPath}: record {recordNumber}: {shownReason}")
         self.path = path
         self.recordNumber = recordNumber
         self.reason = reason

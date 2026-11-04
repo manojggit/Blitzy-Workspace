@@ -28,6 +28,7 @@ from pathlib import Path
 
 from alembic import context, op
 from app.core.config import MigrationSettings
+from app.core.logging import PrintableText
 from app.seed.image_reader import ENCODING_EBCDIC, ImageFormatError
 from app.seed.sample_seed import LoadSampleData
 
@@ -96,15 +97,16 @@ def LogImageFormatError(imageDir: Path, error: ImageFormatError, errorCode: str)
     """Log a malformed image by whitelisted metadata only, never by the error's text.
 
     The metadata is the image directory, the image file name, the record number (0 for the
-    whole file), the error class and errorCode, the class of its cause.
+    whole file), the error class and errorCode, the class of its cause. The directory and file
+    name are shown with every non-printable character escaped, so the line stays one line.
     """
     imageName = Path(error.path).name
     errorClass = type(error).__name__
     LOGGER.error(
         "sample seed failed for the images in %s: %s in image %s record %d, cause %s",
-        imageDir,
+        PrintableText(imageDir),
         errorClass,
-        imageName,
+        PrintableText(imageName),
         error.recordNumber,
         errorCode,
     )
@@ -133,8 +135,9 @@ def LoadImages(settings: MigrationSettings) -> dict[str, int]:
         # raw field content of the malformed record, such as a card number or an SSN.
         raise WithheldImageError(error, errorCode) from None
     except FileNotFoundError as error:
-        # Its message names only a path, so it is re-raised as it is.
-        LOGGER.error("sample seed failed for the images in %s: %s", imageDir, type(error).__name__)
+        # Its message names only a path, which it shows by repr, so it is re-raised as it is.
+        shownDir = PrintableText(imageDir)
+        LOGGER.error("sample seed failed for the images in %s: %s", shownDir, type(error).__name__)
         raise
 
 

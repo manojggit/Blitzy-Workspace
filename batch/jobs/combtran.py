@@ -14,12 +14,15 @@ archived and emptied transactions.transactions.
   KSDS; the port inserts each one into transactions.transactions in file order.
 
 The sort streams, so the records held in memory never grow with the generations; only the list
-of spilled run paths grows, with the run count. Each input is checked for TRAN-ID order by a
+of spilled run names grows, with the run count. Each input is checked for TRAN-ID order by a
 first read; one in order streams from its file, and one out of order (a SYSTRAN whose six-digit
 INTCALC suffix wrapped at 999999, or any other) is sorted stably with bounded record buffers and
-spilled runs, as DFSORT uses work files. The runs go to a work directory in the
+spilled runs, as DFSORT uses work files. The runs go to a private work directory in the
 TRANSACT.COMBINED base directory, beside the generation's .part file, which the job removes
-whatever happens and gdg.ReconcileCatalog removes after a killed run. The two ordered streams
+whatever happens and gdg.ReconcileCatalog removes after a killed run. The work directory and
+its run files, which hold card numbers, are reached only relative to held directory
+descriptors (gdg.WorkDirectory), so a symbolic link at the gdg or base directory is refused
+with gdg.ManagedDirectoryError, a file error, instead of being followed. The two ordered streams
 are merged stably, BKUP first on equal keys, and one pass writes each record, decodes it and
 inserts it in bounded batches.
 
@@ -49,10 +52,10 @@ import errno
 import heapq
 import itertools
 import logging
-import tempfile
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
+from app.core.logging import PrintableText
 from app.models import Transaction
 from app.utils.record_layouts import TRANSACTION_LAYOUT, DecodeRecord, RecordFormatError
 from sqlalchemy import insert
@@ -82,11 +85,12 @@ INSERT_BATCH_SIZE = 500
 # files: runs of at most SORT_RUN_RECORD_COUNT records are sorted in memory and spilled to a
 # work directory (SPILL_DIRECTORY_PREFIX, gdg.WORK_DIRECTORY_SUFFIX) in the TRANSACT.COMBINED
 # base directory, and at most MERGE_FAN_IN runs are open in any merge, so the records held in
-# memory and the run files open per merge stay bounded; only the list of run paths grows with
+# memory and the run files open per merge stay bounded; only the list of run names grows with
 # the number of runs.
 SORT_RUN_RECORD_COUNT = 10_000
 MERGE_FAN_IN = 64
 SPILL_DIRECTORY_PREFIX = "carddemo-combtran-"
+RUN_FILE_PREFIX = "run-"
 RUN_FILE_SUFFIX = ".run"
 
 TRANSACTION_TABLE = Transaction.__table__
@@ -173,7 +177,7 @@ def KeyOrderedRecords(generation: gdg.Generation) -> Iterator[str]:
         recordKey = TranIdSortKey(record)
         if recordKey < previousKey:
             reason = UNORDERED_RECORD_TEMPLATE.format(
-                path=generation.path, recordNumber=recordNumber
+                path=PrintableText(generation.path), recordNumber=recordNumber
             )
             raise UnorderedGenerationError(reason)
         previousKey = recordKey
@@ -193,37 +197,40 @@ def IsInKeyOrder(generation: gdg.Generation) -> bool:
     return True
 
 
-def WriteRun(records: Iterable[str], spillDirectory: Path) -> Path:
-    """Write records, in the order given, to a new run file of the spill directory; return it."""
-    with tempfile.NamedTemporaryFile(
-        mode="wb", dir=spillDirectory, suffix=RUN_FILE_SUFFIX, delete=False
-    ) as runFile:
+def WriteRun(records: Iterable[str], spillDirectory: gdg.ManagedDirectory) -> str:
+    """Write records, in the order given, to a new run file of the spill directory.
+
+    Returns the run file's name, random and created exclusively without following a link.
+    """
+    runName, runFile = spillDirectory.CreateUniqueFile(RUN_FILE_PREFIX, RUN_FILE_SUFFIX)
+    with runFile:
         for record in records:
             runFile.write(record.encode(gdg.GDG_FILE_ENCODING) + gdg.RECORD_TERMINATOR)
-    return Path(runFile.name)
+    return runName
 
 
-def ReadRun(runPath: Path) -> Iterator[str]:
-    """Yield the records of a run file in file order, terminators removed."""
-    with runPath.open("rb") as runFile:
+def ReadRun(runName: str, spillDirectory: gdg.ManagedDirectory) -> Iterator[str]:
+    """Yield the records of a run file of the spill directory in file order, terminators removed."""
+    with spillDirectory.ReadFile(runName) as runFile:
         for line in runFile:
             yield line[: -len(gdg.RECORD_TERMINATOR)].decode(gdg.GDG_FILE_ENCODING)
 
 
-def MergeRuns(runPaths: Sequence[Path]) -> Iterator[str]:
+def MergeRuns(runNames: Sequence[str], spillDirectory: gdg.ManagedDirectory) -> Iterator[str]:
     """Merge sorted runs by TRAN-ID; on equal keys, records of earlier runs come first."""
-    return heapq.merge(*(ReadRun(runPath) for runPath in runPaths), key=TranIdSortKey)
+    runs = (ReadRun(runName, spillDirectory) for runName in runNames)
+    return heapq.merge(*runs, key=TranIdSortKey)
 
 
-def MergeRunGroup(runGroup: Sequence[Path], spillDirectory: Path) -> Path:
-    """Merge consecutive runs into one new run, then delete them; return the new run."""
-    mergedPath = WriteRun(MergeRuns(runGroup), spillDirectory)
-    for runPath in runGroup:
-        runPath.unlink()
-    return mergedPath
+def MergeRunGroup(runGroup: Sequence[str], spillDirectory: gdg.ManagedDirectory) -> str:
+    """Merge consecutive runs into one new run, then delete them; return the new run's name."""
+    mergedName = WriteRun(MergeRuns(runGroup, spillDirectory), spillDirectory)
+    for runName in runGroup:
+        spillDirectory.Unlink(runName)
+    return mergedName
 
 
-def SpillSortedRuns(records: Iterable[str], spillDirectory: Path) -> list[Path]:
+def SpillSortedRuns(records: Iterable[str], spillDirectory: gdg.ManagedDirectory) -> list[str]:
     """Cut records into runs of at most SORT_RUN_RECORD_COUNT, sort each stably and spill it."""
     return [
         WriteRun(sorted(runRecords, key=TranIdSortKey), spillDirectory)
@@ -236,24 +243,22 @@ def ExternalSort(
 ) -> Iterator[str]:
     """Return a generation's records in stable TRAN-ID order, sorted with bounded record buffers.
 
-    Stably sorted runs are spilled to a new work directory under spillRoot, which cleanup
-    removes, then merged MERGE_FAN_IN consecutive runs at a time until one merge of at most
-    MERGE_FAN_IN remains. Only the list of run paths grows, with the number of spilled runs.
+    Stably sorted runs are spilled to a new private work directory of spillRoot, an archive base
+    directory, made and removed by gdg.WorkDirectory, which cleanup exits. The directory is held
+    by its descriptor and every run file is created, read and deleted relative to it, so a
+    symbolic link standing at the gdg, base or work directory is refused, never followed. The
+    runs are merged MERGE_FAN_IN consecutive runs at a time until one merge of at most
+    MERGE_FAN_IN remains. Only the list of run names grows, with the number of spilled runs.
     Each merge puts earlier runs first on equal keys, so the input order of equal keys is kept.
     The directory's gdg.WORK_DIRECTORY_SUFFIX lets gdg.ReconcileCatalog delete it when a killed
     process never ran cleanup.
     """
-    spillName = cleanup.enter_context(
-        tempfile.TemporaryDirectory(
-            suffix=gdg.WORK_DIRECTORY_SUFFIX, prefix=SPILL_DIRECTORY_PREFIX, dir=spillRoot
-        )
-    )
-    spillDirectory = Path(spillName)
-    runPaths = SpillSortedRuns(gdg.ReadGeneration(generation), spillDirectory)
-    while len(runPaths) > MERGE_FAN_IN:
-        runGroups = itertools.batched(runPaths, MERGE_FAN_IN)
-        runPaths = [MergeRunGroup(runGroup, spillDirectory) for runGroup in runGroups]
-    return MergeRuns(runPaths)
+    spillDirectory = cleanup.enter_context(gdg.WorkDirectory(spillRoot, SPILL_DIRECTORY_PREFIX))
+    runNames = SpillSortedRuns(gdg.ReadGeneration(generation), spillDirectory)
+    while len(runNames) > MERGE_FAN_IN:
+        runGroups = itertools.batched(runNames, MERGE_FAN_IN)
+        runNames = [MergeRunGroup(runGroup, spillDirectory) for runGroup in runGroups]
+    return MergeRuns(runNames, spillDirectory)
 
 
 def SortedInputRecords(
@@ -374,7 +379,9 @@ def CombineAndReload(context: JobContext) -> tuple[JobResult, gdg.GenerationWrit
     transaction opens; their merge then streams through it. Spilled runs go to a work directory
     in the TRANSACT.COMBINED base directory, under CARDDEMO_OUTPUT_DIR beside the generation's
     .part file rather than in the system temporary directory, and are removed whatever happens;
-    after a killed run, the next command's gdg.ReconcileCatalog removes them. The generation's
+    after a killed run, the next command's gdg.ReconcileCatalog removes them. gdg.BaseDirectory
+    creates that base directory and refuses a gdg or base directory that is a symbolic link,
+    as gdg.WorkDirectory and gdg.NewGeneration do again when they open it. The generation's
     COMMITTED row is the transaction's last statement, after the run's completion.
     """
     inputGenerations = ResolveInputGenerations(context)
@@ -421,11 +428,17 @@ def DescribeDatabaseError(error: DBAPIError) -> str:
 
 
 def DescribeFileError(error: OSError) -> str:
-    """Return a file error's class, errno symbol and, when known, the file it concerns."""
+    """Return a file error's class, errno symbol and, when known, the file it concerns.
+
+    The file, a str, bytes or file descriptor, is shown with every non-printable character
+    escaped, so a line break in its name cannot split the failure line.
+    """
     errnoName = UNKNOWN_CODE
     if isinstance(error.errno, int):
         errnoName = errno.errorcode.get(error.errno, UNKNOWN_CODE)
-    fileName = "" if error.filename is None else FILE_NAME_TEMPLATE.format(fileName=error.filename)
+    fileName = ""
+    if error.filename is not None:
+        fileName = FILE_NAME_TEMPLATE.format(fileName=PrintableText(error.filename))
     return FILE_ERROR_TEMPLATE.format(
         errorClass=type(error).__name__, errnoName=errnoName, fileName=fileName
     )

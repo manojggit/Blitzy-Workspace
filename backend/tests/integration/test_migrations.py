@@ -17,21 +17,31 @@ IDCAMS DEFINE CLUSTER, DEFINE AIX, BLDINDEX and REPRO steps that built and loade
 
 The session's migratedDatabase fixture has rebuilt the test database at head. Alembic is also
 run as a subprocess from backend/, as the run instructions do, with the session environment, so
-it reaches the same test database. No test downgrades. The one test that writes, the trigger
-test, runs under restoreSeedState, so every test leaves the database as migrated.
+it reaches the same test database. Only the two database-error tests downgrade, to 0001: they
+upgrade over a private copy of the seed images whose CARDDATA image repeats one record, on a
+harness connection and through the alembic CLI, and expect env.py's sanitized CommandError, no
+card number in any output, and the database still at 0001 with no partial seed. They upgrade
+back to head afterwards. They and the trigger test, the only tests that write, run under
+restoreSeedState, so every test leaves the database as migrated.
 """
 
+import logging
 import os
+import shutil
 import subprocess
 import sys
-from collections.abc import Sequence
+import traceback
+from collections.abc import Iterator, Mapping, Sequence
+from pathlib import Path
 from typing import NamedTuple, Protocol
 
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from alembic.util import CommandError
 from sqlalchemy import (
     CheckConstraint,
+    Connection,
     Constraint,
     Engine,
     ForeignKeyConstraint,
@@ -44,9 +54,12 @@ from sqlalchemy import (
     update,
 )
 
+from alembic import command
 from app.core.paths import REPO_ROOT
 from app.core.security import VerifyPassword
 from app.models import ALL_SCHEMAS, CYCLE_STEPS, CYCLES, JOB_RUNS, Base
+from app.seed.image_reader import SAMPLE_IMAGE_NAMES
+from app.utils.record_layouts import CARD_LAYOUT
 
 BACKEND_DIRECTORY = REPO_ROOT / "backend"
 ALEMBIC_INI_PATH = BACKEND_DIRECTORY / "alembic.ini"
@@ -464,6 +477,32 @@ EXPECTED_SEED_STEP_STATES: dict[int, str] = {
 USERS_TABLE = Base.metadata.tables[USERS_TABLE_NAME]
 DAILY_TABLE = Base.metadata.tables[DAILY_TABLE_NAME]
 
+# --- Database error of a seed upgrade (env.py) ---------------------------------------------------
+SHIPPED_EBCDIC_DIR = REPO_ROOT / "data" / "EBCDIC"
+EBCDIC_DIR_SETTING = "CARDDEMO_EBCDIC_DIR"
+EBCDIC_CODEC = "cp037"
+CARD_IMAGE_NAME = SAMPLE_IMAGE_NAMES["cards"].ebcdicName
+CARD_NUMBER_FIELD = next(
+    layoutField for layoutField in CARD_LAYOUT.fields if layoutField.name == "card_num"
+)
+# The revision 0002 upgrades from: the dataset tables exist and are empty.
+SEED_PARENT_REVISION = "0001"
+DATASET_TABLE_NAMES: tuple[str, ...] = tuple(EXPECTED_SEED_COUNTS)
+HARNESS_CONNECTION_ATTRIBUTE = "connection"
+HARNESS_LOGGING_ATTRIBUTE = "configure_logger"
+# Stated from the plan and PostgreSQL's diagnostics, not read from env.py: the duplicate
+# CARD-NUM violates the cards primary key with unique_violation.
+SANITIZED_DUPLICATE_CARD_FAILURE = (
+    "MIGRATION FAILED: DATABASE ERROR IntegrityError (UniqueViolation) SQLSTATE 23505"
+    " ON CONSTRAINT pk_cards; NO REVISION OF THIS RUN WAS COMMITTED"
+)
+CLI_FAILURE_LINE = "FAILED: " + SANITIZED_DUPLICATE_CARD_FAILURE
+# alembic.util.err ends a CommandError with sys.exit(-1); an uncaught exception would exit 1.
+ALEMBIC_COMMAND_ERROR_EXIT_STATUS = 255
+# Text of the raw driver error and its statement, which no output may carry.
+RAW_ERROR_MARKERS: tuple[str, ...] = ("DETAIL", "(card_num)=", "[SQL:", "already exists")
+PYTHON_TRACEBACK_MARKER = "Traceback (most recent call last)"
+
 # --- Catalog SQL: static text, every value bound; :schemas is always list(ALL_SCHEMAS) ----------
 VERSION_SQL = text("SELECT version_num FROM public.alembic_version")
 SCHEMAS_SQL = text(
@@ -593,6 +632,16 @@ class SeedUserRecord(Protocol):
     userType: str
 
 
+class DuplicateCardImages(NamedTuple):
+    """A private copy of the seed images whose CARDDATA image repeats its first record.
+
+    cardNumber is that record's CARD-NUM, decoded from the image when the copy is made.
+    """
+
+    imageDir: Path
+    cardNumber: str
+
+
 def SchemaParameters() -> dict[str, list[str]]:
     """Return the :schemas binding that limits every catalog query to ALL_SCHEMAS."""
     return {"schemas": list(ALL_SCHEMAS)}
@@ -615,16 +664,19 @@ def FetchScalar(engine: Engine, statement: TextClause, parameters: dict[str, obj
         return connection.execute(statement, parameters).scalar()
 
 
-def RunAlembic(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+def RunAlembic(
+    arguments: Sequence[str], environmentOverrides: Mapping[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     """Run ``python -m alembic <arguments>`` from backend/ with the session's environment.
 
     conftest has pointed SYNC_DATABASE_URL at the test database in os.environ, so alembic.ini
     and env.py resolve that database exactly as a developer's run from backend/ resolves theirs.
+    environmentOverrides, when given, is laid over that environment for this run only.
     """
     return subprocess.run(
         [sys.executable, "-m", "alembic", *arguments],
         cwd=BACKEND_DIRECTORY,
-        env=os.environ.copy(),
+        env={**os.environ, **(environmentOverrides or {})},
         capture_output=True,
         text=True,
         timeout=ALEMBIC_TIMEOUT_SECONDS,
@@ -792,6 +844,57 @@ def ReadCycleRuns(engine: Engine, cycleId: int) -> list[Row]:
         return list(connection.execute(statement))
 
 
+def RunAlembicSuccessfully(arguments: Sequence[str]) -> None:
+    """Run RunAlembic(arguments) with the session's environment and fail unless it exits 0."""
+    alembicResult = RunAlembic(arguments)
+    assert alembicResult.returncode == 0, alembicResult.stderr
+
+
+def CopyImagesWithDuplicateCard(imageDir: Path) -> DuplicateCardImages:
+    """Copy every seed image into imageDir and append CARDDATA's first record to its copy.
+
+    The card number is decoded from that record here, so no card number is written in a test.
+    """
+    for imageNames in SAMPLE_IMAGE_NAMES.values():
+        imageName = imageNames.ebcdicName
+        shutil.copyfile(SHIPPED_EBCDIC_DIR / imageName, imageDir / imageName)
+    cardImagePath = imageDir / CARD_IMAGE_NAME
+    firstRecord = cardImagePath.read_bytes()[: CARD_LAYOUT.lrecl]
+    with cardImagePath.open("ab") as cardImage:
+        cardImage.write(firstRecord)
+    fieldEnd = CARD_NUMBER_FIELD.offset + CARD_NUMBER_FIELD.length
+    cardNumber = firstRecord[CARD_NUMBER_FIELD.offset : fieldEnd].decode(EBCDIC_CODEC).strip()
+    return DuplicateCardImages(imageDir, cardNumber)
+
+
+def HarnessConfig(connection: Connection) -> Config:
+    """Return an Alembic Config whose env.py runs on ``connection`` and keeps pytest's logging."""
+    migrationConfig = Config(str(ALEMBIC_INI_PATH))
+    migrationConfig.attributes[HARNESS_CONNECTION_ATTRIBUTE] = connection
+    migrationConfig.attributes[HARNESS_LOGGING_ATTRIBUTE] = False
+    return migrationConfig
+
+
+def AssertWithholdsRawError(printedText: str, cardNumber: str) -> None:
+    """Assert printedText carries neither cardNumber nor any RAW_ERROR_MARKERS text.
+
+    The card number is checked as a boolean, so a failure never prints it.
+    """
+    cardNumberPrinted = cardNumber in printedText
+    assert not cardNumberPrinted, "the duplicated card number was printed"
+    assert [marker for marker in RAW_ERROR_MARKERS if marker in printedText] == []
+
+
+def AssertSeedParentKept(engine: Engine) -> None:
+    """Assert the database is still at 0001 and no dataset table holds a row of the failed seed."""
+    assert FetchNames(engine, VERSION_SQL, {}) == {SEED_PARENT_REVISION}
+    rowCounts = {
+        tableName: CountRows(engine, Base.metadata.tables[tableName])
+        for tableName in DATASET_TABLE_NAMES
+    }
+    assert rowCounts == dict.fromkeys(DATASET_TABLE_NAMES, 0)
+
+
 @pytest.fixture(name="migratedEngine", scope="module")
 def MigratedEngine(syncEngine: Engine, migratedDatabase: object) -> Engine:
     """Return the psycopg2 engine of the test database once it has been migrated to head."""
@@ -828,6 +931,28 @@ def SeedCycleId(migratedEngine: Engine) -> int:
     statement = select(CYCLES.c.cycle_id).where(CYCLES.c.opened_by == SEED_OPENER)
     with migratedEngine.connect() as connection:
         return connection.execute(statement).scalar_one()
+
+
+@pytest.fixture(name="duplicateCardImages")
+def DuplicateCardImagesFixture(request: pytest.FixtureRequest) -> DuplicateCardImages:
+    """Return CopyImagesWithDuplicateCard's images in this test's own temporary directory.
+
+    pytest's tmp_path is fetched by name, so the tests' injected parameters stay camelCase.
+    """
+    return CopyImagesWithDuplicateCard(request.getfixturevalue("tmp_path"))
+
+
+@pytest.fixture(name="seedParentEngine")
+def SeedParentEngine(migratedEngine: Engine, restoreSeedState: None) -> Iterator[Engine]:
+    """Yield the test database's engine at 0001, every dataset table empty; restore head after.
+
+    The downgrade runs 0002's truncate. At teardown the database is upgraded back to head from
+    the shipped images; restoreSeedState, set up first, tears down after that and restores the
+    session snapshot, so the reseeded hashes, timestamps and ledger keys match it again.
+    """
+    RunAlembicSuccessfully(("downgrade", SEED_PARENT_REVISION))
+    yield migratedEngine
+    RunAlembicSuccessfully(("upgrade", "head"))
 
 
 def test_revision_chain_is_linear_from_0001_to_head_0009():
@@ -1125,3 +1250,42 @@ def test_completed_seed_steps_reference_their_completed_runs(migratedEngine, see
     assert len(runRows) == len(completedRunIds)
     assert {runRow.step_no: runRow.run_id for runRow in runRows} == completedRunIds
     assert {runRow.status for runRow in runRows} == {COMPLETED_RUN_STATUS}
+
+
+# --- Database error of a seed upgrade ------------------------------------------------------------
+def test_harness_connection_seed_with_duplicate_card_raises_only_sanitized_command_error(
+    seedParentEngine, duplicateCardImages, capfd, caplog
+):
+    caplog.set_level(logging.INFO)
+    with seedParentEngine.connect() as connection, pytest.MonkeyPatch.context() as environment:
+        environment.setenv(EBCDIC_DIR_SETTING, str(duplicateCardImages.imageDir))
+        with pytest.raises(CommandError) as raised:
+            command.upgrade(HarnessConfig(connection), "head")
+        # Alembic's own transaction was rolled back before the CommandError reached the caller.
+        assert not connection.in_transaction()
+    failure = raised.value
+    # The suppressed original quotes the card number, so the checks below are not vacuous.
+    detailQuotesCardNumber = duplicateCardImages.cardNumber in str(failure.__context__)
+    assert detailQuotesCardNumber, "the raw IntegrityError no longer quotes the card number"
+    capturedOutput = capfd.readouterr()
+    printedText = "".join(
+        (*traceback.format_exception(failure), capturedOutput.out, capturedOutput.err, caplog.text)
+    )
+    AssertWithholdsRawError(printedText, duplicateCardImages.cardNumber)
+    assert str(failure) == SANITIZED_DUPLICATE_CARD_FAILURE
+    assert (failure.__cause__, failure.__suppress_context__) == (None, True)
+    AssertSeedParentKept(seedParentEngine)
+
+
+def test_cli_seed_with_duplicate_card_prints_only_the_sanitized_failed_line(
+    seedParentEngine, duplicateCardImages
+):
+    imageOverride = {EBCDIC_DIR_SETTING: str(duplicateCardImages.imageDir)}
+    upgradeResult = RunAlembic(("upgrade", "head"), imageOverride)
+    printedText = upgradeResult.stdout + upgradeResult.stderr
+    AssertWithholdsRawError(printedText, duplicateCardImages.cardNumber)
+    tracebackPrinted = PYTHON_TRACEBACK_MARKER in printedText
+    assert not tracebackPrinted, "the alembic CLI printed a traceback"
+    assert upgradeResult.returncode == ALEMBIC_COMMAND_ERROR_EXIT_STATUS
+    assert CLI_FAILURE_LINE in upgradeResult.stdout.splitlines()
+    AssertSeedParentKept(seedParentEngine)

@@ -547,6 +547,13 @@ Every base has `LIMIT 5` in `catlg/LISTCAT.txt`. Files live at
 is the generation number. The catalog is `batch.gdg_generations`
 ([data-model.md](data-model.md#supporting-tables)).
 
+Every archive operation stays beneath `CARDDEMO_OUTPUT_DIR`. The configured root is used as given,
+so it may be absolute or a symbolic link. The `gdg` directory, each base directory and each work
+directory are opened relative to their parent without following a symbolic link, and every file
+in them is created, read, renamed and deleted relative to the open directory, never through a
+link at its name. A `gdg` or base directory that is a symbolic link, or not a directory, is
+refused with `gdg.ManagedDirectoryError` and exit 12 ([Recovery](#recovery)).
+
 ### Publication
 
 Publishing a generation takes these steps:
@@ -632,7 +639,9 @@ generation's final path or a directory named like a `.part`, stops the command w
 before it schedules anything. One `FILE ERROR` line names the error class, the errno symbol and
 the path, with non-printable characters escaped, so a line break or terminal escape in a file
 name stays on that line. The batch window is released. Every command stops the same way until
-the path is repaired; the next command then reconciles the catalog as above.
+the path is repaired; the next command then reconciles the catalog as above. A `gdg` or base
+directory that is a symbolic link stops the command the same way, with one
+`FILE ERROR ManagedDirectoryError` line naming it, before anything is deleted through it.
 
 ### Lost generations
 

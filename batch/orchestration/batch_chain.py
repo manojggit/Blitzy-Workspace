@@ -17,10 +17,9 @@ generation found LOST, ends the step with EXIT_FAILURE and stops the chain while
 COMPLETED: the next command's ReconcileCatalog completes the publication, and a LOST generation
 blocks its cycle, which never completes, until seed-all or run-all --new-cycle abandons it.
 
-Runners are named by module path and imported only when a step runs. Loaders and jobs import
-job_context, run_ledger and gdg, so importing them here would form a cycle, would load every
-job for `carddemo-batch --help`, and would keep a test's monkeypatched RunLoader or RunJob from
-being the function the chain calls. All SQL lives in run_ledger and gdg; this module issues none.
+Runners are named by module path and imported only when a step runs, so `carddemo-batch --help`
+does not load every job, and a test's monkeypatched RunLoader or RunJob is the function the chain
+calls. All SQL lives in run_ledger and gdg; this module issues none.
 """
 
 import errno
@@ -29,6 +28,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
+from app.core.logging import PrintableText
 from sqlalchemy.exc import DBAPIError
 
 from batch.orchestration import gdg, run_ledger
@@ -264,13 +264,6 @@ def StepsForJob(definition: JobDefinition) -> tuple[ChainStep, ...]:
     return tuple(step for step in CHAIN if step.job.name == definition.name)
 
 
-def PrintableText(text: str) -> str:
-    """Return operator input for a log line, every non-printable character escaped."""
-    return "".join(
-        character if character.isprintable() else repr(character)[1:-1] for character in text
-    )
-
-
 def OpenCycleId(context: JobContext) -> int | None:
     """Return the OPEN cycle's id, the Alembic seed cycle included, or None."""
     with context.engine.connect() as connection:
@@ -318,14 +311,16 @@ def DescribeIoError(step: ChainStep, error: DBAPIError | OSError) -> str:
 
 
 def HandleFailure(stepContext: JobContext, step: ChainStep, exitCode: int, message: str) -> int:
-    """Record the run and its step FAILED and return the failure's exit status.
+    """Log the failure message, record the run and its step FAILED and return the exit status.
 
-    A status below CHAIN_STOP_THRESHOLD, which a runner must never fail with, is recorded as
-    EXIT_FAILURE so the chain still stops. The catalog is then reconciled, which deletes any
-    .part file a rolled-back atomic step left behind, and the run's ENDED line is logged.
+    The message is logged at ERROR with every non-printable character escaped, so an image,
+    output or generation path a runner names in it stays on its one line. A status below
+    CHAIN_STOP_THRESHOLD, which a runner must never fail with, is recorded as EXIT_FAILURE so
+    the chain still stops. The catalog is then reconciled, which deletes any .part file a
+    rolled-back atomic step left behind, and the run's ENDED line is logged.
     """
     failureExitCode = exitCode if exitCode >= CHAIN_STOP_THRESHOLD else EXIT_FAILURE
-    LOGGER.error(message)
+    LOGGER.error(PrintableText(message))
     run_ledger.RecordFailure(stepContext, stepContext.runId, failureExitCode)
     gdg.ReconcileCatalog(stepContext)
     LogStepEnded(stepContext, step, failureExitCode)

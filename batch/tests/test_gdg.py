@@ -7,7 +7,13 @@ CARDDEMO_OUTPUT_DIR/gdg/<BASE>/G####V00.dat with the batch.gdg_generations catal
 - Publication: .part, then the COMMITTED row with its SHA-256, then the rename to PUBLISHED; (0)
   and (-n) count PUBLISHED rows only, the DSN=...(0) references of jcl/COMBTRAN.jcl.
 - Recovery: ReconcileCatalog, at the start of every command, completes an interrupted rename,
-  marks a row whose file is gone LOST and deletes orphan .part files and work directories.
+  marks a row whose file is gone LOST and deletes orphan .part files and work directories. Each
+  deleted .part is named in one warning with its control characters escaped, and a refused
+  directory fsync is logged by escaped path, error class and errno symbol only.
+- Containment: a gdg or base directory that is a symbolic link is refused with
+  ManagedDirectoryError, and exit 12 from a command, before anything is listed, created or
+  deleted through it; a directory swapped for a link once opened is still the one acted on; a
+  link named like a .part or a work directory inside a real base directory is never followed.
 - LOST blocks the OPEN cycle: every command exits 12 naming the generation until run-all
   --new-cycle abandons the cycle and its LOST rows.
 - Abnormal disposition: DISP=(NEW,CATLG,DELETE) of DALYREJS(+1) and SYSTRAN(+1)
@@ -20,9 +26,12 @@ CARDDEMO_OUTPUT_DIR/gdg/<BASE>/G####V00.dat with the batch.gdg_generations catal
 The crash windows of retention itself are pinned by test_gdg_retention_recovery.py.
 """
 
+import errno
 import hashlib
+import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -71,6 +80,24 @@ FORGED_SHA256 = "0" * 64
 INJECTED_PRODUCER_MESSAGE = "injected failure of a generation producer"
 INJECTED_ABEND_MESSAGE = "INJECTED POSTTRAN ABEND WITH DALYREJS(+1) OPEN"
 ORPHAN_GENERATION = 9
+ORPHAN_PART_NAME = GENERATION_FILE_TEMPLATE.format(generation=ORPHAN_GENERATION) + PART_SUFFIX
+# An orphan .part with no catalog row and the name its deletion warning shows: a generation's
+# name as it is, and a name holding a line feed before forged ERROR text, a carriage return and
+# an ANSI escape with each control character escaped, so it neither splits the line nor forges
+# another.
+ORPHAN_PART_CASES = (
+    pytest.param(ORPHAN_PART_NAME, ORPHAN_PART_NAME, id="generation-name"),
+    pytest.param(
+        "G0009\nERROR forged-recovery-success\r\x1b[31m.dat.part",
+        "G0009\\nERROR forged-recovery-success\\r\\x1b[31m.dat.part",
+        id="control-bearing-name",
+    ),
+)
+# A base directory whose name holds a line feed and an ANSI escape, as a refused directory fsync
+# names it, and the OS text that refusal must not repeat.
+FSYNC_REFUSED_DIRECTORY_NAME = "SYSTRAN\nERROR forged-fsync\x1b[31m"
+SHOWN_FSYNC_REFUSED_DIRECTORY_NAME = "SYSTRAN\\nERROR forged-fsync\\x1b[31m"
+FSYNC_REFUSAL_OS_TEXT = "injected directory fsync refusal"
 # The work directory, with one run file, that a killed COMBTRAN's sort left in its base directory.
 ORPHAN_WORK_DIRECTORY_NAME = "carddemo-combtran-killed" + gdg.WORK_DIRECTORY_SUFFIX
 ORPHAN_RUN_FILE_NAME = "killed.run"
@@ -127,6 +154,18 @@ LOAD_TRAN_TYPES_ARGUMENTS = ("load", "tran-types")
 COMBINED_FIXTURE = EXPECTED_DIR / "combtran_combined.dat"
 TRANSACTION_LAYOUT_NAME = "TRANSACTION"
 PROCESS_STAGED_RECORD_NAME = "ProcessStagedRecord"
+# Containment: a directory outside the archive holding what recovery deletes in a base directory,
+# an orphan .part and a work directory with one file, which no archive operation may change.
+OUTSIDE_DIRECTORY_NAME = "outside-sentinel"
+ORPHAN_RUN_FILE_PATH = f"{ORPHAN_WORK_DIRECTORY_NAME}/{ORPHAN_RUN_FILE_NAME}"
+OUTSIDE_FILES = {ORPHAN_PART_NAME: CORRUPT_FILE_BYTES, ORPHAN_RUN_FILE_PATH: CORRUPT_FILE_BYTES}
+# O_NOFOLLOW with O_DIRECTORY refuses a symbolic link with ENOTDIR on Linux and ELOOP elsewhere.
+REFUSED_LINK_ERRNO_NAMES = {"ENOTDIR", "ELOOP"}
+REFUSAL_LINE_PATTERN = re.compile(r"FILE ERROR ManagedDirectoryError ERRNO (?P<errnoName>\w+) ON ")
+# The name the real base directory takes once a link has replaced it, mid-operation, and the
+# bytes of the .part file its publication renames.
+SWAPPED_OUT_SUFFIX = ".opened"
+PUBLISHED_BYTES = b"GENERATION PLACED BY PUBLICATION\n"
 
 
 class InjectedProducerError(Exception):
@@ -480,17 +519,48 @@ def test_reconcile_marks_committed_row_lost_when_no_file_has_its_hash(
     assert not PartPath(finalPath).exists()
 
 
-def test_reconcile_deletes_orphan_part_file_without_catalog_row(jobContext: JobContext) -> None:
-    """A .part with no catalog row, a crash before commit, is deleted by the reconcile."""
-    orphanPath = PartPath(GenerationPath(jobContext, gdg.SYSTRAN, ORPHAN_GENERATION))
+@pytest.mark.parametrize(("orphanName", "shownName"), ORPHAN_PART_CASES)
+def test_reconcile_deletes_orphan_part_file_without_catalog_row(
+    jobContext: JobContext, caplog: pytest.LogCaptureFixture, orphanName: str, shownName: str
+) -> None:
+    """A .part with no catalog row, a crash before commit, is deleted by the reconcile.
+
+    Its one warning names it with every control character escaped.
+    """
+    orphanPath = jobContext.settings.GdgDir() / gdg.SYSTRAN.name / orphanName
     orphanPath.parent.mkdir(parents=True)
     orphanPath.write_bytes(CORRUPT_FILE_BYTES)
 
-    summary = gdg.ReconcileCatalog(jobContext)
+    with caplog.at_level(logging.WARNING, logger=gdg.LOGGER.name):
+        summary = gdg.ReconcileCatalog(jobContext)
 
     assert summary == gdg.ReconcileSummary(published=0, lost=0, orphansDeleted=1)
     assert not orphanPath.exists()
     assert CatalogRows(jobContext.engine, gdg.SYSTRAN.name) == []
+    gdgWarnings = [
+        record.getMessage() for record in caplog.records if record.name == gdg.LOGGER.name
+    ]
+    assert gdgWarnings == [gdg.ORPHAN_DELETED_LOG % f"{orphanPath.parent}/{shownName}"]
+
+
+def test_directory_fsync_refusal_is_logged_by_escaped_path_class_and_errno_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A platform refusing a directory fsync is logged at DEBUG by the directory, its controls
+    escaped, and the error's class and errno symbol, never by the OS error text."""
+    directory = tmp_path / FSYNC_REFUSED_DIRECTORY_NAME
+    directory.mkdir()
+
+    def RefuseFsync(descriptor: int) -> None:
+        raise OSError(errno.EINVAL, FSYNC_REFUSAL_OS_TEXT)
+
+    with gdg.ArchiveDirectory(directory, create=False) as heldDirectory:
+        monkeypatch.setattr(gdg.os, "fsync", RefuseFsync)
+        with caplog.at_level(logging.DEBUG, logger=gdg.LOGGER.name):
+            gdg.FsyncDirectory(heldDirectory)
+    shownDirectory = f"{tmp_path}/{SHOWN_FSYNC_REFUSED_DIRECTORY_NAME}"
+    expectedMessage = f"DIRECTORY FSYNC REFUSED FOR {shownDirectory}: OSError ERRNO EINVAL"
+    assert caplog.messages == [expectedMessage]
 
 
 def test_reconcile_deletes_orphan_work_directory_and_keeps_generation_files(
@@ -569,6 +639,286 @@ def test_rolled_back_caller_transaction_leaves_orphan_part_for_reconcile(
 
     assert summary == gdg.ReconcileSummary(published=0, lost=0, orphansDeleted=1)
     assert BaseFileNames(context, base) == set()
+
+
+@dataclass(frozen=True)
+class LinkedDirectoryCase:
+    """A symbolic link pointing outside the archive, at the gdg directory when linksGdg, else at
+    base's directory."""
+
+    linksGdg: bool
+    base: gdg.GdgBase
+
+
+# Both levels, for a base the reconcile meets after others (SYSTRAN) and the one it meets last.
+LINKED_DIRECTORY_CASES = [
+    pytest.param(
+        LinkedDirectoryCase(linksGdg, base), id=f"{'gdg' if linksGdg else 'base'}-link-{base.name}"
+    )
+    for linksGdg in (False, True)
+    for base in (gdg.SYSTRAN, gdg.TRANSACT_COMBINED)
+]
+
+
+@dataclass(frozen=True)
+class SwapCase:
+    """An operation on SYSTRAN's directory during which a link to a directory outside replaces
+    it, once the operation has opened it.
+
+    held is what the real directory and the outside one each hold before; operation runs given
+    the context and the directory's path; expectedResult is what it returns; heldAfter is what
+    the real directory, renamed aside, holds afterwards.
+    """
+
+    held: dict[str, bytes]
+    operation: Callable[[JobContext, Path], object]
+    expectedResult: object
+    heldAfter: dict[str, bytes | None]
+
+
+def OutsideDirectory(context: JobContext) -> Path:
+    """Return the path of a directory beside the test's output root, outside the archive."""
+    return context.settings.OutputDir().parent / OUTSIDE_DIRECTORY_NAME
+
+
+def PlantFiles(directory: Path, files: dict[str, bytes]) -> None:
+    """Create directory and each file of files, by its path relative to it, with its bytes."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for relativeName, fileBytes in files.items():
+        filePath = directory / relativeName
+        filePath.parent.mkdir(parents=True, exist_ok=True)
+        filePath.write_bytes(fileBytes)
+
+
+def TreeSnapshot(directory: Path) -> dict[str, bytes | None]:
+    """Return every path under directory, relative to it, with its bytes; None for a directory."""
+    return {
+        path.relative_to(directory).as_posix(): None if path.is_dir() else path.read_bytes()
+        for path in sorted(directory.rglob("*"))
+    }
+
+
+def LinkManagedDirectory(context: JobContext, case: LinkedDirectoryCase, outside: Path) -> Path:
+    """Make the case's managed directory a symbolic link to outside; return the link's path.
+
+    outside receives OUTSIDE_FILES where the linked base directory's files would be.
+    """
+    gdgDirectory = context.settings.GdgDir()
+    if case.linksGdg:
+        PlantFiles(outside / case.base.name, OUTSIDE_FILES)
+        linkPath = gdgDirectory
+    else:
+        PlantFiles(outside, OUTSIDE_FILES)
+        gdgDirectory.mkdir()
+        linkPath = gdgDirectory / case.base.name
+    linkPath.symlink_to(outside, target_is_directory=True)
+    return linkPath
+
+
+def ReconcileThroughLink(context: JobContext, base: gdg.GdgBase) -> None:
+    """Run catalog recovery, which lists and deletes orphans in every base directory."""
+    gdg.ReconcileCatalog(context)
+
+
+def WriteGenerationThroughLink(context: JobContext, base: gdg.GdgBase) -> None:
+    """Write and publish a one-record generation of base, as a producer does."""
+    PublishGenerations(context, base, 1, FIRST_RECORD_TEXT)
+
+
+LINKED_DIRECTORY_OPERATIONS = (
+    pytest.param(ReconcileThroughLink, id="reconcile"),
+    pytest.param(WriteGenerationThroughLink, id="new-generation"),
+)
+
+
+def SwapForLinkOnceOpened(
+    monkeypatch: pytest.MonkeyPatch, directoryPath: Path, outside: Path
+) -> list[Path]:
+    """Replace directoryPath with a link to outside right after an operation first opens it.
+
+    The real directory is renamed beside the link; the returned list receives its new path.
+    """
+    originalOpen = gdg.OpenArchiveDirectory
+    swappedPaths: list[Path] = []
+
+    def OpenThenSwap(openedPath: Path, create: bool) -> gdg.ManagedDirectory:
+        directory = originalOpen(openedPath, create)
+        if openedPath == directoryPath and not swappedPaths:
+            swappedPath = directoryPath.with_name(directoryPath.name + SWAPPED_OUT_SUFFIX)
+            directoryPath.rename(swappedPath)
+            directoryPath.symlink_to(outside, target_is_directory=True)
+            swappedPaths.append(swappedPath)
+        return directory
+
+    monkeypatch.setattr(gdg, "OpenArchiveDirectory", OpenThenSwap)
+    return swappedPaths
+
+
+def DeleteOrphanPartsOf(context: JobContext, directoryPath: Path) -> int:
+    """Delete the orphan .part files of every base directory, as recovery does."""
+    return gdg.DeleteOrphanParts(context)
+
+
+def DeleteOrphanWorkDirectoriesOf(context: JobContext, directoryPath: Path) -> int:
+    """Delete the orphan work directories of every base directory, as recovery does."""
+    return gdg.DeleteOrphanWorkDirectories(context)
+
+
+def PublishFirstGenerationIn(context: JobContext, directoryPath: Path) -> str:
+    """Publish generation 1 of the directory from its .part file holding PUBLISHED_BYTES."""
+    expectedSha256 = hashlib.sha256(PUBLISHED_BYTES).hexdigest()
+    return gdg.PlaceGenerationFile(directoryPath / FileName(OLDEST_GENERATION), expectedSha256)
+
+
+SWAP_CASES = (
+    pytest.param(
+        SwapCase({ORPHAN_PART_NAME: CORRUPT_FILE_BYTES}, DeleteOrphanPartsOf, 1, {}),
+        id="orphan-part",
+    ),
+    pytest.param(
+        SwapCase({ORPHAN_RUN_FILE_PATH: CORRUPT_FILE_BYTES}, DeleteOrphanWorkDirectoriesOf, 1, {}),
+        id="orphan-work-directory",
+    ),
+    pytest.param(
+        SwapCase(
+            {gdg.PartName(OLDEST_GENERATION): PUBLISHED_BYTES},
+            PublishFirstGenerationIn,
+            run_ledger.GDG_PUBLISHED,
+            {FileName(OLDEST_GENERATION): PUBLISHED_BYTES},
+        ),
+        id="publication",
+    ),
+)
+
+
+@pytest.mark.parametrize("operation", LINKED_DIRECTORY_OPERATIONS)
+@pytest.mark.parametrize("case", LINKED_DIRECTORY_CASES)
+def test_linked_managed_directory_is_refused_and_the_directory_outside_is_untouched(
+    jobContext: JobContext,
+    operation: Callable[[JobContext, gdg.GdgBase], None],
+    case: LinkedDirectoryCase,
+) -> None:
+    """A gdg or base directory that is a symbolic link is refused, never followed.
+
+    Recovery and a producer each raise ManagedDirectoryError naming the link, with the kernel's
+    errno, before they list, create or delete anything: the directory the link points to keeps
+    its .part file and work directory, the link stays, and nothing is cataloged.
+    """
+    context = LedgeredContext(jobContext)
+    outside = OutsideDirectory(context)
+    linkPath = LinkManagedDirectory(context, case, outside)
+    outsideBefore = TreeSnapshot(outside)
+
+    with pytest.raises(gdg.ManagedDirectoryError) as raised:
+        operation(context, case.base)
+
+    assert raised.value.filename == str(linkPath)
+    assert errno.errorcode[raised.value.errno] in REFUSED_LINK_ERRNO_NAMES
+    assert linkPath.is_symlink()
+    assert TreeSnapshot(outside) == outsideBefore
+    assert CatalogRows(context.engine, case.base.name) == []
+
+
+@pytest.mark.parametrize("case", SWAP_CASES)
+def test_directory_swapped_for_a_link_once_opened_is_still_the_one_acted_on(
+    jobContext: JobContext, monkeypatch: pytest.MonkeyPatch, case: SwapCase
+) -> None:
+    """A base directory replaced by a link after the operation opened it is still the one used.
+
+    Orphan deletion and publication act through the held directory descriptor, so they change
+    the real directory, now renamed aside, and leave the same names in the directory the link
+    points to exactly as they were.
+    """
+    directoryPath = gdg.BaseDirectoryPath(jobContext, gdg.SYSTRAN)
+    outside = OutsideDirectory(jobContext)
+    PlantFiles(directoryPath, case.held)
+    PlantFiles(outside, case.held)
+    outsideBefore = TreeSnapshot(outside)
+    swappedPaths = SwapForLinkOnceOpened(monkeypatch, directoryPath, outside)
+
+    result = case.operation(jobContext, directoryPath)
+
+    [swappedPath] = swappedPaths
+    assert result == case.expectedResult
+    assert directoryPath.is_symlink()
+    assert TreeSnapshot(swappedPath) == case.heldAfter
+    assert TreeSnapshot(outside) == outsideBefore
+
+
+def test_links_named_like_orphans_in_a_real_base_directory_are_never_followed(
+    jobContext: JobContext,
+) -> None:
+    """A link named like a .part is deleted itself; one named like a work directory is left.
+
+    Neither link's target changes, and only the .part link counts as a deleted orphan.
+    """
+    directoryPath = gdg.BaseDirectoryPath(jobContext, gdg.SYSTRAN)
+    outside = OutsideDirectory(jobContext)
+    PlantFiles(outside, OUTSIDE_FILES)
+    outsideBefore = TreeSnapshot(outside)
+    directoryPath.mkdir(parents=True)
+    (directoryPath / ORPHAN_PART_NAME).symlink_to(outside / ORPHAN_PART_NAME)
+    workLink = directoryPath / ORPHAN_WORK_DIRECTORY_NAME
+    workLink.symlink_to(outside / ORPHAN_WORK_DIRECTORY_NAME, target_is_directory=True)
+
+    summary = gdg.ReconcileCatalog(jobContext)
+
+    assert summary == gdg.ReconcileSummary(published=0, lost=0, orphansDeleted=1)
+    assert BaseFileNames(jobContext, gdg.SYSTRAN) == {ORPHAN_WORK_DIRECTORY_NAME}
+    assert workLink.is_symlink()
+    assert TreeSnapshot(outside) == outsideBefore
+
+
+def test_new_generation_replaces_a_link_at_its_part_name_instead_of_writing_through_it(
+    jobContext: JobContext,
+) -> None:
+    """A link standing at the new generation's .part name is removed, never written through.
+
+    The records go to a new regular file, published in the base directory, and the file the
+    link pointed to keeps its bytes.
+    """
+    context = LedgeredContext(jobContext)
+    directoryPath = gdg.BaseDirectoryPath(context, gdg.SYSTRAN)
+    outside = OutsideDirectory(context)
+    PlantFiles(outside, OUTSIDE_FILES)
+    outsideBefore = TreeSnapshot(outside)
+    directoryPath.mkdir(parents=True)
+    (directoryPath / gdg.PartName(OLDEST_GENERATION)).symlink_to(outside / ORPHAN_PART_NAME)
+
+    [generation] = PublishGenerations(context, gdg.SYSTRAN, 1, FIRST_RECORD_TEXT)
+
+    finalPath = GenerationPath(context, gdg.SYSTRAN, generation)
+    recordBytes = Record(gdg.SYSTRAN, FIRST_RECORD_TEXT).encode(GDG_FILE_ENCODING)
+    assert generation == OLDEST_GENERATION
+    assert not finalPath.is_symlink()
+    assert finalPath.read_bytes() == recordBytes + RECORD_TERMINATOR
+    assert BaseFileNames(context, gdg.SYSTRAN) == {finalPath.name}
+    assert TreeSnapshot(outside) == outsideBefore
+
+
+def test_command_refuses_a_linked_base_directory_with_one_file_error_line(
+    jobContext: JobContext,
+) -> None:
+    """load tran-types exits 12 with one FILE ERROR line naming the linked SYSTRAN directory.
+
+    The prelude's recovery refuses the link before it deletes anything, so no run is recorded
+    and the directory the link points to keeps its files.
+    """
+    outside = OutsideDirectory(jobContext)
+    linkPath = LinkManagedDirectory(jobContext, LinkedDirectoryCase(False, gdg.SYSTRAN), outside)
+    outsideBefore = TreeSnapshot(outside)
+    runsBefore = CountJobRuns(jobContext.engine)
+
+    outcome = InvokeCli(LOAD_TRAN_TYPES_ARGUMENTS)
+
+    lines = outcome.output.splitlines()
+    refusals = [match for line in lines if (match := REFUSAL_LINE_PATTERN.search(line))]
+    assert outcome.exitCode == EXIT_FAILURE, outcome.output
+    assert len(refusals) == 1, outcome.output
+    assert refusals[0]["errnoName"] in REFUSED_LINK_ERRNO_NAMES
+    assert refusals[0].string.endswith(f" ON {linkPath}"), outcome.output
+    assert CountJobRuns(jobContext.engine) == runsBefore
+    assert TreeSnapshot(outside) == outsideBefore
 
 
 @pytest.mark.parametrize(

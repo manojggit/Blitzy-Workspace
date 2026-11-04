@@ -4,12 +4,14 @@ The revision logs a skipped seed or truncate at INFO in offline mode and at WARN
 APP_ENV=production. A malformed seed image is logged by whitelisted metadata only (image
 directory, image file name, record number, error and cause classes) and re-raised as an
 ImageFormatError with no record text, because the decoder's message can quote raw field content
-such as a card number or an SSN. A seeding upgrade sets the seed-provenance marker revision 0008
-reads only after the load, and a seeding downgrade clears it after the truncate; a skipped or
-failed run, whose op stub offers only get_bind, issues no statement at all. The revision is
-loaded from its file, and its Alembic context, op proxy and MigrationSettings are replaced by
-stubs, so no backend/.env and no database is needed. The malformed images are copies of
-data/EBCDIC with one DALYTRAN.PS field overwritten by text carrying SENSITIVE_MARKER.
+such as a card number or an SSN. The directory and file name in an error line have each control
+character escaped, so a line feed in either cannot split the line. A seeding upgrade sets the
+seed-provenance marker revision 0008 reads only after the load, and a seeding downgrade clears
+it after the truncate; a skipped or failed run, whose op stub offers only get_bind, issues no
+statement at all. The revision is loaded from its file, and its Alembic context, op proxy and
+MigrationSettings are replaced by stubs, so no backend/.env and no database is needed. The
+malformed images are copies of data/EBCDIC with one DALYTRAN.PS field overwritten by text
+carrying SENSITIVE_MARKER.
 """
 
 import errno
@@ -100,6 +102,29 @@ class SeededRun(NamedTuple):
     callNames: tuple[str, ...]
 
 
+class ImageDirectoryCase(NamedTuple):
+    """A configured image directory and the text revision 0002's error line shows for it."""
+
+    imageDir: Path
+    shownDir: str
+
+
+# An image directory whose name holds a line feed before forged log text and an ANSI escape, an
+# image name holding a carriage return, and both as the error lines show them: each control
+# character as its escape, so neither name splits its line or forges another.
+FORGED_LOG_TEXT = "ERROR forged-seed-success"
+HOSTILE_IMAGE_DIR = REPO_ROOT / "data" / f"EBCDIC\n{FORGED_LOG_TEXT}\x1b[31m"
+SHOWN_HOSTILE_IMAGE_DIR = f"{REPO_ROOT / 'data'}/EBCDIC\\n{FORGED_LOG_TEXT}\\x1b[31m"
+HOSTILE_IMAGE_NAME = f"{DAILY_IMAGE_NAME}\r{FORGED_LOG_TEXT}"
+SHOWN_HOSTILE_IMAGE_NAME = f"{DAILY_IMAGE_NAME}\\r{FORGED_LOG_TEXT}"
+IMAGE_DIRECTORY_CASES = (
+    pytest.param(
+        ImageDirectoryCase(SHIPPED_EBCDIC_DIR, str(SHIPPED_EBCDIC_DIR)), id="shipped-directory"
+    ),
+    pytest.param(
+        ImageDirectoryCase(HOSTILE_IMAGE_DIR, SHOWN_HOSTILE_IMAGE_DIR), id="control-bearing"
+    ),
+)
 FIELD_CORRUPTIONS = (
     pytest.param(
         FieldCorruption(ORIG_TS_OFFSET, f"{SENSITIVE_MARKER}-123-45-6789-XYZ"),
@@ -270,23 +295,35 @@ def test_causeless_framing_error_is_logged_and_raised_by_its_fixed_code(
     assert errorMessage.endswith("cause framing")
 
 
+@pytest.mark.parametrize("directoryCase", IMAGE_DIRECTORY_CASES)
 def test_file_not_found_is_logged_by_its_class_and_reraised_unchanged(
-    stubRevision, monkeypatch, caplog
+    stubRevision, monkeypatch, caplog, directoryCase
 ):
     missingError = FileNotFoundError(errno.ENOENT, "No such file", f"{SENSITIVE_MARKER}.PS")
 
     def RaiseMissingImage(*loadArguments: object) -> NoReturn:
         raise missingError
 
-    revisionModule = stubRevision(False, SettingsStub())
+    revisionModule = stubRevision(False, SettingsStub(directoryCase.imageDir))
     monkeypatch.setattr(revisionModule, "LoadSampleData", RaiseMissingImage)
     caplog.set_level(logging.INFO, logger=MIGRATION_LOGGER_NAME)
     with pytest.raises(FileNotFoundError) as raised:
         revisionModule.upgrade()
     assert raised.value is missingError
-    expectedMessage = f"sample seed failed for the images in {SHIPPED_EBCDIC_DIR}: "
+    expectedMessage = f"sample seed failed for the images in {directoryCase.shownDir}: "
     assert SoleErrorMessage(caplog.records) == expectedMessage + "FileNotFoundError"
     assert SENSITIVE_MARKER not in caplog.text
+
+
+def test_image_format_error_log_escapes_the_directory_and_image_name(seedRevision, caplog):
+    imageError = ImageFormatError(HOSTILE_IMAGE_DIR / HOSTILE_IMAGE_NAME, 0, "framing")
+    caplog.set_level(logging.INFO, logger=MIGRATION_LOGGER_NAME)
+    seedRevision.LogImageFormatError(HOSTILE_IMAGE_DIR, imageError, "framing")
+    expectedMessage = (
+        f"sample seed failed for the images in {SHOWN_HOSTILE_IMAGE_DIR}: ImageFormatError"
+        f" in image {SHOWN_HOSTILE_IMAGE_NAME} record 0, cause framing"
+    )
+    assert SoleErrorMessage(caplog.records) == expectedMessage
 
 
 @pytest.mark.parametrize("migrationStep", MIGRATION_STEPS)

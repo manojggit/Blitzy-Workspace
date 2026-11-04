@@ -8,7 +8,9 @@ raw-PAN request line and assert the masked output, pin MaskPanRuns, and check th
 ConfigureLogging installs one masking root handler, gives Uvicorn's handlers the timestamped
 LOG_LINE_FORMAT, and changes nothing when called again. They also check that the traceback of a
 stored value failing a response or screen model, as Pydantic or FastAPI raises it, reaches the
-log with the value redacted.
+log with the value redacted. PrintableText is pinned too: a file name carrying a line feed,
+terminal escapes and a card number is logged as one line, its controls escaped and its card
+number masked.
 
 No database is used. Each test that configures logging runs under the isolatedLogging fixture,
 which restores the root and Uvicorn loggers afterwards, so later tests log as before. The
@@ -43,6 +45,7 @@ from app.core.logging import (
     MaskPanRuns,
     MaskSensitiveText,
     PanMaskingFilter,
+    PrintableText,
     SuppressEngineStatementLogging,
 )
 from app.schemas.accounts import AccountScreenFields, AccountViewResponse
@@ -503,6 +506,47 @@ def test_stdout_handler_follows_a_replaced_and_closed_stdout(monkeypatch):
     assert MASKED_SECOND_PAN in laterStdout.getvalue()
     assert SECOND_SAMPLE_PAN not in laterStdout.getvalue()
     assert stderrOutput.getvalue() == ""
+
+
+# Text a log line may carry from outside the program, and how PrintableText shows it: each
+# character str.isprintable() refuses as its Python escape, everything else, a backslash
+# included, as it is.
+FORGED_LOG_TEXT = "ERROR forged-recovery-success"
+PRINTABLE_TEXT_CASES = [
+    pytest.param(f"G0050\n{FORGED_LOG_TEXT}", f"G0050\\n{FORGED_LOG_TEXT}", id="line-feed"),
+    pytest.param("G0050\r.dat", "G0050\\r.dat", id="carriage-return"),
+    pytest.param("\x1b[31mG0050", "\\x1b[31mG0050", id="ansi-escape"),
+    pytest.param("G0050\u2028.dat", "G0050\\u2028.dat", id="line-separator"),
+    pytest.param("G0050\udcff.dat", "G0050\\udcff.dat", id="lone-surrogate"),
+    pytest.param("/var/out/G0050V00.dat", "/var/out/G0050V00.dat", id="printable-path"),
+    pytest.param("C:\\out\\n G0050", "C:\\out\\n G0050", id="literal-backslash"),
+    pytest.param(b"G0050\n", "b'G0050\\n'", id="bytes-repr"),
+]
+
+
+@pytest.mark.parametrize(("value", "expected"), PRINTABLE_TEXT_CASES)
+def test_printable_text_escapes_only_non_printable_characters_and_is_idempotent(value, expected):
+    assert PrintableText(value) == expected
+    assert PrintableText(expected) == expected
+
+
+@pytest.mark.usefixtures("isolatedLogging")
+def test_escaped_path_with_a_card_number_is_logged_as_one_masked_line(monkeypatch):
+    # The card number is assembled at run time; the name forges a second line after its LF.
+    cardNumber = "4" + "1" * 15
+    maskedCardNumber = "*" * 12 + cardNumber[-4:]
+    hostileName = f"G0050\n{FORGED_LOG_TEXT} {cardNumber}\r\x1b[31m.dat.part"
+    shownName = f"G0050\\n{FORGED_LOG_TEXT} {maskedCardNumber}\\r\\x1b[31m.dat.part"
+    ConfigureLogging()
+    capturedStdout = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", capturedStdout)
+    applicationLogger = logging.getLogger(APPLICATION_LOGGER_NAME)
+    applicationLogger.warning("FILE %s DELETED", PrintableText(hostileName))
+    output = capturedStdout.getvalue()
+    assert output.count("\n") == 1, ascii(output)
+    assert output.endswith(f"FILE {shownName} DELETED\n"), ascii(output)
+    assert cardNumber not in output
+    assert "\r" not in output and "\x1b" not in output
 
 
 # The logger above every SQLAlchemy logger; an operator lowers it to see SQLAlchemy's DEBUG.

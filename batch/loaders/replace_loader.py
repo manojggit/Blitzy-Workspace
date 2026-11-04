@@ -33,6 +33,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.core.logging import PrintableText
 from app.core.paths import ResolveRepoPath
 from app.seed.image_reader import (
     ENCODING_ASCII,
@@ -265,11 +266,12 @@ def ImageErrorMessage(spec: LoaderSpec, imagePath: Path, error: ImageFormatError
 
     The error kept for an absent file is named as a missing image; any other gives its path,
     record number and reason as the rejection: a framing error's own fixed-text reason, or the
-    withheld reason of an error with a cause.
+    withheld reason of an error with a cause. The path, which the operator can choose, is shown
+    with every non-printable character escaped, so the message stays on one line.
     """
     if isinstance(error.__cause__, FileNotFoundError):
-        return IMAGE_NOT_FOUND_TEMPLATE.format(dataset=spec.dataset, path=imagePath)
-    return IMAGE_REJECTED_TEMPLATE.format(dataset=spec.dataset, reason=error)
+        return IMAGE_NOT_FOUND_TEMPLATE.format(dataset=spec.dataset, path=PrintableText(imagePath))
+    return IMAGE_REJECTED_TEMPLATE.format(dataset=spec.dataset, reason=PrintableText(error))
 
 
 @contextmanager
@@ -284,13 +286,15 @@ def MappedLoadErrors(spec: LoaderSpec, imagePath: Path) -> Iterator[None]:
     integrity violation are chained to their error. A malformed or undecodable image is
     chained to the ImageFormatError its message reports, which keeps only a framing error's
     fixed-text reason and withholds any other's, so neither the message nor a rendered
-    traceback quotes the refused record's text. JobFailure and every other error propagate
-    unchanged, for batch_chain to record.
+    traceback quotes the refused record's text. Every path a message shows has each
+    non-printable character escaped. JobFailure and every other error propagate unchanged, for
+    batch_chain to record.
     """
     try:
         yield
     except FileNotFoundError as error:
-        message = IMAGE_NOT_FOUND_TEMPLATE.format(dataset=spec.dataset, path=imagePath)
+        shownPath = PrintableText(imagePath)
+        message = IMAGE_NOT_FOUND_TEMPLATE.format(dataset=spec.dataset, path=shownPath)
         raise JobFailure(EXIT_FAILURE, message) from error
     except ImageFormatError as error:
         reportedError = ReportedImageError(error)
@@ -298,7 +302,8 @@ def MappedLoadErrors(spec: LoaderSpec, imagePath: Path) -> Iterator[None]:
         raise JobFailure(EXIT_FAILURE, message) from reportedError
     except UnicodeDecodeError as error:
         reportedError = UndecodableImageError(imagePath, error)
-        message = IMAGE_REJECTED_TEMPLATE.format(dataset=spec.dataset, reason=reportedError)
+        shownReason = PrintableText(reportedError)
+        message = IMAGE_REJECTED_TEMPLATE.format(dataset=spec.dataset, reason=shownReason)
         raise JobFailure(EXIT_FAILURE, message) from reportedError
     except IntegrityError as error:
         message = LOAD_ROLLED_BACK_TEMPLATE.format(

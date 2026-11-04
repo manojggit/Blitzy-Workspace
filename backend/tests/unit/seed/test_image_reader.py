@@ -11,6 +11,8 @@ the Technical Specification, Section 0.8.2:
 - Fields decode strictly by copybook offset, money as two-place Decimal and never float.
 - Truncated, bare-terminator, wrong-length and undecodable inputs raise ImageFormatError naming
     the file and the record.
+- An ImageFormatError's message is one line: control characters in its path or reason are
+    shown escaped, while its path, record number and reason keep the values given.
 The suite is database-free, and every path derives from REPO_ROOT, never the working directory.
 USRSEC passwords are compared only against an independent decode of the image, never a literal.
 """
@@ -323,6 +325,53 @@ FRAMING_ERROR_IDS = (
 FINAL_TERMINATORS = (CRLF, LF)
 
 
+class ErrorTextCase(NamedTuple):
+    """An ImageFormatError's path and reason, and the one-line message it must show for them."""
+
+    path: str | Path
+    reason: str
+    shownText: str
+
+
+ERROR_TEXT_RECORD_NUMBER = 2
+# A line feed before forged log text and an ANSI escape in an operator-chosen image directory,
+# and a carriage return and an escape in a reason quoting record text, are each shown as their
+# escape, so neither splits the message or reaches a terminal.
+FORGED_LOG_TEXT = "ERROR forged-seed-success"
+HOSTILE_DIR_NAME = f"EBCDIC\n{FORGED_LOG_TEXT}\x1b[31m"
+SHOWN_HOSTILE_DIR_NAME = f"EBCDIC\\n{FORGED_LOG_TEXT}\\x1b[31m"
+HOSTILE_REASON = f"field text '12\r{FORGED_LOG_TEXT}\x1b[2J'"
+SHOWN_HOSTILE_REASON = f"field text '12\\r{FORGED_LOG_TEXT}\\x1b[2J'"
+USRSEC_IMAGE_PATH = EBCDIC_DIR / USRSEC_IMAGE_NAME
+ERROR_TEXT_CASES = (
+    pytest.param(
+        ErrorTextCase(
+            USRSEC_IMAGE_PATH,
+            BARE_TERMINATOR_REASON,
+            f"{USRSEC_IMAGE_PATH}: record {ERROR_TEXT_RECORD_NUMBER}: {BARE_TERMINATOR_REASON}",
+        ),
+        id="printable",
+    ),
+    pytest.param(
+        ErrorTextCase(
+            REPO_ROOT / "data" / HOSTILE_DIR_NAME / USRSEC_IMAGE_NAME,
+            BARE_TERMINATOR_REASON,
+            f"{REPO_ROOT / 'data'}/{SHOWN_HOSTILE_DIR_NAME}/{USRSEC_IMAGE_NAME}: "
+            f"record {ERROR_TEXT_RECORD_NUMBER}: {BARE_TERMINATOR_REASON}",
+        ),
+        id="control-bearing-path",
+    ),
+    pytest.param(
+        ErrorTextCase(
+            str(USRSEC_IMAGE_PATH),
+            HOSTILE_REASON,
+            f"{USRSEC_IMAGE_PATH}: record {ERROR_TEXT_RECORD_NUMBER}: {SHOWN_HOSTILE_REASON}",
+        ),
+        id="control-bearing-reason",
+    ),
+)
+
+
 @pytest.mark.parametrize("imageCase", IMAGE_CASES, ids=IMAGE_CASE_IDS)
 def test_ebcdic_record_counts(imageCase):
     contents = ReadCase(imageCase, ENCODING_EBCDIC)
@@ -478,3 +527,14 @@ def test_unknown_timestamp_text(tmp_path):
     assert isinstance(fieldError, RecordFormatError)
     assert fieldError.fieldName == "orig_ts"
     assert isinstance(fieldError.__cause__, TimestampFormatError)
+
+
+@pytest.mark.parametrize("errorTextCase", ERROR_TEXT_CASES)
+def test_image_error_message_is_one_escaped_line(errorTextCase):
+    error = ImageFormatError(errorTextCase.path, ERROR_TEXT_RECORD_NUMBER, errorTextCase.reason)
+    shownText = str(error)
+    assert shownText == errorTextCase.shownText
+    assert len(shownText.splitlines()) == 1
+    assert "\x1b" not in shownText
+    assert error.path is errorTextCase.path
+    assert (error.recordNumber, error.reason) == (ERROR_TEXT_RECORD_NUMBER, errorTextCase.reason)

@@ -660,6 +660,11 @@ PUBLICATION_LEDGER_STATEMENT = "UPDATE batch.job_runs SET status = %(status)s"
 PUBLICATION_CYCLE_ID = 1
 PUBLICATION_STEP_NO = 17
 PUBLICATION_RUN_ID = 1
+# A statements directory, from CARDDEMO_OUTPUT_DIR, whose name holds a line feed before forged
+# ERROR text and an ANSI escape, and the name as each log line shows it: every control character
+# escaped, so no path splits its line or forges another.
+HOSTILE_DIRECTORY_NAME = "statements\nERROR forged-publication\x1b[31m"
+SHOWN_HOSTILE_DIRECTORY_NAME = "statements\\nERROR forged-publication\\x1b[31m"
 
 
 def PublicationRecords(label: str) -> list[cbstm03a.StatementRecords]:
@@ -838,6 +843,29 @@ def test_recovery_rolls_back_a_publication_killed_before_its_commit_point(
     creastmt.RecoverInterruptedPublication(statementsDir)
     assert PublicationFiles(statementsDir) == previous
     assert caplog.messages == PublicationRollbackLogs(statementsDir, hasPrevious, renamesDone)
+
+
+@pytest.mark.parametrize("hasPrevious", [True, False], ids=["previous-pair", "first-run"])
+def test_recovery_logs_a_control_bearing_directory_escaped_on_each_line(
+    tmp_path: Path, hasPrevious: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each .part removed, the rollback and each file restored or removed in a directory whose
+    name holds a line feed and an ANSI escape is logged on one line, the controls escaped."""
+    statementsDir = tmp_path / HOSTILE_DIRECTORY_NAME
+    previous = PublicationInterruptedState(statementsDir, hasPrevious, 1)
+    caplog.set_level(logging.WARNING, logger=creastmt.LOGGER.name)
+    creastmt.RecoverInterruptedPublication(statementsDir)
+    assert PublicationFiles(statementsDir) == previous
+    shownDir = tmp_path / SHOWN_HOSTILE_DIRECTORY_NAME
+    assert caplog.messages == PublicationRollbackLogs(shownDir, hasPrevious, 1)
+
+
+def test_outputs_line_shows_a_control_bearing_directory_escaped() -> None:
+    """The STEP040 DATASETS line names each output file with the directory's controls escaped."""
+    statementsDir = Path("/srv/batch-output") / HOSTILE_DIRECTORY_NAME
+    shownDir = f"/srv/batch-output/{SHOWN_HOSTILE_DIRECTORY_NAME}"
+    expectedText = f"STMTFILE={shownDir}/STATEMNT.PS, HTMLFILE={shownDir}/STATEMNT.HTML"
+    assert creastmt.DescribeOutputs(statementsDir) == expectedText
 
 
 def test_failed_rollback_keeps_its_marker_and_the_next_run_completes_it(tmp_path: Path) -> None:

@@ -17,12 +17,15 @@ Specification, Sections 0.6.8 and 0.9.1):
   TRAN-ID order (a SYSTRAN whose suffix wrapped at 999999), its memory does not grow with the
   generations, and the load writes, decodes and inserts in one pass of bounded batches. Its
   spilled runs go to a work directory of the TRANSACT.COMBINED base, which the job removes and
-  the next command's catalog recovery deletes after a killed run.
+  the next command's catalog recovery deletes after a killed run. A base directory that is a
+  symbolic link is refused before any run is spilled through it.
 - Publication order, pinned for every GDG producer since this module's setup runs all of them:
   the COMMITTED catalog row is the final write of the producer's transaction, an fsync failure
   as the generation closes rolls the run's completion back with everything else, and the
   atomic producers (TRANBKP, COMBTRAN) leave publication to batch_chain, so a rename error after
   the commit keeps the step COMPLETED and an unforced rerun skips it.
+- A file error's failure text names its file, a str, bytes or descriptor, with every control
+  character escaped, so a line feed in a file name cannot split the failure line.
 
 Each CLI test first runs chain steps 6, 13, 14 and 15, or as many of them as its producer
 needs, through the CLI on the seeded test database with the reconciliation clock frozen, so
@@ -204,6 +207,12 @@ INTEREST_TRAN_ID_PREFIX = "2022071800"
 TRANID_SUFFIX_MODULUS = 10**6
 # The one-pass load case: an insert batch of seven rows over the fixture's records.
 SMALL_INSERT_BATCH_SIZE = 7
+# The containment case: a SYSTRAN of four records wrapping at 999999, so its sort must spill, and
+# a TRANSACT.COMBINED base directory under LINKED_OUTPUT_NAME that is a link to a directory
+# outside the archive.
+WRAPPED_RECORD_COUNT = 4
+LINKED_OUTPUT_NAME = "linked-output"
+OUTSIDE_DIRECTORY_NAME = "outside-sentinel"
 
 
 @dataclass(frozen=True)
@@ -614,8 +623,8 @@ def ForceExternalSort(monkeypatch: pytest.MonkeyPatch) -> set[Path]:
     def ReportOutOfOrder(generation: gdg.Generation) -> bool:
         return False
 
-    def RecordingWriteRun(records: Iterable[str], spillDirectory: Path) -> Path:
-        spillDirectories.add(spillDirectory)
+    def RecordingWriteRun(records: Iterable[str], spillDirectory: gdg.ManagedDirectory) -> str:
+        spillDirectories.add(spillDirectory.path)
         return originalWriteRun(records, spillDirectory)
 
     UseExternalSort(monkeypatch, FORCED_SORT_RUN_RECORD_COUNT, TINY_MERGE_FAN_IN)
@@ -919,6 +928,29 @@ def test_publication_error_after_commit_keeps_step_completed_and_rerun_skips(
     assert CountJobRuns(batchEnvironment.engine, case.stepNo, RUN_SKIPPED) == 1
 
 
+# The file an OSError names, as a str or bytes name holding a line feed before forged ERROR text
+# and an ANSI escape, or as a descriptor, and as the FILE ERROR text shows it: every control
+# character escaped, so the name cannot split the failure line or forge another.
+FILE_ERROR_NAME_CASES = (
+    pytest.param("G0001\nERROR forged\x1b[31m.dat", "G0001\\nERROR forged\\x1b[31m.dat", id="str"),
+    pytest.param(
+        b"G0001\nERROR forged\x1b[31m.dat", "b'G0001\\nERROR forged\\x1b[31m.dat'", id="bytes"
+    ),
+    pytest.param(7, "7", id="descriptor"),
+)
+
+
+@pytest.mark.parametrize(("fileName", "shownName"), FILE_ERROR_NAME_CASES)
+def test_file_error_names_its_file_with_control_characters_escaped(
+    fileName: str | bytes | int, shownName: str
+) -> None:
+    """A file error's text names the file it concerns on its one line, controls escaped."""
+    fileError = OSError(errno.EIO, "injected I/O error", fileName)
+    expectedText = f"FILE ERROR OSError ERRNO EIO ON {shownName}"
+    assert combtran.DescribeFileError(fileError) == expectedText
+    assert combtran.DescribeFailure(fileError) == f"COMBTRAN FAILED: {expectedText}"
+
+
 @pytest.mark.parametrize("case", MERGE_CASES)
 def test_streamed_merge_equals_the_stable_sort_of_the_concatenation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: MergeCase
@@ -944,6 +976,35 @@ def test_streamed_merge_equals_the_stable_sort_of_the_concatenation(
     assert mergedRecords == legacy_oracle.RunCombtran(bkupRecords, systranRecords)
     assert spilled == case.spills
     assert list(spillRoot.iterdir()) == []
+
+
+def test_sort_refuses_a_linked_combined_base_directory_and_spills_nothing_through_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An input out of order spills only beneath the archive root, never through a link.
+
+    A TRANSACT.COMBINED base directory that is a symbolic link raises gdg.ManagedDirectoryError
+    naming it before a run is written; the directory it points to keeps exactly what it held,
+    and the failure text COMBTRAN logs names the link on one line.
+    """
+    outsideDirectory = tmp_path / OUTSIDE_DIRECTORY_NAME
+    outsideDirectory.mkdir()
+    (outsideDirectory / ORPHAN_RUN_FILE_NAME).write_bytes(RECORD_TERMINATOR)
+    spillRoot = tmp_path / LINKED_OUTPUT_NAME / compare.GDG_DIRECTORY_NAME / COMBINED_BASE_NAME
+    spillRoot.parent.mkdir(parents=True)
+    spillRoot.symlink_to(outsideDirectory, target_is_directory=True)
+    UseExternalSort(monkeypatch, TINY_RUN_RECORD_COUNT, TINY_MERGE_FAN_IN)
+    systranRecords = SyntheticRecords(InterestTranIds(WRAPPED_RECORD_COUNT, True), SYSTRAN_TAG)
+    inputGenerations = (
+        SyntheticGeneration(tmp_path, gdg.TRANSACT_BKUP, []),
+        SyntheticGeneration(tmp_path, gdg.SYSTRAN, systranRecords),
+    )
+    with pytest.raises(gdg.ManagedDirectoryError) as raised, contextlib.ExitStack() as cleanup:
+        combtran.MergedRecords(inputGenerations, cleanup, spillRoot)
+    assert raised.value.filename == str(spillRoot)
+    assert combtran.DescribeFailure(raised.value).endswith(f" ON {spillRoot}")
+    assert [path.name for path in outsideDirectory.iterdir()] == [ORPHAN_RUN_FILE_NAME]
+    assert spillRoot.is_symlink()
 
 
 def test_sort_spills_in_the_combined_base_directory_and_recovery_deletes_a_killed_runs_spill(
