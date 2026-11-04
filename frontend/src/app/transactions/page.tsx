@@ -50,7 +50,12 @@ import {
     type ReadOptions,
     type RouteAllowance,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+    type InvalidKeyAction,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CT00";
 const PROGRAM_NAME = "COTRN00C";
@@ -148,6 +153,7 @@ interface ListRequestRunner {
     Run: (request: ListRequest) => Promise<void>;
     Invalidate: () => void;
     AbortRead: () => void;
+    IsLocked: () => boolean;
 }
 
 // The number of the latest request, the AbortController offered to the request in flight (null
@@ -420,6 +426,19 @@ function BuildFunctionKeys(actions: ListActions, isBusy: boolean): FunctionKeyDe
     ];
 }
 
+// WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG, MOVE -1 TO TRNIDINL and CCDA-MSG-INVALID-KEY in red. No
+// file is read, so the rows, page number, selection codes and search text stay as shown; the
+// answer is no list page, so the result status is emptied. A fresh feedback object puts the
+// cursor back on TRNIDIN at every press. Like ENTER, F7 and F8, the key is refused while a
+// request holds the lock.
+function ShowInvalidKey(runner: ListRequestRunner, updaters: ListUpdaters): void {
+    if (runner.IsLocked()) {
+        return;
+    }
+    const feedback = { ...EMPTY_FEEDBACK, message: INVALID_KEY_MESSAGE, cursorField: SEARCH_FIELD };
+    updaters.setScreen((screen) => ({ ...WithoutResultStatus(screen), feedback }));
+}
+
 // A message carried across a navigation shows on the first page only when the server sends no
 // literal of its own, so no server literal is replaced.
 function WithPendingMessage(
@@ -516,6 +535,7 @@ function useListRequestRunner(updaters: ListUpdaters): ListRequestRunner {
                 readControllerRef.current?.abort();
             },
             AbortRead: () => AbortAndRelease(readControllerRef),
+            IsLocked: () => readControllerRef.current !== null,
         };
     }, [updaters]);
     useEffect(() => runner.AbortRead, [runner]);
@@ -581,6 +601,15 @@ function useListKeys(state: ListState, runner: ListRequestRunner): FunctionKeyDe
     }, [screen, searchTranId, selectionCodes, isBusy, runner, updaters]);
 }
 
+// The screen's WHEN OTHER action, inactive while a request is out as ENTER, F7 and F8 are.
+function useInvalidKeyAction(state: ListState, runner: ListRequestRunner): InvalidKeyAction {
+    const { isBusy, updaters } = state;
+    return useMemo(
+        () => ({ onPress: () => ShowInvalidKey(runner, updaters), disabled: isBusy }),
+        [runner, updaters, isBusy],
+    );
+}
+
 // The first entry (EIBCALEN > 0, not re-entered) browses from the lowest TRAN-ID. Under React
 // Strict Mode the effect runs twice: the cleanup between the runs aborts the first browse and frees
 // the lock, so the second browse is the one answered, and the ref keeps the pending message the
@@ -617,9 +646,10 @@ function useTransactionList(): TransactionListView {
     const state = useListState();
     const runner = useListRequestRunner(state.updaters);
     const keys = useListKeys(state, runner);
+    const invalidKeyAction = useInvalidKeyAction(state, runner);
     const searchInputRef = useCursorFocus(state.screen.feedback);
     useFirstPage(runner);
-    useFunctionKeys(keys);
+    useFunctionKeys(keys, invalidKeyAction);
     return { ...state, keys, searchInputRef };
 }
 

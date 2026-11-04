@@ -29,7 +29,11 @@ import {
     type MessageSeverity,
 } from "@/lib/apiClient";
 import { AddUser, type UserCreateRequest, type UserMessageResponse } from "@/lib/api/users";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CU01";
 const PROGRAM_NAME = "COUSR01C";
@@ -39,9 +43,6 @@ const SHELL_HEADER = {
     programName: PROGRAM_NAME,
     screenTitle: SCREEN_TITLE,
 } as const;
-
-// CSMSG01Y CCDA-MSG-INVALID-KEY without its X(50) padding.
-const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
 
 // ERRMSG is COLOR=RED; only a completed write turns it green (DFHGREEN).
 const ERROR_SEVERITY = SeverityForOutcome({ isError: true, isCompletedWrite: false });
@@ -134,11 +135,14 @@ interface FocusRequest {
 
 const INITIAL_FOCUS_REQUEST: FocusRequest = { field: INITIAL_FOCUS_FIELD, nonce: 0 };
 
+// isInFlightRef is the synchronous write lock: true from the ENTER that sends the add until that
+// request settles, so a key pressed before the busy render reaches the keys is refused.
 interface UserAddContext {
     fieldValues: UserFieldValues;
     setFieldValues: Dispatch<SetStateAction<UserFieldValues>>;
     setFeedback: Dispatch<SetStateAction<UserAddFeedback>>;
     setIsBusy: Dispatch<SetStateAction<boolean>>;
+    isInFlightRef: RefObject<boolean>;
     RequestFocus: (field: UserFieldName) => void;
 }
 
@@ -195,8 +199,15 @@ function ApplyAddFailure(context: UserAddContext, feedback: CompleteScreenFeedba
 
 // ENTER: PROCESS-ENTER-KEY and the write run on the server, which receives the fields exactly as
 // keyed. Nothing is trimmed, case-folded or checked here, because COUSR01C keeps the password's
-// case, accepts any user type and owns every presence literal.
+// case, accepts any user type and owns every presence literal. The disabled keys take effect only
+// a render after the press, so the in-flight lock, taken before anything else, refuses a second
+// ENTER in that gap and one press sends one write. The lock clears when the request settles, a
+// rethrown defect included.
 async function HandleAddUser(context: UserAddContext): Promise<void> {
+    if (context.isInFlightRef.current) {
+        return;
+    }
+    context.isInFlightRef.current = true;
     context.setIsBusy(true);
     try {
         ApplyAddSuccess(context, await AddUser(context.fieldValues));
@@ -206,22 +217,39 @@ async function HandleAddUser(context: UserAddContext): Promise<void> {
         }
         ApplyAddFailure(context, ToScreenFeedback(error));
     } finally {
+        context.isInFlightRef.current = false;
         context.setIsBusy(false);
     }
 }
 
-// PF4, CLEAR-CURRENT-SCREEN: INITIALIZE-ALL-FIELDS blanks the inputs and the message.
+// PF4, CLEAR-CURRENT-SCREEN: INITIALIZE-ALL-FIELDS blanks the inputs and the message. It is refused
+// while an add is in flight, so the answer still lands on the form that was sent.
 function HandleClear(context: UserAddContext): void {
+    if (context.isInFlightRef.current) {
+        return;
+    }
     context.setFieldValues(EMPTY_FIELD_VALUES);
     context.setFeedback(NO_FEEDBACK);
     context.RequestFocus(INITIAL_FOCUS_FIELD);
 }
 
 // COUSR01C WHEN OTHER (lines 98-102): the legend shows F12=Exit, but PF12 has no handler, so the
-// keyed values are sent back unchanged with the invalid-key literal.
+// keyed values are sent back unchanged with the invalid-key literal. It is refused while an add is
+// in flight, so the answer's message is the one shown.
 function HandleInvalidKey(context: UserAddContext): void {
+    if (context.isInFlightRef.current) {
+        return;
+    }
     context.setFeedback(INVALID_KEY_FEEDBACK);
     context.RequestFocus(INITIAL_FOCUS_FIELD);
+}
+
+// PF3 leaves the screen. It is refused while an add is in flight, so the answer is always shown.
+function HandleBack(context: UserAddContext, returnToAdminMenu: () => void): void {
+    if (context.isInFlightRef.current) {
+        return;
+    }
+    returnToAdminMenu();
 }
 
 // The COUSR01 legend in map order: ENTER=Add User  F3=Back  F4=Clear  F12=Exit.
@@ -232,11 +260,13 @@ function BuildFunctionKeys(
 ): FunctionKeyDefinition[] {
     const definitions: Omit<FunctionKeyDefinition, "disabled">[] = [
         { key: "ENTER", label: "Add User", onPress: () => void HandleAddUser(context) },
-        { key: "F3", label: "Back", onPress: returnToAdminMenu },
+        { key: "F3", label: "Back", onPress: () => HandleBack(context, returnToAdminMenu) },
         { key: "F4", label: "Clear", onPress: () => HandleClear(context) },
         { key: "F12", label: "Exit", onPress: () => HandleInvalidKey(context) },
     ];
-    // Every key waits while an add is in flight, so one ENTER is one write.
+    // Every key waits while an add is in flight, so one ENTER is one write. Disabling takes effect
+    // a render after the press, so each handler also refuses a press made in that gap through the
+    // in-flight lock.
     return definitions.map((definition) => ({ ...definition, disabled: isBusy }));
 }
 
@@ -276,22 +306,45 @@ function useUserAddKeys(context: UserAddContext, isBusy: boolean): FunctionKeyDe
     );
 }
 
-function useUserAdd(): UserAddScreenModel {
+// The keyed values with the setters, cursor request and in-flight lock the key handlers act
+// through. The lock is one ref for the screen's life, so every context rebuilt from new keyed
+// values holds the same lock.
+function useUserAddContext(
+    setFeedback: Dispatch<SetStateAction<UserAddFeedback>>,
+    setIsBusy: Dispatch<SetStateAction<boolean>>,
+    requestFocus: (field: UserFieldName) => void,
+): UserAddContext {
     const [fieldValues, setFieldValues] = useState<UserFieldValues>(EMPTY_FIELD_VALUES);
+    const isInFlightRef = useRef(false);
+    return useMemo(
+        () => ({
+            fieldValues,
+            setFieldValues,
+            setFeedback,
+            setIsBusy,
+            isInFlightRef,
+            RequestFocus: requestFocus,
+        }),
+        [fieldValues, setFeedback, setIsBusy, requestFocus],
+    );
+}
+
+function useUserAdd(): UserAddScreenModel {
     const [feedback, setFeedback] = useState<UserAddFeedback>(NO_FEEDBACK);
     const [isBusy, setIsBusy] = useState(false);
     const fieldElementsRef = useRef<UserFieldElements>({});
     const requestFocus = useFocusRequest(fieldElementsRef);
     usePendingMessage(setFeedback);
-    const context = useMemo<UserAddContext>(
-        () => ({ fieldValues, setFieldValues, setFeedback, setIsBusy, RequestFocus: requestFocus }),
-        [fieldValues, requestFocus],
-    );
+    const context = useUserAddContext(setFeedback, setIsBusy, requestFocus);
     const keys = useUserAddKeys(context, isBusy);
+    const { fieldValues, setFieldValues } = context;
     // The keyed text is stored unchanged; maxLength (the BMS LENGTH) is the only input limit.
-    const setFieldValue = useCallback((name: UserFieldName, value: string) => {
-        setFieldValues((values) => ({ ...values, [name]: value }));
-    }, []);
+    const setFieldValue = useCallback(
+        (name: UserFieldName, value: string) => {
+            setFieldValues((values) => ({ ...values, [name]: value }));
+        },
+        [setFieldValues],
+    );
     return { fieldValues, feedback, isBusy, keys, fieldElementsRef, SetFieldValue: setFieldValue };
 }
 

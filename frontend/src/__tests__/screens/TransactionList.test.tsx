@@ -911,6 +911,51 @@ describe("COTRN00C F3", () => {
     });
 });
 
+// COTRN00C WHEN OTHER: an AID outside ENTER, PF3, PF7 and PF8 sets ERR-FLG, moves -1 to TRNIDINL
+// and sends CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy) over the map as it stood; no file is read.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
+const UNBOUND_KEYS: readonly string[] = ["F4", "F5", "F12"];
+
+// A key the legend lacks, pressed in the selected row's Select; the event tells whether its
+// browser default was blocked.
+function PressUnboundKey(keyName: string): KeyboardEvent {
+    const keyEvent = new KeyboardEvent("keydown", {
+        key: keyName,
+        bubbles: true,
+        cancelable: true,
+    });
+    fireEvent(SelectionField(SELECTED_ROW_NUMBER), keyEvent);
+    return keyEvent;
+}
+
+// The next ENTER sends the S code, the search key, and the first key and page number shown, so
+// the invalid key left every one of them as it was.
+async function ExpectSelectionSentByEnter(user: UserEvent): Promise<void> {
+    mockSelectTransactions.mockResolvedValueOnce({ route: VIEW_ROUTE });
+    await PressKey(user, "ENTER", "button");
+    await waitFor(() => expect(mockRouterPush).toHaveBeenCalledWith(VIEW_ROUTE));
+    expect(mockSelectTransactions).toHaveBeenCalledWith(SELECTION_REQUEST);
+}
+
+describe("COTRN00C WHEN OTHER keys", () => {
+    it.each(UNBOUND_KEYS)(
+        "COTRN00C %s shows the invalid-key literal in red, reads nothing and keeps the map",
+        async (keyName) => {
+            const user = await RenderFirstPage();
+            await user.type(SearchField(), SEARCH_KEY);
+            await ChooseSelection(user, SELECTED_ROW_NUMBER, "S");
+            const keyEvent = PressUnboundKey(keyName);
+            await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+            expect(keyEvent.defaultPrevented).toBe(true);
+            expect(RequestCount()).toBe(1);
+            ExpectShownRows(1);
+            expect(SearchField()).toHaveValue(SEARCH_KEY);
+            expect(SearchField()).toHaveFocus();
+            await ExpectSelectionSentByEnter(user);
+        },
+    );
+});
+
 // The page a pending F7, F8 or ENTER finally answers with: rows 11-20 as page 2.
 const PENDING_ANSWER = BuildListResponse({ rows: BuildRows(11), page: 2 });
 

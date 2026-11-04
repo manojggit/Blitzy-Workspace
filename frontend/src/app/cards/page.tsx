@@ -49,7 +49,12 @@ import {
     type PageState,
     type ScreenFeedback,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition, type PfKey } from "@/lib/useFunctionKeys";
+import {
+    EnterKeyOf,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+    type PfKey,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CCLI";
 const PROGRAM_NAME = "COCRDLIC";
@@ -648,7 +653,9 @@ function useCardListScreen(): CardListScreenModel {
             setters.setList((current) => WithSelectionCode(current, rowKey, code)),
         [setters],
     );
-    useFunctionKeys(keys);
+    // PFK-INVALID: any AID but ENTER, PF3, PF7 and PF8 does SET CCARD-AID-ENTER, so an unbound PF
+    // key runs ENTER.
+    useFunctionKeys(keys, EnterKeyOf(keys));
     useFirstPageLoad(setters, gate, context.listReadRef);
     const { filters, list, messages } = state;
     return { filters, list, messages, isBusy, keys, filterHandlers, tableRef, onSelectionChange };

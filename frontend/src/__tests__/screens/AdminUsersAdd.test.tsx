@@ -152,6 +152,8 @@ const KEYBOARD_KEYS: Readonly<Record<LegendKey, string>> = {
     F12: "F12",
 };
 const PRESS_METHODS: readonly PressMethod[] = ["click", "key"];
+// A second legend key pressed with ENTER before the busy render disables the keys.
+const BURST_SECOND_KEYS: readonly LegendKey[] = ["ENTER", "F3", "F4", "F12"];
 
 // 2022-07-18 09:05:07 UTC, the instant the header clock is held at.
 const FIXED_CLOCK_MILLISECONDS = Date.UTC(2022, 6, 18, 9, 5, 7);
@@ -230,6 +232,17 @@ async function PressLegend(user: UserEvent, key: LegendKey, method: PressMethod)
     await PressKey(user, key);
 }
 
+// Physical keys reach the useFunctionKeys window listener. They all run inside one act, so no
+// render, and no effect handing the keys their disabled state, runs between two presses.
+async function PressInOneTurn(keys: readonly LegendKey[]): Promise<void> {
+    await act(async () => {
+        for (const key of keys) {
+            const init = { key: KEYBOARD_KEYS[key], bubbles: true, cancelable: true };
+            window.dispatchEvent(new KeyboardEvent("keydown", init));
+        }
+    });
+}
+
 // The backend legacy error body (core/errors.ErrorBody) with every key present.
 function BuildErrorBody(overrides: Partial<LegacyErrorResponse>): LegacyErrorResponse {
     return { message: "", info_message: "", field_errors: [], cursor_field: "", ...overrides };
@@ -273,6 +286,13 @@ function DeferAddUser(): (response: UserMessageResponse) => void {
     return (response) => settle(response);
 }
 
+// Answers the deferred add with the green confirmation inside act, so the page applies it first.
+async function AnswerAdded(settleAdd: (response: UserMessageResponse) => void): Promise<void> {
+    await act(async () => {
+        settleAdd({ message: ADDED_MESSAGE, cursor_field: "first_name" });
+    });
+}
+
 // The message line holds exactly the literal, untrimmed, in its severity's colour.
 async function ExpectAlert(text: string, severity: MessageSeverity): Promise<void> {
     const alert = await screen.findByRole("alert");
@@ -298,6 +318,17 @@ function ExpectNoCallOrNavigation(): void {
     expect(mockAddUser).not.toHaveBeenCalled();
     expect(mockRouterPush).not.toHaveBeenCalled();
     expect(mockRouterReplace).not.toHaveBeenCalled();
+}
+
+// One add is out with the form as keyed, and nothing else has happened: no second write, no clear,
+// no message and no navigation.
+function ExpectOneAddInFlight(): void {
+    expect(mockAddUser).toHaveBeenCalledTimes(1);
+    expect(mockAddUser).toHaveBeenCalledWith(KEYED_USER);
+    expect(screen.getByRole("progressbar", { name: "Processing" })).toBeInTheDocument();
+    ExpectFieldValues(KEYED_USER);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(mockRouterPush).not.toHaveBeenCalled();
 }
 
 // The ScreenShell header clock reads Date.now() on every one-second tick. Holding it at one
@@ -404,6 +435,27 @@ describe("COUSR01C ENTER while the write is in flight on /admin/users/add", () =
         await ExpectAlert(ADDED_MESSAGE, "success");
         expect(screen.queryByRole("progressbar")).toBeNull();
     });
+});
+
+// The keys disable a render after ENTER, so a key pressed in that gap meets the in-flight lock:
+// one write is sent, its answer lands on the form that was sent, and the lock then clears.
+describe("COUSR01C keys pressed in the same turn as ENTER on /admin/users/add", () => {
+    it.each(BURST_SECOND_KEYS)(
+        "COUSR01C ENTER and %s in one turn send one write, answered on the form sent",
+        async (secondKey) => {
+            const settleAdd = DeferAddUser();
+            await FillUser(RenderScreen(), KEYED_USER);
+            await PressInOneTurn(["ENTER", secondKey]);
+            ExpectOneAddInFlight();
+            await AnswerAdded(settleAdd);
+            await ExpectAlert(ADDED_MESSAGE, "success");
+            ExpectFieldValues(BLANK_USER);
+            expect(mockRouterPush).not.toHaveBeenCalled();
+            await PressInOneTurn(["ENTER"]);
+            expect(mockAddUser).toHaveBeenCalledTimes(2);
+            expect(mockAddUser).toHaveBeenLastCalledWith(BLANK_USER);
+        },
+    );
 });
 
 describe("COUSR01C ERRMSG literals on /admin/users/add", () => {

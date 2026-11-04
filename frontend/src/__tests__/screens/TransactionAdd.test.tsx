@@ -5,7 +5,7 @@
 // have their own TransactionAdd*.test.tsx suites.
 import { alertClasses, inputBaseClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
@@ -805,6 +805,38 @@ it.each(KEY_METHODS)(
         expect(screen.queryByRole("alert")).toBeNull();
         expect(InputOf("acct_id")).toHaveFocus();
         expect(mockAddTransaction).toHaveBeenCalledTimes(1);
+    },
+);
+
+// COTRN02C WHEN OTHER: an AID outside ENTER, PF3, PF4 and PF5 sets ERR-FLG and sends
+// CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy). Nothing is written: the prompt screen stays as shown,
+// the resolved card masked, no field flagged, and the cursor goes to ACTIDIN, the IC field. The
+// prompt is reached from the account alone, the server sending back every other field, and the
+// pointer leaves the inputs before the key, so the cursor move is the page's alone.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
+const UNBOUND_KEYS: readonly string[] = ["F7", "F8", "F12"];
+
+it.each(UNBOUND_KEYS)(
+    "COTRN02C %s shows the invalid-key literal in red without a call",
+    async (keyName) => {
+        mockAddTransaction.mockResolvedValueOnce(BuildAddResponse());
+        const user = RenderScreen();
+        await KeyInto(user, "acct_id", TEST_ACCOUNT_ID);
+        await UseMapKey(user, "ENTER", "button");
+        await ExpectAlert(CONFIRM_PROMPT_MESSAGE, "error");
+        await KeyInto(user, "confirm", "Y");
+        await user.click(document.body);
+        const keyInit = { key: keyName, bubbles: true, cancelable: true };
+        const keyEvent = new KeyboardEvent("keydown", keyInit);
+        act(() => {
+            document.body.dispatchEvent(keyEvent);
+        });
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+        expect(keyEvent.defaultPrevented).toBe(true);
+        expect(mockAddTransaction).toHaveBeenCalledTimes(1);
+        ExpectScreenValues({ ...E2E_LIKE_INPUT, card_num: SERVED_CARD_MASKED, confirm: "Y" });
+        ExpectMarkedFields([]);
+        expect(InputOf("acct_id")).toHaveFocus();
     },
 );
 

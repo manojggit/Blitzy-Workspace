@@ -80,6 +80,7 @@ import {
     type TransactionReportResponse,
 } from "@/lib/api/reports";
 import {
+    INVALID_KEY_MESSAGE,
     SCREEN_ENTER_PROPS,
     useFunctionKeys,
     type FunctionKeyDefinition,
@@ -442,6 +443,17 @@ function ShowErrorFeedback(error: AxiosError, setters: ScreenSetters): void {
     setters.requestFocus(feedback.cursor_field);
 }
 
+// WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG, MOVE -1 TO MONTHLYL and CCDA-MSG-INVALID-KEY in red. No
+// report is read, so the criteria as keyed and any report shown stay, and no field is flagged.
+// Like ENTER, the key is refused while a report read or a download holds the lock.
+function ShowInvalidKey(setters: ScreenSetters, lock: RequestLock): void {
+    if (lock.current) {
+        return;
+    }
+    setters.setFeedback({ ...EMPTY_FEEDBACK, message: INVALID_KEY_MESSAGE });
+    setters.requestFocus(DEFAULT_CURSOR_FIELD);
+}
+
 interface FunctionKeyHandlers {
     onEnter: () => void;
     onBack: () => void;
@@ -792,10 +804,12 @@ function useReportSubmit(
     return { isBusy, readNumber, submit, abortRead };
 }
 
-// What the PF keys act on: ENTER submits; F3 aborts every request in flight before it leaves.
+// What the PF keys act on: ENTER submits; F3 aborts every request in flight before it leaves;
+// any other PF key shows the invalid-key literal.
 interface ScreenKeyActions {
     submit: SubmitAction;
     abortRequests: ReadAborter;
+    onInvalidKey: () => void;
     isBusy: boolean;
 }
 
@@ -804,7 +818,7 @@ interface ScreenKeyActions {
 // the menu has loaded.
 function useScreenKeys(actions: ScreenKeyActions): readonly FunctionKeyDefinition[] {
     const router = useRouter();
-    const { submit, isBusy, abortRequests } = actions;
+    const { submit, isBusy, abortRequests, onInvalidKey } = actions;
     const keys = useMemo(
         () =>
             BuildFunctionKeys({
@@ -819,7 +833,7 @@ function useScreenKeys(actions: ScreenKeyActions): readonly FunctionKeyDefinitio
             }),
         [submit, abortRequests, router, isBusy],
     );
-    useFunctionKeys(keys);
+    useFunctionKeys(keys, { onPress: onInvalidKey, disabled: isBusy });
     return keys;
 }
 
@@ -836,7 +850,8 @@ function useReportRequests(inputs: ReportInputs, setters: ScreenSetters): Report
         abortRead();
         abortDownload();
     }, [abortRead, abortDownload]);
-    const keys = useScreenKeys({ submit, abortRequests, isBusy });
+    const onInvalidKey = useCallback(() => ShowInvalidKey(setters, lock), [setters]);
+    const keys = useScreenKeys({ submit, abortRequests, onInvalidKey, isBusy });
     const downloads = useMemo(() => ({ disabled: isBusy, startDownload }), [isBusy, startDownload]);
     return { isBusy, readNumber, keys, downloads };
 }

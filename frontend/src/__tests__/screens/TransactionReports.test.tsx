@@ -1720,6 +1720,34 @@ it("CORPT00C Y shows the CBTRN03C report below the cleared form", async () => {
     await waitFor(() => expect(ReportTypeButton(MONTHLY_LABEL)).toHaveFocus());
 });
 
+// CORPT00C WHEN OTHER: any AID but ENTER and PF3 sets ERR-FLG, moves -1 to MONTHLYL and sends
+// CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy). No report is read: the criteria as keyed and the report
+// shown stay, no control is flagged, and the cursor goes to MONTHLY.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
+const UNBOUND_KEYS: readonly string[] = ["F4", "F5", "F7", "F12"];
+
+it.each(UNBOUND_KEYS)(
+    "CORPT00C %s shows the invalid-key literal in red and reads no report",
+    async (keyName) => {
+        const user = await ShowMonthlyReport();
+        await user.click(ReportTypeButton(CUSTOM_LABEL));
+        await user.type(DatePartInput(START_MONTH_PART), CUSTOM_DATE_PARTS.startMm);
+        await user.type(ConfirmInput(), "Y");
+        const keyInit = { key: keyName, bubbles: true, cancelable: true };
+        const keyEvent = new KeyboardEvent("keydown", keyInit);
+        fireEvent(ConfirmInput(), keyEvent);
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+        expect(keyEvent.defaultPrevented).toBe(true);
+        expect(mockFetchTransactionReport).toHaveBeenCalledTimes(1);
+        ExpectMonthlyReportShown();
+        expect(ReportTypeButton(CUSTOM_LABEL)).toHaveAttribute("aria-pressed", "true");
+        expect(DatePartInput(START_MONTH_PART)).toHaveValue(CUSTOM_DATE_PARTS.startMm);
+        expect(ConfirmInput()).toHaveValue("Y");
+        ExpectReportTypeUnflagged();
+        await waitFor(() => expect(MonthlyButton()).toHaveFocus());
+    },
+);
+
 it("CORPT00C empty confirmed range shows its range, an empty row and both downloads", async () => {
     await ShowEmptyCustomReport();
     expect(mockFetchTransactionReport).toHaveBeenCalledWith(

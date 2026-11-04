@@ -45,7 +45,11 @@ import {
     type CompleteScreenFeedback,
     type MessageSeverity,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CT02";
 const PROGRAM_NAME = "COTRN02C";
@@ -477,6 +481,16 @@ function HandleClear(setters: AddScreenSetters): void {
     setters.setFeedback(ClearedFeedback());
 }
 
+// WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY in red. Nothing is written, so the
+// keyed values and the resolved card stay; no field is in error, and the cursor goes to ACTIDIN,
+// the map's IC field. Like F4, it is refused while a request is in flight.
+function HandleInvalidKey(setters: AddScreenSetters): void {
+    if (setters.isInFlightRef.current) {
+        return;
+    }
+    setters.setFeedback({ ...ClearedFeedback(), message: INVALID_KEY_MESSAGE });
+}
+
 function HandleBack(router: AppRouter): void {
     router.push(MENU_ROUTE);
 }
@@ -552,7 +566,11 @@ function useTransactionAddKeys({ values, isBusy, setters }: AddKeyInputs) {
             }),
         [values, isBusy, setters, router],
     );
-    useFunctionKeys(keys);
+    const invalidKeyAction = useMemo(
+        () => ({ onPress: () => HandleInvalidKey(setters), disabled: isBusy }),
+        [setters, isBusy],
+    );
+    useFunctionKeys(keys, invalidKeyAction);
     return keys;
 }
 

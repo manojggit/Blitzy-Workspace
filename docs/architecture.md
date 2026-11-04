@@ -80,7 +80,10 @@ How each legacy mechanism is replaced:
     - `session.tsx`: the session context, read from `GET /api/v1/auth/me` only to choose the menu
         and fill the header.
     - `useFunctionKeys.ts`: binds F3, F4, F5, F7, F8 and F12 to the bar's buttons, so legacy
-        literals that mention PF keys stay accurate.
+        literals that mention PF keys stay accurate. Any other PF1–PF24 key is kept from the
+        browser and answered by the screen's optional invalid-key action: ENTER on CCLI, CCDL and
+        CCUP; the `Invalid key pressed. Please see below...` literal on CT00, CT01, CT02, CR00 and
+        CB00; nothing on the other screens.
     - `api/*.ts`: typed endpoint functions whose types mirror `backend/app/schemas/*.py` field for
         field, with snake_case JSON keys.
 - **Theme.** `frontend/src/app/theme.ts` is the only source of colour, type, shape and spacing

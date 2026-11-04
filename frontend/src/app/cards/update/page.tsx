@@ -50,7 +50,12 @@ import {
     type MessageSeverity,
     type ScreenFeedback,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition, type PfKey } from "@/lib/useFunctionKeys";
+import {
+    EnterKeyOf,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+    type PfKey,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CCUP";
 const PROGRAM_NAME = "COCRDUPC";
@@ -677,7 +682,9 @@ function useCardUpdateScreen(): CardUpdateScreenModel {
         runRequest,
         AbandonEntryFetch: abandonEntryFetch,
     });
-    useFunctionKeys(keys);
+    // PFK-INVALID: an AID outside ENTER, PF3, PF5 and PF12 does SET CCARD-AID-ENTER, so an unbound
+    // PF key sends action "enter"; the server turns an F5 or F12 its state refuses into ENTER.
+    useFunctionKeys(keys, EnterKeyOf(keys));
     const view = useFieldView(store, registry.registerInput);
     return { view, keys, isBusy: store.isBusy, feedback: store.feedback };
 }

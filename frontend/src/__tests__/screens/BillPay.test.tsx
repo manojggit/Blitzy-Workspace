@@ -793,6 +793,35 @@ it.each(KEY_METHODS)(
     },
 );
 
+// COBIL00C WHEN OTHER: an AID outside ENTER, PF3 and PF4 sets ERR-FLG and sends
+// CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy). No payment command is sent: the prompt screen stays as
+// keyed with CURBAL shown, no field is flagged, and the cursor goes to ACTIDIN, the IC field. The
+// pointer first leaves the inputs, as PressInOneTurn's does.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
+const UNBOUND_KEYS: readonly string[] = ["F5", "F7", "F8", "F12"];
+
+it.each(UNBOUND_KEYS)(
+    "COBIL00C %s after the confirm prompt shows the invalid-key literal without a call",
+    async (keyName) => {
+        const user = RenderScreen();
+        await ShowConfirmPrompt(user);
+        await KeyInto(user, "confirm", "Y");
+        await user.click(document.body);
+        const keyInit = { key: keyName, bubbles: true, cancelable: true };
+        const keyEvent = new KeyboardEvent("keydown", keyInit);
+        act(() => {
+            document.body.dispatchEvent(keyEvent);
+        });
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+        expect(keyEvent.defaultPrevented).toBe(true);
+        expect(mockPayBill).toHaveBeenCalledTimes(1);
+        ExpectPaymentScreenKept();
+        expect(InputOf("acct_id")).toHaveAttribute("aria-invalid", "false");
+        expect(InputOf("confirm")).toHaveAttribute("aria-invalid", "false");
+        expect(InputOf("acct_id")).toHaveFocus();
+    },
+);
+
 it.each(KEY_METHODS)("COBIL00C PF3 by %s returns to COMEN01C at /menu", async (method) => {
     const user = RenderScreen();
     await KeyRequest(user, PAY_REQUEST);

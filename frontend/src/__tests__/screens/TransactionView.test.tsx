@@ -703,6 +703,45 @@ describe("COTRN01C F4 (CLEAR-CURRENT-SCREEN) after a failed read", () => {
     });
 });
 
+// COTRN01C WHEN OTHER: an AID outside ENTER, PF3, PF4 and PF5 sets ERR-FLG and sends
+// CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy); TRANSACT is not read, the key and the record shown
+// stay, and the cursor returns to TRNIDIN, the IC field, which is not flagged.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
+const UNBOUND_KEYS: readonly string[] = ["F7", "F8", "F12"];
+
+// A key the legend lacks, pressed with the cursor on a protected detail field; the event tells
+// whether its browser default was blocked.
+async function PressUnboundKey(user: UserEvent, keyName: string): Promise<KeyboardEvent> {
+    const amountField = DetailInput("Amount:");
+    await user.click(amountField);
+    const keyEvent = new KeyboardEvent("keydown", {
+        key: keyName,
+        bubbles: true,
+        cancelable: true,
+    });
+    act(() => {
+        amountField.dispatchEvent(keyEvent);
+    });
+    return keyEvent;
+}
+
+describe("COTRN01C WHEN OTHER (invalid key)", () => {
+    it.each(UNBOUND_KEYS)(
+        "COTRN01C %s shows the invalid-key literal in red and keeps the record shown",
+        async (keyName) => {
+            const user = await RenderFrom(TEST_TRAN_ID);
+            const keyEvent = await PressUnboundKey(user, keyName);
+            await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+            expect(keyEvent.defaultPrevented).toBe(true);
+            expect(mockViewTransaction).toHaveBeenCalledTimes(1);
+            expect(TranIdInput()).toHaveValue(TEST_TRAN_ID);
+            expect(DetailValues()).toEqual(DETAIL_FIELD_CASES.map((field) => field.shownValue));
+            expect(TranIdInput()).toHaveAttribute("aria-invalid", "false");
+            expect(TranIdInput()).toHaveFocus();
+        },
+    );
+});
+
 describe("COTRN01C F5 (XCTL to COTRN00C)", () => {
     it.each(PRESS_MODES)("COTRN01C F5 by %s browses to the transaction list", async (mode) => {
         const user = RenderScreen();

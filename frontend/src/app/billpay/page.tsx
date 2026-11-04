@@ -27,7 +27,11 @@ import {
     ToScreenFeedback,
     type MessageSeverity,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CB00";
 const PROGRAM_NAME = "COBIL00C";
@@ -256,6 +260,17 @@ function ClearScreen(setters: BillPayScreenSetters): void {
     setters.setFeedback(ClearedFeedback());
 }
 
+// WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY in red. No file is read or written,
+// so the keyed fields and the balance shown stay; no field is in error, and the cursor goes to
+// ACTIDIN, the map's IC field. Like F4, it is refused while a payment request is in flight.
+function ShowInvalidKey(setters: BillPayScreenSetters): void {
+    if (setters.isInFlightRef.current) {
+        return;
+    }
+    const severity = SeverityForOutcome({ isError: true, isCompletedWrite: false });
+    setters.setFeedback({ ...ClearedFeedback(), message: INVALID_KEY_MESSAGE, severity });
+}
+
 // The map's legend, in its order: ENTER=Continue  F3=Back  F4=Clear. ENTER and F4 are disabled
 // while the call runs; disabling takes effect a render after the press, so SubmitBillPay and
 // ClearScreen also refuse a press made in that gap through the in-flight lock. A Clear can never
@@ -322,7 +337,11 @@ function useBillPayKeys({ form, isBusy, setters }: BillPayKeyInputs) {
             }),
         [form, isBusy, setters, router],
     );
-    useFunctionKeys(keys);
+    const invalidKeyAction = useMemo(
+        () => ({ onPress: () => ShowInvalidKey(setters), disabled: isBusy }),
+        [setters, isBusy],
+    );
+    useFunctionKeys(keys, invalidKeyAction);
     return keys;
 }
 

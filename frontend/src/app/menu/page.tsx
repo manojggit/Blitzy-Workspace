@@ -365,7 +365,8 @@ function useMenuActionContext(callContext: ScreenCallContext): MenuActionContext
     );
 }
 
-// The COMEN01 legend; no other key is bound, so the WHEN OTHER invalid-key path cannot occur.
+// The COMEN01 legend; no other key is bound, and this screen passes no invalid-key action, so
+// useFunctionKeys swallows any other PF key without an answer.
 function BuildFunctionKeys(inputs: FunctionKeyInputs): FunctionKeyDefinition[] {
     const { actionContext, optionText, isBusy } = inputs;
     return [

@@ -1,15 +1,17 @@
 // Tests: lib/useFunctionKeys.ts (replaces the EVALUATE EIBAID PF-key dispatch of
-// cbl/COUSR02C.cbl and cbl/COTRN00C.cbl; unbound keys keep the CSMSG01Y invalid-key path).
+// cbl/COUSR02C.cbl and cbl/COTRN00C.cbl; an unbound PF key takes the screen's WHEN OTHER path).
 import { Box, Button, TextField, ToggleButton } from "@mui/material";
 import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { createElement, type ReactElement } from "react";
 
 import {
+    EnterKeyOf,
     IsScreenEnterKey,
     PF_KEY_ACTIONS,
     SCREEN_ENTER_PROPS,
     useFunctionKeys,
     type FunctionKeyDefinition,
+    type InvalidKeyAction,
     type PfKey,
 } from "@/lib/useFunctionKeys";
 
@@ -76,10 +78,64 @@ const SCREEN_ENTER_KEY_CASES: readonly { press: string; init: KeyboardEventInit;
     { press: "Space", init: { key: " " }, is: false },
 ];
 
-const UNBOUND_KEYS: readonly string[] = ["F8", "a"];
+// With no invalid-key action an unbound PF key is still blocked; any other unbound key is left to
+// the browser, Enter included while the screen binds no ENTER.
+const UNBOUND_KEY_CASES: readonly { key: string; isBlocked: boolean }[] = [
+    { key: "F8", isBlocked: true },
+    { key: "F12", isBlocked: true },
+    { key: "a", isBlocked: false },
+    { key: "Escape", isBlocked: false },
+    { key: "Tab", isBlocked: false },
+    { key: "Enter", isBlocked: false },
+];
+
+// PF keys no definition binds, across PF1-PF24: one digit, the teens and the twenties.
+const UNBOUND_PF_KEYS: readonly string[] = ["F1", "F6", "F10", "F12", "F13", "F24"];
+
+// The keyboard lock (a disabled action) and an auto-repeat block the key without running it.
+const SWALLOWED_INVALID_KEY_CASES: readonly {
+    press: string;
+    disabled: boolean;
+    init: KeyboardEventInit;
+}[] = [
+    { press: "a disabled action", disabled: true, init: { key: "F5" } },
+    { press: "an auto-repeat", disabled: false, init: { key: "F5", repeat: true } },
+];
+
+// A bound key runs its own WHEN branch, or nothing while disabled, but never WHEN OTHER.
+const BOUND_KEY_CASES: readonly { disabled: boolean; pressCount: number }[] = [
+    { disabled: false, pressCount: 1 },
+    { disabled: true, pressCount: 0 },
+];
+
+interface KeyBindingProps {
+    definitions: readonly FunctionKeyDefinition[];
+    invalidKeyAction?: InvalidKeyAction;
+}
 
 function BuildDefinition(key: PfKey, disabled = false): FunctionKeyDefinition {
     return { key, label: key, onPress: jest.fn(), disabled };
+}
+
+const EXIT_DEFINITION = BuildDefinition("F3");
+const ENTER_DEFINITION = BuildDefinition("ENTER");
+
+// The ENTER that PFK-INVALID falls back to, found among the other keys, or none.
+const ENTER_KEY_OF_CASES: readonly {
+    legend: string;
+    definitions: readonly FunctionKeyDefinition[];
+    enterKey: FunctionKeyDefinition | undefined;
+}[] = [
+    {
+        legend: "F3 and ENTER",
+        definitions: [EXIT_DEFINITION, ENTER_DEFINITION],
+        enterKey: ENTER_DEFINITION,
+    },
+    { legend: "F3 alone", definitions: [EXIT_DEFINITION], enterKey: undefined },
+];
+
+function BuildInvalidKeyAction(disabled = false): InvalidKeyAction {
+    return { onPress: jest.fn(), disabled };
 }
 
 function DispatchKey(init: KeyboardEventInit, target: EventTarget = window): KeyboardEvent {
@@ -94,6 +150,19 @@ function DispatchKey(init: KeyboardEventInit, target: EventTarget = window): Key
 // and refuses a hook call inside a callback nested in one.
 function BindKeys(definitions: readonly FunctionKeyDefinition[]) {
     return renderHook(useFunctionKeys, { initialProps: definitions });
+}
+
+// renderHook passes one props value, so a custom hook unpacks both arguments; its "use" name lets
+// rules-of-hooks accept the call.
+function useKeyBindings({ definitions, invalidKeyAction }: KeyBindingProps): void {
+    useFunctionKeys(definitions, invalidKeyAction);
+}
+
+function BindKeysWithAction(
+    definitions: readonly FunctionKeyDefinition[],
+    invalidKeyAction: InvalidKeyAction,
+) {
+    return renderHook(useKeyBindings, { initialProps: { definitions, invalidKeyAction } });
 }
 
 // The MUI Button focus ripple mounts lazily after a microtask, so focus is awaited inside act.
@@ -227,12 +296,78 @@ it("disabled F5 is blocked but not run (PF key not active on this map)", () => {
     expect(keyEvent.defaultPrevented).toBe(true);
 });
 
-it.each(UNBOUND_KEYS)("unbound key %s is left to the page (WHEN OTHER invalid-key path)", (key) => {
-    const definition = BuildDefinition("ENTER");
-    BindKeys([definition]);
-    const keyEvent = DispatchKey({ key });
-    expect(definition.onPress).not.toHaveBeenCalled();
-    expect(keyEvent.defaultPrevented).toBe(false);
+it.each(UNBOUND_KEY_CASES)(
+    "unbound key $key without an invalid-key action runs nothing; blocked: $isBlocked",
+    ({ key, isBlocked }) => {
+        const definition = BuildDefinition("F3");
+        BindKeys([definition]);
+        const keyEvent = DispatchKey({ key });
+        expect(definition.onPress).not.toHaveBeenCalled();
+        expect(keyEvent.defaultPrevented).toBe(isBlocked);
+    },
+);
+
+it.each(UNBOUND_PF_KEYS)(
+    "unbound %s runs the invalid-key action once and is blocked (EIBAID WHEN OTHER)",
+    (key) => {
+        const definition = BuildDefinition("ENTER");
+        const invalidKeyAction = BuildInvalidKeyAction();
+        BindKeysWithAction([definition], invalidKeyAction);
+        const keyEvent = DispatchKey({ key });
+        expect(invalidKeyAction.onPress).toHaveBeenCalledTimes(1);
+        expect(definition.onPress).not.toHaveBeenCalled();
+        expect(keyEvent.defaultPrevented).toBe(true);
+    },
+);
+
+it.each(SWALLOWED_INVALID_KEY_CASES)(
+    "unbound F5 with $press is blocked but not run (one press is one AID)",
+    ({ disabled, init }) => {
+        const invalidKeyAction = BuildInvalidKeyAction(disabled);
+        BindKeysWithAction([BuildDefinition("ENTER")], invalidKeyAction);
+        const keyEvent = DispatchKey(init);
+        expect(invalidKeyAction.onPress).not.toHaveBeenCalled();
+        expect(keyEvent.defaultPrevented).toBe(true);
+    },
+);
+
+it.each(MODIFIER_CASES)(
+    "$modifier+F12 is left to the browser and never runs the invalid-key action",
+    ({ chord }) => {
+        const invalidKeyAction = BuildInvalidKeyAction();
+        BindKeysWithAction([BuildDefinition("ENTER")], invalidKeyAction);
+        const keyEvent = DispatchKey({ key: "F12", ...chord });
+        expect(invalidKeyAction.onPress).not.toHaveBeenCalled();
+        expect(keyEvent.defaultPrevented).toBe(false);
+    },
+);
+
+it.each(BOUND_KEY_CASES)(
+    "bound F5, disabled $disabled, runs $pressCount time(s) and never the invalid-key action",
+    ({ disabled, pressCount }) => {
+        const definition = BuildDefinition("F5", disabled);
+        const invalidKeyAction = BuildInvalidKeyAction();
+        BindKeysWithAction([definition], invalidKeyAction);
+        const keyEvent = DispatchKey({ key: "F5" });
+        expect(definition.onPress).toHaveBeenCalledTimes(pressCount);
+        expect(invalidKeyAction.onPress).not.toHaveBeenCalled();
+        expect(keyEvent.defaultPrevented).toBe(true);
+    },
+);
+
+it("a re-rendered invalid-key action replaces the earlier one (the current screen answers)", () => {
+    const definitions = [BuildDefinition("ENTER")];
+    const firstAction = BuildInvalidKeyAction();
+    const nextAction = BuildInvalidKeyAction();
+    const { rerender } = BindKeysWithAction(definitions, firstAction);
+    rerender({ definitions, invalidKeyAction: nextAction });
+    fireEvent.keyDown(window, { key: "F12" });
+    expect(nextAction.onPress).toHaveBeenCalledTimes(1);
+    expect(firstAction.onPress).not.toHaveBeenCalled();
+});
+
+it.each(ENTER_KEY_OF_CASES)("EnterKeyOf over $legend returns ENTER, if bound", (enterCase) => {
+    expect(EnterKeyOf(enterCase.definitions)).toBe(enterCase.enterKey);
 });
 
 it("re-rendered definitions replace the earlier ones (the current screen answers)", () => {

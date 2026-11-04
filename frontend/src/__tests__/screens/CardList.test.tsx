@@ -1023,6 +1023,52 @@ describe("COCRDLIC F3 on /cards", () => {
     });
 });
 
+// COCRDLIC PFK-INVALID: an AID outside ENTER, PF3, PF7 and PF8 does SET CCARD-AID-ENTER, so the
+// key never reaches the browser and re-reads the page shown exactly as ENTER does.
+const PFK_INVALID_KEYS: readonly string[] = ["F4", "F5", "F12"];
+
+// ENTER's re-read of the page shown, with the account filter keyed and the card filter blank.
+const ENTER_REREAD_QUERY: CardListQuery = {
+    acctId: KEYED_FILTERS.acctId,
+    cardNum: "",
+    startKey: FIRST_KEY,
+    page: SHOWN_PAGE,
+};
+
+// A key the legend lacks, pressed in the focused field; the event tells whether its browser
+// default was blocked. The cases press it from the account filter, where the answer puts the
+// cursor.
+async function PressUnboundKey(keyName: string): Promise<KeyboardEvent> {
+    const keyEvent = new KeyboardEvent("keydown", {
+        key: keyName,
+        bubbles: true,
+        cancelable: true,
+    });
+    await act(async () => {
+        document.activeElement?.dispatchEvent(keyEvent);
+    });
+    return keyEvent;
+}
+
+describe("COCRDLIC PFK-INVALID keys on /cards", () => {
+    it.each(PFK_INVALID_KEYS)(
+        "COCRDLIC %s is processed as ENTER: the same re-read, the browser default blocked",
+        async (keyName) => {
+            const user = await RenderScreen();
+            await user.type(FilterInput(ACCOUNT_FILTER_LABEL), KEYED_FILTERS.acctId);
+            const keyEvent = await PressUnboundKey(keyName);
+            await WaitForIdle();
+            expect(keyEvent.defaultPrevented).toBe(true);
+            expect(mockListCards).toHaveBeenCalledTimes(2);
+            ExpectLastListRead(ENTER_REREAD_QUERY);
+            await PressScreenKey(user, "Enter", "key");
+            expect(mockListCards).toHaveBeenCalledTimes(3);
+            ExpectLastListRead(ENTER_REREAD_QUERY);
+            expect(mockSelectCards).not.toHaveBeenCalled();
+        },
+    );
+});
+
 describe("COCRDLIC session refusal on /cards", () => {
     // The API client interceptor owns the 401 redirect to /signon, so the page shows nothing.
     it("COCRDLIC 401 on the first page leaves the /signon redirect to the client", async () => {

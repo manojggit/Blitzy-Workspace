@@ -45,7 +45,7 @@ import {
     type MessageSeverity,
     type ScreenFeedback,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import { EnterKeyOf, useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CCDL";
 const PROGRAM_NAME = "COCRDSLC";
@@ -647,7 +647,9 @@ function CardDetailFields({ detail }: CardDetailFieldsProps) {
 
 function CardViewScreen() {
     const screen = useCardViewScreen();
-    useFunctionKeys(screen.keys);
+    // PFK-INVALID: any AID but ENTER and PF3 does SET CCARD-AID-ENTER, so an unbound PF key runs
+    // the search.
+    useFunctionKeys(screen.keys, EnterKeyOf(screen.keys));
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}

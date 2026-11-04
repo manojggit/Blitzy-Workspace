@@ -638,6 +638,30 @@ describe("COCRDSLC PF keys from the main menu on /cards/view", () => {
     });
 });
 
+// COCRDSLC PFK-INVALID: an AID outside ENTER and PF3 does SET CCARD-AID-ENTER, so the key never
+// reaches the browser and reads the card exactly as ENTER does.
+const PFK_INVALID_KEYS: readonly string[] = ["F4", "F5", "F7", "F12"];
+
+describe("COCRDSLC PFK-INVALID keys from the main menu on /cards/view", () => {
+    it.each(PFK_INVALID_KEYS)(
+        "COCRDSLC %s is processed as ENTER and sends both keys as typed",
+        async (keyName) => {
+            mockViewCard.mockResolvedValue(BuildCardDetail());
+            const user = RenderScreen();
+            await TypeKeys(user, TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+            const keyInit = { key: keyName, bubbles: true, cancelable: true };
+            const keyEvent = new KeyboardEvent("keydown", keyInit);
+            fireEvent(InputFor(CARD_LABEL), keyEvent);
+            await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+            expect(keyEvent.defaultPrevented).toBe(true);
+            expect(mockViewCard).toHaveBeenCalledTimes(1);
+            expect(mockViewCard).toHaveBeenCalledWith(
+                ...ReadCall(TYPED_CARD_NUMBER, TEST_ACCOUNT_ID),
+            );
+        },
+    );
+});
+
 describe("COCRDSLC one read at a time from the main menu on /cards/view", () => {
     it.each(SAME_TURN_SEARCH_PRESSES)(
         "COCRDSLC ENTER by %s twice in one turn reads the card once",

@@ -1425,6 +1425,37 @@ describe("COCRDUPC ENTER, F5 and F12 requests on /cards/update", () => {
         SendsEachResponsesToken());
 });
 
+// COCRDUPC PFK-INVALID: an AID outside ENTER, PF3, PF5 and PF12 does SET CCARD-AID-ENTER, so the
+// key never reaches the browser and sends ENTER's request under the held screen_token.
+const PFK_INVALID_KEYS: readonly string[] = ["F4", "F7", "F8"];
+
+async function SendsEnterForInvalidKey(keyName: string): Promise<void> {
+    await RenderFromList(UpdateScreenState.SHOW_DETAILS);
+    const keyEvent = new KeyboardEvent("keydown", {
+        key: keyName,
+        bubbles: true,
+        cancelable: true,
+    });
+    await act(async () => {
+        window.dispatchEvent(keyEvent);
+    });
+    await WaitForIdle();
+    expect(keyEvent.defaultPrevented).toBe(true);
+    expect(mockUpdateCard).toHaveBeenCalledTimes(1);
+    ExpectUpdateRequest(TEST_CARD_REF, {
+        action: UpdateAction.ENTER,
+        screen_token: FIRST_SCREEN_TOKEN,
+        fields: PickFields(TEST_FIELDS, DETAIL_FIELD_NAMES),
+    });
+}
+
+describe("COCRDUPC PFK-INVALID keys on /cards/update", () => {
+    it.each(PFK_INVALID_KEYS)(
+        "COCRDUPC %s is processed as ENTER and sends action enter with the held screen_token",
+        (keyName) => SendsEnterForInvalidKey(keyName),
+    );
+});
+
 describe("COCRDUPC input while ENTER is in flight on /cards/update", () => {
     it.each(ENTER_ANSWER_CASES)(
         "COCRDUPC freezes every input until ENTER's $state answer, then F5 sends its token",

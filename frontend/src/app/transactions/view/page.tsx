@@ -34,7 +34,11 @@ import {
     ToScreenFeedback,
     type MessageSeverity,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CT01";
 const PROGRAM_NAME = "COTRN01C";
@@ -245,6 +249,7 @@ interface TransactionView extends TransactionFetcher {
     tranIdInputRef: RefObject<HTMLInputElement | null>;
     ChangeTranIdText: (text: string) => void;
     Clear: () => void;
+    ShowInvalidKey: () => void;
 }
 
 interface ViewKeyActions {
@@ -330,6 +335,16 @@ function PendingFeedback(message: string): ViewFeedback {
     return {
         ...EMPTY_FEEDBACK,
         message,
+        severity: SeverityForOutcome({ isError: true, isCompletedWrite: false }),
+    };
+}
+
+// WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY in red. No field is in error, so
+// the cursor goes back to TRNIDIN, the IC field; a fresh object places it at every press.
+function InvalidKeyFeedback(): ViewFeedback {
+    return {
+        ...EMPTY_FEEDBACK,
+        message: INVALID_KEY_MESSAGE,
         severity: SeverityForOutcome({ isError: true, isCompletedWrite: false }),
     };
 }
@@ -454,6 +469,13 @@ function useClearScreen(
     }, [setTranIdText, setScreen, tranIdInputRef]);
 }
 
+// The invalid key reads no file, so the key as typed and the transaction shown stay.
+function useInvalidKey(setScreen: ScreenSetter): () => void {
+    return useCallback(() => {
+        setScreen((screen) => ({ ...screen, feedback: InvalidKeyFeedback() }));
+    }, [setScreen]);
+}
+
 // A non-axios error rejects the returned promise unhandled: it is a defect, never a screen
 // message.
 function useFetchTransaction(setScreen: ScreenSetter): TransactionFetcher {
@@ -484,6 +506,7 @@ function useTransactionView(initialTranId: string): TransactionView {
         ChangeTranIdText: setTranIdText,
         ...fetcher,
         Clear: clearScreen,
+        ShowInvalidKey: useInvalidKey(setScreen),
     };
 }
 
@@ -503,7 +526,8 @@ function useViewFunctionKeys(view: TransactionView): readonly FunctionKeyDefinit
         onClear: view.Clear,
         onBrowse: () => LeaveTo(TRANSACTION_LIST_ROUTE, view, router),
     });
-    useFunctionKeys(functionKeys);
+    // The keyboard lock holds the invalid key while a read runs, as it holds ENTER and F4.
+    useFunctionKeys(functionKeys, { onPress: view.ShowInvalidKey, disabled: view.screen.isBusy });
     return functionKeys;
 }
 
