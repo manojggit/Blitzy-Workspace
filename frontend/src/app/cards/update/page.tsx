@@ -247,10 +247,12 @@ interface InputRegistry {
     registerInput: InputRegistration;
 }
 
+// isFrozen is true while a request holds the screen, as a 3270 keyboard locks until the answer.
 interface FieldView {
     fields: CardScreenFields;
     state: UpdateScreenState;
     fieldErrors: readonly string[];
+    isFrozen: boolean;
     registerInput: InputRegistration;
     changeField: FieldChangeHandler;
 }
@@ -266,6 +268,7 @@ interface CardTextFieldProps {
     definition: CardFieldDefinition;
     value: string;
     readOnly: boolean;
+    isFrozen: boolean;
     error: boolean;
     inputRef: InputRefCallback;
     onChange: (value: string) => void;
@@ -327,9 +330,10 @@ function BuildEditableFields(
     return editableFields;
 }
 
-// Responses mask CARDSID, so a key edit or not-found answer during key entry keeps the keys the
-// user typed. Every other response shows the server's fields, among them the empty key screen
-// that discards the input after a done or failed change.
+// Responses mask CARDSID, so a key edit or not-found answer to keys the user typed keeps them as
+// typed. While a card_ref is held no card number was typed: the answer's keys, the held card
+// masked, show which card the next key reads again. Every other response shows the server's
+// fields, among them the empty key screen that discards the input after a done or failed change.
 function MergeScreenFields(
     previous: CardUpdateModel,
     nextState: UpdateScreenState,
@@ -340,6 +344,7 @@ function MergeScreenFields(
     }
     const fields = { ...EMPTY_CARD_FIELDS, ...screenFields };
     const keepsTypedKeys =
+        previous.cardRef === null &&
         previous.state === UpdateScreenState.DETAILS_NOT_FETCHED &&
         nextState === UpdateScreenState.DETAILS_NOT_FETCHED;
     if (!keepsTypedKeys) {
@@ -462,15 +467,44 @@ function ShowPendingMessage(setters: ScreenSetters): void {
     }));
 }
 
+// Lines 482-497: a session the card list opened reads its card by CDEMO-ACCT-ID and
+// CDEMO-CARD-NUM; the held card_ref stands for that card, or for the card a fetch last showed.
+// Until it is fetched, as after a refused entry fetch or F12 re-read, the screen shows at most its
+// number masked, which is no card number to send; so ENTER, F5 and F12, all processed as ENTER
+// before the fetch, read it again by the card_ref. Typing a card number drops the card_ref
+// (WithFieldValue), so typed keys go by PUT.
+function UnfetchedCardRefOf(model: CardUpdateModel): string | null {
+    if (model.state !== UpdateScreenState.DETAILS_NOT_FETCHED) {
+        return null;
+    }
+    return model.cardRef;
+}
+
+// Once details are fetched, F12 is the PFK12 re-read (lines 958-966), which takes the keys from
+// the screen_token and discards the keyed edits, and after a done or failed change every key
+// discards the input; so F12 sends no field, and an edit the request model rejects never blocks
+// it. Before the fetch F12 is processed as ENTER on the keys, so it sends them as keyed, as ENTER
+// and F5 always send the inputs the state leaves editable.
+function FieldsSentBy(action: UpdateAction, model: CardUpdateModel): Partial<CardScreenFields> {
+    const isDiscardingCancel =
+        action === UpdateAction.CANCEL && model.state !== UpdateScreenState.DETAILS_NOT_FETCHED;
+    return isDiscardingCancel ? {} : BuildEditableFields(model.state, model.fields);
+}
+
 // ENTER, F5 and F12 on COCRDUP. Every key reaches the server, whose state machine processes a
 // save or cancel its state does not allow as ENTER (lines 413-424), and answers any key after a
 // done or failed change with the empty key screen, whichever screen opened this one.
 function HandleAction(action: UpdateAction, context: ActionContext): void {
     const { model, runRequest } = context;
+    const unfetchedCardRef = UnfetchedCardRefOf(model);
+    if (unfetchedCardRef !== null) {
+        runRequest(() => FetchCardForEdit(unfetchedCardRef, model.fields.acct_id));
+        return;
+    }
     const request: CardUpdateRequest = {
         action,
         screen_token: model.screenToken,
-        fields: BuildEditableFields(model.state, model.fields),
+        fields: FieldsSentBy(action, model),
     };
     runRequest(() => UpdateCard(ResolveCardKey(model), request));
 }
@@ -612,7 +646,7 @@ function useInputRegistry(): InputRegistry {
 }
 
 function useFieldView(store: ScreenStore, registerInput: InputRegistration): FieldView {
-    const { model, feedback, setters } = store;
+    const { model, feedback, isBusy, setters } = store;
     const changeField = useCallback(
         (change: FieldChange) => setters.setModel((current) => WithFieldValue(current, change)),
         [setters],
@@ -622,10 +656,11 @@ function useFieldView(store: ScreenStore, registerInput: InputRegistration): Fie
             fields: model.fields,
             state: model.state,
             fieldErrors: feedback.fieldErrors,
+            isFrozen: isBusy,
             registerInput,
             changeField,
         }),
-        [model, feedback, registerInput, changeField],
+        [model, feedback, isBusy, registerInput, changeField],
     );
 }
 
@@ -680,6 +715,7 @@ function CardTextFieldPropsFor(
         definition,
         value: view.fields[name],
         readOnly: !IsEditable(view.state, name),
+        isFrozen: view.isFrozen,
         error: view.fieldErrors.includes(name),
         inputRef: (element) => view.registerInput(name, element),
         onChange: (value) => view.changeField({ name, value }),
@@ -688,7 +724,9 @@ function CardTextFieldPropsFor(
 
 // The value is kept exactly as keyed; only the BMS LENGTH is enforced. The key remounts the
 // field when its protection changes, because an input replaced while it has focus never blurs,
-// and MUI would keep showing the old field as focused.
+// and MUI would keep showing the old field as focused. A frozen field only takes no typing until
+// the answer is adopted, so the values sent are the values the answer validates; its look and
+// its element stay as its protection sets them, and nothing flickers or remounts per request.
 function CardTextField(props: CardTextFieldProps) {
     const { definition, readOnly } = props;
     return (
@@ -703,7 +741,7 @@ function CardTextField(props: CardTextFieldProps) {
             helperText={definition.helperText}
             inputRef={props.inputRef}
             onChange={(event) => props.onChange(event.target.value)}
-            slotProps={FieldSlotProps(definition, readOnly, props.error)}
+            slotProps={FieldSlotProps(definition, readOnly || props.isFrozen, props.error)}
         />
     );
 }

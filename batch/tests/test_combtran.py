@@ -15,7 +15,9 @@ Specification, Sections 0.6.8 and 0.9.1):
 
 - The sort streams: its result equals the oracle's stable sort even when an input is out of
   TRAN-ID order (a SYSTRAN whose suffix wrapped at 999999), its memory does not grow with the
-  generations, and the load writes, decodes and inserts in one pass of bounded batches.
+  generations, and the load writes, decodes and inserts in one pass of bounded batches. Its
+  spilled runs go to a work directory of the TRANSACT.COMBINED base, which the job removes and
+  the next command's catalog recovery deletes after a killed run.
 - Publication order, pinned for every GDG producer since this module's setup runs all of them:
   the COMMITTED catalog row is the final write of the producer's transaction, an fsync failure
   as the generation closes rolls the run's completion back with everything else, and the
@@ -27,11 +29,12 @@ needs, through the CLI on the seeded test database with the reconciliation clock
 COMBTRAN reads the generations those steps published.
 """
 
+import concurrent.futures
 import contextlib
 import errno
 import hashlib
 import itertools
-import tempfile
+import multiprocessing
 import tracemalloc
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -175,14 +178,28 @@ INPUT_DIRECTORY_TEMPLATE = "inputs-{recordCount}"
 # more than one merge pass.
 TINY_RUN_RECORD_COUNT = 2
 TINY_MERGE_FAN_IN = 2
+# STEP05R's SORTIN concatenation: BKUP(0), then SYSTRAN(0).
+SORTIN_INPUT_COUNT = 2
+# The job case sorts the sample inputs in runs of 50, so its larger input spills more runs than
+# one merge takes.
+FORCED_SORT_RUN_RECORD_COUNT = 50
+# The spill directory a killed COMBTRAN left in the TRANSACT.COMBINED base directory.
+ORPHAN_SPILL_DIRECTORY_NAME = f"{combtran.SPILL_DIRECTORY_PREFIX}killed{gdg.WORK_DIRECTORY_SUFFIX}"
+ORPHAN_RUN_FILE_NAME = f"killed{combtran.RUN_FILE_SUFFIX}"
 # The memory cases: inputs ten times the size of the first ones, runs of 500 merged 8 at a time,
 # and the most the traced peak may grow between them, far below the 14 MB or so that the 36,000
-# extra records would add held whole.
+# extra records would add held whole. Each size is merged MEMORY_MEASUREMENT_COUNT times in a
+# fresh interpreter, which the spawn start method gives.
 SMALL_INPUT_RECORD_COUNT = 2_000
 LARGE_INPUT_RECORD_COUNT = 20_000
+MEMORY_INPUT_RECORD_COUNTS = (SMALL_INPUT_RECORD_COUNT, LARGE_INPUT_RECORD_COUNT)
 MEMORY_RUN_RECORD_COUNT = 500
 MEMORY_MERGE_FAN_IN = 8
 MERGE_PEAK_GROWTH_LIMIT = 1024 * 1024
+MEMORY_MEASUREMENT_COUNT = 3
+SPAWN_START_METHOD = "spawn"
+# Per input record count, the (traced peak in bytes, records merged) of each measurement.
+type MergeMeasurements = dict[int, list[tuple[int, int]]]
 # INTCALC's TRAN-ID: PARM-DATE 2022071800, then WS-TRANID-SUFFIX 9(06), which wraps to 000000.
 INTEREST_TRAN_ID_PREFIX = "2022071800"
 TRANID_SUFFIX_MODULUS = 10**6
@@ -241,6 +258,21 @@ MEMORY_CASES = (
     pytest.param(False, id="inputs-in-order"),
     pytest.param(True, id="systran-suffix-wrapped"),
 )
+
+
+@dataclass(frozen=True)
+class MergeMemoryProbe:
+    """What MeasureMergePeaks needs in a fresh interpreter, which no monkeypatch reaches.
+
+    workDirectory receives both input sizes and the spill root; wrapped makes the SYSTRAN
+    TRAN-IDs wrap at 999999 halfway; runRecordCount and mergeFanIn stand for combtran's
+    SORT_RUN_RECORD_COUNT and MERGE_FAN_IN during the measurements.
+    """
+
+    workDirectory: Path
+    wrapped: bool
+    runRecordCount: int
+    mergeFanIn: int
 
 
 class RecordingWriter:
@@ -565,14 +597,50 @@ def SyntheticGeneration(
     )
 
 
-def UseExternalSort(
-    monkeypatch: pytest.MonkeyPatch, spillRoot: Path, runRecordCount: int, mergeFanIn: int
-) -> None:
-    """Make COMBTRAN spill runs of runRecordCount under spillRoot, merged mergeFanIn at a time."""
-    spillRoot.mkdir()
-    monkeypatch.setattr(tempfile, "tempdir", str(spillRoot))
+def UseExternalSort(monkeypatch: pytest.MonkeyPatch, runRecordCount: int, mergeFanIn: int) -> None:
+    """Make COMBTRAN's external sort spill runs of runRecordCount, merged mergeFanIn at a time."""
     monkeypatch.setattr(combtran, "SORT_RUN_RECORD_COUNT", runRecordCount)
     monkeypatch.setattr(combtran, "MERGE_FAN_IN", mergeFanIn)
+
+
+def ForceExternalSort(monkeypatch: pytest.MonkeyPatch) -> set[Path]:
+    """Send every COMBTRAN input through ExternalSort; return the directories its runs go to.
+
+    An input already in TRAN-ID order sorts to itself, so the job's output is unchanged. The
+    returned set fills as the job writes run files, one directory per input sorted.
+    """
+    spillDirectories: set[Path] = set()
+    originalWriteRun = combtran.WriteRun
+
+    def ReportOutOfOrder(generation: gdg.Generation) -> bool:
+        return False
+
+    def RecordingWriteRun(records: Iterable[str], spillDirectory: Path) -> Path:
+        spillDirectories.add(spillDirectory)
+        return originalWriteRun(records, spillDirectory)
+
+    UseExternalSort(monkeypatch, FORCED_SORT_RUN_RECORD_COUNT, TINY_MERGE_FAN_IN)
+    monkeypatch.setattr(combtran, "IsInKeyOrder", ReportOutOfOrder)
+    monkeypatch.setattr(combtran, "WriteRun", RecordingWriteRun)
+    return spillDirectories
+
+
+def PlantOrphanWorkDirectory(baseDirectory: Path) -> Path:
+    """Leave the spill directory of a killed COMBTRAN, with one run file, in baseDirectory."""
+    orphanDirectory = baseDirectory / ORPHAN_SPILL_DIRECTORY_NAME
+    orphanDirectory.mkdir(parents=True)
+    runRecord = SyntheticRecords([FIRST_INTEREST_TRAN_ID], SYSTRAN_TAG)[0]
+    (orphanDirectory / ORPHAN_RUN_FILE_NAME).write_bytes(
+        runRecord.encode(gdg.GDG_FILE_ENCODING) + gdg.RECORD_TERMINATOR
+    )
+    return orphanDirectory
+
+
+def IsSpillDirectoryName(name: str) -> bool:
+    """Return whether name is a COMBTRAN spill directory's: its prefix, then the work suffix."""
+    return name.startswith(combtran.SPILL_DIRECTORY_PREFIX) and name.endswith(
+        gdg.WORK_DIRECTORY_SUFFIX
+    )
 
 
 def InterestTranIds(recordCount: int, wrapped: bool) -> list[str]:
@@ -584,27 +652,92 @@ def InterestTranIds(recordCount: int, wrapped: bool) -> list[str]:
     ]
 
 
-def MeasureMerge(directory: Path, recordCount: int, wrapped: bool) -> tuple[int, int]:
-    """Merge a recordCount-record BKUP and SYSTRAN under tracemalloc, keeping no record.
+def WriteMergeInputs(
+    workDirectory: Path, recordCount: int, wrapped: bool
+) -> tuple[gdg.Generation, gdg.Generation]:
+    """Write a recordCount-record BKUP and SYSTRAN in a new directory of workDirectory.
 
-    The BKUP TRAN-IDs ascend; the SYSTRAN ones ascend, or wrap at 999999 halfway. Returns the
-    traced peak in bytes and the number of records merged.
+    The BKUP TRAN-IDs ascend; the SYSTRAN ones ascend, or wrap at 999999 halfway.
     """
+    directory = workDirectory / INPUT_DIRECTORY_TEMPLATE.format(recordCount=recordCount)
     directory.mkdir()
     bkupTranIds = [f"{index:016d}" for index in range(recordCount)]
     systranTranIds = InterestTranIds(recordCount, wrapped)
-    inputGenerations = (
+    return (
         SyntheticGeneration(directory, gdg.TRANSACT_BKUP, SyntheticRecords(bkupTranIds, BKUP_TAG)),
         SyntheticGeneration(directory, gdg.SYSTRAN, SyntheticRecords(systranTranIds, SYSTRAN_TAG)),
     )
+
+
+def MeasureMerge(
+    inputGenerations: tuple[gdg.Generation, gdg.Generation], spillRoot: Path
+) -> tuple[int, int]:
+    """Merge the inputs under tracemalloc, keeping no record, spilling under spillRoot.
+
+    Returns the traced peak in bytes and the number of records merged.
+    """
     tracemalloc.start()
     try:
         with contextlib.ExitStack() as cleanup:
-            mergedCount = sum(1 for record in combtran.MergedRecords(inputGenerations, cleanup))
+            mergedRecords = combtran.MergedRecords(inputGenerations, cleanup, spillRoot)
+            mergedCount = sum(1 for record in mergedRecords)
         peakBytes = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
     return peakBytes, mergedCount
+
+
+def MeasureEachSize(
+    inputsBySize: dict[int, tuple[gdg.Generation, gdg.Generation]], spillRoot: Path
+) -> MergeMeasurements:
+    """Merge every input size MEMORY_MEASUREMENT_COUNT times, the sizes taking turns."""
+    measurements: MergeMeasurements = {recordCount: [] for recordCount in inputsBySize}
+    for _ in range(MEMORY_MEASUREMENT_COUNT):
+        for recordCount, inputGenerations in inputsBySize.items():
+            measurements[recordCount].append(MeasureMerge(inputGenerations, spillRoot))
+    return measurements
+
+
+def MeasureMergePeaks(probe: MergeMemoryProbe) -> MergeMeasurements:
+    """Measure the merge of every MEMORY_INPUT_RECORD_COUNTS size, each more than once.
+
+    The memory test runs this in a fresh interpreter, so the traced peak is the merge's own,
+    never what earlier tests, plugins or logging left in the pytest process. An interpreter
+    still keeps process-wide tables that grow by reallocation, such as the table of interned
+    strings, to which pathlib adds every new run file name. A table reallocated whole lands
+    once, in whichever measurement fills it, and adds megabytes to that peak alone, so each
+    size is measured MEMORY_MEASUREMENT_COUNT times, the sizes taking turns, and the caller
+    compares each size's lowest peak. A merge that holds records raises every peak of the
+    larger size, so the lowest one still shows it. Spilled runs go under workDirectory's spill
+    root.
+    """
+    spillRoot = probe.workDirectory / SPILL_ROOT_NAME
+    spillRoot.mkdir()
+    inputsBySize = {
+        recordCount: WriteMergeInputs(probe.workDirectory, recordCount, probe.wrapped)
+        for recordCount in MEMORY_INPUT_RECORD_COUNTS
+    }
+    with (
+        mock.patch.object(combtran, "SORT_RUN_RECORD_COUNT", probe.runRecordCount),
+        mock.patch.object(combtran, "MERGE_FAN_IN", probe.mergeFanIn),
+    ):
+        return MeasureEachSize(inputsBySize, spillRoot)
+
+
+def MeasureMergePeaksInFreshInterpreter(probe: MergeMemoryProbe) -> MergeMeasurements:
+    """Run MeasureMergePeaks in a new spawned interpreter and return what it measured.
+
+    The spawned worker imports this module, and so conftest, whose import only points the
+    worker's own environment at the test database; it opens no connection.
+    """
+    spawnContext = multiprocessing.get_context(SPAWN_START_METHOD)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=spawnContext) as executor:
+        return executor.submit(MeasureMergePeaks, probe).result()
+
+
+def LowestPeak(measurements: list[tuple[int, int]]) -> int:
+    """Return the lowest traced peak of one input size's measurements."""
+    return min(peakBytes for peakBytes, _ in measurements)
 
 
 def test_combined_generation_equals_expected_fixture(batchEnvironment: BatchEnvironment) -> None:
@@ -798,7 +931,8 @@ def test_streamed_merge_equals_the_stable_sort_of_the_concatenation(
     than one merge pass, and the spill directory is removed once the merge is closed.
     """
     spillRoot = tmp_path / SPILL_ROOT_NAME
-    UseExternalSort(monkeypatch, spillRoot, TINY_RUN_RECORD_COUNT, TINY_MERGE_FAN_IN)
+    spillRoot.mkdir()
+    UseExternalSort(monkeypatch, TINY_RUN_RECORD_COUNT, TINY_MERGE_FAN_IN)
     bkupRecords = SyntheticRecords(case.bkupTranIds, BKUP_TAG)
     systranRecords = SyntheticRecords(case.systranTranIds, SYSTRAN_TAG)
     inputGenerations = (
@@ -806,35 +940,62 @@ def test_streamed_merge_equals_the_stable_sort_of_the_concatenation(
         SyntheticGeneration(tmp_path, gdg.SYSTRAN, systranRecords),
     )
     with contextlib.ExitStack() as cleanup:
-        mergedRecords = list(combtran.MergedRecords(inputGenerations, cleanup))
+        mergedRecords = list(combtran.MergedRecords(inputGenerations, cleanup, spillRoot))
         spilled = any(spillRoot.iterdir())
     assert mergedRecords == legacy_oracle.RunCombtran(bkupRecords, systranRecords)
     assert spilled == case.spills
     assert list(spillRoot.iterdir()) == []
 
 
-@pytest.mark.parametrize("wrapped", MEMORY_CASES)
-def test_merge_memory_does_not_grow_with_the_generations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wrapped: bool
+def test_sort_spills_in_the_combined_base_directory_and_recovery_deletes_a_killed_runs_spill(
+    batchEnvironment: BatchEnvironment, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Spilled runs go beside the TRANSACT.COMBINED .part file, never to the system TMPDIR.
+
+    The spill directory a killed COMBTRAN left there is deleted, runs and all, by the next
+    command's catalog recovery. That command's job, its inputs forced through ExternalSort,
+    writes every run to its own carddemo-combtran-*.work directory in the same base directory,
+    one per input, still equals the fixture, and leaves only the generation file behind.
+    """
+    RunChainThroughSecondBackup(batchEnvironment)
+    baseDirectory = batchEnvironment.outputDir / compare.GDG_DIRECTORY_NAME / COMBINED_BASE_NAME
+    orphanDirectory = PlantOrphanWorkDirectory(baseDirectory)
+    spillDirectories = ForceExternalSort(monkeypatch)
+    outcome = RunCombtranJob()
+    assert outcome.exitCode == legacy_oracle.EXIT_OK, outcome.output
+    assert gdg.ORPHAN_WORK_DIRECTORY_DELETED_LOG % orphanDirectory in outcome.output
+    assert len(spillDirectories) == SORTIN_INPUT_COUNT
+    assert {directory.parent for directory in spillDirectories} == {baseDirectory}
+    assert all(IsSpillDirectoryName(directory.name) for directory in spillDirectories)
+    combinedPath = NewestGenerationPath(batchEnvironment, COMBINED_BASE_NAME)
+    assert ListArchiveFiles(batchEnvironment, COMBINED_BASE_NAME) == [combinedPath.name]
+    differences = compare.CompareFixedWidthFiles(
+        combinedPath, COMBINED_FIXTURE, TRANSACTION_LAYOUT_NAME
+    )
+    assert differences == []
+
+
+@pytest.mark.parametrize("wrapped", MEMORY_CASES)
+def test_merge_memory_does_not_grow_with_the_generations(tmp_path: Path, wrapped: bool) -> None:
     """The merge holds a bounded number of records, whatever the size of its two inputs.
 
-    Inputs ten times larger raise the traced peak by less than MERGE_PEAK_GROWTH_LIMIT, both
-    when they stream from their files and when the wrapped SYSTRAN goes through spilled runs.
+    Inputs ten times larger raise the lowest traced peak by less than MERGE_PEAK_GROWTH_LIMIT,
+    both when they stream from their files and when the wrapped SYSTRAN goes through spilled
+    runs. The merges are measured in a fresh interpreter (MeasureMergePeaks), so the bound holds
+    whatever ran before in the pytest process.
     """
-    spillRoot = tmp_path / SPILL_ROOT_NAME
-    UseExternalSort(monkeypatch, spillRoot, MEMORY_RUN_RECORD_COUNT, MEMORY_MERGE_FAN_IN)
-    smallDirectory = tmp_path / INPUT_DIRECTORY_TEMPLATE.format(
-        recordCount=SMALL_INPUT_RECORD_COUNT
-    )
-    largeDirectory = tmp_path / INPUT_DIRECTORY_TEMPLATE.format(
-        recordCount=LARGE_INPUT_RECORD_COUNT
-    )
-    smallPeak, smallCount = MeasureMerge(smallDirectory, SMALL_INPUT_RECORD_COUNT, wrapped)
-    largePeak, largeCount = MeasureMerge(largeDirectory, LARGE_INPUT_RECORD_COUNT, wrapped)
-    assert (smallCount, largeCount) == (2 * SMALL_INPUT_RECORD_COUNT, 2 * LARGE_INPUT_RECORD_COUNT)
-    assert largePeak - smallPeak < MERGE_PEAK_GROWTH_LIMIT, (smallPeak, largePeak)
-    assert list(spillRoot.iterdir()) == []
+    probe = MergeMemoryProbe(tmp_path, wrapped, MEMORY_RUN_RECORD_COUNT, MEMORY_MERGE_FAN_IN)
+    measurements = MeasureMergePeaksInFreshInterpreter(probe)
+    mergedCounts = {
+        recordCount: {mergedCount for _, mergedCount in sizeMeasurements}
+        for recordCount, sizeMeasurements in measurements.items()
+    }
+    expectedCounts = {recordCount: {2 * recordCount} for recordCount in MEMORY_INPUT_RECORD_COUNTS}
+    assert mergedCounts == expectedCounts
+    smallPeak = LowestPeak(measurements[SMALL_INPUT_RECORD_COUNT])
+    largePeak = LowestPeak(measurements[LARGE_INPUT_RECORD_COUNT])
+    assert largePeak - smallPeak < MERGE_PEAK_GROWTH_LIMIT, measurements
+    assert list((tmp_path / SPILL_ROOT_NAME).iterdir()) == []
 
 
 def test_load_writes_decodes_and_inserts_the_merge_in_one_bounded_pass(

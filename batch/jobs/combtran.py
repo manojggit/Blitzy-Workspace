@@ -16,8 +16,11 @@ archived and emptied transactions.transactions.
 The sort streams, so memory never grows with the generations. Each input is checked for TRAN-ID
 order by a first read; one in order streams from its file, and one out of order (a SYSTRAN whose
 six-digit INTCALC suffix wrapped at 999999, or any other) is sorted stably in bounded memory with
-spilled runs, as DFSORT uses work files. The two ordered streams are merged stably, BKUP first on
-equal keys, and one pass writes each record, decodes it and inserts it in bounded batches.
+spilled runs, as DFSORT uses work files. The runs go to a work directory in the
+TRANSACT.COMBINED base directory, beside the generation's .part file, which the job removes
+whatever happens and gdg.ReconcileCatalog removes after a killed run. The two ordered streams
+are merged stably, BKUP first on equal keys, and one pass writes each record, decodes it and
+inserts it in bounded batches.
 
 Both steps run in one transaction with the run's completion and then the generation's COMMITTED
 catalog row, the transaction's final write, so the step is atomic. This module never publishes:
@@ -74,8 +77,9 @@ EBCDIC_CODEC = "cp037"
 INSERT_BATCH_SIZE = 500
 # The external sort an input out of TRAN-ID order goes through, as DFSORT sorts with work
 # files: runs of at most SORT_RUN_RECORD_COUNT records are sorted in memory and spilled to a
-# temporary directory, and at most MERGE_FAN_IN runs are open in any merge, so neither memory
-# nor open files grow with the generation.
+# work directory (SPILL_DIRECTORY_PREFIX, gdg.WORK_DIRECTORY_SUFFIX) in the TRANSACT.COMBINED
+# base directory, and at most MERGE_FAN_IN runs are open in any merge, so neither memory nor
+# open files grow with the generation.
 SORT_RUN_RECORD_COUNT = 10_000
 MERGE_FAN_IN = 64
 SPILL_DIRECTORY_PREFIX = "carddemo-combtran-"
@@ -223,14 +227,22 @@ def SpillSortedRuns(records: Iterable[str], spillDirectory: Path) -> list[Path]:
     ]
 
 
-def ExternalSort(generation: gdg.Generation, cleanup: contextlib.ExitStack) -> Iterator[str]:
+def ExternalSort(
+    generation: gdg.Generation, cleanup: contextlib.ExitStack, spillRoot: Path
+) -> Iterator[str]:
     """Return a generation's records in stable TRAN-ID order, sorted in bounded memory.
 
-    Stably sorted runs are spilled to a temporary directory that cleanup removes, then merged
-    MERGE_FAN_IN consecutive runs at a time until one merge of at most MERGE_FAN_IN remains.
-    Each merge puts earlier runs first on equal keys, so the input order of equal keys is kept.
+    Stably sorted runs are spilled to a new work directory under spillRoot, which cleanup
+    removes, then merged MERGE_FAN_IN consecutive runs at a time until one merge of at most
+    MERGE_FAN_IN remains. Each merge puts earlier runs first on equal keys, so the input order of
+    equal keys is kept. The directory's gdg.WORK_DIRECTORY_SUFFIX lets gdg.ReconcileCatalog
+    delete it when a killed process never ran cleanup.
     """
-    spillName = cleanup.enter_context(tempfile.TemporaryDirectory(prefix=SPILL_DIRECTORY_PREFIX))
+    spillName = cleanup.enter_context(
+        tempfile.TemporaryDirectory(
+            suffix=gdg.WORK_DIRECTORY_SUFFIX, prefix=SPILL_DIRECTORY_PREFIX, dir=spillRoot
+        )
+    )
     spillDirectory = Path(spillName)
     runPaths = SpillSortedRuns(gdg.ReadGeneration(generation), spillDirectory)
     while len(runPaths) > MERGE_FAN_IN:
@@ -239,30 +251,38 @@ def ExternalSort(generation: gdg.Generation, cleanup: contextlib.ExitStack) -> I
     return MergeRuns(runPaths)
 
 
-def SortedInputRecords(generation: gdg.Generation, cleanup: contextlib.ExitStack) -> Iterator[str]:
+def SortedInputRecords(
+    generation: gdg.Generation, cleanup: contextlib.ExitStack, spillRoot: Path
+) -> Iterator[str]:
     """Return one SORTIN input's records in stable TRAN-ID order, as a stream cleanup closes.
 
     A generation is never assumed to be sorted. A first read checks it: one in order streams
     from its file, checked again as it streams, and one out of order, such as a SYSTRAN whose
-    six-digit INTCALC suffix wrapped from 999999 to 000000, goes through ExternalSort.
+    six-digit INTCALC suffix wrapped from 999999 to 000000, goes through ExternalSort, which
+    spills under spillRoot. Only then is a spill directory made.
     """
     if IsInKeyOrder(generation):
         records = KeyOrderedRecords(generation)
     else:
-        records = ExternalSort(generation, cleanup)
+        records = ExternalSort(generation, cleanup, spillRoot)
     return cleanup.enter_context(contextlib.closing(records))
 
 
 def MergedRecords(
-    inputGenerations: tuple[gdg.Generation, gdg.Generation], cleanup: contextlib.ExitStack
+    inputGenerations: tuple[gdg.Generation, gdg.Generation],
+    cleanup: contextlib.ExitStack,
+    spillRoot: Path,
 ) -> Iterator[str]:
     """STEP05R: BKUP(0) then SYSTRAN(0) sorted by TRAN-ID ascending, as one bounded stream.
 
     Each input is in stable key order and heapq.merge puts the earlier input first on equal
     keys, so the stream equals the stable sort of the concatenation, BKUP before SYSTRAN, while
-    holding one record per input. Records are yielded as read, never re-encoded.
+    holding one record per input. Records are yielded as read, never re-encoded. An input out of
+    order spills its sorted runs under spillRoot, in a work directory cleanup removes.
     """
-    sortedInputs = [SortedInputRecords(generation, cleanup) for generation in inputGenerations]
+    sortedInputs = [
+        SortedInputRecords(generation, cleanup, spillRoot) for generation in inputGenerations
+    ]
     return heapq.merge(*sortedInputs, key=TranIdSortKey)
 
 
@@ -346,13 +366,16 @@ def CombineAndReload(context: JobContext) -> tuple[JobResult, gdg.GenerationWrit
     """Order the inputs, then write, load and finish the run in one transaction.
 
     The inputs are resolved, checked and, when out of order, sorted before the write
-    transaction opens; their merge then streams through it, and the spill files are removed
-    whatever happens. The generation's COMMITTED row is the transaction's last statement,
-    after the run's completion.
+    transaction opens; their merge then streams through it. Spilled runs go to a work directory
+    in the TRANSACT.COMBINED base directory, under CARDDEMO_OUTPUT_DIR beside the generation's
+    .part file rather than in the system temporary directory, and are removed whatever happens;
+    after a killed run, the next command's gdg.ReconcileCatalog removes them. The generation's
+    COMMITTED row is the transaction's last statement, after the run's completion.
     """
     inputGenerations = ResolveInputGenerations(context)
+    spillRoot = gdg.BaseDirectory(context, gdg.TRANSACT_COMBINED)
     with contextlib.ExitStack() as cleanup:
-        mergedRecords = MergedRecords(inputGenerations, cleanup)
+        mergedRecords = MergedRecords(inputGenerations, cleanup, spillRoot)
         with context.engine.begin() as connection:
             return WriteAndLoadCombined(context, connection, mergedRecords, inputGenerations)
 

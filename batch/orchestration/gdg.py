@@ -11,11 +11,12 @@ and transcribed in docs/batch.md ("GDG archives").
   PUBLISHED. Given the caller's connection (atomic and final-transaction callers), the row joins
   the caller's transaction and PublishRunGenerations publishes it once that has committed.
 - Recovery: ReconcileCatalog completes an interrupted publication, marks a row whose file is
-  gone LOST and deletes orphan .part files. It then applies retention to every base and deletes
-  the leftover files of ROLLED_OFF SCRATCH generations, so a crash between publication and
-  retention, or between ROLLED_OFF and the unlink, is completed by the next command. A LOST row
-  blocks the OPEN cycle until seed-all or run-all --new-cycle abandons it
-  (run_ledger.AbandonOpenCycle).
+  gone LOST and deletes orphan .part files, then the work directories (*.work, such as the
+  spill directory of COMBTRAN's sort) that a killed producer left beside them. It then applies
+  retention to every base and deletes the leftover files of ROLLED_OFF SCRATCH generations, so a
+  crash between publication and retention, or between ROLLED_OFF and the unlink, is completed by
+  the next command. A LOST row blocks the OPEN cycle until seed-all or run-all --new-cycle
+  abandons it (run_ledger.AbandonOpenCycle).
 - Abnormal disposition: an exception inside NewGeneration deletes the .part and catalogs
   nothing, as DISP=(NEW,CATLG,DELETE) does.
 - Retention: LIMIT 5, applied after every publication and again by every ReconcileCatalog. The
@@ -34,6 +35,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -63,6 +65,9 @@ GDG_FILE_ENCODING = "latin-1"
 RECORD_TERMINATOR = b"\n"
 FORBIDDEN_RECORD_CHARACTERS = ("\r", "\n")
 PART_SUFFIX = ".part"
+# The suffix of a producer's work directory in its base directory, beside its .part file, such
+# as the spill directory of COMBTRAN's sort. One lives only as long as the command that made it.
+WORK_DIRECTORY_SUFFIX = ".work"
 GENERATION_FILE_TEMPLATE = "G{generation:04d}V00.dat"
 # The final file names GENERATION_FILE_TEMPLATE produces; a match is kept only when it
 # round-trips through the template, so G01V00.dat or G00001V00.dat names no generation.
@@ -83,9 +88,13 @@ PUBLISHED_LOG = "GENERATION %s PUBLISHED: %d RECORDS"
 LOST_LOG = "GENERATION %s IS LOST: NEITHER %s NOR ITS .part FILE MATCHES SHA-256 %s"
 ROLLED_OFF_LOG = "GENERATION %s ROLLED OFF (LIMIT %d); FILE %s"
 ORPHAN_DELETED_LOG = "ORPHAN GENERATION FILE %s DELETED"
+ORPHAN_WORK_DIRECTORY_DELETED_LOG = "ORPHAN WORK DIRECTORY %s DELETED"
 LEFTOVER_DELETED_LOG = "ROLLED-OFF GENERATION %s: LEFTOVER FILE %s DELETED"
 DIRECTORY_FSYNC_LOG = "DIRECTORY FSYNC REFUSED FOR %s: %s"
-RECONCILE_LOG = "GDG CATALOG RECONCILED: %d PUBLISHED, %d LOST, %d ORPHAN .part FILES DELETED"
+RECONCILE_LOG = (
+    "GDG CATALOG RECONCILED: %d PUBLISHED, %d LOST, %d ORPHAN .part FILES DELETED,"
+    " %d ORPHAN WORK DIRECTORIES DELETED"
+)
 FILE_SCRATCHED = "SCRATCHED"
 FILE_KEPT = "KEPT (NOSCRATCH)"
 
@@ -123,11 +132,16 @@ class Generation:
 
 @dataclass(frozen=True)
 class ReconcileSummary:
-    """What ReconcileCatalog did: rows published, rows found LOST, orphan .part files deleted."""
+    """What ReconcileCatalog did: rows published, rows found LOST, orphan .part files deleted.
+
+    workDirectoriesDeleted counts the orphan work directories deleted; a reconcile that found
+    none, the usual case, leaves it 0.
+    """
 
     published: int
     lost: int
     orphansDeleted: int
+    workDirectoriesDeleted: int = 0
 
 
 class LostGenerationError(Exception):
@@ -516,6 +530,25 @@ def DeleteOrphanParts(context: JobContext) -> int:
     return deletedCount
 
 
+def DeleteOrphanWorkDirectories(context: JobContext) -> int:
+    """Delete every work directory left under the base directories; return how many there were.
+
+    A work directory lives only as long as the command that made it, and the batch window admits
+    one batch command, so any found at the start of a command, or after its failed step has
+    closed its own, belongs to a killed process. It is deleted with its contents. A symbolic
+    link or a file with the suffix is no producer's work directory and is left alone.
+    """
+    deletedCount = 0
+    for base in GDG_BASES.values():
+        directory = context.settings.GdgDir() / base.name
+        for workPath in sorted(directory.glob("*" + WORK_DIRECTORY_SUFFIX)):
+            if workPath.is_dir(follow_symlinks=False):
+                shutil.rmtree(workPath)
+                LOGGER.warning(ORPHAN_WORK_DIRECTORY_DELETED_LOG, workPath)
+                deletedCount += 1
+    return deletedCount
+
+
 def GenerationOfFileName(fileName: str) -> int | None:
     """Return the generation a final file name holds, or None for any other name."""
     match = GENERATION_FILE_PATTERN.fullmatch(fileName)
@@ -583,21 +616,33 @@ def ReconcileCatalog(context: JobContext) -> ReconcileSummary:
     batch/cli.py runs it at the start of every command, under the batch window and after
     run_ledger.ClassifyInterruptedRuns; batch_chain also runs it after a failed step. Once every
     COMMITTED row is PUBLISHED or LOST, any .part left is an orphan of a crash before commit, or
-    the corrupt file of a LOST row. Retention then runs for every base, whether or not it gained
-    a generation here, so the extra generation a crash between publication and RollOff left
-    resolvable rolls off before any command resolves it. Last, the files of ROLLED_OFF SCRATCH
-    generations that a crash or unlink error left behind are deleted. Each stage finds nothing
-    to do when the catalog is already consistent, so a second call changes nothing.
+    the corrupt file of a LOST row, and any work directory, such as the spill directory of a
+    killed COMBTRAN's sort, is an orphan too; both are deleted. Retention then runs for every
+    base, whether or not it gained a generation here, so the extra generation a crash between
+    publication and RollOff left resolvable rolls off before any command resolves it. Last, the
+    files of ROLLED_OFF SCRATCH generations that a crash or unlink error left behind are
+    deleted. Each stage finds nothing to do when the catalog is already consistent, so a second
+    call changes nothing.
     """
     committedRows = SelectRows(context, CommittedRowsStatement())
     _, lostCount = PublishRows(context, committedRows)
     orphansDeleted = DeleteOrphanParts(context)
+    workDirectoriesDeleted = DeleteOrphanWorkDirectories(context)
     RollOffBases(context, GDG_BASES.keys())
     DeleteRolledOffLeftovers(context)
     summary = ReconcileSummary(
-        published=len(committedRows) - lostCount, lost=lostCount, orphansDeleted=orphansDeleted
+        published=len(committedRows) - lostCount,
+        lost=lostCount,
+        orphansDeleted=orphansDeleted,
+        workDirectoriesDeleted=workDirectoriesDeleted,
     )
-    LOGGER.info(RECONCILE_LOG, summary.published, summary.lost, summary.orphansDeleted)
+    LOGGER.info(
+        RECONCILE_LOG,
+        summary.published,
+        summary.lost,
+        summary.orphansDeleted,
+        summary.workDirectoriesDeleted,
+    )
     return summary
 
 

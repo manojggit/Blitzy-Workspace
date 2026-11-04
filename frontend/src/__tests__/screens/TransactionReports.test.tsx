@@ -1,6 +1,13 @@
 // Screen tests: BMS CORPT00, program CORPT00C with CBTRN03C lines (CR00),
 // page /reports/transactions.
-import { alertClasses, inputBaseClasses, inputLabelClasses, tableCellClasses } from "@mui/material";
+import {
+    alertClasses,
+    formHelperTextClasses,
+    formLabelClasses,
+    inputBaseClasses,
+    inputLabelClasses,
+    tableCellClasses,
+} from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { PointerEventsCheckLevel, type UserEvent } from "@testing-library/user-event";
@@ -147,19 +154,19 @@ interface DatePartCase {
 }
 
 const START_MONTH_PART: DatePartCase = {
-    name: "Start Date month",
+    name: "Start Date MM (month)",
     legend: START_DATE_LEGEND,
     queryKey: "startMm",
     maxLength: 2,
 };
 const START_DAY_PART: DatePartCase = {
-    name: "Start Date day",
+    name: "Start Date DD (day)",
     legend: START_DATE_LEGEND,
     queryKey: "startDd",
     maxLength: 2,
 };
 const START_YEAR_PART: DatePartCase = {
-    name: "Start Date year",
+    name: "Start Date YYYY (year)",
     legend: START_DATE_LEGEND,
     queryKey: "startYyyy",
     maxLength: 4,
@@ -168,10 +175,12 @@ const DATE_PARTS: readonly DatePartCase[] = [
     START_MONTH_PART,
     START_DAY_PART,
     START_YEAR_PART,
-    { name: "End Date month", legend: END_DATE_LEGEND, queryKey: "endMm", maxLength: 2 },
-    { name: "End Date day", legend: END_DATE_LEGEND, queryKey: "endDd", maxLength: 2 },
-    { name: "End Date year", legend: END_DATE_LEGEND, queryKey: "endYyyy", maxLength: 4 },
+    { name: "End Date MM (month)", legend: END_DATE_LEGEND, queryKey: "endMm", maxLength: 2 },
+    { name: "End Date DD (day)", legend: END_DATE_LEGEND, queryKey: "endDd", maxLength: 2 },
+    { name: "End Date YYYY (year)", legend: END_DATE_LEGEND, queryKey: "endYyyy", maxLength: 4 },
 ];
+// The BMS labels the date parts show: SDTMM/EDTMM, SDTDD/EDTDD and SDTYYYY/EDTYYYY.
+const DATE_PART_VISIBLE_LABELS: readonly string[] = ["MM", "DD", "YYYY"];
 
 // A month CORPT00C rejects and a day with a leading blank: the page must send both untouched.
 const CUSTOM_DATE_PARTS: DatePartValues = {
@@ -221,6 +230,8 @@ const EMPTY_RANGE_CONFIRMED_QUERY: ReportQuery = {
     confirm: "Y",
 };
 const EMPTY_RANGE_HEADING = "Date Range: 2021-01-01 to 2021-01-31";
+// The one row of the report table for a range CBTRN03C prints no line for.
+const EMPTY_REPORT_TEXT = "No transactions in this date range";
 
 // The corpt00c.py literals (CORPT00C lines 213-531).
 const SELECT_REPORT_TYPE_MESSAGE = "Select a report type to print report...";
@@ -244,7 +255,7 @@ function BuildReportLine(fields: Partial<ReportLine> & Pick<ReportLine, "line_ki
     };
 }
 
-// The REPORT-NAME-HEADER print line, its 133-column padding kept, so the page must show it raw.
+// A REPORT-NAME-HEADER print line with its padding blanks, which set its parts apart.
 const HEADER_TEXT = "DALYREPT                    Daily Transaction Report                    ";
 
 // One line of each CVTRA07Y kind, in CBTRN03C print order, with distinct texts and amounts.
@@ -279,8 +290,9 @@ const REPORT_LINES: readonly ReportLine[] = [
     }),
 ];
 
-// The rendered cells of each line kind: the header is its print line, a detail line its six
-// columns, and a total its CVTRA07Y label and amount in footer cells.
+// The rendered cells of each line kind, as ShownCellText reads them: the header its title parts
+// in one cell, a detail line its six columns, and a total its CVTRA07Y label and amount in footer
+// cells.
 interface LineKindCase {
     kind: ReportLineKind;
     position: number;
@@ -289,7 +301,12 @@ interface LineKindCase {
 }
 
 const LINE_KIND_CASES: readonly LineKindCase[] = [
-    { kind: ReportLineKind.HEADER, position: 0, cells: [HEADER_TEXT], isFooter: false },
+    {
+        kind: ReportLineKind.HEADER,
+        position: 0,
+        cells: ["DALYREPT Daily Transaction Report"],
+        isFooter: false,
+    },
     {
         kind: ReportLineKind.DETAIL,
         position: 1,
@@ -306,32 +323,57 @@ const LINE_KIND_CASES: readonly LineKindCase[] = [
     {
         kind: ReportLineKind.ACCOUNT_TOTAL,
         position: 2,
-        cells: ["Account Total", "150.00"],
+        cells: ["Account Total", "+150.00"],
         isFooter: true,
     },
     {
         kind: ReportLineKind.PAGE_TOTAL,
         position: 3,
-        cells: ["Page Total", "250.00"],
+        cells: ["Page Total", "+250.00"],
         isFooter: true,
     },
     {
         kind: ReportLineKind.GRAND_TOTAL,
         position: 4,
-        cells: ["Grand Total", "350.00"],
+        cells: ["Grand Total", "+350.00"],
         isFooter: true,
     },
+];
+
+// A total's decimal amount and the amount its row shows, signed as the CVTRA07Y total picture
+// +ZZZ,ZZZ,ZZZ.ZZ signs it: '-' when negative, '+' otherwise, a zero of either sign included.
+interface TotalSignCase {
+    kind: ReportLineKind;
+    amount: string;
+    shownAmount: string;
+}
+
+const TOTAL_SIGN_CASES: readonly TotalSignCase[] = [
+    { kind: ReportLineKind.ACCOUNT_TOTAL, amount: "972.68", shownAmount: "+972.68" },
+    { kind: ReportLineKind.PAGE_TOTAL, amount: "100003409.79", shownAmount: "+100003409.79" },
+    { kind: ReportLineKind.GRAND_TOTAL, amount: "0.00", shownAmount: "+0.00" },
+    { kind: ReportLineKind.ACCOUNT_TOTAL, amount: "-0.00", shownAmount: "+0.00" },
+    { kind: ReportLineKind.PAGE_TOTAL, amount: "-0.01", shownAmount: "-0.01" },
+    { kind: ReportLineKind.GRAND_TOTAL, amount: "-19945.00", shownAmount: "-19945.00" },
 ];
 
 // FD-REPTFILE-REC PIC X(133): every CBTRN03C print line is padded with blanks to 133 columns.
 const PRINT_LINE_COLUMNS = 133;
 // The four lines of CBTRN03C 1120-WRITE-HEADERS, as cbtrn03c.py prints them for the Monthly
-// range: their inner and trailing blanks must all reach the screen.
+// range, and the cells the page shows for each, as ShownCellText reads them. The title line's
+// parts share one cell, and the blank line and the dash rule are empty cells, each across all
+// six columns; the column headings take one column each. colSpans holds each cell's colspan
+// attribute, null for a one-column cell.
 interface HeaderLineCase {
     name: string;
     position: number;
     text: string;
+    cells: readonly string[];
+    colSpans: readonly (string | null)[];
 }
+
+const FULL_ROW_COLSPAN = String(TABLE_HEADINGS.length);
+const TITLE_LINE_PARTS = ["DALYREPT", "Daily Transaction Report", DATE_RANGE_HEADING] as const;
 
 const HEADER_LINE_CASES: readonly HeaderLineCase[] = [
     {
@@ -340,8 +382,16 @@ const HEADER_LINE_CASES: readonly HeaderLineCase[] = [
         text: ["DALYREPT".padEnd(38), "Daily Transaction Report".padEnd(41), DATE_RANGE_HEADING]
             .join("")
             .padEnd(PRINT_LINE_COLUMNS),
+        cells: [TITLE_LINE_PARTS.join(" ")],
+        colSpans: [FULL_ROW_COLSPAN],
     },
-    { name: "WS-BLANK-LINE", position: 1, text: " ".repeat(PRINT_LINE_COLUMNS) },
+    {
+        name: "WS-BLANK-LINE",
+        position: 1,
+        text: " ".repeat(PRINT_LINE_COLUMNS),
+        cells: [""],
+        colSpans: [FULL_ROW_COLSPAN],
+    },
     {
         name: "TRANSACTION-HEADER-1",
         position: 2,
@@ -355,17 +405,28 @@ const HEADER_LINE_CASES: readonly HeaderLineCase[] = [
         ]
             .join("")
             .padEnd(PRINT_LINE_COLUMNS),
+        cells: TABLE_HEADINGS,
+        colSpans: TABLE_HEADINGS.map(() => null),
     },
-    { name: "TRANSACTION-HEADER-2", position: 3, text: "-".repeat(PRINT_LINE_COLUMNS) },
+    {
+        name: "TRANSACTION-HEADER-2",
+        position: 3,
+        text: "-".repeat(PRINT_LINE_COLUMNS),
+        cells: [""],
+        colSpans: [FULL_ROW_COLSPAN],
+    },
 ];
 const HEADER_LINES: readonly ReportLine[] = HEADER_LINE_CASES.map(({ text }) =>
     BuildReportLine({ line_kind: ReportLineKind.HEADER, text }),
 );
-// A print line keeps every blank, never wraps and sets its columns in Courier, as the PDF does.
-const PRINT_LINE_CELL_STYLE = {
-    fontFamily: '"Courier New", Courier, monospace',
-    whiteSpace: "pre",
-};
+const TITLE_LINE_POSITION = 0;
+const COLUMN_HEADINGS_POSITION = 2;
+// Every report cell is set in the theme's Roboto stack, never in the fixed-pitch, blank-keeping
+// print face the PDF alone uses.
+const SCREEN_FONT_FAMILY = CARD_DEMO_THEME.typography.fontFamily;
+const PRINT_LINE_WHITE_SPACE_STYLE = { whiteSpace: "pre" };
+// The M3 title-small role of the title parts and the column headings.
+const TITLE_SMALL_STYLE = { fontSize: "14px", lineHeight: "20px", fontWeight: "500" };
 
 // One CORPT00C outcome: the literal, its HTTP status, the message-line severity, the field the
 // cursor goes to and, for a 200, the report lines returned with it. isCleared marks the screen
@@ -625,10 +686,11 @@ const FLAGGED_REPORT_TYPE_CASES: readonly FlaggedReportTypeCase[] = [
         chosenLabel: null,
     },
     {
-        name: "the file error (503, cursor_field only) with Monthly chosen",
+        name: "the file error (503, field_errors and cursor_field) with Monthly chosen",
         status: HTTP_SERVICE_UNAVAILABLE,
         body: BuildErrorBody({
             message: "Unable to Write TDQ (JOBS)...",
+            field_errors: ["reportType"],
             cursor_field: "reportType",
         }),
         chosenLabel: MONTHLY_LABEL,
@@ -677,9 +739,8 @@ function HelperTextId(control: HTMLElement): string {
     return `${control.id}-helper-text`;
 }
 
-// The date edits and the invalid-confirm edit name their field in field_errors; the blank-confirm
-// prompt names CONFIRM as its cursor. A date part keeps its row's (MM/DD/YYYY) hint, and CONFIRM
-// its Y/N hint, after the ERRMSG line.
+// The date edits and the invalid-confirm edit name their field in field_errors. A date part keeps
+// its row's (MM/DD/YYYY) hint, and CONFIRM its Y/N hint, after the ERRMSG line.
 const FLAGGED_CONTROL_CASES: readonly FlaggedControlCase[] = [
     {
         control: "the start month",
@@ -691,13 +752,6 @@ const FLAGGED_CONTROL_CASES: readonly FlaggedControlCase[] = [
     {
         control: "CONFIRM",
         outcome: EditFailure('"X" is not a valid value to confirm...', "confirm"),
-        FlaggedControl: () => ConfirmInput(),
-        hint: "Y/N",
-        HintId: HelperTextId,
-    },
-    {
-        control: "CONFIRM",
-        outcome: PromptOutcome("Please confirm to print the Monthly report..."),
         FlaggedControl: () => ConfirmInput(),
         hint: "Y/N",
         HintId: HelperTextId,
@@ -973,6 +1027,17 @@ async function ShowEmptyCustomReport(): Promise<void> {
     await ExpectAlert(CUSTOM_SUBMITTED_MESSAGE, "success");
 }
 
+// The report table of an empty range: every column heading, then one row across all columns.
+function ExpectEmptyReportTable(): void {
+    const table = screen.getByRole("table", { name: REPORT_TABLE_LABEL });
+    const headings = within(table).getAllByRole("columnheader");
+    expect(headings.map((heading) => heading.textContent)).toEqual([...TABLE_HEADINGS]);
+    expect(within(table).getAllByRole("row")).toHaveLength(2);
+    const emptyRowCells = within(ReportBodyRow(0)).getAllByRole("cell");
+    expect(emptyRowCells.map((cell) => cell.textContent)).toEqual([EMPTY_REPORT_TEXT]);
+    expect(emptyRowCells[0]).toHaveAttribute("colspan", FULL_ROW_COLSPAN);
+}
+
 // Both download links repeat the whole confirmed query, and every link built so far was built
 // from it.
 function ExpectCompleteDownloads(query: ReportQuery): void {
@@ -995,6 +1060,21 @@ function ReportBodyRow(position: number): HTMLElement {
         throw new Error(`The report shows no line at position ${position}`);
     }
     return row;
+}
+
+// The text a cell shows, each part it sets apart on screen joined to the next by one blank.
+function ShownCellText(cell: HTMLElement): string {
+    const textWalker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+    const shownParts: string[] = [];
+    while (textWalker.nextNode() !== null) {
+        shownParts.push(textWalker.currentNode.textContent ?? "");
+    }
+    return shownParts.join(" ");
+}
+
+// jsdom keeps every name of a computed font stack but drops the blank after each comma.
+function ComputedFontStack(element: HTMLElement): string {
+    return getComputedStyle(element).fontFamily.replace(/,\s*/g, ", ");
 }
 
 // The request ends once the busy bar is gone; ENTER sets it before the call is made.
@@ -1112,6 +1192,16 @@ it.each(DATE_PARTS)(
         expect(input).toHaveValue("");
     },
 );
+
+// WCAG 2.5.3 label in name: the accessible name of each part holds the label it shows.
+it.each(DATE_PARTS)("CORPT00 $name contains the visible label of its part", async (part) => {
+    await RenderScreen();
+    const input = DatePartInput(part);
+    const visibleLabel = document.querySelector(`label[for="${input.id}"]`)?.textContent ?? "";
+    expect(DATE_PART_VISIBLE_LABELS).toContain(visibleLabel);
+    expect(input).toHaveAccessibleName(part.name);
+    expect(part.name).toContain(visibleLabel);
+});
 
 interface EnterPressCase {
     entry: string;
@@ -1380,6 +1470,26 @@ it.each(DATE_PARTS)(
     },
 );
 
+// Each row's hint is outlined-field helper text: on-surface-variant, on the 16 px field inset and
+// 4 px below the parts. It stays neutral while the server flags a part of its row.
+it.each([START_DATE_LEGEND, END_DATE_LEGEND])(
+    "CORPT00 the (MM/DD/YYYY) hint of the %s row is neutral outlined helper text",
+    async (legend) => {
+        MockReportOutcome(EditFailure(START_MONTH_INVALID_MESSAGE, "startMm"));
+        const user = await RenderScreen();
+        await PressScreenKey(user, ENTER_KEY, "click");
+        await ExpectAlert(START_MONTH_INVALID_MESSAGE, "error");
+        const hint = DateHint(legend);
+        expect(hint).toHaveClass(formHelperTextClasses.root, formHelperTextClasses.contained);
+        expect(hint).not.toHaveClass(formHelperTextClasses.error);
+        expect(hint).toHaveStyle({
+            color: CARD_DEMO_THEME.palette.text.secondary,
+            marginLeft: "16px",
+            marginTop: "4px",
+        });
+    },
+);
+
 // The ERRMSG Alert comes first in the description, then the control's own hint; a part the
 // answer does not name is described by its row's hint alone.
 it.each(FLAGGED_CONTROL_CASES)(
@@ -1397,6 +1507,27 @@ it.each(FLAGGED_CONTROL_CASES)(
         ExpectDescribedByDateHintOnly(START_YEAR_PART);
     },
 );
+
+// The blank-confirm prompt names CONFIRM as its cursor_field and no field_errors: CONFIRM takes
+// the cursor but its outline, prompt label and Y/N hint stay out of the error colour.
+it("CORPT00C the blank-confirm prompt (200) focuses CONFIRM without marking it", async () => {
+    const outcome = PromptOutcome("Please confirm to print the Monthly report...");
+    MockReportOutcome(outcome);
+    const user = await RenderScreen();
+    await user.click(MonthlyButton());
+    await PressScreenKey(user, ENTER_KEY, "click");
+    await ExpectAlert(outcome.literal, outcome.severity);
+    const confirmInput = ConfirmInput();
+    await waitFor(() => expect(confirmInput).toHaveFocus());
+    expect(confirmInput).toHaveAttribute("aria-invalid", "false");
+    expect(confirmInput).toHaveAttribute("aria-describedby", HelperTextId(confirmInput));
+    expect(confirmInput).toHaveAccessibleDescription("Y/N");
+    const confirmOutline = confirmInput.closest(`.${inputBaseClasses.root}`);
+    expect(confirmOutline).not.toHaveClass(inputBaseClasses.error);
+    const promptLabel = document.querySelector(`label[for="${confirmInput.id}"]`);
+    expect(promptLabel).not.toHaveClass(formLabelClasses.error);
+    ExpectReportTypeUnflagged();
+});
 
 it.each(UNFLAGGED_REPORT_TYPE_CASES)(
     "CORPT00C leaves the Report type group unflagged $name",
@@ -1577,7 +1708,7 @@ it("CORPT00C Y shows the CBTRN03C report below the cleared form", async () => {
     await waitFor(() => expect(ReportTypeButton(MONTHLY_LABEL)).toHaveFocus());
 });
 
-it("CORPT00C empty confirmed range shows its range and both downloads, no table", async () => {
+it("CORPT00C empty confirmed range shows its range, an empty row and both downloads", async () => {
     await ShowEmptyCustomReport();
     expect(mockFetchTransactionReport).toHaveBeenCalledWith(
         EMPTY_RANGE_CONFIRMED_QUERY,
@@ -1586,7 +1717,7 @@ it("CORPT00C empty confirmed range shows its range and both downloads, no table"
     expect(
         screen.getByRole("heading", { level: 2, name: EMPTY_RANGE_HEADING }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    ExpectEmptyReportTable();
     ExpectCompleteDownloads(EMPTY_RANGE_CONFIRMED_QUERY);
 });
 
@@ -1595,24 +1726,63 @@ it.each(LINE_KIND_CASES)(
     async ({ position, cells, isFooter }) => {
         await ShowMonthlyReport();
         const rowCells = within(ReportBodyRow(position)).getAllByRole("cell");
-        expect(rowCells.map((cell) => cell.textContent)).toEqual([...cells]);
+        expect(rowCells.map(ShownCellText)).toEqual([...cells]);
         for (const cell of rowCells) {
             expect(cell.classList.contains(tableCellClasses.footer)).toBe(isFooter);
         }
     },
 );
 
-it.each(HEADER_LINE_CASES)(
-    "CBTRN03C $name keeps its print text in one fixed-pitch cell across every column",
-    async ({ position, text }) => {
-        await ShowMonthlyReport(HEADER_LINES);
-        const rowCells = within(ReportBodyRow(position)).getAllByRole("cell");
-        expect(rowCells).toHaveLength(1);
-        expect(rowCells[0]?.textContent).toBe(text);
-        expect(rowCells[0]).toHaveAttribute("colspan", String(TABLE_HEADINGS.length));
-        expect(rowCells[0]).toHaveStyle(PRINT_LINE_CELL_STYLE);
+it.each(TOTAL_SIGN_CASES)(
+    "CBTRN03C $kind line of $amount shows $shownAmount",
+    async ({ kind, amount, shownAmount }) => {
+        await ShowMonthlyReport([BuildReportLine({ line_kind: kind, amount })]);
+        const rowCells = within(ReportBodyRow(0)).getAllByRole("cell");
+        expect(rowCells).toHaveLength(2);
+        expect(rowCells[1]?.textContent).toBe(shownAmount);
     },
 );
+
+it.each(HEADER_LINE_CASES)(
+    "CBTRN03C $name shows its print text as table cells in the screen's type",
+    async ({ position, cells, colSpans }) => {
+        await ShowMonthlyReport(HEADER_LINES);
+        const rowCells = within(ReportBodyRow(position)).getAllByRole("cell");
+        expect(rowCells.map(ShownCellText)).toEqual([...cells]);
+        expect(rowCells.map((cell) => cell.getAttribute("colspan"))).toEqual([...colSpans]);
+        for (const cell of rowCells) {
+            expect(ComputedFontStack(cell)).toBe(SCREEN_FONT_FAMILY);
+            expect(cell).not.toHaveStyle(PRINT_LINE_WHITE_SPACE_STYLE);
+        }
+    },
+);
+
+it("CBTRN03C REPORT-NAME-HEADER shows each part in its own title-small text", async () => {
+    await ShowMonthlyReport(HEADER_LINES);
+    const titleCell = within(ReportBodyRow(TITLE_LINE_POSITION)).getByRole("cell");
+    for (const part of TITLE_LINE_PARTS) {
+        const partText = within(titleCell).getByText(part);
+        expect(ComputedFontStack(partText)).toBe(SCREEN_FONT_FAMILY);
+        expect(partText).toHaveStyle(TITLE_SMALL_STYLE);
+        expect(partText).not.toHaveStyle(PRINT_LINE_WHITE_SPACE_STYLE);
+    }
+});
+
+// A page break repeats the headings in the body, each under its own sticky heading.
+it("CBTRN03C TRANSACTION-HEADER-1 lines up with the sticky headings", async () => {
+    await ShowMonthlyReport(HEADER_LINES);
+    const table = screen.getByRole("table", { name: REPORT_TABLE_LABEL });
+    const stickyHeadings = within(table).getAllByRole("columnheader");
+    const bodyHeadings = within(ReportBodyRow(COLUMN_HEADINGS_POSITION)).getAllByRole("cell");
+    expect(bodyHeadings).toHaveLength(stickyHeadings.length);
+    for (const [column, bodyHeading] of bodyHeadings.entries()) {
+        const isRightAligned = stickyHeadings[column]?.classList.contains(
+            tableCellClasses.alignRight,
+        );
+        expect(bodyHeading.classList.contains(tableCellClasses.alignRight)).toBe(isRightAligned);
+        expect(bodyHeading).toHaveStyle(TITLE_SMALL_STYLE);
+    }
+});
 
 it.each(DOWNLOAD_CASES)(
     "CORPT00C report download as %s repeats the confirmed query",
@@ -2168,6 +2338,6 @@ it("CORPT00C tells a confirmed empty range by its dates and cursor, not its mess
     expect(
         screen.getByRole("heading", { level: 2, name: EMPTY_RANGE_HEADING }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    ExpectEmptyReportTable();
     ExpectCompleteDownloads(MONTHLY_CONFIRMED_QUERY);
 });

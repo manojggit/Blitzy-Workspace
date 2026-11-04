@@ -27,6 +27,7 @@ import {
     type CardUpdateRequest,
 } from "@/lib/api/cards";
 import {
+    ABEND_MESSAGE,
     SIGN_ON_ROUTE,
     UpdateAction,
     UpdateScreenState,
@@ -43,6 +44,10 @@ type CardKeyFields = Pick<CardScreenFields, "acct_id" | "card_num">;
 // The CCUP error body: the four legacy keys beside the screen the page keeps the state machine on.
 type CardErrorBody = LegacyErrorResponse &
     Partial<Pick<CardScreen, "fields" | "state" | "screen_token">>;
+
+// The 422 body FastAPI sends for text no 3270 can key: the request-model detail beside the legacy
+// keys that name the field, and no screen.
+type StructuralErrorBody = CardErrorBody & { detail: readonly object[] };
 
 // One Alert of the message line: its raw text and its severity.
 type ShownAlert = readonly [text: string, severity: string];
@@ -126,6 +131,19 @@ interface ExitCase {
     method: InputMethod;
 }
 
+// Renders the page and has the server refuse a read of the held card_ref with the case's screen.
+type RefusalRenderer = (refusalCase: KeyRefusalCase) => Promise<UserEvent>;
+
+// A refused read of the held card_ref, the entry fetch or F12's re-read, and how it is reached.
+interface HeldCardRefusalCase {
+    refusedRead: string;
+    refusalCase: KeyRefusalCase;
+    RenderRefusal: RefusalRenderer;
+}
+
+// Such a refusal, then one ENTER, F5 or F12 on the key screen it leaves.
+type HeldCardRetryCase = HeldCardRefusalCase & UpdateKey;
+
 const mockRouterPush = jest.fn();
 const mockRouterReplace = jest.fn();
 // One router object for every render, as the App Router keeps useRouter stable.
@@ -208,6 +226,11 @@ const HTTP_NOT_FOUND = 404;
 const HTTP_RECORD_CHANGED = 409;
 const HTTP_RECORD_LOCKED = 423;
 const HTTP_FILE_ERROR = 503;
+// The ScreenText request check rejects text outside code page 037 before COCRDUPC runs.
+const HTTP_UNPROCESSABLE_CONTENT = 422;
+const NON_CP037_EMBOSSED_NAME = "JOHN 😀";
+const MSG_NOT_CP037 =
+    "Value error, text contains characters a 3270 terminal cannot send (code page 037)";
 
 // The COCRDUP INITIAL texts, verbatim.
 const SCREEN_TITLE = "Update Credit Card Details";
@@ -294,6 +317,13 @@ const EDITABLE_NAMES_BY_STATE: Readonly<Record<UpdateScreenState, readonly CardF
 const EDITABLE_BY_STATE_CASES: readonly EditableByStateCase[] = Object.values(
     UpdateScreenState,
 ).map((state) => ({ state, editableNames: EDITABLE_NAMES_BY_STATE[state] }));
+
+// The states ENTER answers edited details with: validated, or refused by a detail edit.
+const ENTER_ANSWER_CASES: readonly EditableByStateCase[] = EDITABLE_BY_STATE_CASES.filter(
+    ({ state }) =>
+        state === UpdateScreenState.CHANGES_OK_NOT_CONFIRMED ||
+        state === UpdateScreenState.CHANGES_NOT_OK,
+);
 
 // The fetched card: the number masked, and the dark EXPDAY never shown.
 const TEST_FIELDS: Readonly<CardScreenFields> = {
@@ -410,6 +440,20 @@ function PickFields(
     return picked;
 }
 
+// What a key sends once details are fetched: ENTER and F5 the inputs the state leaves editable;
+// F12 none, as RereadCard takes the keys from the screen_token and discards the edits, and
+// ResetScreen discards every input after a done or failed change.
+function FieldsSentAfterFetch(
+    updateKey: UpdateKey,
+    state: UpdateScreenState,
+    fields: Readonly<CardScreenFields>,
+): Partial<CardScreenFields> {
+    if (updateKey.action === UpdateAction.CANCEL) {
+        return {};
+    }
+    return PickFields(fields, EDITABLE_NAMES_BY_STATE[state]);
+}
+
 function BuildErrorBody(overrides: Partial<CardErrorBody>): CardErrorBody {
     return { message: "", info_message: "", field_errors: [], cursor_field: "", ...overrides };
 }
@@ -453,6 +497,14 @@ function QueueUpdateOutcome(status: number, cardScreen: CardScreen): void {
         return;
     }
     mockUpdateCard.mockRejectedValueOnce(BuildAxiosError(status, ErrorBodyOf(cardScreen)));
+}
+
+function StructuralRejection(name: CardFieldName): AxiosError<CardErrorBody> {
+    const body: StructuralErrorBody = {
+        ...BuildErrorBody({ field_errors: [name], cursor_field: name }),
+        detail: [{ loc: ["body", "fields", name], msg: MSG_NOT_CP037, type: "value_error" }],
+    };
+    return BuildAxiosError(HTTP_UNPROCESSABLE_CONTENT, body);
 }
 
 function RenderScreen(): UserEvent {
@@ -758,6 +810,10 @@ const NAME_NOT_PROVIDED_FIELDS: Readonly<CardScreenFields> = {
     ...TEST_FIELDS,
     embossed_name: BLANK_FIELD_MARKER,
 };
+// RereadCard's answer to F12: the stored card in SHOW_DETAILS under a new screen_token.
+const REREAD_SCREEN: CardScreen = BuildCardScreen(UpdateScreenState.SHOW_DETAILS, {
+    screen_token: ADOPTED_SCREEN_TOKEN,
+});
 const NAME_NOT_PROVIDED_SCREEN: CardScreen = BuildCardScreen(UpdateScreenState.CHANGES_NOT_OK, {
     message: MSG_CARD_NAME_NOT_PROVIDED,
     fields: { ...NAME_NOT_PROVIDED_FIELDS },
@@ -794,20 +850,10 @@ function TypedKeyRefusal(
     return { text, status, ...flagged, echoedKeys, shownKeys: typedKeys };
 }
 
-// A card list selection whose entry fetch is refused: the page keeps the account the list handed
-// over and a blank CARDSID, whatever keys the body echoes.
-function EntryFetchRefusal(
-    text: string,
-    status: number,
-    flagged: FlaggedFields,
-    echoedKeys: CardKeyFields,
-): KeyRefusalCase {
-    return { text, status, ...flagged, echoedKeys, shownKeys: LIST_ENTRY_KEYS };
-}
-
-// F12 from SHOW_DETAILS refused: the page leaves the fetched state, so it shows the keys the body
-// echoes.
-function CancelRefusal(
+// A read of the held card_ref refused, the entry fetch or F12 from SHOW_DETAILS: no card number
+// was typed, so MergeScreenFields shows the keys the body echoes (the held card masked, or no
+// card for an invalid card_ref) as the card the next key reads again by its card_ref.
+function HeldCardRefusal(
     text: string,
     status: number,
     flagged: FlaggedFields,
@@ -838,15 +884,15 @@ const TYPED_KEY_REFUSAL_CASES: readonly KeyRefusalCase[] = [
 // An invalid or expired card_ref (404: the list's account echoed, no card), and a failed CARDDAT
 // read of the card it names (503: its masked number echoed).
 const ENTRY_FETCH_REFUSAL_CASES: readonly KeyRefusalCase[] = [
-    EntryFetchRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, BOTH_KEYS_FLAGGED, LIST_ENTRY_KEYS),
-    EntryFetchRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ACCOUNT_FLAGGED, FETCHED_KEYS),
+    HeldCardRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, BOTH_KEYS_FLAGGED, LIST_ENTRY_KEYS),
+    HeldCardRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ACCOUNT_FLAGGED, FETCHED_KEYS),
 ];
 
 // RereadCard's failed CARDDAT read echoes the held keys (503); an invalid or expired card_ref
 // path (BindStateToPath, 404) echoes none, so neither the card nor the token shows.
 const CANCEL_REFUSAL_CASES: readonly KeyRefusalCase[] = [
-    CancelRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ACCOUNT_FLAGGED, FETCHED_KEYS),
-    CancelRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, BOTH_KEYS_FLAGGED, NO_KEYS),
+    HeldCardRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ACCOUNT_FLAGGED, FETCHED_KEYS),
+    HeldCardRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, BOTH_KEYS_FLAGGED, NO_KEYS),
 ];
 
 function ShowsHeaderAndLegend(): void {
@@ -873,7 +919,7 @@ async function FetchesSelectedCard(): Promise<void> {
     expect(mockUpdateCard).not.toHaveBeenCalled();
 }
 
-// The card_ref path segment, the held screen_token, and only the four detail inputs.
+// The card_ref path segment, the held screen_token, and the four detail inputs for ENTER and F5.
 async function SendsHeldToken(actionKeyCase: ActionKeyCase): Promise<void> {
     const user = await RenderFromList(UpdateScreenState.SHOW_DETAILS);
     await PressFunctionKey(user, actionKeyCase, actionKeyCase.method);
@@ -881,7 +927,7 @@ async function SendsHeldToken(actionKeyCase: ActionKeyCase): Promise<void> {
     ExpectUpdateRequest(TEST_CARD_REF, {
         action: actionKeyCase.action,
         screen_token: FIRST_SCREEN_TOKEN,
-        fields: PickFields(TEST_FIELDS, DETAIL_FIELD_NAMES),
+        fields: FieldsSentAfterFetch(actionKeyCase, UpdateScreenState.SHOW_DETAILS, TEST_FIELDS),
     });
 }
 
@@ -943,6 +989,56 @@ async function SendsEachResponsesToken(): Promise<void> {
     });
 }
 
+// The name edited, then an ENTER whose answer the case gives when it chooses.
+async function SendHeldEnter(user: UserEvent): Promise<PromiseWithResolvers<CardScreen>> {
+    await user.clear(InputOf("embossed_name"));
+    await user.type(InputOf("embossed_name"), EDITED_EMBOSSED_NAME);
+    const heldEnter = Promise.withResolvers<CardScreen>();
+    mockUpdateCard.mockReturnValueOnce(heldEnter.promise);
+    await user.click(screen.getByRole("button", { name: ENTER_KEY.buttonName }));
+    return heldEnter;
+}
+
+// Every input is read-only and keeps its value when typed into; the name stays the same outlined
+// element, so the freeze changes neither the field's look nor its protection key.
+async function ExpectFieldsFrozen(user: UserEvent, nameInput: HTMLInputElement): Promise<void> {
+    for (const fieldCase of FIELD_CASES) {
+        expect(InputOf(fieldCase.name)).toHaveAttribute("readonly");
+    }
+    await user.type(nameInput, "X");
+    expect(InputOf("embossed_name")).toBe(nameInput);
+    expect(nameInput).toHaveValue(EDITED_EMBOSSED_NAME);
+    expect(nameInput.closest(".MuiOutlinedInput-root")).not.toBeNull();
+}
+
+// ENTER's answer to the edited name in the case's state, under the next screen_token.
+function EditedNameScreen(state: UpdateScreenState): CardScreen {
+    return BuildCardScreen(state, {
+        fields: { ...TEST_FIELDS, embossed_name: EDITED_EMBOSSED_NAME },
+        screen_token: NEXT_SCREEN_TOKEN,
+    });
+}
+
+// While ENTER is in flight no input takes typing, so the answer never replaces newer edits; its
+// state then sets protection again, and F5 sends its screen_token with the values it validated.
+async function FreezesFieldsDuringEnter(answerCase: EditableByStateCase): Promise<void> {
+    const user = await RenderFromList(UpdateScreenState.SHOW_DETAILS);
+    const heldEnter = await SendHeldEnter(user);
+    expect(LastUpdateCall()[1].fields?.embossed_name).toBe(EDITED_EMBOSSED_NAME);
+    await ExpectFieldsFrozen(user, InputOf("embossed_name"));
+    const answer = EditedNameScreen(answerCase.state);
+    await act(async () => heldEnter.resolve(answer));
+    await WaitForIdle();
+    ExpectOnlyEditable(answerCase.editableNames);
+    expect(InputOf("embossed_name")).toHaveValue(EDITED_EMBOSSED_NAME);
+    await PressFunctionKey(user, SAVE_KEY);
+    ExpectUpdateRequest(TEST_CARD_REF, {
+        action: UpdateAction.SAVE,
+        screen_token: NEXT_SCREEN_TOKEN,
+        fields: FieldsSentAfterFetch(SAVE_KEY, answerCase.state, answer.fields),
+    });
+}
+
 function QueueRefusedSave(adoptionCase: AdoptionCase): void {
     const refusal = BuildCardScreen(adoptionCase.adoptedState, {
         message: adoptionCase.message,
@@ -987,7 +1083,7 @@ async function ResetsAfterFinishedChange(finishedCase: FinishedKeyCase): Promise
     ExpectUpdateRequest(TEST_CARD_REF, {
         action: finishedCase.action,
         screen_token: FIRST_SCREEN_TOKEN,
-        fields: PickFields(TEST_FIELDS, EDITABLE_NAMES_BY_STATE[finishedCase.state]),
+        fields: FieldsSentAfterFetch(finishedCase, finishedCase.state, TEST_FIELDS),
     });
     ExpectEmptyKeyScreen();
     expect(mockRouterPush).not.toHaveBeenCalled();
@@ -1106,13 +1202,48 @@ async function RefusesTypedKeys(refusalCase: KeyRefusalCase): Promise<void> {
     ExpectKeyRefusalScreen(refusalCase);
 }
 
-// The selection is fetched once by its card_ref and the list's account; nothing is written.
-async function RefusesEntryFetch(refusalCase: KeyRefusalCase): Promise<void> {
+// A card list selection whose entry fetch the server refuses with the case's key screen.
+async function RenderRefusedEntry(refusalCase: KeyRefusalCase): Promise<UserEvent> {
     mockSearchParams = new URLSearchParams({ cardRef: TEST_CARD_REF, acctId: TEST_ACCOUNT_ID });
     const refusal = ErrorBodyOf(KeyRefusalScreen(refusalCase));
     mockFetchCardForEdit.mockRejectedValueOnce(BuildAxiosError(refusalCase.status, refusal));
-    RenderScreen();
+    const user = RenderScreen();
     await WaitForIdle();
+    return user;
+}
+
+// A card list selection shown in SHOW_DETAILS whose F12 re-read the server refuses.
+async function RenderRefusedCancel(refusalCase: KeyRefusalCase): Promise<UserEvent> {
+    const user = await RenderFromList(UpdateScreenState.SHOW_DETAILS);
+    QueueUpdateOutcome(refusalCase.status, KeyRefusalScreen(refusalCase));
+    await PressFunctionKey(user, CANCEL_KEY);
+    return user;
+}
+
+function HeldCardRefusals(
+    refusedRead: string,
+    renderRefusal: RefusalRenderer,
+    refusalCases: readonly KeyRefusalCase[],
+): HeldCardRefusalCase[] {
+    return refusalCases.map((refusalCase) => ({
+        refusedRead,
+        refusalCase,
+        RenderRefusal: renderRefusal,
+    }));
+}
+
+const HELD_CARD_REFUSAL_CASES: readonly HeldCardRefusalCase[] = [
+    ...HeldCardRefusals("entry fetch", RenderRefusedEntry, ENTRY_FETCH_REFUSAL_CASES),
+    ...HeldCardRefusals("F12 re-read", RenderRefusedCancel, CANCEL_REFUSAL_CASES),
+];
+
+const HELD_CARD_RETRY_CASES: readonly HeldCardRetryCase[] = HELD_CARD_REFUSAL_CASES.flatMap(
+    (refusal) => REQUEST_KEYS.map((updateKey) => ({ ...updateKey, ...refusal })),
+);
+
+// The selection is fetched once by its card_ref and the list's account; nothing is written.
+async function RefusesEntryFetch(refusalCase: KeyRefusalCase): Promise<void> {
+    await RenderRefusedEntry(refusalCase);
     expect(mockFetchCardForEdit.mock.calls).toEqual([
         [TEST_CARD_REF, TEST_ACCOUNT_ID, READ_OPTIONS],
     ]);
@@ -1120,17 +1251,79 @@ async function RefusesEntryFetch(refusalCase: KeyRefusalCase): Promise<void> {
     ExpectKeyRefusalScreen(refusalCase);
 }
 
-// F12 sends cancel by the card_ref under the held screen_token, with the four detail inputs.
+// F12 sends cancel by the card_ref under the held screen_token with no field: RereadCard takes
+// the keys from the screen_token and discards the keyed edits (FieldsSentBy).
 async function RefusesCancel(refusalCase: KeyRefusalCase): Promise<void> {
+    await RenderRefusedCancel(refusalCase);
+    ExpectUpdateRequest(TEST_CARD_REF, {
+        action: UpdateAction.CANCEL,
+        screen_token: FIRST_SCREEN_TOKEN,
+        fields: {},
+    });
+    ExpectKeyRefusalScreen(refusalCase);
+}
+
+// ENTER with a name outside code page 037 is refused with a 422, which carries no screen: the
+// page keeps the name as keyed beneath the abend text.
+async function RejectNonCp037Name(user: UserEvent): Promise<void> {
+    await user.clear(InputOf("embossed_name"));
+    await user.type(InputOf("embossed_name"), NON_CP037_EMBOSSED_NAME);
+    mockUpdateCard.mockRejectedValueOnce(StructuralRejection("embossed_name"));
+    await PressFunctionKey(user, ENTER_KEY);
+    expect(LastUpdateCall()[1].fields?.embossed_name).toBe(NON_CP037_EMBOSSED_NAME);
+    expect(InputOf("embossed_name")).toHaveValue(NON_CP037_EMBOSSED_NAME);
+    ExpectAlert(ABEND_MESSAGE, "error");
+}
+
+// F12 still re-reads after the 422, as it sends no field for the request model to reject, and
+// the SHOW_DETAILS re-read and its screen_token are adopted.
+async function CancelsAfterStructuralRejection(): Promise<void> {
     const user = await RenderFromList(UpdateScreenState.SHOW_DETAILS);
-    QueueUpdateOutcome(refusalCase.status, KeyRefusalScreen(refusalCase));
+    await RejectNonCp037Name(user);
+    QueueUpdateOutcome(HTTP_OK, REREAD_SCREEN);
     await PressFunctionKey(user, CANCEL_KEY);
     ExpectUpdateRequest(TEST_CARD_REF, {
         action: UpdateAction.CANCEL,
         screen_token: FIRST_SCREEN_TOKEN,
-        fields: PickFields(TEST_FIELDS, DETAIL_FIELD_NAMES),
+        fields: {},
     });
-    ExpectKeyRefusalScreen(refusalCase);
+    expect(InputOf("embossed_name")).toHaveValue(TEST_EMBOSSED_NAME);
+    expect(ShownAlerts()).toEqual([[INFO_DETAILS_SHOWN, "info"]]);
+    await PressFunctionKey(user, ENTER_KEY);
+    expect(LastUpdateCall()[1].screen_token).toBe(ADOPTED_SCREEN_TOKEN);
+}
+
+// Whichever key is pressed, the held card_ref is read again with the account shown: the masked
+// number never travels as a card number, nothing is written, and the read's answer is adopted.
+async function RetriesHeldCardRef(retryCase: HeldCardRetryCase): Promise<void> {
+    const user = await retryCase.RenderRefusal(retryCase.refusalCase);
+    const writeCount = mockUpdateCard.mock.calls.length;
+    mockFetchCardForEdit.mockResolvedValueOnce(BuildCardScreen(UpdateScreenState.SHOW_DETAILS));
+    await PressFunctionKey(user, retryCase);
+    expect(mockFetchCardForEdit).toHaveBeenCalledTimes(2);
+    expect(mockFetchCardForEdit.mock.lastCall).toStrictEqual([
+        TEST_CARD_REF,
+        retryCase.refusalCase.echoedKeys.acct_id,
+    ]);
+    expect(mockUpdateCard).toHaveBeenCalledTimes(writeCount);
+    expect(InputOf("embossed_name")).toHaveValue(TEST_EMBOSSED_NAME);
+    expect(ShownAlerts()).toEqual([[INFO_DETAILS_SHOWN, "info"]]);
+    ExpectOnlyEditable(DETAIL_FIELD_NAMES);
+}
+
+// A typed card number replaces the held card_ref, so ENTER is the not-fetched PUT keyed by it,
+// with both keys as shown and the refusal's screen_token, and nothing is read again.
+async function KeysTypedCardAfterHeldCardRefusal(refusal: HeldCardRefusalCase): Promise<void> {
+    const user = await refusal.RenderRefusal(refusal.refusalCase);
+    await user.clear(InputOf("card_num"));
+    await user.type(InputOf("card_num"), TYPED_CARD_NUMBER);
+    await PressFunctionKey(user, ENTER_KEY);
+    expect(mockFetchCardForEdit).toHaveBeenCalledTimes(1);
+    ExpectUpdateRequest(TYPED_CARD_NUMBER, {
+        action: UpdateAction.ENTER,
+        screen_token: NEXT_SCREEN_TOKEN,
+        fields: { acct_id: refusal.refusalCase.echoedKeys.acct_id, card_num: TYPED_CARD_NUMBER },
+    });
 }
 
 async function ExitsToMainMenu(exitCase: ExitCase): Promise<void> {
@@ -1232,6 +1425,13 @@ describe("COCRDUPC ENTER, F5 and F12 requests on /cards/update", () => {
         SendsEachResponsesToken());
 });
 
+describe("COCRDUPC input while ENTER is in flight on /cards/update", () => {
+    it.each(ENTER_ANSWER_CASES)(
+        "COCRDUPC freezes every input until ENTER's $state answer, then F5 sends its token",
+        (answerCase) => FreezesFieldsDuringEnter(answerCase),
+    );
+});
+
 describe("COCRDUPC refused F5 outcomes of 9200-WRITE-PROCESSING on /cards/update", () => {
     it.each(ADOPTION_CASES)(
         "COCRDUPC $status $message adopts the body's screen and its screen_token",
@@ -1280,6 +1480,25 @@ describe("COCRDUPC key edit and CARDDAT read refusals on /cards/update", () => {
     it.each(CANCEL_REFUSAL_CASES)(
         "COCRDUPC F12 from SHOW_DETAILS: $status $text flags $fieldErrors",
         (refusalCase) => RefusesCancel(refusalCase),
+    );
+});
+
+describe("COCRDUPC F12 after a 422 structural rejection on /cards/update", () => {
+    it("COCRDUPC F12 sends no field after a rejected name and adopts the re-read card", () =>
+        CancelsAfterStructuralRejection());
+});
+
+// COCRDUPC lines 482-497 read a card list session's card by CDEMO-CARD-NUM, which the held
+// card_ref stands for; until it is fetched no card number is on the screen to send.
+describe("COCRDUPC the held card_ref after a refused read on /cards/update", () => {
+    it.each(HELD_CARD_RETRY_CASES)(
+        "COCRDUPC after a $refusalCase.status $refusedRead, $buttonName reads the card_ref again",
+        (retryCase) => RetriesHeldCardRef(retryCase),
+    );
+
+    it.each(HELD_CARD_REFUSAL_CASES)(
+        "COCRDUPC after a $refusalCase.status $refusedRead, a typed card number is sent by PUT",
+        (refusal) => KeysTypedCardAfterHeldCardRefusal(refusal),
     );
 });
 

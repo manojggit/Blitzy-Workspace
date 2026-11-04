@@ -25,6 +25,7 @@ import {
 import { useRouter } from "next/navigation";
 import {
     Button,
+    FormHelperText,
     Grid,
     Stack,
     Table,
@@ -51,7 +52,6 @@ import {
 import DownloadIcon from "@mui/icons-material/Download";
 import axios, { type AxiosError } from "axios";
 
-import { PRINT_LINE_STYLE } from "@/app/theme";
 import { ConfirmField } from "@/components/ConfirmField";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import {
@@ -138,6 +138,8 @@ const TABLE_HEADINGS = [
 ] as const;
 const AMOUNT_HEADING = "Amount";
 const REPORT_TABLE_LABEL = "Transaction report";
+// The table's only row for a confirmed range that matched no transaction.
+const EMPTY_REPORT_TEXT = "No transactions in this date range";
 // The scrolling container of the table is a tab stop, so the keyboard can scroll it; it is named
 // apart from the table it holds.
 const REPORT_LINES_REGION_PROPS = {
@@ -165,10 +167,29 @@ const TOTAL_LABELS: Readonly<Partial<Record<ReportLineKind, string>>> = {
     [ReportLineKind.PAGE_TOTAL]: "Page Total",
     [ReportLineKind.GRAND_TOTAL]: "Grand Total",
 };
+// The leading sign of the CVTRA07Y total picture +ZZZ,ZZZ,ZZZ.ZZ: '-' for a negative total and
+// '+' for any other, zero included.
+const NEGATIVE_SIGN = "-";
+const POSITIVE_SIGN = "+";
+// A total with no digit but zero is zero, whatever sign its decimal text carries.
+const NONZERO_DIGIT_PATTERN = /[1-9]/;
 // TRAN-REPORT-CAT-CD PIC 9(04): the category code prints zero-padded to four digits.
 const CATEGORY_CODE_DIGITS = 4;
 // The '-' FILLER between each code and its description in TRANSACTION-DETAIL-REPORT.
 const CODE_DESCRIPTION_SEPARATOR = "-";
+
+// The blank runs CVTRA07Y pads between the parts of a header line: two blanks or more.
+const PRINT_SEGMENT_SEPARATOR = /\s{2,}/;
+// TRANSACTION-HEADER-2, which CBTRN03C also writes after every account and page total.
+const DASH_RULE_PATTERN = /^-+$/;
+// WS-BLANK-LINE: a gap between the report title and the column headings, with no divider.
+const BLANK_LINE_CELL_STYLE: SxProps<Theme> = { borderBottom: "none" };
+// A dash rule: no text, only a divider in the outline role, stronger than the row dividers.
+const DASH_RULE_CELL_STYLE: SxProps<Theme> = { padding: 0, borderBottomColor: "m3.outline" };
+// TRANSACTION-HEADER-1 repeated in the body, in the M3 title-small role of column headings.
+const COLUMN_HEADING_CELL_STYLE: SxProps<Theme> = { typography: "titleSmall" };
+// The parts of a title line sit side by side and wrap on a narrow screen; theme spacing units.
+const TITLE_SEGMENTS_STYLE: SxProps<Theme> = { flexWrap: "wrap", columnGap: 8, rowGap: 1 };
 
 // CVTRA07Y REPORT-NAME-HEADER: 'Date Range: ' <start> ' to ' <end>.
 const DATE_RANGE_PREFIX = "Date Range: ";
@@ -223,20 +244,22 @@ interface ReportInputs {
 interface DatePartDefinition {
     name: DatePartName;
     label: string;
+    // The row legend, the visible label and the part it stands for, so the accessible name
+    // contains the visible label a speech-input user says.
     ariaLabel: string;
     // The BMS LENGTH of the part (SDTMM 2, SDTDD 2, SDTYYYY 4; EDTMM, EDTDD, EDTYYYY alike).
     maxLength: number;
 }
 
 const START_DATE_PARTS: readonly DatePartDefinition[] = [
-    { name: "startMm", label: "MM", ariaLabel: "Start Date month", maxLength: 2 },
-    { name: "startDd", label: "DD", ariaLabel: "Start Date day", maxLength: 2 },
-    { name: "startYyyy", label: "YYYY", ariaLabel: "Start Date year", maxLength: 4 },
+    { name: "startMm", label: "MM", ariaLabel: "Start Date MM (month)", maxLength: 2 },
+    { name: "startDd", label: "DD", ariaLabel: "Start Date DD (day)", maxLength: 2 },
+    { name: "startYyyy", label: "YYYY", ariaLabel: "Start Date YYYY (year)", maxLength: 4 },
 ];
 const END_DATE_PARTS: readonly DatePartDefinition[] = [
-    { name: "endMm", label: "MM", ariaLabel: "End Date month", maxLength: 2 },
-    { name: "endDd", label: "DD", ariaLabel: "End Date day", maxLength: 2 },
-    { name: "endYyyy", label: "YYYY", ariaLabel: "End Date year", maxLength: 4 },
+    { name: "endMm", label: "MM", ariaLabel: "End Date MM (month)", maxLength: 2 },
+    { name: "endDd", label: "DD", ariaLabel: "End Date DD (day)", maxLength: 2 },
+    { name: "endYyyy", label: "YYYY", ariaLabel: "End Date YYYY (year)", maxLength: 4 },
 ];
 
 // CORPT00C INITIALIZE-ALL-FIELDS (line 633): every selector, date part and the confirm flag.
@@ -255,8 +278,9 @@ interface FeedbackState {
     message: string;
     severity: MessageSeverity;
     infoMessage: string;
+    // The server's field_errors: the only fields shown in error. Its cursor_field only places
+    // the cursor (requestFocus).
     fieldErrors: string[];
-    cursorField: string;
 }
 
 // ERRMSG is COLOR=RED on the map: every message CORPT00C sends with its error flag set is red.
@@ -270,7 +294,6 @@ const EMPTY_FEEDBACK: FeedbackState = {
     severity: ERROR_SEVERITY,
     infoMessage: "",
     fieldErrors: [],
-    cursorField: "",
 };
 
 interface ReportResult {
@@ -312,9 +335,10 @@ function ToCursorField(name: string | null): CursorField {
     return CURSOR_FIELDS.find((field) => field === name) ?? DEFAULT_CURSOR_FIELD;
 }
 
-// The fields shown in error: the cursor field and every field the server flags.
+// The fields shown in error: every field the server names in field_errors. A cursor_field it does
+// not also name there, such as CONFIRM on the blank-confirm prompt, takes the cursor unmarked.
 function FlaggedFields(feedback: FeedbackState): readonly string[] {
-    return [feedback.cursorField, ...feedback.fieldErrors];
+    return feedback.fieldErrors;
 }
 
 // The raw screen fields. The date parts and the confirm flag are sent exactly as keyed, because
@@ -359,15 +383,14 @@ function ApplyReset(response: TransactionReportResponse, setters: ScreenSetters)
 }
 
 // The blank-confirm prompt (CORPT00C lines 464-474): the error flag is set, so ERRMSG stays red,
-// the keyed fields are echoed and the cursor goes to CONFIRM.
+// the keyed fields are echoed and the cursor goes to CONFIRM. The prompt names no field_errors,
+// so no field is marked in error.
 function ApplyPrompt(response: TransactionReportResponse, setters: ScreenSetters): void {
-    const cursorField = response.cursor_field ?? "";
     setters.setResult(null);
     setters.setFeedback({
         ...EMPTY_FEEDBACK,
         message: response.message,
         severity: ERROR_SEVERITY,
-        cursorField,
     });
     setters.requestFocus(response.cursor_field);
 }
@@ -406,8 +429,8 @@ function ApplyError(error: AxiosError, setters: ScreenSetters): void {
     ShowErrorFeedback(error, setters);
 }
 
-// The legacy outcome of a failed call, or the abend text, red: every field the server names is
-// marked and the cursor goes to its cursor_field. Nothing else on the screen changes.
+// The legacy outcome of a failed call, or the abend text, red: every field named in field_errors
+// is marked and the cursor goes to its cursor_field. Nothing else on the screen changes.
 function ShowErrorFeedback(error: AxiosError, setters: ScreenSetters): void {
     const feedback = ToScreenFeedback(error);
     setters.setFeedback({
@@ -415,7 +438,6 @@ function ShowErrorFeedback(error: AxiosError, setters: ScreenSetters): void {
         severity: ERROR_SEVERITY,
         infoMessage: feedback.info_message,
         fieldErrors: feedback.field_errors,
-        cursorField: feedback.cursor_field ?? "",
     });
     setters.requestFocus(feedback.cursor_field);
 }
@@ -837,7 +859,7 @@ interface ReportTypeSelectorProps {
     onChange: ReportTypeSetter;
     disabled: boolean;
     firstButtonRef: Ref<HTMLButtonElement>;
-    // The server names reportType in cursor_field or field_errors.
+    // The server names reportType in field_errors.
     isFlagged: boolean;
     // The ENTER outcome that flag comes from.
     feedback: FeedbackState;
@@ -1016,6 +1038,7 @@ function DatePartsRow(props: DatePartsRowProps) {
 }
 
 // The legend, the date parts and the (MM/DD/YYYY) hint of one map row, which describes each part.
+// The hint is the row's helper text, on the outlined fields' inset and directly below them.
 function DatePartsField(props: DatePartsFieldProps) {
     const hintId = useId();
     return (
@@ -1023,10 +1046,12 @@ function DatePartsField(props: DatePartsFieldProps) {
             <Typography variant="titleSmall" component="p">
                 {props.legend}
             </Typography>
-            <DatePartsRow {...props} hintId={hintId} />
-            <Typography id={hintId} variant="bodySmall" component="p" color="text.secondary">
-                {DATE_HINT}
-            </Typography>
+            <Stack>
+                <DatePartsRow {...props} hintId={hintId} />
+                <FormHelperText id={hintId} variant="outlined" disabled={props.disabled}>
+                    {DATE_HINT}
+                </FormHelperText>
+            </Stack>
         </Stack>
     );
 }
@@ -1143,6 +1168,18 @@ function DetailRow({ line }: ReportLineRowProps) {
     );
 }
 
+// A total's decimal text behind the sign its +ZZZ,ZZZ,ZZZ.ZZ picture prints.
+function SignedTotalAmount(amount: ReportLine["amount"]): string {
+    if (amount === null) {
+        return "";
+    }
+    const unsignedAmount = amount.startsWith(NEGATIVE_SIGN)
+        ? amount.slice(NEGATIVE_SIGN.length)
+        : amount;
+    const isNegative = unsignedAmount !== amount && NONZERO_DIGIT_PATTERN.test(unsignedAmount);
+    return (isNegative ? NEGATIVE_SIGN : POSITIVE_SIGN) + unsignedAmount;
+}
+
 // REPORT-ACCOUNT-TOTALS, REPORT-PAGE-TOTALS and REPORT-GRAND-TOTALS.
 function TotalRow({ line }: ReportLineRowProps) {
     return (
@@ -1151,24 +1188,98 @@ function TotalRow({ line }: ReportLineRowProps) {
                 {TOTAL_LABELS[line.line_kind] ?? line.text}
             </TableCell>
             <TableCell variant="footer" align="right">
-                {line.amount ?? ""}
+                {SignedTotalAmount(line.amount ?? null)}
             </TableCell>
         </TableRow>
     );
 }
 
-// The page headers CBTRN03C repeats: REPORT-NAME-HEADER, WS-BLANK-LINE, TRANSACTION-HEADER-1 and
-// the TRANSACTION-HEADER-2 dash rule, each shown as printed, in fixed pitch across every column.
-// The blank line stays a blank row rather than a copy of the column headings, which the next
-// header line already prints.
-function HeaderRow({ line }: ReportLineRowProps) {
+type ColumnAlignment = "left" | "right";
+
+function HeadingAlignment(heading: string): ColumnAlignment {
+    return heading === AMOUNT_HEADING ? "right" : "left";
+}
+
+// WS-BLANK-LINE.
+function BlankLineRow() {
     return (
         <TableRow>
-            <TableCell colSpan={TABLE_HEADINGS.length} sx={PRINT_LINE_STYLE}>
-                {line.text ?? ""}
+            <TableCell colSpan={TABLE_HEADINGS.length} sx={BLANK_LINE_CELL_STYLE} />
+        </TableRow>
+    );
+}
+
+// TRANSACTION-HEADER-2: the dashes become a divider across every column.
+function DashRuleRow() {
+    return (
+        <TableRow>
+            <TableCell colSpan={TABLE_HEADINGS.length} sx={DASH_RULE_CELL_STYLE} />
+        </TableRow>
+    );
+}
+
+// TRANSACTION-HEADER-1 after each page break: every heading in its own column, aligned as the
+// sticky headings are.
+function ColumnHeadingsRow() {
+    return (
+        <TableRow>
+            {TABLE_HEADINGS.map((heading) => (
+                <TableCell
+                    key={heading}
+                    align={HeadingAlignment(heading)}
+                    sx={COLUMN_HEADING_CELL_STYLE}
+                >
+                    {heading}
+                </TableCell>
+            ))}
+        </TableRow>
+    );
+}
+
+interface TitleLineRowProps {
+    segments: readonly string[];
+}
+
+// REPORT-NAME-HEADER, or any other header text: each part the print line sets apart with blanks,
+// side by side across the table.
+function TitleLineRow({ segments }: TitleLineRowProps) {
+    return (
+        <TableRow>
+            <TableCell colSpan={TABLE_HEADINGS.length}>
+                <Stack direction="row" sx={TITLE_SEGMENTS_STYLE}>
+                    {segments.map((segment, position) => (
+                        <Typography key={position} variant="titleSmall" component="span">
+                            {segment}
+                        </Typography>
+                    ))}
+                </Stack>
             </TableCell>
         </TableRow>
     );
+}
+
+function IsColumnHeadings(segments: readonly string[]): boolean {
+    return (
+        segments.length === TABLE_HEADINGS.length &&
+        segments.every((segment, column) => segment === TABLE_HEADINGS[column])
+    );
+}
+
+// The page headers CBTRN03C repeats, and the dash rules it writes after the totals, read from
+// their print text: a blank line, a dash rule, the column headings or a title line.
+function HeaderRow({ line }: ReportLineRowProps) {
+    const printText = (line.text ?? "").trim();
+    if (printText === "") {
+        return <BlankLineRow />;
+    }
+    if (DASH_RULE_PATTERN.test(printText)) {
+        return <DashRuleRow />;
+    }
+    const segments = printText.split(PRINT_SEGMENT_SEPARATOR);
+    if (IsColumnHeadings(segments)) {
+        return <ColumnHeadingsRow />;
+    }
+    return <TitleLineRow segments={segments} />;
 }
 
 const ROW_RENDERERS: Readonly<Record<ReportLineKind, (line: ReportLine) => ReactNode>> = {
@@ -1179,7 +1290,7 @@ const ROW_RENDERERS: Readonly<Record<ReportLineKind, (line: ReportLine) => React
     [ReportLineKind.GRAND_TOTAL]: (line) => <TotalRow line={line} />,
 };
 
-// A kind this page does not know is shown as its print line, like a header.
+// A kind this page does not know is shown from its print text, like a header.
 function RenderReportLine(line: ReportLine): ReactNode {
     const renderRow = ROW_RENDERERS[line.line_kind] ?? ROW_RENDERERS[ReportLineKind.HEADER];
     return renderRow(line);
@@ -1194,7 +1305,7 @@ function ReportTableHead() {
         <TableHead>
             <TableRow>
                 {TABLE_HEADINGS.map((heading) => (
-                    <TableCell key={heading} align={heading === AMOUNT_HEADING ? "right" : "left"}>
+                    <TableCell key={heading} align={HeadingAlignment(heading)}>
                         {heading}
                     </TableCell>
                 ))}
@@ -1208,9 +1319,40 @@ interface ReportLinesPageProps {
     page: number;
 }
 
-// One on-screen page of the TRANREPT lines, in print order. The order never changes, so each row
-// keys on its position in the whole report. Each page remounts the container, which therefore
-// opens scrolled to the page's first line.
+// CBTRN03C prints no line for a range that matched no transaction, so the table says so.
+function EmptyReportRow() {
+    return (
+        <TableRow>
+            <TableCell colSpan={TABLE_HEADINGS.length} align="center">
+                {EMPTY_REPORT_TEXT}
+            </TableCell>
+        </TableRow>
+    );
+}
+
+interface ReportPageRowsProps {
+    pageLines: readonly ReportLine[];
+    firstPosition: number;
+}
+
+// The order never changes, so each row keys on its position in the whole report.
+function ReportPageRows({ pageLines, firstPosition }: ReportPageRowsProps) {
+    if (pageLines.length === 0) {
+        return <EmptyReportRow />;
+    }
+    return (
+        <>
+            {pageLines.map((line, offset) => (
+                <Fragment key={`${line.line_kind}-${firstPosition + offset}`}>
+                    {RenderReportLine(line)}
+                </Fragment>
+            ))}
+        </>
+    );
+}
+
+// One on-screen page of the TRANREPT lines, in print order. Each page remounts the container,
+// which therefore opens scrolled to the page's first line.
 function ReportLinesPageTable({ lines, page }: ReportLinesPageProps) {
     const firstPosition = page * REPORT_LINES_PER_PAGE;
     const pageLines = lines.slice(firstPosition, firstPosition + REPORT_LINES_PER_PAGE);
@@ -1219,11 +1361,7 @@ function ReportLinesPageTable({ lines, page }: ReportLinesPageProps) {
             <Table stickyHeader size="small" aria-label={REPORT_TABLE_LABEL}>
                 <ReportTableHead />
                 <TableBody>
-                    {pageLines.map((line, offset) => (
-                        <Fragment key={`${line.line_kind}-${firstPosition + offset}`}>
-                            {RenderReportLine(line)}
-                        </Fragment>
-                    ))}
+                    <ReportPageRows pageLines={pageLines} firstPosition={firstPosition} />
                 </TableBody>
             </Table>
         </TableContainer>
@@ -1400,8 +1538,8 @@ interface ReportResultSectionProps {
     downloads: ReportDownloads;
 }
 
-// A confirmed range that matched no transaction shows its range and no table, as CBTRN03C
-// prints nothing for an empty input; its downloads still give that empty report.
+// A confirmed report: its range, its table and its downloads. A range that matched no
+// transaction keeps its table, with one row saying so, and its downloads give that empty report.
 function ReportResultSection({ result, downloads }: ReportResultSectionProps) {
     if (result === null) {
         return null;
@@ -1411,7 +1549,7 @@ function ReportResultSection({ result, downloads }: ReportResultSectionProps) {
             <Typography variant="titleSmall" component="h2">
                 {DATE_RANGE_PREFIX + result.startDate + DATE_RANGE_SEPARATOR + result.endDate}
             </Typography>
-            {result.lines.length > 0 ? <ReportLinesTable lines={result.lines} /> : null}
+            <ReportLinesTable lines={result.lines} />
             <ReportDownloadButtons query={result.submittedQuery} downloads={downloads} />
         </Stack>
     );

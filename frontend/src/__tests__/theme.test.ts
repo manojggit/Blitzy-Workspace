@@ -1,12 +1,7 @@
-// Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE, PRINT_LINE_STYLE,
+// Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE,
 // AUTOFILL_KEYFRAMES_STYLE), the Material Design 3 token theme of AAP 0.5.3–0.5.4.
 import type { Theme, TypeAction } from "@mui/material/styles";
-import {
-    AUTOFILL_KEYFRAMES_STYLE,
-    CARD_DEMO_THEME,
-    PRINT_LINE_STYLE,
-    VISUALLY_HIDDEN_STYLE,
-} from "@/app/theme";
+import { AUTOFILL_KEYFRAMES_STYLE, CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE } from "@/app/theme";
 
 type ColourReader = (theme: Theme) => string | undefined;
 
@@ -440,7 +435,8 @@ const OUTLINE_AND_FILL_RULES: readonly ThemeRuleExpectation[] = [
     },
 ];
 
-// The M3 focus indicator: 3 px secondary, 2 px outside, or inside where an ancestor would clip it.
+// The M3 focus indicator: 3 px secondary, 2 px outside, or inside where an ancestor would clip it
+// or a neighbour would sit under it.
 const FOCUS_RING_RULES: readonly ThemeRuleExpectation[] = [
     {
         rule: "every ButtonBase shows a 3 px secondary ring 2 px outside it",
@@ -469,6 +465,13 @@ const FOCUS_RING_RULES: readonly ThemeRuleExpectation[] = [
         slot: "root",
         selectorPath: [FOCUS_VISIBLE_SELECTOR],
         expectedStyle: { outlineOffset: -3 },
+    },
+    {
+        rule: "a segment draws its ring inside itself, raised above the segment it overlaps",
+        component: "MuiToggleButton",
+        slot: "root",
+        selectorPath: [FOCUS_VISIBLE_SELECTOR],
+        expectedStyle: { outlineOffset: -3, zIndex: 1 },
     },
 ];
 
@@ -666,11 +669,11 @@ const TYPE_AND_SPACING_RULES: readonly ThemeRuleExpectation[] = [
         expectedStyle: { paddingTop: "8px", paddingBottom: "8px" },
     },
     {
-        rule: "a medium segment pads its label 12 px on every side",
+        rule: "a medium segment is at least 40 px tall with 8 px and 12 px padding, as a button",
         component: "MuiToggleButton",
         slot: "sizeMedium",
         selectorPath: [],
-        expectedStyle: { padding: "12px" },
+        expectedStyle: { minHeight: 40, padding: "8px 12px" },
     },
 ];
 
@@ -1016,18 +1019,6 @@ const MUI_VISUALLY_HIDDEN_VALUES = {
     width: "1px",
 };
 
-// The TRANREPT print lines: Courier, as the report PDF draws them, then a generic fixed-pitch face,
-// in the M3 body-small role (size, line height and tracking), with every blank kept and no
-// wrapping. The tracking is uniform per character, so fixed-pitch columns still line up.
-const PRINT_LINE_VALUES = {
-    fontFamily: '"Courier New", Courier, monospace',
-    fontSize: "12px",
-    lineHeight: "16px",
-    fontWeight: 400,
-    letterSpacing: "0.4px",
-    whiteSpace: "pre",
-};
-
 function FontSizeToPixels(value: string | number | undefined): number {
     if (typeof value === "number") {
         return value;
@@ -1351,11 +1342,5 @@ describe("M3 segmented-button states (gap 0.5.4)", () => {
 describe("Visually hidden text", () => {
     it("VISUALLY_HIDDEN_STYLE carries MUI's visuallyHidden values", () => {
         expect(VISUALLY_HIDDEN_STYLE).toEqual(MUI_VISUALLY_HIDDEN_VALUES);
-    });
-});
-
-describe("Report print lines", () => {
-    it("PRINT_LINE_STYLE is fixed pitch, body-small and pre-formatted", () => {
-        expect(PRINT_LINE_STYLE).toEqual(PRINT_LINE_VALUES);
     });
 });

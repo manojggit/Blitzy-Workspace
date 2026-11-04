@@ -115,6 +115,18 @@ const INSET_FOCUS_RING_STYLE: CSSObject = {
     [FOCUS_VISIBLE_SELECTOR]: { outlineOffset: -M3_FOCUS_RING_WIDTH_PX },
 };
 
+/**
+ * A segment's ring is drawn inside it too, as segments abut. ToggleButtonGroup overlaps adjacent
+ * segments by 1 px, so the focused one is raised and a selected neighbour's fill never covers it.
+ */
+const RAISED_SEGMENT_Z_INDEX = 1;
+const SEGMENT_FOCUS_RING_STYLE: CSSObject = {
+    [FOCUS_VISIBLE_SELECTOR]: {
+        outlineOffset: -M3_FOCUS_RING_WIDTH_PX,
+        zIndex: RAISED_SEGMENT_Z_INDEX,
+    },
+};
+
 // The focus ring replaces MUI's pulsing focus ripple, which dims the label while it pulses.
 const NO_FOCUS_RIPPLE_PROPS = { disableFocusRipple: true } as const;
 
@@ -481,7 +493,8 @@ function BuildDisabledSegmentStyle(theme: StyleTheme): CSSObject {
 /**
  * One M3 segmented-button segment. Every segment gets the full extra-large radius and
  * ToggleButtonGroup squares the inner corners, so only the first and last segments keep
- * rounded outer corners, in either orientation.
+ * rounded outer corners, in either orientation. The focus ring follows those corners inside the
+ * segment, so it never covers a neighbour or the group's edge.
  */
 function BuildSegmentStyle({ theme }: ThemedStyleProps): CSSObject {
     const selectedStyle = {
@@ -489,6 +502,7 @@ function BuildSegmentStyle({ theme }: ThemedStyleProps): CSSObject {
         color: theme.palette.m3.onPrimaryContainer,
     };
     return {
+        ...SEGMENT_FOCUS_RING_STYLE,
         borderRadius: M3_SHAPE_SCALE.extraLarge,
         borderColor: theme.palette.m3.outline,
         // The M3 unselected-segment label role, in place of MUI's 54 % black action colour.
@@ -504,9 +518,12 @@ function BuildSegmentStyle({ theme }: ThemedStyleProps): CSSObject {
     };
 }
 
-/** A medium segment on the 4 dp grid: 12 px around its 20 px label, 46 px tall with its border. */
+/**
+ * A medium segment is 40 px tall like the M3 common button, its border included: 8 px above and
+ * below its 20 px label and 12 px beside it, on the 4 dp grid.
+ */
 function BuildMediumSegmentStyle({ theme }: ThemedStyleProps): CSSObject {
-    return { padding: theme.spacing(3) };
+    return { minHeight: M3_BUTTON_HEIGHT_PX, padding: theme.spacing(2, 3) };
 }
 
 /** The M3 focus indicator on every MUI button, segment, list item, menu item and icon button. */
@@ -935,18 +952,4 @@ export const VISUALLY_HIDDEN_STYLE: SxProps<Theme> = {
     position: "absolute",
     whiteSpace: "nowrap",
     width: "1px",
-};
-
-// Courier, the face the report PDF draws its print lines in, then the platform's fixed-pitch face.
-const PRINT_LINE_FONT_FAMILY = '"Courier New", Courier, monospace';
-
-/**
- * A CBTRN03C print line shown as the TRANREPT file prints it, as an sx style: a fixed-pitch face
- * at the M3 body-small size, every blank kept and no wrapping, so the column headings and the
- * 133-column dash rule line up as printed. A line wider than its table scrolls with the table.
- */
-export const PRINT_LINE_STYLE: SxProps<Theme> = {
-    ...M3_TYPE_SCALE.bodySmall,
-    fontFamily: PRINT_LINE_FONT_FAMILY,
-    whiteSpace: "pre",
 };

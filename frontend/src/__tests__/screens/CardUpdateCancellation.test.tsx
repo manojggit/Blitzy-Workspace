@@ -411,16 +411,21 @@ describe("COCRDUPC F3 during the entry fetch on /cards/update", () => {
     });
 });
 
+// The card is still unfetched and its card_ref held, so ENTER reads it again by the card_ref
+// (HandleAction), as no card number is on the screen to send.
 describe("COCRDUPC a cancelled entry fetch on /cards/update", () => {
     it("COCRDUPC a CanceledError shows no message and leaves the keys working", async () => {
         mockFetchCardForEdit.mockRejectedValueOnce(new CanceledError());
+        mockFetchCardForEdit.mockResolvedValueOnce(BuildCardScreen());
         const { user } = RenderPage(false);
         await WaitForRequestEnd();
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
         expect(screen.queryAllByRole("status")).toHaveLength(0);
         expect(screen.queryByText(ABEND_MESSAGE)).not.toBeInTheDocument();
         await ClickEnter(user);
-        await waitFor(() => expect(mockUpdateCard).toHaveBeenCalledTimes(1));
+        expect(await screen.findByDisplayValue(TEST_EMBOSSED_NAME)).toBeInTheDocument();
+        expect(mockFetchCardForEdit).toHaveBeenLastCalledWith(TEST_CARD_REF, TEST_ACCOUNT_ID);
+        expect(mockUpdateCard).not.toHaveBeenCalled();
     });
 });
 

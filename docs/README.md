@@ -716,7 +716,13 @@ resolve against the repository root.
 
 > **Warning:** the suite's global setup runs `carddemo-batch seed-all` against the database in
 > `backend/.env`, normally the local `carddemo` database. It reloads every loaded table and
-> abandons the open batch cycle, so it destroys any data you entered there.
+> abandons the open batch cycle, so it destroys any data you entered there. Global setup refuses
+> to seed, before any request or command, unless `APP_ENV` is `local` or `test`,
+> `SYNC_DATABASE_URL` has the host `127.0.0.1` as SQLAlchemy parses it, with no `host`,
+> `hostaddr` or `service` query parameter, and the environment sets neither `PGHOSTADDR` nor
+> `PGSERVICE`. It reads both settings as the batch CLI does, from the environment or else from
+> `backend/.env`, whose lines for them must be plain unquoted values with no comment. Every
+> `carddemo-batch` command that global setup or a spec runs is given the checked values.
 
 With the backend and frontend running as described above, to install the Playwright browser and
 run the suite:

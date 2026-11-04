@@ -282,6 +282,11 @@ framing and decoding are in [data-model.md](data-model.md#loader-decoding).
 - **Inputs → outputs.** `TRANSACT.BKUP(0)` and `SYSTRAN(0)`, merged in `tran_id` EBCDIC order →
     `TRANSACT.COMBINED(+1)` plus inserts into `transactions`.
 - **Durability and rerun class.** Atomic; not repeatable.
+- **Work files.** An input out of `tran_id` order is sorted with spilled runs, as DFSORT uses
+    work files. The runs go to a work directory, `carddemo-combtran-*.work`, in
+    `CARDDEMO_OUTPUT_DIR/gdg/TRANSACT.COMBINED/`, beside the generation's `.part` file. The job
+    removes it whatever its outcome; after a killed run, catalog recovery removes it
+    ([Recovery](#recovery)).
 - **Parameters.** None.
 - **Exit status.** 0, or 12 on a duplicate key, with full rollback. This replaces the legacy
     `REPRO` step.
@@ -587,8 +592,8 @@ The module's interface:
     counting `PUBLISHED` rows only. It refuses a base with a `LOST` row in the `OPEN` cycle.
 - `RollOff(context, base, limit=GDG_LIMIT)`: applies retention, rolling off every `PUBLISHED`
     generation older than the newest `limit`. `GDG_LIMIT` is 5, the `LIMIT 5` above.
-- `ReconcileCatalog(context)`: completes or condemns interrupted publications, then completes
-    interrupted retention for every base.
+- `ReconcileCatalog(context)`: completes or condemns interrupted publications, deletes orphan
+    `.part` files and work directories, then completes interrupted retention for every base.
 
 `context` is the command's `JobContext` (`batch/orchestration/job_context.py`): the job engine,
 the settings, the clock and the run's identity. `base` is a `GdgBase`, one of `gdg.TRANSACT_BKUP`,
@@ -606,6 +611,9 @@ interrupted runs are classified and before any resolution, skip or retention:
     becomes `PUBLISHED`;
 - any other `COMMITTED` row becomes `LOST`;
 - a `.part` file with no catalog row, left by a crash before commit, is deleted;
+- a work directory (`*.work`) in a base directory, such as the spill directory of a killed
+    COMBTRAN ([Step 16](#step-16-combtran)), is deleted with its contents. The batch window
+    admits one command, so no live job owns it;
 - `LIMIT 5` retention ([Retention](#retention-and-the-scratch-conflict)) is applied to every
     base, whether or not it gained a generation in this call;
 - the final file of a `ROLLED_OFF` generation of a `SCRATCH` base is deleted. TRANSACT.BKUP

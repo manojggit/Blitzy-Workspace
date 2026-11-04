@@ -49,8 +49,8 @@ export default defineConfig({
     // and video from here to blitzy/screenshots and blitzy/screen_recordings.
     outputDir: "test-results",
     use: {
-        // Must use host 127.0.0.1, like the API origin, or the SameSite=Lax session cookie is
-        // not sent; global setup checks that both hosts match.
+        // Must use host 127.0.0.1 and the API origin's scheme, or the SameSite=Lax session cookie
+        // is not sent; global setup refuses any other pair.
         baseURL: process.env.CARDDEMO_E2E_BASE_URL,
         // Tracing stays off: a trace records the sign-on request body and every fill value, so
         // it would store the passwords. The screenshot and video show the password field masked.

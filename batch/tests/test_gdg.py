@@ -7,7 +7,7 @@ CARDDEMO_OUTPUT_DIR/gdg/<BASE>/G####V00.dat with the batch.gdg_generations catal
 - Publication: .part, then the COMMITTED row with its SHA-256, then the rename to PUBLISHED; (0)
   and (-n) count PUBLISHED rows only, the DSN=...(0) references of jcl/COMBTRAN.jcl.
 - Recovery: ReconcileCatalog, at the start of every command, completes an interrupted rename,
-  marks a row whose file is gone LOST and deletes orphan .part files.
+  marks a row whose file is gone LOST and deletes orphan .part files and work directories.
 - LOST blocks the OPEN cycle: every command exits 12 naming the generation until run-all
   --new-cycle abandons the cycle and its LOST rows.
 - Abnormal disposition: DISP=(NEW,CATLG,DELETE) of DALYREJS(+1) and SYSTRAN(+1)
@@ -66,6 +66,9 @@ FORGED_SHA256 = "0" * 64
 INJECTED_PRODUCER_MESSAGE = "injected failure of a generation producer"
 INJECTED_ABEND_MESSAGE = "INJECTED POSTTRAN ABEND WITH DALYREJS(+1) OPEN"
 ORPHAN_GENERATION = 9
+# The work directory, with one run file, that a killed COMBTRAN's sort left in its base directory.
+ORPHAN_WORK_DIRECTORY_NAME = "carddemo-combtran-killed" + gdg.WORK_DIRECTORY_SUFFIX
+ORPHAN_RUN_FILE_NAME = "killed.run"
 # LIMIT(5) of jcl/DEFGDGB.jcl and catlg/LISTCAT.txt line 1637, stated here rather than read from
 # batch/orchestration/gdg.py, so a production limit other than 5 fails the retention tests.
 LEGACY_GDG_LIMIT = 5
@@ -442,6 +445,33 @@ def test_reconcile_deletes_orphan_part_file_without_catalog_row(jobContext: JobC
     assert summary == gdg.ReconcileSummary(published=0, lost=0, orphansDeleted=1)
     assert not orphanPath.exists()
     assert CatalogRows(jobContext.engine, gdg.SYSTRAN.name) == []
+
+
+def test_reconcile_deletes_orphan_work_directory_and_keeps_generation_files(
+    jobContext: JobContext,
+) -> None:
+    """A killed producer's *.work directory is deleted with its runs; generations are untouched.
+
+    The PUBLISHED generation beside it keeps its file and row, and a second reconcile finds
+    nothing to delete.
+    """
+    context = LedgeredContext(jobContext)
+    base = gdg.TRANSACT_COMBINED
+    [generation] = PublishGenerations(context, base, 1, FIRST_RECORD_TEXT)
+    workDirectory = context.settings.GdgDir() / base.name / ORPHAN_WORK_DIRECTORY_NAME
+    workDirectory.mkdir()
+    (workDirectory / ORPHAN_RUN_FILE_NAME).write_bytes(CORRUPT_FILE_BYTES)
+
+    summary = gdg.ReconcileCatalog(context)
+
+    expectedSummary = gdg.ReconcileSummary(
+        published=0, lost=0, orphansDeleted=0, workDirectoriesDeleted=1
+    )
+    assert summary == expectedSummary
+    assert BaseFileNames(context, base) == {FileName(generation)}
+    assert CatalogStates(context.engine, base.name) == {generation: run_ledger.GDG_PUBLISHED}
+    nothingDeleted = gdg.ReconcileSummary(published=0, lost=0, orphansDeleted=0)
+    assert gdg.ReconcileCatalog(context) == nothingDeleted
 
 
 def test_abnormal_disposition_discards_part_and_catalogs_nothing(jobContext: JobContext) -> None:

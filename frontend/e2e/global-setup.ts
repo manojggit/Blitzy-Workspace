@@ -9,11 +9,16 @@
 // Playwright runs the default export as globalSetup, and the function it returns as the global
 // teardown that publishes failure evidence. Both specs import the named helpers, so importing
 // this module performs no I/O: its top level only defines constants and functions.
-// Every setting comes from frontend/.env.e2e, which playwright.config.ts loads; user IDs and
-// passwords are read from the environment only and never appear in messages.
+// Every e2e setting comes from frontend/.env.e2e, which playwright.config.ts loads; user IDs and
+// passwords are read from the environment only and never appear in messages. APP_ENV and
+// SYNC_DATABASE_URL are read as the batch CLI reads them, from the environment or else from
+// plain unquoted backend/.env lines, and the URL as SQLAlchemy parses it. Every carddemo-batch
+// command that global setup or a spec runs is given the checked values, and no message repeats
+// them.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { parseEnv } from "node:util";
 
 import { expect, type FullConfig, type Page } from "@playwright/test";
 
@@ -137,13 +142,14 @@ export function AdminUser(): Credentials {
 
 /**
  * Runs carddemo-batch from the repository root with an argument array, never a shell string,
- * and the output root passed as an absolute path. The exit status is returned, not judged:
- * callers assert the status their step expects.
+ * and the output root passed as an absolute path. It first refuses a batch target that is not
+ * local, and gives the command the checked APP_ENV and SYNC_DATABASE_URL. The exit status is
+ * returned, not judged: callers assert the status their step expects.
  */
 export function RunBatchCli(args: readonly string[]): BatchRun {
     const result = spawnSync(ResolveRepoPath(RequireEnv("CARDDEMO_BATCH_BIN")), [...args], {
         cwd: REPO_ROOT,
-        env: { ...process.env, CARDDEMO_OUTPUT_DIR: OutputDir() },
+        env: BatchCliEnvironment(),
         encoding: "utf8",
         shell: false,
         timeout: BATCH_TIMEOUT_MS,
@@ -312,24 +318,308 @@ function ValidateEnvironment(): void {
     }
 }
 
-// The API sets the SameSite=Lax session cookie, so the browser sends it on the page's API calls
-// only while both origins share one host; ports do not count. The templates use 127.0.0.1 for
-// both, because localhost is another site and may resolve to IPv6 first.
-function ValidateSharedHost(): void {
-    const pageHost = RequireOrigin("CARDDEMO_E2E_BASE_URL").hostname;
-    const apiHost = RequireOrigin("CARDDEMO_E2E_API_URL").hostname;
-    if (pageHost !== apiHost) {
+// The one host of every local URL: localhost is another site and may resolve to IPv6 first.
+const LOCAL_HOSTNAME = "127.0.0.1";
+
+/** A parsed origin and the variable it came from, which a refusal names. */
+interface NamedOrigin {
+    name: RequiredVariable;
+    url: URL;
+}
+
+function RequireNamedOrigin(name: RequiredVariable): NamedOrigin {
+    return { name, url: RequireOrigin(name) };
+}
+
+// Names every origin whose host is not 127.0.0.1, with its parsed host only: RequireOrigin has
+// already refused user names and passwords.
+function DescribeNonLocalOrigins(origins: readonly NamedOrigin[]): string | undefined {
+    const nonLocalOrigins = origins.filter((origin) => origin.url.hostname !== LOCAL_HOSTNAME);
+    if (nonLocalOrigins.length === 0) {
+        return undefined;
+    }
+    const hosts = nonLocalOrigins.map((origin) => `${origin.name} (host ${origin.url.hostname})`);
+    return (
+        `${hosts.join(" and ")} must use host ${LOCAL_HOSTNAME}, or the SameSite=Lax session` +
+        " cookie is not sent."
+    );
+}
+
+// The API sets the SameSite=Lax session cookie, which the browser sends on the page's API calls
+// only when both origins are the same site: one host, 127.0.0.1, and one scheme, because
+// SameSite is schemeful. Ports do not count, so each clone may use its own.
+function ValidateLocalOrigins(): void {
+    const pageOrigin = RequireNamedOrigin("CARDDEMO_E2E_BASE_URL");
+    const apiOrigin = RequireNamedOrigin("CARDDEMO_E2E_API_URL");
+    const hostProblem = DescribeNonLocalOrigins([pageOrigin, apiOrigin]);
+    if (hostProblem !== undefined) {
+        throw new Error(hostProblem);
+    }
+    if (pageOrigin.url.protocol !== apiOrigin.url.protocol) {
         throw new Error(
-            `CARDDEMO_E2E_BASE_URL (host ${pageHost}) and CARDDEMO_E2E_API_URL (host ${apiHost})` +
-                " must use the same host, 127.0.0.1, or the session cookie is not sent.",
+            `CARDDEMO_E2E_BASE_URL (scheme ${pageOrigin.url.protocol}) and` +
+                ` CARDDEMO_E2E_API_URL (scheme ${apiOrigin.url.protocol}) must use the same` +
+                " scheme, or the SameSite=Lax session cookie is not sent.",
         );
     }
 }
 
-// Destructive to the database in backend/.env, normally the local carddemo database, as
-// docs/README.md warns: seed-all abandons the open batch cycle and reloads every loader, users
-// included. TRANFILE loads 0 rows, so transactions.transactions is left empty and the first
-// online add of day-in-the-life.spec.ts receives TRAN-ID 0000000000000001.
+// The two settings that decide which database a carddemo-batch command uses, resolved as
+// batch/config.BatchSettings resolves them: a nonempty process value, then a nonempty value in
+// backend/.env (app.core.paths.ENV_FILE), then the default, which only APP_ENV has.
+type BatchVariable = "APP_ENV" | "SYNC_DATABASE_URL";
+
+/** backend/.env as text and as parseEnv reads it; both empty when the file is absent. */
+interface BatchEnvFile {
+    text: string;
+    values: NodeJS.Dict<string>;
+}
+
+/**
+ * One batch CLI setting and the source it came from, undefined for both when unset.
+ * isPlainLine is false when backend/.env assigns the setting in a form that python-dotenv, the
+ * CLI's parser, may read differently from parseEnv.
+ */
+interface BatchSetting {
+    name: BatchVariable;
+    value: string | undefined;
+    source: string | undefined;
+    isPlainLine: boolean;
+}
+
+/** The checked APP_ENV and SYNC_DATABASE_URL that every carddemo-batch command is given. */
+interface BatchTarget {
+    appEnv: string;
+    syncDatabaseUrl: string;
+}
+
+const BATCH_ENV_FILE = path.join(REPO_ROOT, "backend", ".env");
+const BATCH_ENV_FILE_SOURCE = "backend/.env";
+const PROCESS_ENV_SOURCE = "the environment";
+// The CLI reads the environment alone when backend/.env is missing or is not a file.
+const ABSENT_FILE_ERROR_CODES: readonly string[] = ["ENOENT", "ENOTDIR", "EISDIR"];
+const DEFAULT_APP_ENV = "local";
+const BATCH_DEFAULTS: Readonly<Record<BatchVariable, string | undefined>> = {
+    APP_ENV: DEFAULT_APP_ENV,
+    SYNC_DATABASE_URL: undefined,
+};
+const SEEDABLE_APP_ENVS: readonly string[] = ["local", "test"];
+// The batch CLI parses SYNC_DATABASE_URL with SQLAlchemy's make_url, so this is the pattern of
+// sqlalchemy.engine.url._parse_url in SQLAlchemy 2.0.36. Python's re.match anchors it at the
+// start only, as "^" does here. Over printable ASCII, \w and "." match the same characters in
+// both languages, so the URL is refused unless it is printable ASCII.
+const PRINTABLE_ASCII_PATTERN = /^[\x21-\x7E]*$/;
+const SQLALCHEMY_URL_PATTERN = new RegExp(
+    [
+        String.raw`^(?<name>[\w\+]+)://`,
+        String.raw`(?:(?<username>[^:/]*)(?::(?<password>[^@]*))?@)?`,
+        String.raw`(?:(?:\[(?<ipv6host>[^/\?]+)\]|(?<ipv4host>[^/:\?]+))?(?::(?<port>[^/\?]*))?)?`,
+        String.raw`(?:/(?<database>[^\?]*))?`,
+        String.raw`(?:\?(?<query>.*))?`,
+    ].join(""),
+);
+// make_url converts a port that follows ":" with int(), and the CLI refuses the URL when that
+// fails, as it does for an empty port; only ASCII digits are accepted here.
+const PORT_PATTERN = /^[0-9]+$/;
+// libpq connects to the server these query parameters name, whatever host the URL carries.
+const HOST_OVERRIDE_PARAMETERS: readonly string[] = ["host", "hostaddr", "service"];
+// libpq reads these from the CLI's environment whenever the URL omits hostaddr or service, and
+// then connects to the server they give, whatever host the URL carries.
+const LIBPQ_ADDRESS_VARIABLES: readonly string[] = ["PGHOSTADDR", "PGSERVICE"];
+// python-dotenv expands ${NAME} in backend/.env values, so the value the CLI would use is unknown.
+const INTERPOLATION_MARKER = "${";
+const EDGE_BLANKS_PATTERN = /^[ \t]+|[ \t]+$/g;
+// A value that opens with a quote, which parseEnv also reads as quoting when it is a backtick.
+const QUOTE_START_PATTERN = /^["'`]/;
+const UNSET_PROBLEM = `is set in neither ${PROCESS_ENV_SOURCE} nor ${BATCH_ENV_FILE_SOURCE}`;
+const PLAIN_LINE_PROBLEM =
+    "must be a plain unquoted value with no comment, so global setup reads it as the batch CLI" +
+    " does";
+const BATCH_TARGET_HINT =
+    "carddemo-batch, whose seed-all resets its database, runs only with APP_ENV local or test and" +
+    ` a SYNC_DATABASE_URL whose host, as SQLAlchemy parses it, is ${LOCAL_HOSTNAME}. Both are` +
+    " read as the CLI reads them, from the environment or else from plain unquoted backend/.env" +
+    " lines, and every command is given the values checked. carddemo-batch was not started.";
+
+// Node's file-system errors name their errno in code; any other failure propagates.
+function IsAbsentFileError(error: unknown): boolean {
+    if (typeof error !== "object" || error === null || !("code" in error)) {
+        return false;
+    }
+    return typeof error.code === "string" && ABSENT_FILE_ERROR_CODES.includes(error.code);
+}
+
+function ReadBatchEnvFile(): BatchEnvFile {
+    try {
+        const text = fs.readFileSync(BATCH_ENV_FILE, "utf8");
+        return { text, values: parseEnv(text) };
+    } catch (error) {
+        if (IsAbsentFileError(error)) {
+            return { text: "", values: {} };
+        }
+        throw error;
+    }
+}
+
+// The lines python-dotenv reads as assigning name: optional leading whitespace and export, then
+// the name, bare or in single quotes, then "=". The pattern is built from the fixed name only.
+function AssignmentPattern(name: BatchVariable): RegExp {
+    return new RegExp(
+        String.raw`^[^\S\r\n]*(?:export[^\S\r\n]+)?(?:${name}|'${name}')[^\S\r\n]*=(.*)$`,
+        "gm",
+    );
+}
+
+// The text after "=" on the last line of backend/.env that assigns name, trimmed of spaces and
+// tabs, or undefined when no line does. Both dotenv parsers keep the last assignment.
+function LastAssignedText(text: string, name: BatchVariable): string | undefined {
+    const assignments = [...text.matchAll(AssignmentPattern(name))];
+    return assignments.at(-1)?.[1]?.replace(EDGE_BLANKS_PATTERN, "");
+}
+
+// pydantic-settings skips an empty value (env_ignore_empty), so the next source supplies it.
+function IsNonEmpty(value: string | undefined): value is string {
+    return value !== undefined && value !== "";
+}
+
+// A file value is plain when its last assignment is unquoted and parseEnv returns exactly its
+// raw text. It then holds no "#" either, and python-dotenv reads the same text; the value
+// checks refuse any edge whitespace other than spaces and tabs, which only python-dotenv trims.
+function IsPlainAssignment(envFile: BatchEnvFile, name: BatchVariable): boolean {
+    const assignedText = LastAssignedText(envFile.text, name);
+    if (assignedText !== undefined && QUOTE_START_PATTERN.test(assignedText)) {
+        return false;
+    }
+    return assignedText === envFile.values[name];
+}
+
+function ResolveBatchSetting(name: BatchVariable, envFile: BatchEnvFile): BatchSetting {
+    const processValue = process.env[name];
+    if (IsNonEmpty(processValue)) {
+        return { name, value: processValue, source: PROCESS_ENV_SOURCE, isPlainLine: true };
+    }
+    const fileValue = envFile.values[name];
+    const isPlainLine = IsPlainAssignment(envFile, name);
+    if (IsNonEmpty(fileValue) || !isPlainLine) {
+        return { name, value: fileValue, source: BATCH_ENV_FILE_SOURCE, isPlainLine };
+    }
+    return { name, value: BATCH_DEFAULTS[name], source: undefined, isPlainLine };
+}
+
+function DescribeAppEnvProblem(value: string): string | undefined {
+    if (SEEDABLE_APP_ENVS.includes(value)) {
+        return undefined;
+    }
+    return "is not local or test";
+}
+
+// The query keys make_url keeps and psycopg2 hands to libpq. parse_qsl splits on "&", decodes
+// "%" and "+", and drops a pair whose value is empty or missing. The leading "&" keeps a "?"
+// that opens the query in the first key, as parse_qsl does, where URLSearchParams drops it.
+function QueryKeys(query: string): string[] {
+    const pairs = [...new URLSearchParams(`&${query}`)];
+    return pairs.filter(([, value]) => value !== "").map(([key]) => key);
+}
+
+// Regular expressions decide without raising, and no message holds the URL, which holds the
+// database password.
+function DescribeDatabaseUrlProblem(value: string): string | undefined {
+    if (!PRINTABLE_ASCII_PATTERN.test(value)) {
+        return "must hold printable ASCII characters only, with no spaces";
+    }
+    const parts = SQLALCHEMY_URL_PATTERN.exec(value)?.groups;
+    if (parts === undefined || (parts.port !== undefined && !PORT_PATTERN.test(parts.port))) {
+        return "is not a valid URL";
+    }
+    if ((parts.ipv4host ?? parts.ipv6host) !== LOCAL_HOSTNAME) {
+        return `must use host ${LOCAL_HOSTNAME}`;
+    }
+    const queryKeys = parts.query === undefined ? [] : QueryKeys(parts.query);
+    if (queryKeys.some((key) => HOST_OVERRIDE_PARAMETERS.includes(key))) {
+        return "must not set host, hostaddr or service in its query";
+    }
+    return undefined;
+}
+
+function DescribeBatchValueProblem(
+    setting: BatchSetting,
+    value: string,
+    describeValueProblem: (value: string) => string | undefined,
+): string | undefined {
+    if (setting.source === BATCH_ENV_FILE_SOURCE && value.includes(INTERPOLATION_MARKER)) {
+        return `contains ${INTERPOLATION_MARKER}, which the batch CLI expands from other variables`;
+    }
+    return describeValueProblem(value);
+}
+
+// The message names the variable, its source and the rule broken, never the value: the
+// database URL holds a password.
+function RefuseBatchSetting(setting: BatchSetting, problem: string): never {
+    const sourcePhrase = setting.source === undefined ? "" : ` from ${setting.source}`;
+    throw new Error(`${setting.name}${sourcePhrase} ${problem}: ${BATCH_TARGET_HINT}`);
+}
+
+function RequireLocalBatchSetting(
+    setting: BatchSetting,
+    describeValueProblem: (value: string) => string | undefined,
+): string {
+    if (!setting.isPlainLine) {
+        RefuseBatchSetting(setting, PLAIN_LINE_PROBLEM);
+    }
+    if (setting.value === undefined) {
+        RefuseBatchSetting(setting, UNSET_PROBLEM);
+    }
+    const problem = DescribeBatchValueProblem(setting, setting.value, describeValueProblem);
+    if (problem !== undefined) {
+        RefuseBatchSetting(setting, problem);
+    }
+    return setting.value;
+}
+
+function RequireNoLibpqAddressOverride(): void {
+    const setNames = LIBPQ_ADDRESS_VARIABLES.filter((name) => IsNonEmpty(process.env[name]));
+    if (setNames.length > 0) {
+        throw new Error(
+            `${setNames.join(" and ")} from the environment must be unset, or libpq ignores the` +
+                ` host of SYNC_DATABASE_URL: ${BATCH_TARGET_HINT}`,
+        );
+    }
+}
+
+// The batch CLI refuses production only at its DUSRSECJ step, after the earlier loaders have
+// replaced their tables. So before any command, the settings the CLI would read must name a
+// local, non-production database. They are returned, checked, for the command to be given.
+function RequireLocalBatchTarget(): BatchTarget {
+    const envFile = ReadBatchEnvFile();
+    const appEnv = RequireLocalBatchSetting(
+        ResolveBatchSetting("APP_ENV", envFile),
+        DescribeAppEnvProblem,
+    );
+    const syncDatabaseUrl = RequireLocalBatchSetting(
+        ResolveBatchSetting("SYNC_DATABASE_URL", envFile),
+        DescribeDatabaseUrlProblem,
+    );
+    RequireNoLibpqAddressOverride();
+    return { appEnv, syncDatabaseUrl };
+}
+
+// BatchSettings takes a nonempty process value over backend/.env, so the command uses exactly
+// the target checked here, whatever its own dotenv parser would read from the file.
+function BatchCliEnvironment(): NodeJS.ProcessEnv {
+    const target = RequireLocalBatchTarget();
+    return {
+        ...process.env,
+        APP_ENV: target.appEnv,
+        SYNC_DATABASE_URL: target.syncDatabaseUrl,
+        CARDDEMO_OUTPUT_DIR: OutputDir(),
+    };
+}
+
+// Destructive, as docs/README.md warns, to the database SYNC_DATABASE_URL names, which
+// RunBatchCli confirms is on host 127.0.0.1 with APP_ENV local or test before it starts the CLI:
+// seed-all abandons the open batch cycle and reloads every loader, users included. TRANFILE
+// loads 0 rows, so transactions.transactions is left empty and the first online add of
+// day-in-the-life.spec.ts receives TRAN-ID 0000000000000001.
 function SeedSampleData(): void {
     const seedArgs = ["seed-all"] as const;
     const run = RunBatchCli(seedArgs);
@@ -403,13 +693,16 @@ function PublishFailureEvidence(config: FullConfig): void {
 }
 
 /**
- * Validates the settings, waits for the backend and seeds the sample data. The returned
- * function is Playwright's global teardown: once every test has finished, it copies each
- * failed test's screenshots to blitzy/screenshots and videos to blitzy/screen_recordings.
+ * Validates the settings, the two origins and the batch CLI's database target, then waits for
+ * the backend and seeds the sample data: no request is made and no command runs until every
+ * check has passed. The returned function is Playwright's global teardown: once every test has
+ * finished, it copies each failed test's screenshots to blitzy/screenshots and videos to
+ * blitzy/screen_recordings.
  */
 export default async function GlobalSetup(config: FullConfig): Promise<() => void> {
     ValidateEnvironment();
-    ValidateSharedHost();
+    ValidateLocalOrigins();
+    RequireLocalBatchTarget();
     await WaitForBackendReady();
     SeedSampleData();
     return () => {
