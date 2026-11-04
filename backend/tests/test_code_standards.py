@@ -6,13 +6,19 @@ included), import none of them, and need no database and no fixture:
 
 - Naming (clause 1): classes, type aliases and functions are PascalCase, parameters and
   variables camelCase, and module-level assignments UPPER_CASE constants. Identifiers a
-  framework dictates keep their form; each exemption set below names its framework. Class-body
-  attributes are not checked, because ORM columns, Pydantic fields, Settings environment
-  fields, dataclass fields and enum members keep their fixed names.
+  framework dictates keep their form; each exemption set below names its framework. A
+  framework-dictated function name leaves its parameters camelCase unless the framework also
+  names them. pytest and pytest-asyncio fixtures, whatever name their decorator is imported
+  under, are PascalCase functions whose decorator declares a camelCase name= string literal, so
+  injected parameters stay camelCase; a producer named like a test, hook or dunder is not
+  exempt. Class-body attributes are not checked, because ORM columns, Pydantic fields, Settings
+  environment fields, dataclass fields and enum members keep their fixed names.
 - Size (clause 3): a function body, its docstring excluded, spans at most 20 lines, and a
-  function takes at most four parameters, counted as ruff's PLR0913 counts them (receiver,
-  *args and **kwargs excluded). Only a signature a framework fixes is exempt from the parameter
-  limit, so pytest test functions and constructors are counted.
+  function takes at most four parameters: positional and keyword-only ones, excluding a self or
+  cls receiver, *args and **kwargs. A framework-dictated function name does not exempt its
+  parameters, so test functions, hooks, sunder and dunder methods and constructors are counted.
+  Only a class-body override declaring exactly a signature in FIXED_FRAMEWORK_SIGNATURES is
+  exempt from the parameter limit.
 - Source references (clause 5, Section 0.11.3): every ported module under backend/app/services,
   batch/jobs and batch/loaders opens with a "Replaces:" docstring naming a legacy artefact.
 - Traceability (Section 0.11.3): the program-to-module map in docs/traceability.md lists each
@@ -88,6 +94,8 @@ MAX_PARAMETERS = 4
 PASCAL_CASE_PATTERN = re.compile(r"^_{0,2}[A-Z][A-Za-z0-9]*$")
 # The bare "_" is the conventional throwaway name, so it counts as camelCase.
 CAMEL_CASE_PATTERN = re.compile(r"^(?:_|_{0,2}[a-z][A-Za-z0-9]*)$")
+# A fixture alias is the parameter name tests inject, so the bare "_" throwaway is not one.
+FIXTURE_ALIAS_PATTERN = re.compile(r"^_{0,2}[a-z][A-Za-z0-9]*$")
 UPPER_CASE_PATTERN = re.compile(r"^_{0,2}[A-Z][A-Z0-9_]*$")
 DUNDER_PATTERN = re.compile(r"^__[a-z0-9_]+__$")
 # Enum hooks such as _missing_ and _generate_next_value_.
@@ -144,9 +152,21 @@ FRAMEWORK_METHOD_NAMES = frozenset(
         "generic_visit",
     }
 )
-RECEIVER_NAMES = frozenset({"self", "cls", "mcs"})
+RECEIVER_NAMES = frozenset({"self", "cls"})
 # Python fixes only the name of these dunders; the class author writes their parameters.
 AUTHOR_SIGNATURE_DUNDERS = frozenset({"__init__", "__new__", "__call__"})
+# pydantic-settings calls BaseSettings.settings_customise_sources with these keywords (from
+# BaseSettings._settings_build_values in the pinned 2.7.1), so an override declares exactly them.
+# No other framework callback overridden here takes more than four parameters.
+FIXED_FRAMEWORK_SIGNATURES: dict[str, tuple[str, ...]] = {
+    "settings_customise_sources": (
+        "settings_cls",
+        "init_settings",
+        "env_settings",
+        "dotenv_settings",
+        "file_secret_settings",
+    ),
+}
 # pytest built-in fixtures, injected by parameter name.
 PYTEST_BUILTIN_FIXTURE_PARAMETERS = frozenset(
     {
@@ -158,6 +178,10 @@ PYTEST_BUILTIN_FIXTURE_PARAMETERS = frozenset(
         "doctest_namespace",
     }
 )
+# pytest and pytest-asyncio: fixture(...) from either module declares the injected name in name=.
+FIXTURE_DECORATOR_MODULES = frozenset({"pytest", "pytest_asyncio"})
+FIXTURE_DECORATOR_NAME = "fixture"
+FIXTURE_ALIAS_KEYWORD = "name"
 # Python's property protocol: an accessor is an attribute, so camelCase is accepted.
 PROPERTY_DECORATORS = frozenset({"property", "cached_property"})
 PROPERTY_ACCESSOR_ATTRIBUTES = frozenset({"setter", "getter", "deleter"})
@@ -196,6 +220,19 @@ class SourceModule:
     tree: ast.Module | None
     error: str
 
+
+@dataclass(frozen=True)
+class FixtureBindings:
+    """Names that reach a fixture decorator: module names for module.fixture, bare callee names."""
+
+    moduleNames: frozenset[str]
+    functionNames: frozenset[str]
+
+
+# pytest.fixture, pytest_asyncio.fixture and a bare fixture, recognised whatever a module imports.
+CANONICAL_FIXTURE_BINDINGS = FixtureBindings(
+    FIXTURE_DECORATOR_MODULES, frozenset({FIXTURE_DECORATOR_NAME})
+)
 
 type Checker = Callable[[SourceModule], list[Violation]]
 
@@ -316,19 +353,23 @@ def IsFrameworkMandated(function: FunctionNode, parentIsClass: bool, module: Sou
     return parentIsClass and (name in FRAMEWORK_METHOD_NAMES or bool(VISITOR_PATTERN.match(name)))
 
 
-def IsSignatureDictated(function: FunctionNode, parentIsClass: bool, module: SourceModule) -> bool:
-    """Whether the framework also fixes the parameters, both their names and their count.
+def HasFrameworkParameterNames(
+    function: FunctionNode, parentIsClass: bool, module: SourceModule
+) -> bool:
+    """Whether a framework, not the author, names the function's parameters.
 
-    Two kinds of framework-named function are still checked, because their authors choose the
-    parameters: pytest's test_* functions, whose parameters are the fixture names the suite
-    author selects, declared camelCase through pytest.fixture(name=...); and the constructors
-    and __call__ in AUTHOR_SIGNATURE_DUNDERS, whose parameters the class author writes.
+    These are the dunders outside AUTHOR_SIGNATURE_DUNDERS, whose parameters Python's data model
+    fixes; the pytest_* hooks in the test trees, whose arguments pluggy binds by name; and the
+    class-body FRAMEWORK_METHOD_NAMES and visit_* overrides, whose base class names them. A
+    framework that fixes only the function name, as for use* hooks, sunder methods and test_*
+    functions, leaves the parameters to the author, so they stay camelCase.
     """
-    if IsInTestTree(module) and TEST_FUNCTION_PATTERN.match(function.name):
-        return False
-    if function.name in AUTHOR_SIGNATURE_DUNDERS:
-        return False
-    return IsFrameworkMandated(function, parentIsClass, module)
+    name = function.name
+    if DUNDER_PATTERN.match(name):
+        return name not in AUTHOR_SIGNATURE_DUNDERS
+    if IsInTestTree(module) and PYTEST_HOOK_PATTERN.match(name):
+        return True
+    return parentIsClass and (name in FRAMEWORK_METHOD_NAMES or bool(VISITOR_PATTERN.match(name)))
 
 
 def IsPropertyAccessor(function: FunctionNode) -> bool:
@@ -353,8 +394,14 @@ def CheckClassNames(module: SourceModule) -> list[Violation]:
 
 
 def IsAcceptedFunctionName(
-    function: FunctionNode, parentIsClass: bool, module: SourceModule
+    function: FunctionNode, parentIsClass: bool, module: SourceModule, bindings: FixtureBindings
 ) -> bool:
+    """A fixture producer is PascalCase even in a framework-exempt form such as test_* or use*.
+
+    pytest injects a fixture by its name= alias, so no framework calls the producer by its name.
+    """
+    if FixtureDecorator(function, bindings) is not None:
+        return bool(PASCAL_CASE_PATTERN.match(function.name))
     if IsFrameworkMandated(function, parentIsClass, module):
         return True
     if IsPropertyAccessor(function) and CAMEL_CASE_PATTERN.match(function.name):
@@ -363,10 +410,11 @@ def IsAcceptedFunctionName(
 
 
 def CheckFunctionNames(module: SourceModule) -> list[Violation]:
+    bindings = ModuleFixtureBindings(module)
     return [
         NameViolation(module, function, f"function {function.name!r} is not PascalCase")
         for function, parentIsClass in IterFunctions(module.tree)
-        if not IsAcceptedFunctionName(function, parentIsClass, module)
+        if not IsAcceptedFunctionName(function, parentIsClass, module, bindings)
     ]
 
 
@@ -396,11 +444,107 @@ def ParameterViolations(owner: ParameterOwner, module: SourceModule) -> list[Vio
 def CheckParameterNames(module: SourceModule) -> list[Violation]:
     violations: list[Violation] = []
     for function, parentIsClass in IterFunctions(module.tree):
-        if not IsSignatureDictated(function, parentIsClass, module):
+        if not HasFrameworkParameterNames(function, parentIsClass, module):
             violations.extend(ParameterViolations(function, module))
     for node in ast.walk(module.tree):
         if isinstance(node, ast.Lambda):
             violations.extend(ParameterViolations(node, module))
+    return violations
+
+
+def IsFixtureModule(dottedName: str) -> bool:
+    """pytest, pytest_asyncio, or a submodule of either, such as pytest_asyncio.plugin."""
+    return dottedName.split(".")[0] in FIXTURE_DECORATOR_MODULES
+
+
+def ImportedModuleNames(statement: ast.Import) -> Iterator[str]:
+    """Names an import statement binds to a fixture module: import pytest_asyncio as pa binds pa."""
+    for alias in statement.names:
+        if IsFixtureModule(alias.name):
+            yield alias.asname or alias.name.split(".")[0]
+
+
+def ImportedFunctionNames(statement: ast.ImportFrom) -> Iterator[str]:
+    """Names a from-import binds to fixture: from pytest import fixture as Fixture binds Fixture."""
+    if statement.level == 0 and IsFixtureModule(statement.module or ""):
+        for alias in statement.names:
+            if alias.name == FIXTURE_DECORATOR_NAME:
+                yield alias.asname or alias.name
+
+
+def ModuleFixtureBindings(module: SourceModule) -> FixtureBindings:
+    """The canonical spellings plus the names any import in the module binds to a fixture.
+
+    Every import counts, including those inside functions and if TYPE_CHECKING blocks.
+    """
+    moduleNames = set(CANONICAL_FIXTURE_BINDINGS.moduleNames)
+    functionNames = set(CANONICAL_FIXTURE_BINDINGS.functionNames)
+    for node in ast.walk(module.tree):
+        if isinstance(node, ast.Import):
+            moduleNames.update(ImportedModuleNames(node))
+        elif isinstance(node, ast.ImportFrom):
+            functionNames.update(ImportedFunctionNames(node))
+    return FixtureBindings(frozenset(moduleNames), frozenset(functionNames))
+
+
+def DottedRoot(node: ast.expr) -> str:
+    """The leading identifier of a dotted name: pytest_asyncio in pytest_asyncio.plugin."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def IsFixtureDecoratorCallee(callee: ast.expr, bindings: FixtureBindings) -> bool:
+    """fixture called through a name bound to it, or as an attribute of a fixture module."""
+    if isinstance(callee, ast.Name):
+        return callee.id in bindings.functionNames
+    return (
+        isinstance(callee, ast.Attribute)
+        and callee.attr == FIXTURE_DECORATOR_NAME
+        and DottedRoot(callee.value) in bindings.moduleNames
+    )
+
+
+def FixtureDecorator(
+    function: FunctionNode, bindings: FixtureBindings = CANONICAL_FIXTURE_BINDINGS
+) -> ast.expr | None:
+    """The fixture decorator on a function, bare (@pytest.fixture) or called (@pytest.fixture()).
+
+    Without a module's own bindings, only the canonical spellings are recognised.
+    """
+    for decorator in function.decorator_list:
+        callee = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if IsFixtureDecoratorCallee(callee, bindings):
+            return decorator
+    return None
+
+
+def FixtureAliasProblem(decorator: ast.expr) -> str:
+    """Why a fixture decorator's name= alias breaks the convention, or "" when it is camelCase."""
+    keywords = decorator.keywords if isinstance(decorator, ast.Call) else []
+    aliases = [keyword.value for keyword in keywords if keyword.arg == FIXTURE_ALIAS_KEYWORD]
+    if not aliases:
+        return "declares no camelCase name= alias"
+    if not isinstance(aliases[0], ast.Constant) or not isinstance(aliases[0].value, str):
+        return "name= alias is not a string literal"
+    if not FIXTURE_ALIAS_PATTERN.fullmatch(aliases[0].value):
+        return f"name= alias {aliases[0].value!r} is not camelCase"
+    return ""
+
+
+def CheckFixtureNames(module: SourceModule) -> list[Violation]:
+    """Each fixture declares, as a string literal, the camelCase name its consumers inject.
+
+    The PascalCase form of the producing function itself is CheckFunctionNames' concern.
+    """
+    bindings = ModuleFixtureBindings(module)
+    violations: list[Violation] = []
+    for function, _ in IterFunctions(module.tree):
+        decorator = FixtureDecorator(function, bindings)
+        problem = FixtureAliasProblem(decorator) if decorator is not None else ""
+        if problem:
+            message = f"fixture {function.name!r} {problem}"
+            violations.append(NameViolation(module, function, message))
     return violations
 
 
@@ -560,19 +704,25 @@ def CheckFunctionLength(module: SourceModule) -> list[Violation]:
     return violations
 
 
-def CountParameters(function: FunctionNode) -> int:
-    """Positional and keyword-only parameters, excluding a receiver, *args and **kwargs."""
+def CountedParameterNames(function: FunctionNode) -> tuple[str, ...]:
+    """Positional and keyword-only parameter names, without a self or cls receiver or variadics."""
     positional = [*function.args.posonlyargs, *function.args.args]
     if positional and positional[0].arg in RECEIVER_NAMES:
         positional = positional[1:]
-    return len(positional) + len(function.args.kwonlyargs)
+    return tuple(parameter.arg for parameter in (*positional, *function.args.kwonlyargs))
+
+
+def HasFixedFrameworkSignature(function: FunctionNode, parentIsClass: bool) -> bool:
+    """A class-body override declaring exactly the parameters its framework passes."""
+    fixedNames = FIXED_FRAMEWORK_SIGNATURES.get(function.name)
+    return parentIsClass and CountedParameterNames(function) == fixedNames
 
 
 def CheckParameterCount(module: SourceModule) -> list[Violation]:
     violations: list[Violation] = []
     for function, parentIsClass in IterFunctions(module.tree):
-        count = CountParameters(function)
-        if count > MAX_PARAMETERS and not IsSignatureDictated(function, parentIsClass, module):
+        count = len(CountedParameterNames(function))
+        if count > MAX_PARAMETERS and not HasFixedFrameworkSignature(function, parentIsClass):
             message = (
                 f"function {function.name!r} takes {count} parameters (limit {MAX_PARAMETERS})"
             )
@@ -696,6 +846,7 @@ NAMING_CHECKERS: tuple[Checker, ...] = (
     CheckClassNames,
     CheckFunctionNames,
     CheckParameterNames,
+    CheckFixtureNames,
     CheckLocalNames,
     CheckModuleNames,
 )
@@ -747,32 +898,200 @@ VIOLATING_SOURCE = textwrap.dedent(
             self.recordId = record_id
 
 
+    def useFiveParameters(first, second, third, fourth, fifth):
+        return first
+
+
+    def useSnakeParameter(account_id):
+        return account_id
+
+
+    def _five_parameters_(first, second, third, fourth, fifth):
+        return first
+
+
+    class FiveParameterMeta(type):
+        def Build(mcs, first, second, third, fourth):
+            return first
+
+
+    class FiveParameterOverrides:
+        def filter(self, first, second, third, fourth, fifth):
+            return first
+
+        def copy(self, first, second, third, fourth, fifth):
+            return first
+
+        @classmethod
+        def settings_customise_sources(
+            cls,
+            settings_cls,
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+            extra_settings,
+        ):
+            return (init_settings,)
+
+
     """
 ) + NumberedFunctionSource("LongFunction", MAX_FUNCTION_BODY_LINES + 1)
 VIOLATING_TEST_PATH = "backend/tests/unit/test_violations.py"
-VIOLATING_SOURCES = {
-    VIOLATING_PATH: VIOLATING_SOURCE,
-    VIOLATING_TEST_PATH: (
-        "def test_x(account_id):\n    return account_id\n\n\n"
-        "def test_five(one, two, three, four, five):\n    return one\n"
-    ),
-}
+VIOLATING_TEST_SOURCE = textwrap.dedent(
+    """
+    import pytest
+    import pytest as pt
+    import pytest_asyncio
+    import pytest_asyncio as pa
+    import pytest_asyncio.plugin
+    from pytest import fixture
+    from pytest import fixture as SyncFixture
+    from pytest_asyncio import fixture as AsyncFixture
+
+    ALIAS_NAME = "nonLiteralAlias"
+
+
+    @pytest.fixture(name="snake_fixture")
+    def SnakeAliasFixture():
+        return 1
+
+
+    @pytest.fixture
+    def ImplicitNameFixture():
+        return 1
+
+
+    @pytest_asyncio.fixture(scope="module")
+    async def AsyncImplicitFixture():
+        return 1
+
+
+    @fixture(name="PascalAlias")
+    def PascalAliasFixture():
+        return 1
+
+
+    @pytest.fixture(name=ALIAS_NAME)
+    def NonLiteralAliasFixture():
+        return 1
+
+
+    @pytest.fixture(name="snakeProducer")
+    def snake_producer():
+        return 1
+
+
+    @pt.fixture(name="aliased_snake")
+    def AliasedModuleSnakeFixture():
+        return 1
+
+
+    @pa.fixture
+    async def AliasedModuleImplicitFixture():
+        return 1
+
+
+    @pytest_asyncio.plugin.fixture
+    async def SubmoduleImplicitFixture():
+        return 1
+
+
+    @SyncFixture(name="renamed_snake")
+    def RenamedSnakeFixture():
+        return 1
+
+
+    @AsyncFixture
+    async def RenamedImplicitFixture():
+        return 1
+
+
+    @pytest.fixture(name="newlineAlias\\n")
+    def NewlineAliasFixture():
+        return 1
+
+
+    @pytest.fixture(name="hookProducer")
+    def useHookProducer():
+        return 1
+
+
+    @pytest.fixture(name="testProducer")
+    def test_producer():
+        return 1
+
+
+    def test_x(account_id):
+        return account_id
+
+
+    def test_five(one, two, three, four, five):
+        return one
+    """
+)
+VIOLATING_SOURCES = {VIOLATING_PATH: VIOLATING_SOURCE, VIOLATING_TEST_PATH: VIOLATING_TEST_SOURCE}
 
 EXEMPT_SOURCES = (
     pytest.param(
         """
+        import pytest
+        import pytest_asyncio
+        from pytest import fixture
+
         pytestmark = []
 
 
+        @pytest.fixture(name="demoFixture")
         def DemoFixture(tmp_path):
             return tmp_path
 
 
-        def test_x(demoFixture):
+        @pytest_asyncio.fixture(name="asyncDemo", scope="module")
+        async def AsyncDemo():
+            return 1
+
+
+        @fixture(name="bareDemo")
+        def BareDemo():
+            return 1
+
+
+        @pytest.mark.usefixtures("demoFixture")
+        def test_x(demoFixture, asyncDemo, bareDemo):
             return demoFixture
         """,
         "backend/tests/unit/test_demo.py",
-        id="pytest-test-function-and-builtin-fixture",
+        id="pytest-fixture-aliases-test-function-and-builtin-fixture",
+    ),
+    pytest.param(
+        """
+        import pytest as pt
+        import pytest_asyncio.plugin
+        from pytest_asyncio import fixture as asyncFixture
+
+
+        @pt.fixture(name="aliasedDemo")
+        def AliasedDemo():
+            return 1
+
+
+        @asyncFixture(name="renamedDemo")
+        async def RenamedDemo():
+            return 1
+
+
+        @pytest_asyncio.plugin.fixture(name="submoduleDemo")
+        async def SubmoduleDemo():
+            return 1
+
+
+        @pt.mark.usefixtures("aliasedDemo")
+        def test_x(aliasedDemo, renamedDemo, submoduleDemo):
+            return aliasedDemo
+        """,
+        "backend/tests/unit/test_demo_aliases.py",
+        id="aliased-and-renamed-fixture-imports-and-aliased-usefixtures-mark",
     ),
     pytest.param(
         """
@@ -833,6 +1152,33 @@ EXEMPT_SOURCES = (
         "backend/app/core/demo_settings.py",
         id="pydantic-settings-fixed-signature",
     ),
+    pytest.param(
+        """
+        import enum
+
+        import click
+
+
+        class DemoCommand(click.Command):
+            def make_context(self, info_name, args, parent=None, **extra):
+                return super().make_context(info_name, args, parent, **extra)
+
+
+        class DemoResource:
+            def __exit__(self, excType, excValue, traceback):
+                return None
+
+
+        class DemoStatus(enum.Enum):
+            ACTIVE = "Y"
+
+            @classmethod
+            def _missing_(cls, value):
+                return None
+        """,
+        "backend/app/core/demo_overrides.py",
+        id="framework-fixed-parameter-names",
+    ),
 )
 
 PROGRAM_MAP_DEFECTS = (
@@ -868,6 +1214,10 @@ def test_parameters_and_local_variables_are_camel_case() -> None:
     AssertNoViolations(CollectViolations((CheckParameterNames, CheckLocalNames)))
 
 
+def test_fixtures_declare_camel_case_injection_names() -> None:
+    AssertNoViolations(CollectViolations((CheckFixtureNames,)))
+
+
 def test_module_level_names_are_upper_case_constants() -> None:
     AssertNoViolations(CollectViolations((CheckModuleNames,)))
 
@@ -900,9 +1250,54 @@ def test_traceability_program_map_matches_ported_modules() -> None:
         (VIOLATING_PATH, "function 'FiveParameters' takes 5 parameters"),
         (VIOLATING_PATH, "function '__init__' takes 5 parameters"),
         (VIOLATING_PATH, "parameter 'record_id' of '__init__' is not camelCase"),
+        (VIOLATING_PATH, "function 'useFiveParameters' takes 5 parameters"),
+        (VIOLATING_PATH, "parameter 'account_id' of 'useSnakeParameter' is not camelCase"),
+        (VIOLATING_PATH, "function '_five_parameters_' takes 5 parameters"),
+        (VIOLATING_PATH, "function 'Build' takes 5 parameters"),
+        (VIOLATING_PATH, "function 'filter' takes 5 parameters"),
+        (VIOLATING_PATH, "function 'copy' takes 5 parameters"),
+        (VIOLATING_PATH, "function 'settings_customise_sources' takes 6 parameters"),
         (VIOLATING_PATH, "lacks a 'Replaces:' header"),
         (VIOLATING_TEST_PATH, "parameter 'account_id' of 'test_x' is not camelCase"),
         (VIOLATING_TEST_PATH, "function 'test_five' takes 5 parameters"),
+        (
+            VIOLATING_TEST_PATH,
+            "fixture 'SnakeAliasFixture' name= alias 'snake_fixture' is not camelCase",
+        ),
+        (VIOLATING_TEST_PATH, "fixture 'ImplicitNameFixture' declares no camelCase name= alias"),
+        (VIOLATING_TEST_PATH, "fixture 'AsyncImplicitFixture' declares no camelCase name= alias"),
+        (
+            VIOLATING_TEST_PATH,
+            "fixture 'PascalAliasFixture' name= alias 'PascalAlias' is not camelCase",
+        ),
+        (
+            VIOLATING_TEST_PATH,
+            "fixture 'NonLiteralAliasFixture' name= alias is not a string literal",
+        ),
+        (VIOLATING_TEST_PATH, "function 'snake_producer' is not PascalCase"),
+        (
+            VIOLATING_TEST_PATH,
+            "fixture 'AliasedModuleSnakeFixture' name= alias 'aliased_snake' is not camelCase",
+        ),
+        (
+            VIOLATING_TEST_PATH,
+            "fixture 'AliasedModuleImplicitFixture' declares no camelCase name= alias",
+        ),
+        (
+            VIOLATING_TEST_PATH,
+            "fixture 'SubmoduleImplicitFixture' declares no camelCase name= alias",
+        ),
+        (
+            VIOLATING_TEST_PATH,
+            "fixture 'RenamedSnakeFixture' name= alias 'renamed_snake' is not camelCase",
+        ),
+        (VIOLATING_TEST_PATH, "fixture 'RenamedImplicitFixture' declares no camelCase name= alias"),
+        (
+            VIOLATING_TEST_PATH,
+            "fixture 'NewlineAliasFixture' name= alias 'newlineAlias\\n' is not camelCase",
+        ),
+        (VIOLATING_TEST_PATH, "function 'useHookProducer' is not PascalCase"),
+        (VIOLATING_TEST_PATH, "function 'test_producer' is not PascalCase"),
     ],
 )
 def test_checkers_flag_synthetic_violations(relativePath: str, expectedFragment: str) -> None:

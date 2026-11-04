@@ -7,7 +7,9 @@ valid UTF-8, or one nested too deeply to decode, with its own 400 ``{"detail"}``
 tests pin that app.core.errors.HandleHttpException answers such a body on every JSON write
 route with the sanitised 422 body of malformed JSON, sent with the session cookie of the role
 the route's guard passes, while every other HTTP error keeps FastAPI's default answer and an
-unexpected error stays FastAPI's 500.
+unexpected error stays FastAPI's 500. CORS is the outermost layer, so that 500 and the CORS
+preflight carry Access-Control-Allow-Origin for the allow-listed origin, while OriginGuard's 403
+to an unlisted origin carries none.
 
 A missing, expired or invalid cookie gives 401, and a role refusal 403 (Section 0.7.1), even
 when the body cannot be parsed: app.api.v1.SessionFirstRoute runs the route's session guard
@@ -52,6 +54,7 @@ JSON_HEADERS = {"Content-Type": "application/json"}
 FASTAPI_PARSE_DETAIL_TEXT = "There was an error parsing the body"
 CAUSELESS_PARSE_400_PATH = "/test-only/causeless-parse-400"
 UNEXPECTED_ERROR_PATH = "/test-only/unexpected-error"
+HTTP_OK = 200
 HTTP_BAD_REQUEST = 400
 HTTP_UNAUTHORIZED = 401
 HTTP_FORBIDDEN = 403
@@ -127,6 +130,38 @@ DEFAULT_ERROR_CASES = [
     DefaultErrorCase("GET", CAUSELESS_PARSE_400_PATH, HTTP_BAD_REQUEST, FASTAPI_PARSE_DETAIL_TEXT),
 ]
 DEFAULT_ERROR_IDS = ["unknown-path-404", "unsupported-method-405", "causeless-parse-detail-400"]
+
+# An origin BACKEND_CORS_ORIGINS does not list: another host name of the same frontend.
+UNLISTED_ORIGIN = "http://localhost:3000"
+ALLOW_ORIGIN_HEADER = "access-control-allow-origin"
+ALLOW_CREDENTIALS_HEADER = "access-control-allow-credentials"
+ALLOW_CREDENTIALS_VALUE = "true"
+PREFLIGHT_OK_TEXT = "OK"
+# The browser's preflight of the CAUP save, a JSON PUT, from the allow-listed Origin.
+PREFLIGHT_PUT_HEADERS = {
+    "Access-Control-Request-Method": "PUT",
+    "Access-Control-Request-Headers": "content-type",
+}
+
+
+@dataclass(frozen=True)
+class CorsAnswerCase:
+    """A request from the allow-listed Origin, and the status and text CORS must decorate."""
+
+    method: str
+    path: str
+    headers: dict[str, str]
+    status: int
+    text: str
+
+
+CORS_ANSWER_CASES = [
+    CorsAnswerCase("GET", UNEXPECTED_ERROR_PATH, {}, HTTP_SERVER_ERROR, INTERNAL_SERVER_ERROR_TEXT),
+    CorsAnswerCase(
+        "OPTIONS", "/api/v1/accounts/99999999999", PREFLIGHT_PUT_HEADERS, HTTP_OK, PREFLIGHT_OK_TEXT
+    ),
+]
+CORS_ANSWER_IDS = ["unexpected-error-500", "preflight-put-200"]
 
 
 async def RaiseCauselessParseDetail() -> None:
@@ -368,6 +403,25 @@ async def test_unexpected_error_stays_fastapi_500(bodyParseApp):
         response = await client.get(UNEXPECTED_ERROR_PATH)
     assert response.status_code == HTTP_SERVER_ERROR
     assert response.text == INTERNAL_SERVER_ERROR_TEXT
+
+
+@pytest.mark.parametrize("corsCase", CORS_ANSWER_CASES, ids=CORS_ANSWER_IDS)
+async def test_allowed_origin_answer_carries_cors_headers(corsCase, bodyParseApp):
+    async with BuildClient(bodyParseApp, raiseAppExceptions=False) as client:
+        response = await client.request(corsCase.method, corsCase.path, headers=corsCase.headers)
+    assert response.status_code == corsCase.status
+    assert response.text == corsCase.text
+    assert response.headers.get(ALLOW_ORIGIN_HEADER) == ALLOWED_ORIGIN
+    assert response.headers.get(ALLOW_CREDENTIALS_HEADER) == ALLOW_CREDENTIALS_VALUE
+
+
+async def test_origin_guard_403_to_an_unlisted_origin_has_no_allow_origin(bodyParseClient):
+    method, path = REGULAR_BODY_ROUTES[-1]
+    response = await bodyParseClient.request(method, path, headers={"Origin": UNLISTED_ORIGIN})
+    assert response.status_code == HTTP_FORBIDDEN
+    assert response.json() == EMPTY_MESSAGE_RESPONSE
+    assert ALLOW_ORIGIN_HEADER not in response.headers
+    assert response.headers.get(ALLOW_CREDENTIALS_HEADER) == ALLOW_CREDENTIALS_VALUE
 
 
 def test_no_catch_all_handler_is_registered(bodyParseApp):

@@ -15,8 +15,9 @@ The guard is pure ASGI and inspects only the scope's method, path and Origin hea
 it passes reaches the app with receive and send untouched, so the guard never consumes the
 request body, and responses, streamed ones such as the CR00 report export included, flow through
 unchanged. A refused request is answered by the guard itself with the 403 JSONResponse.
-main.CreateApp adds it before CORSMiddleware, so CORS is the outer layer and its headers
-decorate the 403 as well.
+main.CreateApp adds it with add_middleware and wraps the whole stack in CORSMiddleware, so CORS
+is the outer layer and its headers decorate the 403 as well. That 403 never carries
+Access-Control-Allow-Origin, because the guard refuses only an Origin CORS does not allow.
 """
 
 from collections.abc import Sequence

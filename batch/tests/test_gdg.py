@@ -66,9 +66,13 @@ FORGED_SHA256 = "0" * 64
 INJECTED_PRODUCER_MESSAGE = "injected failure of a generation producer"
 INJECTED_ABEND_MESSAGE = "INJECTED POSTTRAN ABEND WITH DALYREJS(+1) OPEN"
 ORPHAN_GENERATION = 9
+# LIMIT(5) of jcl/DEFGDGB.jcl and catlg/LISTCAT.txt line 1637, stated here rather than read from
+# batch/orchestration/gdg.py, so a production limit other than 5 fails the retention tests.
+LEGACY_GDG_LIMIT = 5
 OLDEST_GENERATION = 1
-SIXTH_GENERATION = gdg.GDG_LIMIT + 1
-OLDEST_RETAINED_RELATIVE = -(gdg.GDG_LIMIT - 1)
+SIXTH_GENERATION = LEGACY_GDG_LIMIT + 1
+OLDEST_RETAINED_RELATIVE = -(LEGACY_GDG_LIMIT - 1)
+ROLLED_OFF_RELATIVE = -LEGACY_GDG_LIMIT
 SCRATCH_BASES = [gdg.DALYREJS, gdg.SYSTRAN, gdg.TRANSACT_COMBINED]
 SCRATCH_BASE_IDS = [base.name for base in SCRATCH_BASES]
 
@@ -329,7 +333,7 @@ def AssertOldestRolledOff(context: JobContext, base: gdg.GdgBase) -> None:
     oldestRetained = gdg.ResolveGeneration(context, base, OLDEST_RETAINED_RELATIVE)
     assert oldestRetained.generation == OLDEST_GENERATION + 1
     with pytest.raises(gdg.MissingGenerationError):
-        gdg.ResolveGeneration(context, base, -gdg.GDG_LIMIT)
+        gdg.ResolveGeneration(context, base, ROLLED_OFF_RELATIVE)
 
 
 # --- Publication and recovery --------------------------------------------------------------------

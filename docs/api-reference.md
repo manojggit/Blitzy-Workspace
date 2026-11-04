@@ -136,7 +136,10 @@ guarded, so it too needs the `Origin` header.
 
 CORS allows the `BACKEND_CORS_ORIGINS` origins with credentials, the methods `GET`, `POST`, `PUT`,
 `DELETE` and `OPTIONS`, and the request headers `Content-Type` and `Accept`. It exposes the
-`Content-Disposition` header, which names the report downloads.
+`Content-Disposition` header, which names the report downloads. Every response to an allow-listed
+`Origin` carries `Access-Control-Allow-Origin`, an unexpected 500 included, so the browser can
+read it. The guard's 403 never does, because the guard refuses only an unlisted or missing
+`Origin`.
 
 ## Roles
 

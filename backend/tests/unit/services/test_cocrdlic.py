@@ -10,6 +10,10 @@ cbl/COCRDLIC.cbl:
     NUMBER`` unguarded and first; 2220-EDIT-CARD (lines 1051-1060) moves ``CARD ID FILTER,IF
     SUPPLIED MUST BE A 16 DIGIT NUMBER`` only while WS-ERROR-MSG-OFF holds. Both fields stay
     flagged (all-field mode), and 1400-SETUP-MESSAGE sets no information line for them.
+- 2220-EDIT-CARD (lines 1036-1068) takes 16 digits as FLG-CARDFILTER-ISVALID, and
+    9500-FILTER-RECORDS (lines 1382-1409) keeps a card only when it equals every valid filter:
+    a seeded card's number, alone or with its own account, lists that one card; with another
+    account, or as a number no card has, it lists none.
 - 9000-READ-FORWARD (lines 1219-1244): ENDFILE sets ``NO MORE RECORDS TO SHOW``, and page 1
     with no row read sets ``NO RECORDS FOUND FOR THIS SEARCH CONDITION.``.
 - The READNEXT and READPREV WHEN OTHER branches (lines 1222-1230, 1246-1254, 1308-1317,
@@ -117,6 +121,8 @@ SELECTION_ERROR_BODY_KEYS = {
 # A seeded account with a single card, and an account no seeded card names.
 FILTERED_ACCT_ID = "00000000004"
 UNKNOWN_ACCT_ID = "00000000099"
+# A valid CARDSID filter, CC-CARD-NUM X(16) all digits, that no seeded card number equals.
+UNKNOWN_CARD_NUM = "9" * 16
 NON_NUMERIC_ACCT_TEXT = "abc"
 NON_NUMERIC_CARD_TEXT = "xyz"
 
@@ -155,6 +161,16 @@ class FilterErrorCase(NamedTuple):
     cardText: str
     expectedMessage: str
     failedFields: tuple[str, ...]
+
+
+class CardNumberFilterCase(NamedTuple):
+    """A valid CARDSID filter, alone or with ACCTSID, and the page 9500-FILTER-RECORDS leaves."""
+
+    filterOf: Callable[["SeededCardFile"], CardListQuery]
+    cardIsSeeded: bool
+    expectedCardCount: int
+    expectedMessage: str
+    expectedInfo: str
 
 
 class SelectionErrorCase(NamedTuple):
@@ -225,12 +241,21 @@ TRANSFER_CASES = [
 ]
 
 
-def ExpectedCardOrder(syncEngine: Engine, acctId: str | None = None) -> list[str]:
-    """Return the seeded card numbers of ``acctId`` (all cards when None) in EBCDIC key order."""
+def ExpectedCardOrder(
+    syncEngine: Engine, acctId: str | None = None, cardNum: str | None = None
+) -> list[str]:
+    """Return the seeded card numbers matching ``acctId`` and ``cardNum`` in EBCDIC key order.
+
+    A None filter matches every card, as an unset 9500-FILTER-RECORDS filter does.
+    """
     with syncEngine.connect() as connection:
         cardKeys = connection.execute(text(CARD_KEYS_SQL)).mappings().all()
-    cardNums = [card["card_num"] for card in cardKeys if acctId in (None, card["acct_id"])]
-    return sorted(cardNums, key=lambda cardNum: cardNum.encode(EBCDIC_CODEC))
+    cardNums = [
+        card["card_num"]
+        for card in cardKeys
+        if acctId in (None, card["acct_id"]) and cardNum in (None, card["card_num"])
+    ]
+    return sorted(cardNums, key=lambda seededCardNum: seededCardNum.encode(EBCDIC_CODEC))
 
 
 def ReadCardTable(syncEngine: Engine) -> list[dict[str, Any]]:
@@ -247,9 +272,9 @@ class SeededCardFile:
         self.syncEngine = syncEngine
         self.seededRows = ReadCardTable(syncEngine)
 
-    def CardOrder(self, acctId: str | None = None) -> list[str]:
-        """Return the card numbers of ``acctId`` (all cards when None) in EBCDIC key order."""
-        return ExpectedCardOrder(self.syncEngine, acctId)
+    def CardOrder(self, acctId: str | None = None, cardNum: str | None = None) -> list[str]:
+        """Return the card numbers matching ``acctId`` and ``cardNum`` (None: any) in key order."""
+        return ExpectedCardOrder(self.syncEngine, acctId, cardNum)
 
     def CurrentRows(self) -> list[dict[str, Any]]:
         """Return cards.cards as it stands now, to compare with ``seededRows``."""
@@ -383,6 +408,58 @@ BROWSE_ERROR_CASES = [
 ]
 
 
+def FilteredAccountCard(cardFile: SeededCardFile) -> str:
+    """Return the first CVACT02Y CARD-NUM of FILTERED_ACCT_ID in key order, from cards.cards."""
+    return cardFile.CardOrder(FILTERED_ACCT_ID)[0]
+
+
+def OwnCardQuery(cardFile: SeededCardFile) -> CardListQuery:
+    """Return CARDSID keyed alone with a seeded card number (2220-EDIT-CARD, lines 1036-1068)."""
+    return CardListQuery(card_num=FilteredAccountCard(cardFile))
+
+
+def AccountAndOwnCardQuery(cardFile: SeededCardFile) -> CardListQuery:
+    """Return ACCTSID and CARDSID keyed with an account and its own card: both filters ISVALID."""
+    return CardListQuery(acct_id=FILTERED_ACCT_ID, card_num=FilteredAccountCard(cardFile))
+
+
+def AccountAndOtherCardQuery(cardFile: SeededCardFile) -> CardListQuery:
+    """Return ACCTSID keyed with an account, CARDSID with another account's card (9500 excludes)."""
+    ownCards = cardFile.CardOrder(FILTERED_ACCT_ID)
+    otherCard = next(cardNum for cardNum in cardFile.CardOrder() if cardNum not in ownCards)
+    return CardListQuery(acct_id=FILTERED_ACCT_ID, card_num=otherCard)
+
+
+def UnknownCardQuery(cardFile: SeededCardFile) -> CardListQuery:
+    """Return CARDSID keyed alone with 16 digits, valid for 2220-EDIT-CARD, that no card has."""
+    return CardListQuery(card_num=UNKNOWN_CARD_NUM)
+
+
+# 9500-FILTER-RECORDS (lines 1382-1409) over 9000-READ-FORWARD's ENDFILE (lines 1219-1244).
+CARD_NUMBER_FILTER_CASES = [
+    pytest.param(
+        CardNumberFilterCase(OwnCardQuery, True, 1, NO_MORE_RECORDS_MESSAGE, RECORD_ACTIONS_INFO),
+        id="card-number-alone",
+    ),
+    pytest.param(
+        CardNumberFilterCase(
+            AccountAndOwnCardQuery, True, 1, NO_MORE_RECORDS_MESSAGE, RECORD_ACTIONS_INFO
+        ),
+        id="account-and-its-card-number",
+    ),
+    pytest.param(
+        CardNumberFilterCase(
+            AccountAndOtherCardQuery, True, 0, NO_RECORDS_FOUND_MESSAGE, NO_MESSAGE
+        ),
+        id="account-and-another-accounts-card-number",
+    ),
+    pytest.param(
+        CardNumberFilterCase(UnknownCardQuery, False, 0, NO_RECORDS_FOUND_MESSAGE, NO_MESSAGE),
+        id="card-number-no-card-has",
+    ),
+]
+
+
 @pytest.fixture(name="cardFile")
 def SeededCardFileFixture(migratedDatabase, syncEngine: Engine) -> SeededCardFile:
     """Return the seeded CARDDAT, so each case can show CCLI wrote nothing to it."""
@@ -472,6 +549,30 @@ async def test_filter_matching_no_card_finds_no_records(
     assert ScreenOf(emptyPage, context) == ListScreen(
         [], FIRST_PAGE, NO_RECORDS_FOUND_MESSAGE, NO_MESSAGE
     )
+    assert cardFile.CurrentRows() == cardFile.seededRows
+
+
+@pytest.mark.parametrize("case", CARD_NUMBER_FILTER_CASES)
+async def test_card_number_filter_lists_only_the_card_every_filter_matches(
+    case: CardNumberFilterCase,
+    makeOnlineContext: ContextFactory,
+    cardFile: SeededCardFile,
+) -> None:
+    """9500-FILTER-RECORDS keeps a card only when it equals the card and any account filter."""
+    context = await makeOnlineContext(REGULAR_USER_TYPE)
+    query = case.filterOf(cardFile)
+    acctFilter = query.acct_id or None
+    expectedCards = cardFile.CardOrder(acctFilter, query.card_num)
+    filteredPage = await ListCards(context, query)
+    assert cardFile.CardOrder(acctFilter), "the account filter alone must match a seeded card"
+    assert bool(cardFile.CardOrder(cardNum=query.card_num)) == case.cardIsSeeded
+    assert len(expectedCards) == case.expectedCardCount
+    assert ScreenOf(filteredPage, context) == ListScreen(
+        expectedCards, FIRST_PAGE, case.expectedMessage, case.expectedInfo
+    )
+    assert [(row.acct_id, row.card_num_masked) for row in filteredPage.rows] == [
+        (FILTERED_ACCT_ID, MaskOf(cardNum)) for cardNum in expectedCards
+    ]
     assert cardFile.CurrentRows() == cardFile.seededRows
 
 

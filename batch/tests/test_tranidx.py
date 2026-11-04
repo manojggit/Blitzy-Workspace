@@ -8,18 +8,29 @@ ix_transactions_proc_ts on transactions.transactions (proc_ts). Technical Specif
 or 12, and a cycle becomes COMPLETED when step 18 completes. Section 0.9.3: TRANIDX produces no
 records, so its bar is no errors.
 
+The job checks the definition as well as the validity: a same-named index on another column or
+table, or unique, partial or descending, is replaced by the proc_ts index. The step is atomic
+(Section 0.6.12): an injected failure of its final ledger write leaves a valid index, an absent
+index and a same-named orig_ts index each as they were, and the retry then completes.
+
 Completing step 18 closes its cycle even when the step runs on its own, so a second
 ``job tran-index`` finds no OPEN cycle and exits 12 (Section 0.6.8, "Standalone commands"). A
 rerun of the step therefore runs in a new OPEN cycle, which seed-all opens.
 """
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from app.models import CYCLE_STEPS, CYCLES, JOB_RUNS, TRANSACTIONS_SCHEMA, Transaction
-from sqlalchemy import Engine, func, select, text
+from sqlalchemy import Engine, TextClause, func, select, text
 
-from batch.jobs.tranidx import INDEXES_VERIFIED_COUNT_KEY, JOB_NAME, PROC_TS_INDEX_NAME
+from batch.jobs.tranidx import (
+    INDEX_REPLACED_LOG,
+    INDEXES_VERIFIED_COUNT_KEY,
+    JOB_NAME,
+    PROC_TS_INDEX_NAME,
+)
 from batch.tests.conftest import (
     FIXED_AS_OF_TEXT,
     INJECTED_ROLLBACK_TEMPLATE,
@@ -60,6 +71,53 @@ RUN_ALL_COMMAND = ("run-all", "--as-of", FIXED_AS_OF_TEXT)
 
 # A fixed identifier, never input: the index the job must recreate.
 DROP_PROC_TS_INDEX_SQL = text("DROP INDEX transactions.ix_transactions_proc_ts")
+# procTsIndexRestored drops whatever index a test left and creates revision 0003's definition.
+DROP_PROC_TS_INDEX_IF_EXISTS_SQL = text("DROP INDEX IF EXISTS transactions.ix_transactions_proc_ts")
+SEED_PROC_TS_INDEX_SQL = text(
+    "CREATE INDEX ix_transactions_proc_ts ON transactions.transactions (proc_ts)"
+)
+
+# Same-named indexes of another definition, over fixed identifiers; the job must replace each
+# with the proc_ts index. Every index lives in its table's schema, so the one on
+# daily_transactions (300 seed rows) takes the name too, and the UNIQUE one builds because the
+# seed leaves transactions.transactions empty.
+ORIG_TS_INDEX_SQL = text(
+    "CREATE INDEX ix_transactions_proc_ts ON transactions.transactions (orig_ts)"
+)
+UNIQUE_PROC_TS_INDEX_SQL = text(
+    "CREATE UNIQUE INDEX ix_transactions_proc_ts ON transactions.transactions (proc_ts)"
+)
+DAILY_PROC_TS_INDEX_SQL = text(
+    "CREATE INDEX ix_transactions_proc_ts ON transactions.daily_transactions (proc_ts)"
+)
+PARTIAL_PROC_TS_INDEX_SQL = text(
+    "CREATE INDEX ix_transactions_proc_ts ON transactions.transactions (proc_ts)"
+    " WHERE proc_ts IS NOT NULL"
+)
+DESCENDING_PROC_TS_INDEX_SQL = text(
+    "CREATE INDEX ix_transactions_proc_ts ON transactions.transactions (proc_ts DESC)"
+)
+MISDEFINED_INDEX_CASES = [
+    pytest.param(ORIG_TS_INDEX_SQL, id="orig-ts-column"),
+    pytest.param(UNIQUE_PROC_TS_INDEX_SQL, id="unique"),
+    pytest.param(DAILY_PROC_TS_INDEX_SQL, id="daily-transactions-table"),
+    pytest.param(PARTIAL_PROC_TS_INDEX_SQL, id="partial"),
+    pytest.param(DESCENDING_PROC_TS_INDEX_SQL, id="descending"),
+]
+# The index states a rolled-back run must leave as they were: none, which the run would create,
+# and the orig_ts index, which the run would drop.
+ROLLBACK_PRECONDITION_CASES = [
+    pytest.param(None, id="index-absent"),
+    pytest.param(ORIG_TS_INDEX_SQL, id="orig-ts-column"),
+]
+# The warning the job logs when it drops a same-named index of another definition.
+INDEX_REPLACED_TEXT = INDEX_REPLACED_LOG % (
+    INDEX_SCHEMA,
+    PROC_TS_INDEX_NAME,
+    INDEX_SCHEMA,
+    INDEXED_TABLE_NAME,
+    PROC_TS_COLUMN,
+)
 
 # pg_index flags, table, key columns in key order and definition of one index; no row when the
 # index does not exist. indkey is an int2vector, so it is cast to an array to unnest it.
@@ -110,6 +168,17 @@ def DropProcTsIndex(engine: Engine) -> None:
         connection.execute(DROP_PROC_TS_INDEX_SQL)
 
 
+def ReplaceProcTsIndex(engine: Engine, replacementDdl: TextClause | None) -> None:
+    """Drop the PROC-TS index, then create replacementDdl's same-named index when one is given.
+
+    A test that passes a replacement uses procTsIndexRestored, which puts the seed index back.
+    """
+    with engine.begin() as connection:
+        connection.execute(DROP_PROC_TS_INDEX_SQL)
+        if replacementDdl is not None:
+            connection.execute(replacementDdl)
+
+
 def InvokeExpecting(arguments: tuple[str, ...], exitCode: int) -> CliOutcome:
     """Run a carddemo-batch command in process and assert its exit status."""
     outcome = InvokeCli(arguments)
@@ -157,6 +226,20 @@ def TransactionCount(engine: Engine) -> int:
 def WrittenFiles(outputDir: Path) -> list[Path]:
     """Return every file under the batch output directory, in path order."""
     return sorted(path for path in outputDir.rglob("*") if path.is_file())
+
+
+# --- Fixtures ------------------------------------------------------------------------------------
+@pytest.fixture(name="procTsIndexRestored")
+def ProcTsIndexRestored(batchEnvironment: BatchEnvironment) -> Iterator[None]:
+    """After the test, replace whatever ix_transactions_proc_ts it left by revision 0003's index.
+
+    seedState recreates the index only when no relation has its name, so a same-named index of
+    another definition that a failing test left would otherwise reach the next test.
+    """
+    yield
+    with batchEnvironment.engine.begin() as connection:
+        connection.execute(DROP_PROC_TS_INDEX_IF_EXISTS_SQL)
+        connection.execute(SEED_PROC_TS_INDEX_SQL)
 
 
 # --- Tests ---------------------------------------------------------------------------------------
@@ -276,3 +359,54 @@ def test_injected_failure_in_tran_index_transaction_exits_12_and_keeps_index(
     assert stepRow["state"] == STEP_FAILED
     assert stepRow["cycle_status"] == CYCLE_OPEN
     assert CountJobRuns(engine, stepNo=TRANIDX_STEP_NO, status=RUN_FAILED) == failedCount + 1
+
+
+@pytest.mark.usefixtures("procTsIndexRestored")
+@pytest.mark.parametrize("replacementDdl", ROLLBACK_PRECONDITION_CASES)
+def test_injected_failure_rolls_back_index_creation_and_retry_creates_it(
+    batchEnvironment: BatchEnvironment, replacementDdl: TextClause | None
+) -> None:
+    """A failed final ledger write commits no index change; the unforced retry then succeeds.
+
+    The index starts absent, or as a same-named index on orig_ts, so a job that committed its
+    create or its drop before the ledger write would leave a different state. The FAILED atomic
+    step has rolled back completely, so the next job tran-index retries it (Section 0.6.8,
+    "Failure") and ends with the seed index.
+    """
+    engine = batchEnvironment.engine
+    seedIndexState = RequireValidProcTsIndex(engine)
+    ReplaceProcTsIndex(engine, replacementDdl)
+    stateBefore = IndexState(engine)
+    assert stateBefore != seedIndexState
+    failedCount = CountJobRuns(engine, stepNo=TRANIDX_STEP_NO, status=RUN_FAILED)
+    with pytest.MonkeyPatch.context() as injection:
+        InjectAtomicRollbackFailure(injection, TRANIDX_STEP_NO)
+        outcome = InvokeExpecting(JOB_COMMAND, EXIT_FAILURE)
+    assert INJECTED_ROLLBACK_TEMPLATE.format(stepNo=TRANIDX_STEP_NO) in outcome.output
+    assert IndexState(engine) == stateBefore
+    stepRow = StepRow(engine, TRANIDX_STEP_NO)
+    assert (stepRow["state"], stepRow["cycle_status"]) == (STEP_FAILED, CYCLE_OPEN)
+    assert CountJobRuns(engine, stepNo=TRANIDX_STEP_NO, status=RUN_FAILED) == failedCount + 1
+    InvokeExpecting(JOB_COMMAND, EXIT_OK)
+    assert RequireValidProcTsIndex(engine) == seedIndexState
+    assert StepRow(engine, TRANIDX_STEP_NO)["state"] == STEP_COMPLETED
+
+
+@pytest.mark.usefixtures("procTsIndexRestored")
+@pytest.mark.parametrize("replacementDdl", MISDEFINED_INDEX_CASES)
+def test_same_named_index_of_another_definition_is_replaced_by_proc_ts_index(
+    batchEnvironment: BatchEnvironment, replacementDdl: TextClause
+) -> None:
+    """A same-named index that is not the proc_ts B-tree is dropped and created again.
+
+    job tran-index exits 0, logs the replacement and leaves revision 0003's index: the same
+    table, key column, flags and pg_get_indexdef as the seed.
+    """
+    engine = batchEnvironment.engine
+    seedIndexState = RequireValidProcTsIndex(engine)
+    ReplaceProcTsIndex(engine, replacementDdl)
+    assert IndexState(engine) != seedIndexState
+    outcome = InvokeExpecting(JOB_COMMAND, EXIT_OK)
+    assert RequireValidProcTsIndex(engine) == seedIndexState
+    assert StepRow(engine, TRANIDX_STEP_NO)["state"] == STEP_COMPLETED
+    assert INDEX_REPLACED_TEXT in outcome.output

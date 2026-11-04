@@ -411,7 +411,10 @@ async def RereadReadRefusal(
 class FieldEditCase(NamedTuple):
     """One detail value 1230-1260 refuse, its literal, its field and the value then shown.
 
-    A blank failing field shows '*' (3300); EXPMON is JUSTIFY=(RIGHT), so ``0`` shows `` 0``.
+    1100 receives an empty, all-space or '*' field as LOW-VALUES, and each edit takes
+    LOW-VALUES, SPACES or ZEROS as not supplied, so 3300 shows '*' in the field. Any other
+    refused value, non-numeric month or year included, shows as received; EXPMON is
+    JUSTIFY=(RIGHT), so ``0`` shows `` 0``.
     """
 
     changes: dict[str, str]
@@ -424,19 +427,57 @@ FIELD_EDIT_CASES = [
     FieldEditCase({NAME_FIELD: ""}, CARD_NAME_NOT_PROVIDED_MESSAGE, NAME_FIELD, BLANK_KEY_MARKER),
     FieldEditCase({NAME_FIELD: "JOHN 3RD"}, CARD_NAME_ALPHA_MESSAGE, NAME_FIELD, "JOHN 3RD"),
     FieldEditCase({STATUS_FIELD: "X"}, CARD_STATUS_MESSAGE, STATUS_FIELD, "X"),
+    FieldEditCase({STATUS_FIELD: ""}, CARD_STATUS_MESSAGE, STATUS_FIELD, BLANK_KEY_MARKER),
+    FieldEditCase({STATUS_FIELD: " "}, CARD_STATUS_MESSAGE, STATUS_FIELD, BLANK_KEY_MARKER),
+    FieldEditCase(
+        {STATUS_FIELD: BLANK_KEY_MARKER}, CARD_STATUS_MESSAGE, STATUS_FIELD, BLANK_KEY_MARKER
+    ),
+    FieldEditCase({STATUS_FIELD: "0"}, CARD_STATUS_MESSAGE, STATUS_FIELD, BLANK_KEY_MARKER),
     FieldEditCase({MONTH_FIELD: "13"}, EXPIRY_MONTH_MESSAGE, MONTH_FIELD, "13"),
     FieldEditCase({MONTH_FIELD: "0"}, EXPIRY_MONTH_MESSAGE, MONTH_FIELD, " 0"),
+    FieldEditCase({MONTH_FIELD: ""}, EXPIRY_MONTH_MESSAGE, MONTH_FIELD, BLANK_KEY_MARKER),
+    FieldEditCase({MONTH_FIELD: " " * 2}, EXPIRY_MONTH_MESSAGE, MONTH_FIELD, BLANK_KEY_MARKER),
+    FieldEditCase(
+        {MONTH_FIELD: BLANK_KEY_MARKER}, EXPIRY_MONTH_MESSAGE, MONTH_FIELD, BLANK_KEY_MARKER
+    ),
+    FieldEditCase({MONTH_FIELD: "00"}, EXPIRY_MONTH_MESSAGE, MONTH_FIELD, BLANK_KEY_MARKER),
+    FieldEditCase({MONTH_FIELD: "AB"}, EXPIRY_MONTH_MESSAGE, MONTH_FIELD, "AB"),
+    FieldEditCase({MONTH_FIELD: "1A"}, EXPIRY_MONTH_MESSAGE, MONTH_FIELD, "1A"),
     FieldEditCase({YEAR_FIELD: "1949"}, EXPIRY_YEAR_MESSAGE, YEAR_FIELD, "1949"),
     FieldEditCase({YEAR_FIELD: "2100"}, EXPIRY_YEAR_MESSAGE, YEAR_FIELD, "2100"),
+    FieldEditCase({YEAR_FIELD: ""}, EXPIRY_YEAR_MESSAGE, YEAR_FIELD, BLANK_KEY_MARKER),
+    FieldEditCase({YEAR_FIELD: " " * 4}, EXPIRY_YEAR_MESSAGE, YEAR_FIELD, BLANK_KEY_MARKER),
+    FieldEditCase(
+        {YEAR_FIELD: BLANK_KEY_MARKER}, EXPIRY_YEAR_MESSAGE, YEAR_FIELD, BLANK_KEY_MARKER
+    ),
+    FieldEditCase({YEAR_FIELD: "0000"}, EXPIRY_YEAR_MESSAGE, YEAR_FIELD, BLANK_KEY_MARKER),
+    FieldEditCase({YEAR_FIELD: "20X1"}, EXPIRY_YEAR_MESSAGE, YEAR_FIELD, "20X1"),
+    FieldEditCase({YEAR_FIELD: "ABCD"}, EXPIRY_YEAR_MESSAGE, YEAR_FIELD, "ABCD"),
 ]
 FIELD_EDIT_IDS = [
     "blank-name",
     "name-with-digit",
     "status-x",
+    "blank-status",
+    "space-status",
+    "asterisk-status",
+    "zero-status",
     "month-13",
     "month-0",
+    "blank-month",
+    "space-month",
+    "asterisk-month",
+    "zero-filled-month",
+    "non-numeric-month-AB",
+    "non-numeric-month-1A",
     "year-1949",
     "year-2100",
+    "blank-year",
+    "space-year",
+    "asterisk-year",
+    "zero-filled-year",
+    "non-numeric-year-20X1",
+    "non-numeric-year-ABCD",
 ]
 
 

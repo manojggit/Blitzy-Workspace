@@ -5,6 +5,8 @@ jcl/DEFGDGB.jcl lines 48-59) and the NOSCRATCH TRANSACT.BKUP of catlg/LISTCAT.tx
 Technical Specification Section 0.6.8 ("GDG archives") ports them, across the two crash windows:
 after a sixth generation is PUBLISHED but before RollOff runs, and after RollOff commits
 ROLLED_OFF but before the SCRATCH file is unlinked. A second ReconcileCatalog changes nothing.
+The expected limit is the literal LEGACY_GDG_LIMIT, never gdg.py's own constant, so a production
+limit other than 5 fails these tests.
 
 The module is self-contained. It reads TEST_SYNC_DATABASE_URL from the process environment,
 else from backend/.env, refuses a database whose name does not end in _test, and creates the
@@ -59,8 +61,14 @@ GDG_SUBDIRECTORY = "gdg"
 RECORD_FILLER = " "
 CRASH_MESSAGE = "simulated crash of the batch process"
 UNLINK_REFUSED_MESSAGE = "simulated unlink failure of a rolled-off generation file"
+# LIMIT(5) of jcl/DEFGDGB.jcl and catlg/LISTCAT.txt line 1637, stated here rather than read from
+# batch/orchestration/gdg.py, so a production limit other than 5 fails the retention tests.
+LEGACY_GDG_LIMIT = 5
 OLDEST_GENERATION = 1
-SIXTH_GENERATION = gdg.GDG_LIMIT + 1
+GENERATIONS_BEFORE_CRASH = LEGACY_GDG_LIMIT
+SIXTH_GENERATION = LEGACY_GDG_LIMIT + 1
+OLDEST_RETAINED_RELATIVE = -(LEGACY_GDG_LIMIT - 1)
+ROLLED_OFF_RELATIVE = -LEGACY_GDG_LIMIT
 # A final file whose generation has no catalog row, which reconciliation must leave alone.
 UNCATALOGED_FILE_NAME = gdg.GENERATION_FILE_TEMPLATE.format(generation=99)
 NOTHING_RECONCILED = gdg.ReconcileSummary(published=0, lost=0, orphansDeleted=0)
@@ -196,8 +204,8 @@ def RefuseUnlink(context: JobContext, base: gdg.GdgBase, row: Row) -> NoReturn:
 
 
 def CrashBetweenPublicationAndRetention(context: JobContext, base: gdg.GdgBase) -> None:
-    """Publish GDG_LIMIT generations, then a sixth whose process dies before RollOff runs."""
-    for _ in range(gdg.GDG_LIMIT):
+    """Publish five generations, then a sixth whose process dies before RollOff runs."""
+    for _ in range(GENERATIONS_BEFORE_CRASH):
         PublishGeneration(context, base)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(gdg, "RollOffBases", CrashBeforeRetention)
@@ -206,8 +214,8 @@ def CrashBetweenPublicationAndRetention(context: JobContext, base: gdg.GdgBase) 
 
 
 def CrashBetweenRollOffAndUnlink(context: JobContext, base: gdg.GdgBase) -> None:
-    """Publish GDG_LIMIT generations, then a sixth whose RollOff fails after ROLLED_OFF commits."""
-    for _ in range(gdg.GDG_LIMIT):
+    """Publish five generations, then a sixth whose RollOff fails after ROLLED_OFF commits."""
+    for _ in range(GENERATIONS_BEFORE_CRASH):
         PublishGeneration(context, base)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(gdg, "ScratchFile", RefuseUnlink)
@@ -284,7 +292,7 @@ def test_reconcile_applies_retention_left_undone_after_publication(
     CrashBetweenPublicationAndRetention(context, base)
     allGenerations = range(OLDEST_GENERATION, SIXTH_GENERATION + 1)
     assert CatalogStates(context, base) == ExpectedStates([], allGenerations)
-    assert gdg.ResolveGeneration(context, base, -gdg.GDG_LIMIT).generation == OLDEST_GENERATION
+    assert gdg.ResolveGeneration(context, base, ROLLED_OFF_RELATIVE).generation == OLDEST_GENERATION
 
     assert gdg.ReconcileCatalog(context) == NOTHING_RECONCILED
 
@@ -292,10 +300,10 @@ def test_reconcile_applies_retention_left_undone_after_publication(
     assert CatalogStates(context, base) == ExpectedStates([OLDEST_GENERATION], newerGenerations)
     assert BaseFileNames(context, base) == RetainedFileNames(base)
     assert gdg.ResolveGeneration(context, base, 0).generation == SIXTH_GENERATION
-    oldestRetained = gdg.ResolveGeneration(context, base, -(gdg.GDG_LIMIT - 1))
+    oldestRetained = gdg.ResolveGeneration(context, base, OLDEST_RETAINED_RELATIVE)
     assert oldestRetained.generation == OLDEST_GENERATION + 1
     with pytest.raises(gdg.MissingGenerationError):
-        gdg.ResolveGeneration(context, base, -gdg.GDG_LIMIT)
+        gdg.ResolveGeneration(context, base, ROLLED_OFF_RELATIVE)
 
 
 @pytest.mark.parametrize("base", GDG_BASE_LIST, ids=GDG_BASE_IDS)
@@ -319,7 +327,7 @@ def test_reconcile_deletes_scratch_file_left_after_roll_off(
     assert BaseFileNames(context, base) == RetainedFileNames(base) | {UNCATALOGED_FILE_NAME}
     assert LeftoverLogCount(caplog.records) == (1 if base.scratch else 0)
     with pytest.raises(gdg.MissingGenerationError):
-        gdg.ResolveGeneration(context, base, -gdg.GDG_LIMIT)
+        gdg.ResolveGeneration(context, base, ROLLED_OFF_RELATIVE)
 
 
 @pytest.mark.parametrize(

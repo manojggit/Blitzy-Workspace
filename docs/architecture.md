@@ -99,8 +99,8 @@ How each legacy mechanism is replaced:
     2. The FastAPI app, with `/docs`, `/redoc` and `/openapi.json` only when the docs are enabled
         ([Health probes and API documentation](#health-probes-and-api-documentation)).
     3. The settings, the lazily connecting async engine and its session factory on `app.state`.
-    4. `OriginGuard`, then CORS as the outer middleware, so CORS answers preflight requests and
-        decorates the guard's 403.
+    4. `OriginGuard`, then CORS as the outermost layer, around Starlette's error middleware, so
+        CORS answers preflight requests and decorates the guard's 403 and an unexpected 500.
     5. The `LegacyMessageError`, request-validation and HTTP-exception handlers, and no other.
     6. The health router at the root and the `/api/v1` router.
 - **Routers.** `backend/app/api/v1/router.py` aggregates the eight cluster routers under

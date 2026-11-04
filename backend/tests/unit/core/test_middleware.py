@@ -11,7 +11,10 @@ http://127.0.0.1:3000 the one local frontend origin, so http://localhost:3000, a
 site, is refused.
 
 The guard wraps a bare FastAPI app whose routes only echo, so no settings, secret or database
-are needed.
+are needed. A pure-ASGI recorder sits directly beneath the guard and lists the method and path
+of every request it receives, in a fresh list per test. An empty list proves a refused write
+reached nothing beneath the guard, not merely that its response was replaced; one entry proves
+a passed request reached the app once.
 """
 
 from collections.abc import AsyncIterator
@@ -20,6 +23,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.core.config import API_V1_PREFIX
 from app.core.middleware import GUARDED_METHODS, ORIGIN_EXEMPT_ROUTES, OriginGuard
@@ -38,24 +42,50 @@ HTTP_FORBIDDEN = 403
 HANDLER_BODY = {"ok": True}
 EMPTY_LEGACY_BODY = {"message": "", "info_message": "", "field_errors": [], "cursor_field": ""}
 
+# The method and path of one request that reached the app beneath OriginGuard.
+type DownstreamCall = tuple[str, str]
+
 
 async def EchoOk() -> dict[str, bool]:
     """Answer every test route, so a response carrying HANDLER_BODY shows the handler ran."""
     return dict(HANDLER_BODY)
 
 
-def BuildGuardedApp() -> OriginGuard:
-    """Return an echoing FastAPI app wrapped in OriginGuard allow-listing only ALLOWED_ORIGIN."""
+class DownstreamRecorder:
+    """Pure-ASGI layer that records each HTTP request it receives, then passes it on unchanged."""
+
+    def __init__(self, app: ASGIApp, downstreamCalls: list[DownstreamCall]) -> None:
+        self.app = app
+        self.downstreamCalls = downstreamCalls
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Recorded before the app runs, so a call whose output is later discarded still counts.
+        if scope["type"] == "http":
+            self.downstreamCalls.append((scope["method"], scope["path"]))
+        await self.app(scope, receive, send)
+
+
+def BuildGuardedApp(downstreamCalls: list[DownstreamCall]) -> OriginGuard:
+    """Return OriginGuard, allow-listing only ALLOWED_ORIGIN, over the recorded echoing app."""
     application = FastAPI()
     application.add_api_route(ACCOUNT_PATH, EchoOk, methods=ACCOUNT_METHODS)
     application.add_api_route(LOGIN_PATH, EchoOk, methods=["POST"])
-    return OriginGuard(application, allowedOrigins=[ALLOWED_ORIGIN])
+    recordedApplication = DownstreamRecorder(application, downstreamCalls)
+    return OriginGuard(recordedApplication, allowedOrigins=[ALLOWED_ORIGIN])
+
+
+@pytest.fixture(name="downstreamCalls")
+def DownstreamCalls() -> list[DownstreamCall]:
+    """Return the empty list this test's guarded app records each request beneath the guard in."""
+    return []
 
 
 @pytest_asyncio.fixture(name="guardedClient")
-async def GuardedClient() -> AsyncIterator[httpx.AsyncClient]:
+async def GuardedClient(
+    downstreamCalls: list[DownstreamCall],
+) -> AsyncIterator[httpx.AsyncClient]:
     """Yield a client of BuildGuardedApp that sends no Origin unless a request adds one."""
-    transport = httpx.ASGITransport(app=BuildGuardedApp())
+    transport = httpx.ASGITransport(app=BuildGuardedApp(downstreamCalls))
     async with httpx.AsyncClient(transport=transport, base_url=API_BASE_URL) as client:
         yield client
 
@@ -69,32 +99,37 @@ def OriginHeaders(origin: str | None) -> dict[str, str]:
 
 @pytest.mark.parametrize("origin", REFUSED_ORIGINS, ids=REFUSED_ORIGIN_IDS)
 @pytest.mark.parametrize("method", GUARDED)
-async def test_guarded_write_without_allowed_origin_is_refused(guardedClient, method, origin):
+async def test_guarded_write_without_allowed_origin_is_refused(
+    guardedClient, downstreamCalls, method, origin
+):
     response = await guardedClient.request(method, ACCOUNT_PATH, headers=OriginHeaders(origin))
     assert response.status_code == HTTP_FORBIDDEN
     assert response.json() == EMPTY_LEGACY_BODY
-    assert response.json() != HANDLER_BODY
+    assert downstreamCalls == []
 
 
 @pytest.mark.parametrize("method", GUARDED)
-async def test_allowed_origin_passes(guardedClient, method):
+async def test_allowed_origin_passes(guardedClient, downstreamCalls, method):
     response = await guardedClient.request(
         method, ACCOUNT_PATH, headers=OriginHeaders(ALLOWED_ORIGIN)
     )
     assert response.status_code == HTTP_OK
     assert response.json() == HANDLER_BODY
+    assert downstreamCalls == [(method, ACCOUNT_PATH)]
 
 
-async def test_get_without_origin_passes(guardedClient):
+async def test_get_without_origin_passes(guardedClient, downstreamCalls):
     response = await guardedClient.get(ACCOUNT_PATH)
     assert response.status_code == HTTP_OK
     assert response.json() == HANDLER_BODY
+    assert downstreamCalls == [("GET", ACCOUNT_PATH)]
 
 
-async def test_login_is_exempt_without_origin(guardedClient):
+async def test_login_is_exempt_without_origin(guardedClient, downstreamCalls):
     response = await guardedClient.post(LOGIN_PATH)
     assert response.status_code == HTTP_OK
     assert response.json() == HANDLER_BODY
+    assert downstreamCalls == [("POST", LOGIN_PATH)]
 
 
 def test_only_login_is_exempt():

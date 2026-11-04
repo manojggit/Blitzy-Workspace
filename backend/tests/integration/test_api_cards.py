@@ -976,13 +976,36 @@ async def test_invalid_screen_token_restarts_the_flow(
 
 
 # --- Roles and the superseded Style B user-type reset (AAP 0.6.12, 0.7.1) ------------------------
-async def test_admin_is_refused_and_stays_an_admin(adminClient: httpx.AsyncClient) -> None:
-    """An admin gets 403 with an empty message; the session keeps type A and its menu."""
-    AssertLegacyError(await adminClient.get(CARDS_URL), HTTP_ACCESS_REFUSED, "")
+@pytest.mark.parametrize("call", CARD_ENDPOINTS)
+async def test_admin_is_refused_and_stays_an_admin(
+    adminClient: httpx.AsyncClient, call: EndpointCall
+) -> None:
+    """Every card endpoint gives an admin 403 with an empty message; type A and its menu stay.
+
+    The request carries the allow-listed Origin, so the refusal is the regular-role guard's.
+    """
+    response = await adminClient.send(BuildRequest(adminClient, call))
+    AssertLegacyError(response, HTTP_ACCESS_REFUSED, "")
     menuResponse = await adminClient.get(ADMIN_MENU_URL)
     assert menuResponse.status_code == HTTP_OK, menuResponse.text
     currentUser = ExpectOk(await adminClient.get(CURRENT_USER_URL))
     assert currentUser["user_type"] == ADMIN_USER_TYPE
+
+
+async def test_admin_save_of_a_validated_screen_writes_nothing(
+    cardUpdate: CardUpdateSession, adminClient: httpx.AsyncClient
+) -> None:
+    """An admin's F5 on a regular user's validated screen is refused and the card is unchanged.
+
+    The same request then saves for the regular user, so the refused request was a valid save.
+    """
+    saveBody = UpdateBody(await cardUpdate.Validate(RENAME_CHANGES), SAVE, {})
+    refused = await PutCard(adminClient, cardUpdate.screen["card_ref"], saveBody)
+    AssertLegacyError(refused, HTTP_ACCESS_REFUSED, "")
+    assert cardUpdate.ReadCard() == cardUpdate.before
+    saved = ExpectOk(await cardUpdate.Send(saveBody))
+    AssertScreenState(saved, CHANGES_DONE)
+    assert cardUpdate.ReadCard() == cardUpdate.before | {"embossed_name": RENAMED_NAME}
 
 
 @pytest.mark.parametrize("userType", OTHER_USER_TYPES)

@@ -304,7 +304,9 @@ framing and decoding are in [data-model.md](data-model.md#loader-decoding).
 
 - **Module.** `batch/jobs/tranidx.py`.
 - **Inputs → outputs.** Ensures `ix_transactions_proc_ts` exists and is valid:
-    `CREATE INDEX IF NOT EXISTS`, then `REINDEX`.
+    `CREATE INDEX IF NOT EXISTS`, then `REINDEX`. A same-named index with another definition
+    (anything but the non-unique B-tree on `transactions.transactions (proc_ts)`) is dropped
+    first, so the job ends with the `proc_ts` index or exits 12.
 - **Durability and rerun class.** Same result on every run.
 - **Parameters.** None.
 - **Exit status.** 0 or 12.

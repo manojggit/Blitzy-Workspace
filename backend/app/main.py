@@ -29,6 +29,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.constants import REF_PREFIX
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp
 
 from app.api.health import ROUTER as HEALTH_ROUTER
 from app.api.v1.router import ROUTER as API_V1_ROUTER
@@ -135,24 +136,45 @@ def AttachState(application: FastAPI, settings: Settings) -> None:
 
 
 def AddMiddleware(application: FastAPI, settings: Settings) -> None:
-    """Add the CSRF origin guard, then CORS, so CORS is the outer layer.
+    """Add the CSRF origin guard, then make CORS the outermost layer of the whole stack.
 
-    Starlette wraps later-added middleware around earlier ones. CORS therefore answers the
-    preflight OPTIONS before the guard sees it, and decorates the guard's 403 with its headers,
-    so the browser can read the refusal. Credentials are allowed, so the origins are always the
-    explicit BACKEND_CORS_ORIGINS list: Settings refuses a wildcard or a malformed entry at
-    startup.
+    CORS wraps the guard and Starlette's ServerErrorMiddleware, which sends the 500 of an
+    unhandled error. It therefore answers the preflight OPTIONS before the guard sees it, adds
+    its headers to the guard's 403, and adds them to an unexpected 500, so a browser can read
+    that abend. Access-Control-Allow-Origin goes only to an allow-listed origin, which the guard
+    never refuses. Credentials are allowed, so the origins are always the explicit
+    BACKEND_CORS_ORIGINS list: Settings refuses a wildcard or a malformed entry at startup.
     """
     allowedOrigins = settings.CorsOrigins()
     application.add_middleware(OriginGuard, allowedOrigins=allowedOrigins)
-    application.add_middleware(
-        CORSMiddleware,
-        allow_origins=list(allowedOrigins),
-        allow_credentials=True,
-        allow_methods=CORS_ALLOWED_METHODS,
-        allow_headers=CORS_ALLOWED_HEADERS,
-        expose_headers=CORS_EXPOSED_HEADERS,
-    )
+    WrapStackInCors(application, allowedOrigins)
+
+
+def WrapStackInCors(application: FastAPI, allowedOrigins: Sequence[str]) -> None:
+    """Make ``application`` build its middleware stack inside CORSMiddleware.
+
+    Middleware added with add_middleware sits inside ServerErrorMiddleware, whose 500 would then
+    bypass CORS. The replacement wraps the stack FastAPI builds, ServerErrorMiddleware included,
+    and registers no exception handler. Starlette builds the stack on the first request, so
+    routes added after CreateApp are still served.
+    """
+    buildFastApiStack = application.build_middleware_stack
+
+    def BuildCorsWrappedStack() -> ASGIApp:
+        """Return FastAPI's middleware stack wrapped in CORSMiddleware for ``allowedOrigins``."""
+        return CORSMiddleware(
+            buildFastApiStack(),
+            allow_origins=list(allowedOrigins),
+            allow_credentials=True,
+            allow_methods=CORS_ALLOWED_METHODS,
+            allow_headers=CORS_ALLOWED_HEADERS,
+            expose_headers=CORS_EXPOSED_HEADERS,
+        )
+
+    # Starlette calls this exact attribute name, lazily on the first request, so it stays
+    # lower-case: a framework-mandated exception to the MK_Modernization Rule's PascalCase
+    # method naming.
+    application.build_middleware_stack = BuildCorsWrappedStack
 
 
 def AddExceptionHandlers(application: FastAPI) -> None:

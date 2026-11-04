@@ -12,7 +12,8 @@ being the clock in DB2 form. The final account is never rewritten.
 
 The sample-chain tests compare the outputs with the committed oracle fixtures. Every synthetic
 test reads the database it arranged into the oracle's state and runs legacy_oracle.RunIntcalc
-on it, so each expectation comes from the independent oracle (Section 0.9.3).
+on it, so each expectation comes from the independent oracle (Section 0.9.3). One of them gives
+an account competing cards, whose SYSTRAN records must carry the first in EBCDIC card_num order.
 """
 
 import logging
@@ -23,7 +24,14 @@ from pathlib import Path
 
 import pytest
 from app.core.logging import PanMaskingFilter
-from app.models import GDG_GENERATIONS, Account, DisclosureGroup, TransactionCategoryBalance
+from app.models import (
+    GDG_GENERATIONS,
+    Account,
+    Card,
+    CardXref,
+    DisclosureGroup,
+    TransactionCategoryBalance,
+)
 from sqlalchemy import ColumnElement, Engine, delete, func, insert, select, update
 from sqlalchemy.engine import Connection
 
@@ -31,8 +39,10 @@ from batch.jobs import interest_calc
 from batch.orchestration import gdg
 from batch.orchestration.job_context import EXIT_ABEND, EXIT_OK, EXIT_REJECTS, JobContext
 from batch.tests.conftest import (
+    ACTIVE_STATUS,
     EXPECTED_DIR,
     FIXED_AS_OF_TEXT,
+    SYNTHETIC_EXPIRY_DATE,
     BatchEnvironment,
     InvokeCli,
     StepRow,
@@ -81,6 +91,17 @@ ACCOUNT_IDS = tuple(f"{index:011d}" for index in range(1, 6))
 SYNTHETIC_CARD_NUM = "9000000000000001"
 SYNTHETIC_INTEREST = Decimal("1.23")
 INTEREST_RATE_FUNCTION_NAME = "ReadInterestRate"
+# 1300-B-WRITE-TX's TRAN-DESC: this prefix, then ACCT-ID.
+INTEREST_DESCRIPTION_PREFIX = "Int. for a/c "
+
+# Account 1's competing cards in insertion order, beside its all-digit seed card. Code page 037
+# orders lower case before upper case before digits, so its first xref card is the k card,
+# inserted last; ASCII order and both descending orders each put another card first.
+FIRST_XREF_ACCT_ID = ACCOUNT_IDS[0]
+FIRST_XREF_CARD_NUM = "k000000000000001"
+COMPETING_CARD_NUMS = ("Q000000000000001", "x000000000000001", FIRST_XREF_CARD_NUM)
+COMPETING_CVV_CD = "000"
+COMPETING_EMBOSSED_NAME = "COMPETING CARD HOLDER"
 
 
 @dataclass(frozen=True)
@@ -296,6 +317,57 @@ def ArrangeScenario(engine: Engine, scenario: SyntheticScenario) -> None:
     SetDisclosureRates(engine, scenario.rates)
 
 
+def AccountCardNums(engine: Engine, acctId: str) -> list[str]:
+    """Return the card numbers of acctId's cross-references, in no defined order."""
+    statement = select(CardXref.card_num).where(CardXref.acct_id == acctId)
+    with engine.connect() as connection:
+        return list(connection.execute(statement).scalars())
+
+
+def CompetingCardRow(acctId: str, cardNum: str) -> dict[str, object]:
+    """Return an active cards.cards row of acctId; CARD-NUM is X(16), so letters are valid."""
+    return {
+        "card_num": cardNum,
+        "acct_id": acctId,
+        "cvv_cd": COMPETING_CVV_CD,
+        "embossed_name": COMPETING_EMBOSSED_NAME,
+        "expiration_date": SYNTHETIC_EXPIRY_DATE,
+        "active_status": ACTIVE_STATUS,
+    }
+
+
+def InsertCompetingCards(engine: Engine, acctId: str, cardNums: Sequence[str]) -> None:
+    """Insert a card and a cross-reference of acctId for each of cardNums, in the order given.
+
+    Each cross-reference names the customer of acctId's one seed cross-reference.
+    """
+    custIdStatement = select(CardXref.cust_id).where(CardXref.acct_id == acctId)
+    with engine.begin() as connection:
+        custId = connection.execute(custIdStatement).scalar_one()
+        for cardNum in cardNums:
+            connection.execute(insert(Card.__table__), CompetingCardRow(acctId, cardNum))
+            xrefRow = {"card_num": cardNum, "cust_id": custId, "acct_id": acctId}
+            connection.execute(insert(CardXref.__table__), xrefRow)
+
+
+def WrongOrderFirstCards(
+    seedCardNums: Sequence[str], addedCardNums: Sequence[str]
+) -> dict[str, str]:
+    """Return the card each read order other than ascending code page 037 would take first.
+
+    ASCII order is card_num under C collation. A read with no ORDER BY tends to return rows as
+    inserted: the seed cards, then addedCardNums.
+    """
+    insertionOrder = [*seedCardNums, *addedCardNums]
+    return {
+        "ascii-ascending": min(insertionOrder),
+        "ascii-descending": max(insertionOrder),
+        "cp037-descending": max(insertionOrder, key=legacy_oracle.EbcdicSortKey),
+        "first-inserted": insertionOrder[0],
+        "first-added": addedCardNums[0],
+    }
+
+
 # --- Running INTCALC and reading its outputs ----------------------------------------------------
 def ReadOracleState(engine: Engine) -> legacy_oracle.OracleState:
     """Read every dataset of the database into the oracle's state, through plain SQL."""
@@ -390,6 +462,16 @@ def FixtureAccountTexts(csvPath: Path, acctId: str) -> dict[str, str]:
     _header, rows = compare.ReadExpectedCsv(csvPath)
     row = next(row for row in rows if row[ACCT_ID_COLUMN] == acctId)
     return {column: str(row[column]) for column in UNFLUSHED_COLUMNS}
+
+
+def AccountRecordCards(records: Iterable[str], acctId: str) -> set[str]:
+    """Return the TRAN-CARD-NUM of every SYSTRAN record whose TRAN-DESC names acctId."""
+    description = INTEREST_DESCRIPTION_PREFIX + acctId
+    return {
+        record[legacy_oracle.TRAN_CARD_SLICE]
+        for record in records
+        if record[legacy_oracle.TRAN_DESC_SLICE].rstrip(" ") == description
+    }
 
 
 # --- Sample chain parity ------------------------------------------------------------------------
@@ -489,6 +571,32 @@ def test_multi_account_input_matches_oracle_including_unflushed_last_account(
     for acctId in FLUSHED_ACCOUNT_IDS:
         assert CycleFields(run.after, acctId) == ZEROED_CYCLE_FIELDS
     assert AccountFields(run.after, LAST_ACCOUNT_ID) == AccountFields(run.before, LAST_ACCOUNT_ID)
+
+
+def test_account_change_reads_first_xref_card_in_ebcdic_card_num_order(
+    batchEnvironment: BatchEnvironment,
+) -> None:
+    """1110-GET-XREF-DATA takes the account's first card in code page 037 card_num order.
+
+    Account 1 gets three more cards, inserted out of key order with its EBCDIC-first card last.
+    ASCII order, both descending orders and insertion order each pick another card, so only the
+    CXACAIX prime-key order puts FIRST_XREF_CARD_NUM on account 1's SYSTRAN records, as the
+    oracle's FirstXrefForAccount predicts.
+    """
+    engine = batchEnvironment.engine
+    ArrangeScenario(engine, MULTI_ACCOUNT_SCENARIO)
+    seedCardNums = AccountCardNums(engine, FIRST_XREF_ACCT_ID)
+    InsertCompetingCards(engine, FIRST_XREF_ACCT_ID, COMPETING_CARD_NUMS)
+    cardNums = AccountCardNums(engine, FIRST_XREF_ACCT_ID)
+    assert sorted(cardNums) == sorted([*seedCardNums, *COMPETING_CARD_NUMS])
+    assert min(cardNums, key=legacy_oracle.EbcdicSortKey) == FIRST_XREF_CARD_NUM
+    wrongFirstCards = WrongOrderFirstCards(seedCardNums, COMPETING_CARD_NUMS)
+    assert FIRST_XREF_CARD_NUM not in wrongFirstCards.values(), wrongFirstCards
+    run = RunSyntheticIntcalc(batchEnvironment)
+    assert run.exitCode == run.expected.exitCode == EXIT_OK, run.output
+    assert run.systranRecords == run.expected.systranRecords
+    for records in (run.systranRecords, run.expected.systranRecords):
+        assert AccountRecordCards(records, FIRST_XREF_ACCT_ID) == {FIRST_XREF_CARD_NUM}
 
 
 def test_missing_default_disclosure_group_exits_16(batchEnvironment: BatchEnvironment) -> None:
