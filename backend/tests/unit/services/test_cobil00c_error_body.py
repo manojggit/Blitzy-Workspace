@@ -108,7 +108,9 @@ def AccountRepositoryStub(monkeypatch) -> StubAccountRepository:
 
 def BuildContext() -> OnlineContext:
     """Return an online context whose app state holds an engine only the stubs receive."""
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(engine=None)))
+    # The request's own state is where core.locks.RequestEngine looks before app.state.engine.
+    appState = SimpleNamespace(engine=None)
+    request = SimpleNamespace(app=SimpleNamespace(state=appState), state=SimpleNamespace())
     return OnlineContext(request=request, session=SimpleNamespace(), settings=None)
 
 

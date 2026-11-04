@@ -5,17 +5,18 @@ app.services.reports.corpt00c runs CORPT00C's edits and confirmation first, wait
 nothing. A confirmed report then takes one of REPORT_WORKER_LIMIT report slots, then a request
 admission (core.database.AdmittedReads), and reads TRANTYPE, TRANCATG and a validation pass of
 TRANSACT, so a read failure, an abend or a gone client still sets the status before any byte is
-sent. Its build pass then reads TRANSACT again and builds, and for the screen JSON or a download
-renders, the report on a report thread. Both passes fetch their rows a batch at a time, the
-renderers yield the document in chunks as it is built, and the slot, the admission and the
-connection are freed as soon as the build ends, before the response has sent every chunk. A
-report whose client has gone stops when its slot is granted or after its validation pass, with
-the 499 no client receives and one INFO record; a listed report also stops at the next line
-check on the thread, and a streamed one at its next chunk, logging the same record. A build pass
-that fails after the response started raises, so the body never ends normally.
-cbtrn03c.IterateReport yields BuildReport's lines lazily, and the report_export renderers read
-them once. The screen JSON is byte for byte what FastAPI sends for the response model
-RunTransactionReport returns (TypeAdapter.dump_json by alias), built without a line list.
+sent; a report refused admission within DB_CONNECT_TIMEOUT_SECONDS reads nothing and answers
+the WHEN OTHER literal. Its build pass then reads TRANSACT again and builds, and for the screen
+JSON or a download renders, the report on a report thread. Both passes fetch their rows a batch
+at a time, the renderers yield the document in chunks as it is built, and the slot, the
+admission and the connection are freed as soon as the build ends, before the response has sent
+every chunk. A report whose client has gone stops when its slot is granted or after its
+validation pass, with the 499 no client receives and one INFO record; a listed report also stops
+at the next line check on the thread, and a streamed one at its next chunk, logging the same
+record. A build pass that fails after the response started raises, so the body never ends
+normally. cbtrn03c.IterateReport yields BuildReport's lines lazily, and the report_export
+renderers read them once. The screen JSON is byte for byte what FastAPI sends for the response
+model RunTransactionReport returns (TypeAdapter.dump_json by alias), built without a line list.
 
 The repositories and the ASGI receive channel are stubbed, and ChunkCollector plays the
 response that drains a report stream, so no HTTP request is made, except in the first case,
@@ -27,6 +28,7 @@ report...`` (lines 464-474), ``"X" is not a valid value to confirm...`` (lines 4
 """
 
 import asyncio
+import contextlib
 import functools
 import itertools
 import logging
@@ -117,6 +119,16 @@ EDIT_DEADLINE_SECONDS = 1.0
 MID_BUILD_CHECK_LINES = 3
 # No report slot borrowed and every request admission free.
 NOTHING_HELD = (0, ADMITTED_REQUEST_LIMIT)
+# The admission bound of a report whose admissions are all held, far below the default.
+SHORT_ADMISSION_WAIT_SECONDS = 0.05
+# CORPT00C's cursor on the report type (MOVE -1 TO MONTHLYL), as the ReportQuery wire name.
+CURSOR_REPORT_TYPE = "reportType"
+# The WHEN OTHER file condition of a report refused admission: IOERR of TRANTYPE, its first read.
+ADMISSION_REFUSED_TEXT = (
+    "Transaction CR00 READ on TRANTYPE returned RESP:17 REAS:0"
+    " (cause AdmissionTimeoutError, SQLSTATE none)"
+)
+ADMISSION_REFUSED_LOG = (logging.ERROR, ADMISSION_REFUSED_TEXT)
 # Rows per fetch and bytes per chunk small enough that a LARGEST_ROW_COUNT report spans many.
 SMALL_BATCH_ROWS = 5
 SMALL_CHUNK_BYTES = 256
@@ -397,7 +409,8 @@ def ReportHarnessFixture(
     stubRepository = functools.partial(StubRepository, readLog)
     monkeypatch.setattr(corpt00c, "ReferenceRepository", stubRepository)
     monkeypatch.setattr(corpt00c, "TransactionRepository", stubRepository)
-    application = SimpleNamespace(state=State())
+    # The settings bound the reads' admission wait, as main.CreateApp keeps them on app.state.
+    application = SimpleNamespace(state=State({"settings": testSettings}))
     return ReportHarness(readLog, buildObserver, application, testSettings, monkeypatch)
 
 
@@ -668,6 +681,29 @@ async def test_a_failed_read_or_an_abend_keeps_its_outcome_and_frees_slot_and_ad
     else:
         assert type(raisedError) is cbtrn03c.ReportAbendError
     assert harness.buildObserver.buildsStarted == 0
+    assert harness.Held() == NOTHING_HELD
+
+
+@pytest.mark.parametrize("entryName", ENTRIES)
+async def test_a_report_refused_admission_reads_nothing_and_answers_the_tdq_literal(
+    harness, caplog, entryName
+):
+    """Past the admission bound the reads never run: 503, the CR00 log line, nothing held."""
+    caplog.set_level(logging.INFO, logger=corpt00c.LOGGER.name)
+    shortWait = {"DB_CONNECT_TIMEOUT_SECONDS": SHORT_ADMISSION_WAIT_SECONDS}
+    harness.application.state.settings = harness.settings.model_copy(update=shortWait)
+    admission = RequestAdmission(harness.Context().request)
+    async with contextlib.AsyncExitStack() as heldAdmissions:
+        for _ in range(ADMITTED_REQUEST_LIMIT):
+            await heldAdmissions.enter_async_context(admission)
+        raisedError = await RaisedBy(entryName, harness.Context())
+
+    assert isinstance(raisedError, LegacyMessageError)
+    outcome = (raisedError.httpStatus, raisedError.message, raisedError.field)
+    assert outcome == (FILE_ERROR_STATUS, UNABLE_TO_WRITE_TDQ_MESSAGE, CURSOR_REPORT_TYPE)
+    assert (harness.readLog.rowReads, harness.readLog.freeAdmissions) == (0, [])
+    logged = [(record.levelno, record.getMessage()) for record in caplog.records]
+    assert logged == [ADMISSION_REFUSED_LOG]
     assert harness.Held() == NOTHING_HELD
 
 

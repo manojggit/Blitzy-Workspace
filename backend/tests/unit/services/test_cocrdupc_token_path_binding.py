@@ -170,7 +170,9 @@ def CardRepositoryStub(monkeypatch) -> StubCardRepository:
 
 def BuildContext(settings: "Settings") -> OnlineContext:
     """Return an online context with the settings the ciphers use and an unused engine."""
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(engine=None)))
+    # The request's own state is where core.locks.RequestEngine looks before app.state.engine.
+    appState = SimpleNamespace(engine=None)
+    request = SimpleNamespace(app=SimpleNamespace(state=appState), state=SimpleNamespace())
     return OnlineContext(request=request, session=SimpleNamespace(), settings=settings)
 
 

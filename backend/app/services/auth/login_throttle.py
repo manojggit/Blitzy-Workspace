@@ -60,7 +60,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from app.core.database import UNIT_FAILURES, TranslateWriteFailure, WriteUnit
+from app.core.database import UNIT_FAILURES, EngineDeadline, TranslateWriteFailure, WriteUnit
 from app.core.dependencies import OnlineContext
 from app.core.errors import HTTP_LOGIN_LOCKED, LegacyMessageError, RecordLockError
 from app.core.messages import LOGIN_LOCKED_MESSAGE
@@ -220,9 +220,14 @@ async def WaitForAdmission(context: OnlineContext, slot: CheckSlot) -> None:
 
 
 async def OpenSlotConnection(engine: AsyncEngine) -> AsyncConnection:
-    """Check out the attempt's check-slot connection; a failure becomes the LOGINATT condition."""
+    """Check out the attempt's check-slot connection; a failure becomes the LOGINATT condition.
+
+    The checkout and its pre-ping run within EngineDeadline of the engine, whose expiry is a
+    TimeoutError and so FileIoError.
+    """
     try:
-        return await engine.connect()
+        with anyio.fail_after(EngineDeadline(engine)):
+            return await engine.connect()
     except UNIT_FAILURES as exc:
         raise TranslateWriteFailure(exc, LOGIN_ATTEMPTS_FILE_NAME) from exc
 

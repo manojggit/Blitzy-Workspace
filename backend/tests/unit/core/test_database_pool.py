@@ -6,7 +6,9 @@ connections (its session, the batch-window connection and two write units), and 
 admits at most ADMITTED_REQUEST_LIMIT requests at once. These tests pin that the pool keeps
 every connection the admitted requests can hold at once, so steady load reuses warm connections
 instead of opening and closing overflow ones, that only the closing-session headroom overflows,
-that admission still leaves that headroom within the pool's capacity, and that BuildEngine
+that admission still leaves that headroom within the pool's capacity, that requests which can
+change data (POST, PUT, DELETE) are admitted at most MUTATING_REQUEST_LIMIT at a time, leaving
+RESERVED_READ_ADMISSIONS of the admissions to every other request, and that BuildEngine
 applies the sizing without connecting. No test touches a database. Every key and password is
 generated at run time with the secrets module, and backend/.env is never read (_env_file=None).
 """
@@ -22,6 +24,10 @@ from app.core.config import Settings
 
 # Nine admitted requests, the admission the pool resizing leaves unchanged.
 EXPECTED_ADMITTED_REQUEST_LIMIT = 9
+# Six of them at most may change data, so three always stay for reads and DB-free requests.
+EXPECTED_MUTATING_REQUEST_LIMIT = 6
+EXPECTED_RESERVED_READ_ADMISSIONS = 3
+EXPECTED_MUTATING_METHODS = frozenset({"POST", "PUT", "DELETE"})
 ADMITTED_PEAK_CONNECTIONS = database.ADMITTED_REQUEST_LIMIT * database.REQUEST_CONNECTION_LIMIT
 
 
@@ -54,6 +60,15 @@ def PoolSettings():
         (operator.eq, database.POOL_SIZE + database.POOL_MAX_OVERFLOW, database.POOL_CAPACITY),
         (operator.eq, database.POOL_MAX_OVERFLOW, database.POOL_HEADROOM_CONNECTIONS),
         (operator.eq, database.ADMITTED_REQUEST_LIMIT, EXPECTED_ADMITTED_REQUEST_LIMIT),
+        (operator.eq, database.MUTATING_REQUEST_LIMIT, EXPECTED_MUTATING_REQUEST_LIMIT),
+        (operator.eq, database.RESERVED_READ_ADMISSIONS, EXPECTED_RESERVED_READ_ADMISSIONS),
+        (
+            operator.eq,
+            database.MUTATING_REQUEST_LIMIT + database.RESERVED_READ_ADMISSIONS,
+            database.ADMITTED_REQUEST_LIMIT,
+        ),
+        (operator.lt, database.MUTATING_REQUEST_LIMIT, database.ADMITTED_REQUEST_LIMIT),
+        (operator.eq, database.MUTATING_METHODS, EXPECTED_MUTATING_METHODS),
     ],
     ids=[
         "admitted-peak-stays-pooled",
@@ -61,6 +76,11 @@ def PoolSettings():
         "pool-plus-overflow-is-capacity",
         "only-headroom-overflows",
         "admission-limit-unchanged",
+        "mutating-limit",
+        "reserved-read-admissions",
+        "mutating-plus-reserved-is-admission-limit",
+        "mutating-requests-never-take-every-admission",
+        "mutating-methods",
     ],
 )
 def test_pool_sizing_keeps_admitted_peak_pooled(comparison, leftValue, rightValue):

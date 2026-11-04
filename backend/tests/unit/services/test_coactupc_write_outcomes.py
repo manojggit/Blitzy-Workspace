@@ -161,7 +161,8 @@ def BuildSettings() -> Settings:
 def BuildContext() -> OnlineContext:
     """Return an online context whose engine only the stubbed write units receive."""
     appState = SimpleNamespace(engine=SimpleNamespace())
-    request = SimpleNamespace(app=SimpleNamespace(state=appState))
+    # The request's own state is where core.locks.RequestEngine looks before app.state.engine.
+    request = SimpleNamespace(app=SimpleNamespace(state=appState), state=SimpleNamespace())
     return OnlineContext(request=request, session=SimpleNamespace(), settings=BuildSettings())
 
 

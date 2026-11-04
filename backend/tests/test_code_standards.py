@@ -129,6 +129,13 @@ FRAMEWORK_METHOD_NAMES = frozenset(
         "matches",
         # FastAPI APIRoute.get_route_handler.
         "get_route_handler",
+        # asyncpg Connection.close, which SQLAlchemy's asyncpg adapter calls on every pooled
+        # connection, and SQLAlchemy AsyncSession.execute, AsyncSession.connection and
+        # AsyncSession.stream, which the repositories call.
+        "close",
+        "execute",
+        "connection",
+        "stream",
         # SQLAlchemy TypeDecorator, and TypeEngine.literal_processor.
         "process_bind_param",
         "process_result_value",

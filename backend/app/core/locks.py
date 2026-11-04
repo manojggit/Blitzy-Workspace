@@ -20,10 +20,10 @@ users. A refusal raises FileNotOpenError, a RepositoryError like any database fa
 service returns its program's WHEN OTHER literal with HTTP 503. LeaveOnlineWindow, in the
 request dependency's finally, releases the lock and the connection.
 
-This is a leaf module: it imports only the standard library, asyncpg, SQLAlchemy, FastAPI's
-Request and app.core.errors, and reads no settings at import, so batch imports the lock keys
-without a SECRET_KEY or a database. Batch never calls EnterOnlineWindow, because its job
-connections would conflict with its own exclusive window.
+This is a leaf module: it imports only the standard library, anyio, asyncpg, SQLAlchemy,
+FastAPI's Request and app.core.errors, and reads no settings at import, so batch imports the
+lock keys without a SECRET_KEY or a database. Batch never calls EnterOnlineWindow, because its
+job connections would conflict with its own exclusive window.
 """
 
 import logging
@@ -31,9 +31,10 @@ from collections.abc import Mapping
 from types import MappingProxyType
 
 import asyncpg
+from anyio import fail_after
 from fastapi import Request
 from sqlalchemy import BigInteger, TextClause, bindparam, text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, PendingRollbackError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -69,16 +70,29 @@ WINDOW_REFUSED = "REFUSED"
 # Reported as CICS IOERR: the failure set of app.core.database.UNIT_FAILURES, kept here so this
 # module stays a leaf. Catching only DBAPIError and OSError would not do: the asyncpg dialect
 # raises connect-time rejections (bad credentials, unknown database, too many connections)
-# unwrapped, and a pool checkout that waits past pool_timeout raises PoolTimeoutError.
+# unwrapped, and a pool checkout that waits past pool_timeout raises PoolTimeoutError. asyncpg
+# raises InternalClientError, untranslated, when PostgreSQL ends the session mid-operation
+# (server shutdown, pg_terminate_backend), and SQLAlchemy raises PendingRollbackError for a
+# statement on a connection a lost connection invalidated inside its transaction.
 WINDOW_FAILURES = (
     DBAPIError,
     OSError,
     asyncpg.PostgresError,
     asyncpg.InterfaceError,
+    asyncpg.InternalClientError,
+    PendingRollbackError,
     PoolTimeoutError,
 )
 
 UNLOCK_FAILED_LOG = "Batch-window unlock failed (%s); the connection is discarded instead"
+
+# app.core.database.DEADLINE_EXECUTION_OPTION, kept here so this module stays a leaf: the engine
+# execution option holding the seconds a checkout may take, absent from engines without one.
+DEADLINE_EXECUTION_OPTION = "carddemo_deadline_seconds"
+# The request.state attribute of the engine a request takes its own connections from when it is
+# not app.state.engine: app.core.database stores its refusing engine there for a request that
+# must never check out a pooled connection. Defined here so this module stays a leaf.
+REQUEST_ENGINE_ATTRIBUTE = "requestEngine"
 
 
 def LockKeyStatement(sql: str) -> TextClause:
@@ -97,6 +111,19 @@ class FileNotOpenError(RepositoryError):
         super().__init__(fileName, resp=CICS_RESP_NOTOPEN, resp2=CICS_RESP2_NOTOPEN_CLOSED)
 
 
+def RequestEngine(request: Request) -> AsyncEngine:
+    """Return the engine of the request's window connection and write units.
+
+    That is the engine stored under REQUEST_ENGINE_ATTRIBUTE, whose every connection fails at
+    once, for a request app.core.database refused or a route that does no file I/O, and
+    ``request.app.state.engine`` for every other request.
+    """
+    requestEngine: AsyncEngine | None = getattr(request.state, REQUEST_ENGINE_ATTRIBUTE, None)
+    if requestEngine is None:
+        return request.app.state.engine
+    return requestEngine
+
+
 def WindowState(request: Request) -> str | None:
     """Return WINDOW_GRANTED, WINDOW_REFUSED, or None while the request has not entered."""
     return getattr(request.state, WINDOW_STATE_ATTRIBUTE, None)
@@ -111,9 +138,14 @@ def StoreWindowState(
 
 
 async def OpenWindowConnection(engine: AsyncEngine, fileName: str) -> AsyncConnection:
-    """Check out the request's window connection; a connection failure becomes FileIoError."""
+    """Check out the request's window connection; a connection failure becomes FileIoError.
+
+    The checkout and its pre-ping run within the engine's DEADLINE_EXECUTION_OPTION seconds,
+    whose expiry is a TimeoutError and so a connection failure too.
+    """
     try:
-        return await engine.connect()
+        with fail_after(engine.get_execution_options().get(DEADLINE_EXECUTION_OPTION)):
+            return await engine.connect()
     except WINDOW_FAILURES as exc:
         raise FileIoError(fileName) from exc
 
@@ -163,17 +195,17 @@ async def EnterOnlineWindow(request: Request, fileName: str) -> None:
 
     ``fileName`` is the legacy CICS file the statement addresses (TRANSACT, CCXREF, CXACAIX,
     ACCTDAT or USRSEC) and is named by the raised condition. The first call of a request takes
-    the shared window lock on a connection of its own, ``request.app.state.engine``; later calls
-    reuse the outcome without a query. Raises FileNotOpenError (NOTOPEN) while batch holds or
-    awaits the window, on this call and every later one in the request, and FileIoError when
-    the database cannot be reached; a later call then tries again.
+    the shared window lock on a connection of its own from RequestEngine; later calls reuse the
+    outcome without a query. Raises FileNotOpenError (NOTOPEN) while batch holds or awaits the
+    window, on this call and every later one in the request, and FileIoError when the database
+    cannot be reached or the request was refused admission; a later call then tries again.
     """
     state = WindowState(request)
     if state == WINDOW_GRANTED:
         return
     if state == WINDOW_REFUSED:
         raise FileNotOpenError(fileName)
-    connection = await OpenWindowConnection(request.app.state.engine, fileName)
+    connection = await OpenWindowConnection(RequestEngine(request), fileName)
     if not await LockWindowOrDiscard(connection, fileName):
         await connection.close()
         StoreWindowState(request, WINDOW_REFUSED, None)

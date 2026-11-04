@@ -18,13 +18,20 @@ happens per request. Admin is exactly A; every other stored type (U, u, a, X, ..
 - RunSessionGuard runs one of SESSION_GUARDS on the cookie alone. app.api.v1.SessionFirstRoute
   calls it before FastAPI reads a guarded route's body, so a missing or invalid cookie gives 401
   and a wrong role 403 even when the body is malformed.
-- OnlineContext is the one parameter object services and repositories receive. Every context
-  dependency releases the request's shared batch-window lock (core.locks) when the request ends,
-  whether it succeeds, fails or is cancelled.
+- OnlineContext is the one parameter object services and repositories receive. Its engine, of
+  every write unit, is core.locks.RequestEngine, the engine of its batch-window connection too.
+  Every context dependency that can take the window releases the request's shared
+  batch-window lock (core.locks) when the request ends, whether it succeeds, fails or is
+  cancelled.
 - GetRegularReportContext serves CR00 alone. Its session comes from core.database
   GetReportSession, which admits nothing, because the CR00 service takes the request admission
-  only for its reads and its build (core.database.AdmittedReads); every other context is
-  admitted by GetSession for the whole request.
+  only for its reads and its build (core.database.AdmittedReads).
+- GetRegularMenuContext and GetAdminMenuContext serve CM00 (COMEN01C) and CA00 (COADM01C),
+  which do no file I/O. Their session comes from core.database GetUnadmittedSession, which
+  admits nothing and can never reach the pool, so the menus never wait behind other requests
+  or for the database.
+- Every other context is admitted by core.database GetSession for the whole request, or
+  refused when no admission comes free within DB_CONNECT_TIMEOUT_SECONDS.
 
 COMEN01C's own admin-only option check (CDEMO-USRTYP-USER, exactly U) is ported in the menu
 service, not here.
@@ -40,9 +47,9 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.core.config import Settings
-from app.core.database import GetReportSession, GetSession
+from app.core.database import GetReportSession, GetSession, GetUnadmittedSession
 from app.core.errors import HTTP_ACCESS_REFUSED, HTTP_SIGN_ON_FAILURE, LegacyMessageError
-from app.core.locks import LeaveOnlineWindow
+from app.core.locks import LeaveOnlineWindow, RequestEngine
 from app.core.messages import ADMIN_ONLY_MESSAGE
 from app.core.security import ReadSessionToken
 
@@ -143,8 +150,13 @@ class OnlineContext:
     user: CurrentUser | None = None
 
     def Engine(self) -> AsyncEngine:
-        """Return the app.state engine of core.database.WriteUnit and core.locks windows."""
-        return self.request.app.state.engine
+        """Return the request's engine (core.locks.RequestEngine) of every WriteUnit it opens.
+
+        It is app.state.engine, or the refusing engine of a request core.database refused or
+        of a route that does no file I/O, so the request's write units, the login throttle's
+        included, come from the same engine as its batch-window connection.
+        """
+        return RequestEngine(self.request)
 
     engine = property(Engine)
 
@@ -170,6 +182,36 @@ async def GetOnlineContext(
             await LeaveOnlineWindow(request)
 
 
+async def GetFileFreeContext(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(GetUnadmittedSession)],
+    settings: Annotated[Settings, Depends(GetAppSettings)],
+) -> OnlineContext:
+    """Return the anonymous context of a route whose program does no file I/O.
+
+    The request takes no admission. Its session and its engine are core.database's refusing
+    engine, so the context can never reach the pool and never holds a batch-window lock to
+    release. GetRegularMenuContext and GetAdminMenuContext add the verified user.
+    """
+    return OnlineContext(request=request, session=session, settings=settings)
+
+
+async def GetRegularMenuContext(
+    user: Annotated[CurrentUser, Depends(RequireRegular)],
+    context: Annotated[OnlineContext, Depends(GetFileFreeContext)],
+) -> OnlineContext:
+    """Return the CM00 (COMEN01C) context of a regular user; the guard runs before the context."""
+    return replace(context, user=user)
+
+
+async def GetAdminMenuContext(
+    user: Annotated[CurrentUser, Depends(RequireAdmin)],
+    context: Annotated[OnlineContext, Depends(GetFileFreeContext)],
+) -> OnlineContext:
+    """Return the CA00 (COADM01C) context of an admin; the guard runs before the context."""
+    return replace(context, user=user)
+
+
 async def GetAuthenticatedContext(
     user: Annotated[CurrentUser, Depends(GetCurrentUser)],
     context: Annotated[OnlineContext, Depends(GetOnlineContext)],
@@ -186,7 +228,7 @@ async def GetAdminContext(
     user: Annotated[CurrentUser, Depends(RequireAdmin)],
     context: Annotated[OnlineContext, Depends(GetOnlineContext)],
 ) -> OnlineContext:
-    """Return the context of an admin (CA00, CU00-CU03); the guard runs before the context."""
+    """Return the context of an admin (CU00-CU03); the guard runs before the context."""
     return replace(context, user=user)
 
 
@@ -196,7 +238,7 @@ async def GetRegularContext(
 ) -> OnlineContext:
     """Return the context of a regular user; the guard runs before the context.
 
-    Serves CM00, CAVW, CAUP, CCLI, CCDL, CCUP, CT00-CT02 and CB00.
+    Serves CAVW, CAUP, CCLI, CCDL, CCUP, CT00-CT02 and CB00.
     """
     return replace(context, user=user)
 

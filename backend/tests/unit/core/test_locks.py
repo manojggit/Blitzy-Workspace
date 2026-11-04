@@ -17,10 +17,11 @@ import contextlib
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from starlette.applications import Starlette
 from starlette.requests import Request
 
-from app.core.errors import RepositoryError
+from app.core.errors import LOCK_NOT_AVAILABLE_SQLSTATE, RepositoryError, SqlStateOf
 from app.core.locks import (
     BATCH_WINDOW_LOCK,
     TRAN_ID_ALLOCATION_LOCK,
@@ -49,6 +50,8 @@ SHARED_MODE = "ShareLock"
 EXCLUSIVE_MODE = "ExclusiveLock"
 WINDOW_LOCK_PARAMETERS = {"lockKey": BATCH_WINDOW_LOCK}
 BATCH_LOCK_TIMEOUT = "10s"
+# Expires while the in-flight request still holds the window, so the batch waiter fails.
+EXPIRING_BATCH_LOCK_TIMEOUT = "200ms"
 BATCH_WAIT_SECONDS = 10.0
 QUEUE_POLL_SECONDS = 0.05
 QUEUE_POLL_ATTEMPTS = 200
@@ -152,13 +155,14 @@ def TryBatchWindow(syncEngine):
         batchLock.Release()
 
 
-async def WaitForBatchWindow(asyncEngine):
+async def WaitForBatchWindow(asyncEngine, lockTimeout):
     """Queue for the window exclusively, as the batch CLI does, then release it once granted.
 
-    asyncEngine is unpooled, so closing the connection on any failure also ends its session.
+    A wait longer than lockTimeout fails with SQLSTATE 55P03. asyncEngine is unpooled, so
+    closing the connection on any failure also ends its session.
     """
     async with asyncEngine.connect() as connection:
-        await connection.execute(SET_LOCK_TIMEOUT_SQL, {"lockTimeout": BATCH_LOCK_TIMEOUT})
+        await connection.execute(SET_LOCK_TIMEOUT_SQL, {"lockTimeout": lockTimeout})
         await connection.execute(WAIT_BATCH_WINDOW_SQL, WINDOW_LOCK_PARAMETERS)
         releaseResult = await connection.execute(RELEASE_BATCH_WINDOW_SQL, WINDOW_LOCK_PARAMETERS)
         await connection.commit()
@@ -172,6 +176,43 @@ async def WaitUntilBatchQueues(syncEngine):
             return
         await asyncio.sleep(QUEUE_POLL_SECONDS)
     pytest.fail("No exclusive request for BATCH_WINDOW_LOCK started waiting")
+
+
+async def CancelAndReap(task):
+    """Cancel the task and wait for it to end, suppressing only its cancellation.
+
+    A task that has already failed re-raises its error here, so the caller sees it.
+    """
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def PendingTasks():
+    """Return the event loop's unfinished tasks other than the running one."""
+    return asyncio.all_tasks() - {asyncio.current_task()}
+
+
+@contextlib.asynccontextmanager
+async def ClosingWindow(asyncEngine, batchLockTimeout):
+    """Yield an in-flight request inside the window, a new request and a batch waiter's task.
+
+    The waiter queues for the window exclusively for at most batchLockTimeout. At exit it is
+    reaped first, inside a try whose finally leaves both requests' windows, so an error the
+    waiter raised surfaces only once no shared lock or connection of the requests is left.
+    """
+    inFlightRequest = BuildRequest(asyncEngine)
+    newRequest = BuildRequest(asyncEngine)
+    await EnterOnlineWindow(inFlightRequest, "ACCTDAT")
+    batchWait = asyncio.create_task(WaitForBatchWindow(asyncEngine, batchLockTimeout))
+    try:
+        yield inFlightRequest, newRequest, batchWait
+    finally:
+        try:
+            await CancelAndReap(batchWait)
+        finally:
+            await LeaveOnlineWindow(inFlightRequest)
+            await LeaveOnlineWindow(newRequest)
 
 
 def test_window_tables_are_the_closefil_files():
@@ -286,20 +327,31 @@ async def test_batch_lock_waits_for_online_request(asyncEngine, syncEngine):
 async def test_closing_window_refuses_new_requests_until_in_flight_ones_leave(
     asyncEngine, syncEngine
 ):
-    inFlightRequest = BuildRequest(asyncEngine)
-    newRequest = BuildRequest(asyncEngine)
-    await EnterOnlineWindow(inFlightRequest, "ACCTDAT")
-    batchWait = asyncio.create_task(WaitForBatchWindow(asyncEngine))
-    try:
+    closingWindow = ClosingWindow(asyncEngine, BATCH_LOCK_TIMEOUT)
+    async with closingWindow as (inFlightRequest, newRequest, batchWait):
         await WaitUntilBatchQueues(syncEngine)
         with pytest.raises(FileNotOpenError):
             await EnterOnlineWindow(newRequest, "ACCTDAT")
         await LeaveOnlineWindow(inFlightRequest)
         assert await asyncio.wait_for(batchWait, BATCH_WAIT_SECONDS) is True
-    finally:
-        batchWait.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await batchWait
-        await LeaveOnlineWindow(inFlightRequest)
-        await LeaveOnlineWindow(newRequest)
     assert CountAdvisoryLocks(syncEngine, EXCLUSIVE_MODE) == 0
+
+
+# A batch waiter that fails while the in-flight request still holds the window does not stop
+# the cleanup: both requests leave the window, and only then does the waiter's error surface.
+async def test_closing_window_cleanup_releases_the_window_when_the_batch_waiter_fails(
+    asyncEngine, syncEngine
+):
+    tasksBefore = PendingTasks()
+    closingWindow = ClosingWindow(asyncEngine, EXPIRING_BATCH_LOCK_TIMEOUT)
+    with pytest.raises(DBAPIError) as waiterFailure:
+        async with closingWindow as (_, _, batchWait):
+            await asyncio.wait({batchWait}, timeout=BATCH_WAIT_SECONDS)
+            assert batchWait.done()
+            assert CountAdvisoryLocks(syncEngine, SHARED_MODE) == 1
+    assert SqlStateOf(waiterFailure.value) == LOCK_NOT_AVAILABLE_SQLSTATE
+    assert any(entry.name == CancelAndReap.__name__ for entry in waiterFailure.traceback)
+    assert CountAdvisoryLocks(syncEngine, SHARED_MODE) == 0
+    assert CountAdvisoryLocks(syncEngine, EXCLUSIVE_MODE) == 0
+    assert CountAdvisoryLocks(syncEngine, EXCLUSIVE_MODE, granted=False) == 0
+    assert PendingTasks() <= tasksBefore

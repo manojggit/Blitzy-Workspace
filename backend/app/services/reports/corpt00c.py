@@ -76,7 +76,7 @@ from app.core.errors import (
     LogFileCondition,
     RepositoryError,
 )
-from app.repositories.reference_repository import ReferenceRepository
+from app.repositories.reference_repository import TRANTYPE_FILE_NAME, ReferenceRepository
 from app.repositories.transaction_repository import TransactionRepository
 from app.schemas.common import ExportFormat, ReportType
 from app.schemas.reports import ReportLine, ReportQuery, TransactionReportResponse
@@ -806,17 +806,23 @@ async def OpenReportJob(
 
     The slot comes first and is waited for holding nothing; the admission is taken only once it
     is granted. holdings keeps both, and the session's connection and snapshot, until the
-    caller's build ends. A gone client is checked for when the slot is granted and after the
-    validation pass. ``cbtrn03c.ReportAbendError`` (the CBTRN03C abend 999) is deliberately
-    not caught, so it reaches FastAPI's 500 and the page shows the legacy abend.
+    caller's build ends. A request refused admission within its wait bound
+    (``core.database.AdmittedReads``) reads nothing and fails as an IOERR of TRANTYPE, its
+    first file read, so it answers the WHEN OTHER literal. A gone client is checked for when
+    the slot is granted and after the validation pass. ``cbtrn03c.ReportAbendError`` (the
+    CBTRN03C abend 999) is deliberately not caught, so it reaches FastAPI's 500 and the page
+    shows the legacy abend.
 
     Raises:
         ReportAbandonedError: The client has disconnected.
-        LegacyMessageError: As ``ReadReportJob``.
+        LegacyMessageError: 503 ``Unable to Write TDQ (JOBS)...`` as ``ReportReadFailures``
+            when the request is refused admission; otherwise as ``ReadReportJob``.
     """
     await holdings.enter_async_context(REPORT_SLOTS)
     await StopIfClientGone(context.request)
-    await holdings.enter_async_context(AdmittedReads(context.request, context.session))
+    admittedReads = AdmittedReads(context.request, context.session, TRANTYPE_FILE_NAME)
+    with ReportReadFailures():
+        await holdings.enter_async_context(admittedReads)
     job = await ReadReportJob(context, reportRange)
     await StopIfClientGone(context.request)
     return job

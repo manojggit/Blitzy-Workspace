@@ -215,7 +215,8 @@ Only the backend reads these variables:
     IPv6 host is in compressed form inside brackets. The backend refuses to start when the list
     has no entry or an entry in any other form.
 - `DB_CONNECT_TIMEOUT_SECONDS`: a finite number greater than 0; default `10`. The seconds the
-    API waits for a new database connection.
+    API waits for a new database connection, and the longest a request waits for a free request
+    admission before its program answers its 503 file-error literal.
 - `DB_COMMAND_TIMEOUT_SECONDS`: a finite number greater than 0; default `30`. The seconds one
     database statement of the API may run.
 - `HEALTH_READY_TIMEOUT_SECONDS`: a finite number greater than 0; default `2`. The seconds the

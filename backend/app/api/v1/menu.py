@@ -6,11 +6,15 @@ table; ``POST .../selection`` replaces ENTER on the OPTION field, and the chosen
 ``EXEC CICS XCTL`` becomes the ``route`` of ``MenuSelectionResponse``. The menu services own
 every literal and every edit; they do no I/O, so they are called without ``await``.
 
-CM00 serves regular users (any type other than exactly ``A``) through ``GetRegularContext``,
-which refuses an admin with 403 and an empty message. CA00 serves admins (type exactly ``A``)
-through ``GetAdminContext``, which refuses anyone else with 403 and the COMEN01C literal
-``No access - Admin Only option... ``. A POST without an allow-listed Origin is refused with 403
-by ``core.middleware.OriginGuard`` before it reaches a handler.
+CM00 serves regular users (any type other than exactly ``A``) through
+``GetRegularMenuContext``, whose ``RequireRegular`` guard refuses an admin with 403 and an empty
+message. CA00 serves admins (type exactly ``A``) through ``GetAdminMenuContext``, whose
+``RequireAdmin`` guard refuses anyone else with 403 and the COMEN01C literal
+``No access - Admin Only option... ``. Neither program does file I/O, so neither context takes
+a request admission or a pooled connection (``core.dependencies.GetFileFreeContext``): the menus
+answer at once while other requests queue for admission or the database stops answering. A POST
+without an allow-listed Origin is refused with 403 by ``core.middleware.OriginGuard`` before it
+reaches a handler.
 """
 
 from typing import Annotated
@@ -18,7 +22,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 
 from app.api.v1 import LegacyErrorResponses, SessionFirstRoute
-from app.core.dependencies import GetAdminContext, GetRegularContext, OnlineContext
+from app.core.dependencies import GetAdminMenuContext, GetRegularMenuContext, OnlineContext
 from app.schemas.menu import MenuResponse, MenuSelectionRequest, MenuSelectionResponse
 from app.services.menu import coadm01c, comen01c
 
@@ -52,7 +56,7 @@ ADMIN_SELECTION_DESCRIPTION = (
     responses=LegacyErrorResponses(401, 403),
 )
 async def GetMainMenu(
-    context: Annotated[OnlineContext, Depends(GetRegularContext)],
+    context: Annotated[OnlineContext, Depends(GetRegularMenuContext)],
 ) -> MenuResponse:
     """Return the main menu option table (COMEN01C SEND-MENU-SCREEN)."""
     return comen01c.GetMainMenu(context)
@@ -67,7 +71,7 @@ async def GetMainMenu(
 )
 async def SelectMainMenuOption(
     selectionRequest: MenuSelectionRequest,
-    context: Annotated[OnlineContext, Depends(GetRegularContext)],
+    context: Annotated[OnlineContext, Depends(GetRegularMenuContext)],
 ) -> MenuSelectionResponse:
     """Process ENTER on COMEN01 (COMEN01C PROCESS-ENTER-KEY)."""
     return comen01c.SelectMainOption(context, selectionRequest)
@@ -81,7 +85,7 @@ async def SelectMainMenuOption(
     responses=LegacyErrorResponses(401, 403),
 )
 async def GetAdminMenu(
-    context: Annotated[OnlineContext, Depends(GetAdminContext)],
+    context: Annotated[OnlineContext, Depends(GetAdminMenuContext)],
 ) -> MenuResponse:
     """Return the admin menu option table (COADM01C SEND-MENU-SCREEN)."""
     return coadm01c.GetAdminMenu(context)
@@ -96,7 +100,7 @@ async def GetAdminMenu(
 )
 async def SelectAdminMenuOption(
     selectionRequest: MenuSelectionRequest,
-    context: Annotated[OnlineContext, Depends(GetAdminContext)],
+    context: Annotated[OnlineContext, Depends(GetAdminMenuContext)],
 ) -> MenuSelectionResponse:
     """Process ENTER on COADM01 (COADM01C PROCESS-ENTER-KEY)."""
     return coadm01c.SelectAdminOption(context, selectionRequest)
