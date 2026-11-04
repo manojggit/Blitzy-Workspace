@@ -23,19 +23,25 @@ const ACCOUNTS_PATH = "/accounts";
 const EDIT_SUFFIX = "/edit";
 
 // The COACTVW screen: one account (CVACT01Y) and its customer (CVCUS01Y), display only. Amounts
-// are exact decimal text, dates YYYY-MM-DD text (empty when not stored) and the SSN is masked.
+// are exact decimal text, each followed by its *_edited text as the map's PICOUT +ZZZ,ZZZ,ZZZ.99
+// shows it; dates are YYYY-MM-DD text (empty when not stored) and the SSN is masked.
 export interface AccountViewResponse extends ScreenFeedback {
     acct_id: string;
     active_status: string;
     open_date: string;
     credit_limit: MoneyAmount;
+    credit_limit_edited: string;
     expiration_date: string;
     cash_credit_limit: MoneyAmount;
+    cash_credit_limit_edited: string;
     reissue_date: string;
     curr_balance: MoneyAmount;
+    curr_balance_edited: string;
     curr_cycle_credit: MoneyAmount;
+    curr_cycle_credit_edited: string;
     group_id: string;
     curr_cycle_debit: MoneyAmount;
+    curr_cycle_debit_edited: string;
     cust_id: string;
     ssn_masked: string;
     date_of_birth: string;

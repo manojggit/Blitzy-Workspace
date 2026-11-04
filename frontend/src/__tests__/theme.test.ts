@@ -1,11 +1,13 @@
 // Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE,
-// AUTOFILL_KEYFRAMES_STYLE, SCROLL_REGION_STYLE, FixedLayoutTableStyle), the Material Design 3
-// token theme of AAP 0.5.3–0.5.4.
-import type { SxProps, Theme, TypeAction } from "@mui/material/styles";
+// AUTOFILL_KEYFRAMES_STYLE, SCROLL_REGION_STYLE, FixedLayoutTableStyle, RowShareStyle,
+// RowEndAlignmentFrom), the Material Design 3 token theme of AAP 0.5.3–0.5.4.
+import type { Breakpoint, SxProps, Theme, TypeAction } from "@mui/material/styles";
 import {
     AUTOFILL_KEYFRAMES_STYLE,
     CARD_DEMO_THEME,
     FixedLayoutTableStyle,
+    RowEndAlignmentFrom,
+    RowShareStyle,
     SCROLL_REGION_STYLE,
     VISUALLY_HIDDEN_STYLE,
 } from "@/app/theme";
@@ -1315,6 +1317,16 @@ const MUI_VISUALLY_HIDDEN_VALUES = {
     width: "1px",
 };
 
+// Each MUI breakpoint the theme keeps: a row aligns by its bottom edge from that breakpoint up and
+// keeps its default alignment below it, so the style holds that one breakpoint key.
+const ROW_END_ALIGNMENT_CASES: readonly (readonly [Breakpoint, StyleRecord])[] = [
+    ["xs", { alignItems: { xs: "flex-end" } }],
+    ["sm", { alignItems: { sm: "flex-end" } }],
+    ["md", { alignItems: { md: "flex-end" } }],
+    ["lg", { alignItems: { lg: "flex-end" } }],
+    ["xl", { alignItems: { xl: "flex-end" } }],
+];
+
 // The list tables' scrolling region: edge shadows in the shadow role under 40 px paper-coloured
 // covers that scroll with the content, so only an edge with hidden content shows its 12 px shadow;
 // a thin outline-role scrollbar; and the M3 focus ring, 3 px secondary 2 px outside the region.
@@ -1751,6 +1763,21 @@ describe("Visually hidden text", () => {
     it("VISUALLY_HIDDEN_STYLE carries MUI's visuallyHidden values", () => {
         expect(VISUALLY_HIDDEN_STYLE).toEqual(MUI_VISUALLY_HIDDEN_VALUES);
     });
+});
+
+describe("Row shares", () => {
+    it("RowShareStyle grows an item from no width to its shares of the row", () => {
+        expect(RowShareStyle(4)).toEqual({ flex: 4 });
+    });
+});
+
+describe("Row end alignment", () => {
+    it.each(ROW_END_ALIGNMENT_CASES)(
+        "RowEndAlignmentFrom(%s) aligns a row by its bottom edge from that breakpoint up",
+        (breakpoint, expectedStyle) => {
+            expect(RowEndAlignmentFrom(breakpoint)).toEqual(expectedStyle);
+        },
+    );
 });
 
 describe("List table scrolling regions", () => {

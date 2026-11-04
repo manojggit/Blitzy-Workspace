@@ -8,6 +8,8 @@ import {
     Stack,
     TextField,
     Typography,
+    type GridProps,
+    type StackProps,
     type SxProps,
     type TextFieldProps,
     type Theme,
@@ -27,6 +29,7 @@ import {
     type SetStateAction,
 } from "react";
 
+import { RowEndAlignmentFrom, RowShareStyle } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
@@ -59,11 +62,18 @@ interface ScreenFieldDefinition {
     maxLength: number;
     helperText?: string;
     inputMode?: "numeric";
+    // A part's share of its group's row width. The parts of a group without shares split the
+    // row equally.
+    rowShares?: number;
 }
 
 interface FieldGroupDefinition {
     groupLabel: string;
     parts: readonly ScreenFieldDefinition[];
+    // The group's grid cell; a group without one takes a half row from md, as a single field does.
+    gridSize?: GridProps["size"];
+    // How the parts lay out; a group without a direction takes GROUP_DIRECTION.
+    direction?: StackProps["direction"];
 }
 
 type SectionEntry = ScreenFieldDefinition | FieldGroupDefinition;
@@ -110,7 +120,10 @@ interface ScreenStore {
     setters: ScreenSetters;
 }
 
-type InputRefMap = Partial<Record<AccountFieldName, HTMLInputElement | null>>;
+// An open field is a single-line input; a protected one is a read-only textarea, so it wraps.
+type FieldElement = HTMLInputElement | HTMLTextAreaElement;
+
+type InputRefMap = Partial<Record<AccountFieldName, FieldElement | null>>;
 
 type AccountRequest = () => Promise<AccountScreen>;
 
@@ -143,22 +156,24 @@ interface FocusRequest {
 
 interface InputRegistry {
     inputRefs: RefObject<InputRefMap>;
-    RegisterInput: (name: AccountFieldName, element: HTMLInputElement | null) => void;
+    RegisterInput: (name: AccountFieldName, element: FieldElement | null) => void;
 }
 
 interface FieldView {
     fields: AccountScreenFields;
     editableFields: ReadonlySet<AccountFieldName>;
     fieldErrors: ReadonlySet<string>;
-    RegisterInput: (name: AccountFieldName, element: HTMLInputElement | null) => void;
+    RegisterInput: (name: AccountFieldName, element: FieldElement | null) => void;
     onFieldChange: (name: AccountFieldName, value: string) => void;
 }
 
+// keys binds every COACTUP PF key; legendKeys are the buttons the state's legend shows.
 interface AccountUpdateScreenModel {
     view: FieldView;
     feedback: ScreenFeedbackView;
     isBusy: boolean;
     keys: readonly FunctionKeyDefinition[];
+    legendKeys: readonly FunctionKeyDefinition[];
 }
 
 interface SectionProps {
@@ -185,6 +200,17 @@ interface ScreenFieldProps {
     view: FieldView;
 }
 
+// What one field renders from: its own value, protection and error mark, and the page's stable
+// callbacks.
+interface ScreenFieldInputProps {
+    definition: ScreenFieldDefinition;
+    value: AccountScreenFields[AccountFieldName];
+    isEditable: boolean;
+    hasError: boolean;
+    RegisterInput: FieldView["RegisterInput"];
+    onFieldChange: FieldView["onFieldChange"];
+}
+
 interface AccountMessageLineProps {
     feedback: ScreenFeedbackView;
 }
@@ -207,17 +233,28 @@ const FIELD_ID_PREFIX = "account-update-";
 const ACCOUNT_ID_FIELD: AccountFieldName = "acct_id";
 
 const ENTRY_GRID_SIZE = { xs: 12, md: 6 } as const;
+// Until lg, half a row is narrower than the SSN and phone part labels at full size, which a blank
+// open part shows, so those groups take the whole row there.
+const WIDE_GROUP_GRID_SIZE = { xs: 12, lg: 6 } as const;
+const FULL_ROW_GRID_SIZE = 12;
 // Theme spacing units: room between fields for an outlined field's raised label.
 const FIELD_SPACING = 4;
 const CAPTION_SPACING = 3;
 const EDITABLE_FIELD_KEY = "editable";
 const PROTECTED_FIELD_KEY = "protected";
+// A protected field is one native textarea row, which wraps a value wider than the field.
+const PROTECTED_FIELD_ELEMENT = "textarea";
+const PROTECTED_FIELD_ROWS = 1;
 // The parts of one map field sit side by side, as on the 3270, and stack on narrow viewports.
 const GROUP_DIRECTION = { xs: "column", sm: "row" } as const;
-// A group's inputs sit below its caption, so a section holding a group aligns each row by its
-// bottom edge, which keeps a single field level with the group's inputs. A section without a
-// group keeps the top edge, where a Y/N field's helper text hangs below its input.
-const GROUP_ROW_STYLE: SxProps<Theme> = { alignItems: "flex-end" };
+// Parts that stand on map rows of their own, one under the other, at every width.
+const STACKED_GROUP_DIRECTION = "column";
+// A group's inputs sit below its caption, so a section where a group shares a row with a single
+// field aligns each row by its bottom edge, which keeps the field level with the group's inputs:
+// at every width for a half-row group, which shares its row from md, and from lg for a wide one.
+// Elsewhere rows keep the top edge, where a Y/N field's helper text hangs below its input.
+const GROUP_ROW_STYLE = RowEndAlignmentFrom("xs");
+const WIDE_GROUP_ROW_STYLE = RowEndAlignmentFrom("lg");
 
 // The DFHMDF ACCTSID ... ACSPFLG inputs before any detail is fetched: all blank.
 const EMPTY_FIELDS: Readonly<AccountScreenFields> = Object.freeze({
@@ -278,17 +315,19 @@ function DateGroup(groupLabel: string, [year, month, day]: ThreePartNames): Fiel
     };
 }
 
-// ACSPH1A/ACSPH1B/ACSPH1C and ACSPH2A/ACSPH2B/ACSPH2C: LENGTH 3, 3 and 4.
+// ACSPH1A/ACSPH1B/ACSPH1C and ACSPH2A/ACSPH2B/ACSPH2C: LENGTH 3, 3 and 4. "Line number code" is
+// the longest part label, so the row splits 3:3:4, which keeps it whole in a half-width row.
 function PhoneGroup(
     groupLabel: string,
     [area, prefix, line]: ThreePartNames,
 ): FieldGroupDefinition {
     return {
         groupLabel,
+        gridSize: WIDE_GROUP_GRID_SIZE,
         parts: [
-            { name: area, label: "Area code", maxLength: 3 },
-            { name: prefix, label: "Prefix code", maxLength: 3 },
-            { name: line, label: "Line number code", maxLength: 4 },
+            { name: area, label: "Area code", maxLength: 3, rowShares: 3 },
+            { name: prefix, label: "Prefix code", maxLength: 3, rowShares: 3 },
+            { name: line, label: "Line number code", maxLength: 4, rowShares: 4 },
         ],
     };
 }
@@ -319,6 +358,7 @@ const FIELD_DEFINITIONS: Readonly<SectionDefinitions> = Object.freeze<SectionDef
         { name: "cust_id", label: "Customer id  :", maxLength: 9 },
         {
             groupLabel: "SSN:",
+            gridSize: WIDE_GROUP_GRID_SIZE,
             parts: [
                 { name: "ssn_part_1", label: "First 3 chars", maxLength: 3 },
                 { name: "ssn_part_2", label: "4th & 5th chars", maxLength: 2 },
@@ -331,9 +371,12 @@ const FIELD_DEFINITIONS: Readonly<SectionDefinitions> = Object.freeze<SectionDef
         { name: "middle_name", label: "Middle Name:", maxLength: 25 },
         { name: "last_name", label: "Last Name :", maxLength: 25 },
     ],
+    // ACSADL1 and ACSADL2 stand on map rows 16 and 17, one under the other.
     addressFields: [
         {
             groupLabel: "Address:",
+            gridSize: FULL_ROW_GRID_SIZE,
+            direction: STACKED_GROUP_DIRECTION,
             parts: [
                 { name: "addr_line_1", label: "Line 1", maxLength: 50 },
                 { name: "addr_line_2", label: "Line 2", maxLength: 50 },
@@ -393,6 +436,25 @@ const EDITABLE_FIELDS_BY_STATE: Readonly<Record<UpdateScreenState, readonly Acco
         [UpdateScreenState.CHANGES_DONE]: NO_EDITABLE_FIELDS,
         [UpdateScreenState.CHANGES_FAILED]: KEY_EDITABLE_FIELDS,
     });
+
+// The COACTUP PF legend: FKEYS (ENTER=Process F3=Exit) is always shown, while FKEY05 (F5=Save)
+// and FKEY12 (F12=Cancel) are ATTRB=(ASKIP,DRK) until 3390-SETUP-INFOMSG-ATTRS brightens them.
+const FKEYS_LEGEND: readonly PfKey[] = Object.freeze(["ENTER", "F3"]);
+// ACUP-CHANGES-MADE AND NOT ACUP-CHANGES-OKAYED-AND-DONE brightens FKEY12.
+const CANCEL_LEGEND: readonly PfKey[] = Object.freeze(["ENTER", "F3", "F12"]);
+// PROMPT-FOR-CONFIRMATION, which 3250-SETUP-INFOMSG sets only WHEN ACUP-CHANGES-OK-NOT-CONFIRMED,
+// brightens FKEY05 and FKEY12.
+const CONFIRMATION_LEGEND: readonly PfKey[] = Object.freeze(["ENTER", "F3", "F5", "F12"]);
+
+// The legend each returned state shows, by the ACUP-CHANGE-ACTION 88-levels.
+const LEGEND_KEYS_BY_STATE: Readonly<Record<UpdateScreenState, readonly PfKey[]>> = Object.freeze({
+    [UpdateScreenState.DETAILS_NOT_FETCHED]: FKEYS_LEGEND,
+    [UpdateScreenState.SHOW_DETAILS]: FKEYS_LEGEND,
+    [UpdateScreenState.CHANGES_NOT_OK]: CANCEL_LEGEND,
+    [UpdateScreenState.CHANGES_OK_NOT_CONFIRMED]: CONFIRMATION_LEGEND,
+    [UpdateScreenState.CHANGES_DONE]: FKEYS_LEGEND,
+    [UpdateScreenState.CHANGES_FAILED]: CANCEL_LEGEND,
+});
 
 const INITIAL_MODEL: ScreenModel = {
     state: UpdateScreenState.DETAILS_NOT_FETCHED,
@@ -546,9 +608,12 @@ function HandleAction(action: UpdateAction, context: ActionContext): void {
     runRequest(() => UpdateAccount(accountKey, request));
 }
 
-// The FKEYS legend ENTER=Process F3=Exit, with F5=Save and F12=Cancel offered in every state: the
-// server processes a save or cancel its state does not allow as ENTER. ENTER, F5 and F12 each
-// send a request, so they are disabled while one is in flight; F3 sends none and stays enabled.
+// Every COACTUP key, in legend order: ENTER=Process, F3=Exit, F5=Save and F12=Cancel. All four
+// stay bound in every state, as a dark 3270 PF key still sends its AID: the server processes a
+// save or cancel its state does not allow as ENTER, and a bound F5 cannot reload the page and
+// lose the screen_token. LegendKeysShownIn picks the buttons the state's legend shows. ENTER, F5
+// and F12 each send a request, so they are disabled while one is in flight; F3 sends none and
+// stays enabled.
 function BuildFunctionKeys(handlers: KeyHandlers, isBusy: boolean): FunctionKeyDefinition[] {
     const requestKey = (key: PfKey, label: string, action: UpdateAction) => ({
         key,
@@ -562,6 +627,21 @@ function BuildFunctionKeys(handlers: KeyHandlers, isBusy: boolean): FunctionKeyD
         requestKey("F5", "Save", UpdateAction.SAVE),
         requestKey("F12", "Cancel", UpdateAction.CANCEL),
     ];
+}
+
+// A state the table does not name shows the DETAILS_NOT_FETCHED legend, as the server processes
+// an unreadable screen_token as DETAILS_NOT_FETCHED.
+function LegendKeysFor(state: UpdateScreenState): readonly PfKey[] {
+    return Object.hasOwn(LEGEND_KEYS_BY_STATE, state) ? LEGEND_KEYS_BY_STATE[state] : FKEYS_LEGEND;
+}
+
+// The keys whose legend entry the state shows, in BuildFunctionKeys order.
+function LegendKeysShownIn(
+    keys: readonly FunctionKeyDefinition[],
+    state: UpdateScreenState,
+): FunctionKeyDefinition[] {
+    const legendPfKeys = LegendKeysFor(state);
+    return keys.filter((definition) => legendPfKeys.includes(definition.key));
 }
 
 // The MOVE -1 TO <field>L cursor: the server's cursor_field, else the first editable input.
@@ -683,12 +763,9 @@ function useFunctionKeyDefinitions(
 // Each input registers its element, so a response can move the cursor to it.
 function useInputRegistry(): InputRegistry {
     const inputRefs = useRef<InputRefMap>({});
-    const registerInput = useCallback(
-        (name: AccountFieldName, element: HTMLInputElement | null) => {
-            inputRefs.current[name] = element;
-        },
-        [],
-    );
+    const registerInput = useCallback((name: AccountFieldName, element: FieldElement | null) => {
+        inputRefs.current[name] = element;
+    }, []);
     return { inputRefs, RegisterInput: registerInput };
 }
 
@@ -719,67 +796,106 @@ function useAccountUpdateScreen(): AccountUpdateScreenModel {
     const abortEntryFetch = useEntryRequest(acctId, runRequest, store.setters);
     useCursorFocus(store, registry.inputRefs);
     const keys = useFunctionKeyDefinitions(store, runRequest, abortEntryFetch);
+    const legendKeys = LegendKeysShownIn(keys, store.model.state);
     const view = useFieldView(store, registry);
-    return { view, keys, isBusy: store.isBusy, feedback: store.feedback };
+    return { view, keys, legendKeys, isBusy: store.isBusy, feedback: store.feedback };
 }
 
 function FieldIdOf(name: AccountFieldName): string {
     return FIELD_ID_PREFIX + name;
 }
 
+// A part with row shares takes them of the row its group lays out.
+function PartShareStyle(definition: ScreenFieldDefinition): SxProps<Theme> | undefined {
+    return definition.rowShares === undefined ? undefined : RowShareStyle(definition.rowShares);
+}
+
 // The attributes a field takes from its BMS definition alone.
 function StaticFieldProps(
     definition: ScreenFieldDefinition,
-): Pick<TextFieldProps, "id" | "label" | "helperText"> {
+): Pick<TextFieldProps, "id" | "label" | "helperText" | "sx"> {
     return {
         id: FieldIdOf(definition.name),
         label: definition.label,
         helperText: definition.helperText,
+        sx: PartShareStyle(definition),
     };
 }
 
 // The BMS UNPROT/ASKIP attribute: a protected field stays focusable, but cannot be changed, and
-// its label stays raised, so a blank protected value shows as an empty field under it.
-// While the server names the field in error, its input is tied to the ERRMSG line ahead of the
-// field's hint.
+// its label stays raised, so a blank protected value shows as an empty field under it. A
+// protected field renders a native textarea, which takes no type, so the input type MUI passes
+// is dropped. While the server names the field in error, its input is tied to the ERRMSG line
+// ahead of the field's hint.
 function FieldSlotProps(
     definition: ScreenFieldDefinition,
     isEditable: boolean,
     hasError: boolean,
 ): TextFieldProps["slotProps"] {
     const helperTextId = HelperTextIdOf(FieldIdOf(definition.name), definition.helperText);
+    const htmlInput = {
+        maxLength: definition.maxLength,
+        inputMode: definition.inputMode,
+        ...ErrorMessageReference(hasError, helperTextId),
+    };
+    const inputComponent = isEditable ? undefined : PROTECTED_FIELD_ELEMENT;
     return {
-        htmlInput: {
-            maxLength: definition.maxLength,
-            inputMode: definition.inputMode,
-            ...ErrorMessageReference(hasError, helperTextId),
-        },
-        input: { readOnly: !isEditable },
+        htmlInput: isEditable ? htmlInput : { ...htmlInput, type: undefined },
+        input: { readOnly: !isEditable, inputComponent },
         inputLabel: isEditable ? {} : { shrink: true },
     };
 }
 
 // The value is kept exactly as keyed: COACTUPC's edits run on the server, in source order.
-// The key remounts the field when its protection changes, because an input replaced while it
-// has focus never blurs, and MUI would keep showing the old field as focused.
-function ScreenField({ definition, view }: ScreenFieldProps) {
-    const isEditable = view.editableFields.has(definition.name);
-    const hasError = view.fieldErrors.has(definition.name);
+// A protected field is a read-only display, as on CAVW: a native textarea, which the theme sizes
+// to its content, so its value keeps one row while it fits and wraps where it does not, and a
+// 50-character address line is never cut off, with no hidden copy of the field rendered to
+// measure it. An open field stays a single-line input, because a textarea would take a newline
+// the server refuses. The key remounts the field when its protection changes, because an input
+// replaced while it has focus never blurs, and MUI would keep showing the old field as focused.
+function ScreenFieldInput(props: ScreenFieldInputProps) {
+    const { definition, value, isEditable, hasError, RegisterInput, onFieldChange } = props;
     return (
         <TextField
             key={isEditable ? EDITABLE_FIELD_KEY : PROTECTED_FIELD_KEY}
             {...StaticFieldProps(definition)}
             fullWidth
-            value={view.fields[definition.name]}
+            multiline={!isEditable}
+            rows={isEditable ? undefined : PROTECTED_FIELD_ROWS}
+            value={value}
             variant={isEditable ? "outlined" : "filled"}
             error={hasError}
-            inputRef={(element: HTMLInputElement | null) =>
-                view.RegisterInput(definition.name, element)
-            }
-            onChange={(event) => view.onFieldChange(definition.name, event.target.value)}
+            inputRef={(element: FieldElement | null) => RegisterInput(definition.name, element)}
+            onChange={(event) => onFieldChange(definition.name, event.target.value)}
             slotProps={FieldSlotProps(definition, isEditable, hasError)}
         />
     );
+}
+
+// A field renders again only when its own value, protection or error mark changes, so a key
+// typed in one field re-renders that field alone, not every field on the screen.
+function ScreenField({ definition, view }: ScreenFieldProps) {
+    const isEditable = view.editableFields.has(definition.name);
+    const hasError = view.fieldErrors.has(definition.name);
+    const value = view.fields[definition.name];
+    const { RegisterInput, onFieldChange } = view;
+    return useMemo(
+        () => (
+            <ScreenFieldInput
+                definition={definition}
+                value={value}
+                isEditable={isEditable}
+                hasError={hasError}
+                RegisterInput={RegisterInput}
+                onFieldChange={onFieldChange}
+            />
+        ),
+        [definition, value, isEditable, hasError, RegisterInput, onFieldChange],
+    );
+}
+
+function EntryGridSize(entry: SectionEntry): GridProps["size"] {
+    return (IsFieldGroup(entry) ? entry.gridSize : undefined) ?? ENTRY_GRID_SIZE;
 }
 
 // One map field keyed in parts (a date, the SSN, a phone number or the address lines).
@@ -790,7 +906,7 @@ function FieldGroup({ group, view }: FieldGroupProps) {
                 {group.groupLabel}
             </Typography>
             <Stack
-                direction={GROUP_DIRECTION}
+                direction={group.direction ?? GROUP_DIRECTION}
                 spacing={FIELD_SPACING}
                 role="group"
                 aria-label={group.groupLabel}
@@ -814,12 +930,21 @@ function EntryKey(entry: SectionEntry): string {
     return IsFieldGroup(entry) ? entry.groupLabel : entry.name;
 }
 
+// A full-row group shares no row, so only half-row and wide groups set the alignment.
+function SectionRowStyle(entries: readonly SectionEntry[]): SxProps<Theme> | undefined {
+    const groupSizes = entries.filter(IsFieldGroup).map(EntryGridSize);
+    if (groupSizes.includes(ENTRY_GRID_SIZE)) {
+        return GROUP_ROW_STYLE;
+    }
+    return groupSizes.includes(WIDE_GROUP_GRID_SIZE) ? WIDE_GROUP_ROW_STYLE : undefined;
+}
+
 function FieldSection({ entries, view }: FieldSectionProps) {
-    const rowStyle = entries.some(IsFieldGroup) ? GROUP_ROW_STYLE : undefined;
+    const rowStyle = SectionRowStyle(entries);
     return (
         <Grid container spacing={FIELD_SPACING} sx={rowStyle}>
             {entries.map((entry) => (
-                <Grid key={EntryKey(entry)} size={ENTRY_GRID_SIZE}>
+                <Grid key={EntryKey(entry)} size={EntryGridSize(entry)}>
                     <SectionEntryField entry={entry} view={view} />
                 </Grid>
             ))}
@@ -881,7 +1006,7 @@ function AccountMessageLine({ feedback }: AccountMessageLineProps) {
 }
 
 function AccountUpdateScreen() {
-    const { view, feedback, isBusy, keys } = useAccountUpdateScreen();
+    const { view, feedback, isBusy, keys, legendKeys } = useAccountUpdateScreen();
     useFunctionKeys(keys);
     return (
         <ScreenShell
@@ -892,7 +1017,7 @@ function AccountUpdateScreen() {
         >
             <AccountDetailSections view={view} />
             <AccountMessageLine feedback={feedback} />
-            <FunctionKeyBar keys={keys} />
+            <FunctionKeyBar keys={legendKeys} />
         </ScreenShell>
     );
 }

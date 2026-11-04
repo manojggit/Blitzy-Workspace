@@ -1,5 +1,6 @@
 """Unit tests for CR00, the transaction report screen: ``corpt00c.RunTransactionReport``, and
-the screen JSON and downloads of ``RenderTransactionReportJson`` and ``ExportTransactionReport``.
+the screen JSON and downloads of ``PrepareTransactionReportJson`` and ``ExportTransactionReport``,
+whose confirmed report streams are drained through ``corpt00c.StreamReport``.
 
 Replaces: CORPT00C (CR00), BMS map CORPT00, the CSUTLDTC date check it calls, and the TRANREPT
 job (``proc/TRANREPT.prc``) its TDQ ``JOBS`` write submitted, which the online report supersedes.
@@ -13,11 +14,14 @@ STEP01R backup (TRANSACT unloaded to a new TRANSACT.BKUP generation) is not repr
 TRANSACT keeps every row with every column; batch.gdg_generations, job_runs, cycles and
 cycle_steps are unchanged; no TRANSACT.BKUP archive directory appears under an isolated batch
 output root; and every statement the application engine sends PostgreSQL is a SELECT. Expected
-literals are typed from ``cbl/CORPT00C.cbl``, never imported from the service.
+literals are typed from ``cbl/CORPT00C.cbl``, never imported from the service. A confirmed
+report reads one snapshot, so a row committed between its validation and build passes is in
+neither, and the connection it read on returns to the pool read-write and READ COMMITTED.
 """
 
 import contextlib
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+import dataclasses
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -27,7 +31,12 @@ import pytest
 import pytest_asyncio
 from batch.config import LoadBatchSettings
 from sqlalchemy import Connection, Engine, Table, event, select, text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncMappingResult,
+    AsyncSession,
+    create_async_engine,
+)
 
 from app.core.errors import FileIoError, LegacyMessageError
 from app.models import CYCLE_STEPS, CYCLES, GDG_GENERATIONS, JOB_RUNS, Transaction
@@ -141,6 +150,14 @@ REPORT_ROWS = (
 )
 # The Yearly report on REPORT_TODAY holds all three, in TRANSACT key order.
 YEARLY_TRAN_IDS = (JUNE_TRAN_ID, JULY_FIRST_TRAN_ID, JULY_LAST_TRAN_ID)
+# A July row of the same card, committed once a report's validation pass has checked its rows.
+LATE_TRAN_ID = "0000000000000103"
+LATE_ROW = (LATE_TRAN_ID, datetime(2022, 7, 15, 12, 0), "D")
+# The isolation level and read-only flag of the transaction a pooled connection begins.
+TRANSACTION_CHARACTERISTICS_SQL = text(
+    "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')"
+)
+POOLED_CHARACTERISTICS = ("read committed", "off")
 TRANSACTION_FIELDS = {
     "tran_type_cd": "01",
     "tran_cat_cd": 1,
@@ -269,21 +286,53 @@ def IsolateBatchOutput(monkeypatch: pytest.MonkeyPatch, outputRoot: Path) -> Pat
     return LoadBatchSettings().GdgDir() / TRANSACT_BACKUP_BASE
 
 
-def StoreReportTransactions(syncEngine: Engine) -> None:
-    """Commit REPORT_ROWS, each with its ORIG-TS and PROC-TS set to its proc timestamp."""
+def CommitTransactionRows(
+    syncEngine: Engine, reportRows: Sequence[tuple[str, datetime, str]]
+) -> None:
+    """Commit reportRows, each with its ORIG-TS and PROC-TS set to its proc timestamp."""
     rows = [
         {**TRANSACTION_FIELDS, "tran_id": tranId, "proc_ts": procTs, "ts_format": tsFormat}
-        for tranId, procTs, tsFormat in REPORT_ROWS
+        for tranId, procTs, tsFormat in reportRows
     ]
     with syncEngine.begin() as connection:
         connection.execute(INSERT_TRANSACTION_SQL, rows)
 
 
-async def FailReportRead(
-    repository: TransactionRepository, startDate: date, endDate: date
+def StoreReportTransactions(syncEngine: Engine) -> None:
+    """Commit REPORT_ROWS."""
+    CommitTransactionRows(syncEngine, REPORT_ROWS)
+
+
+def CommitAfterFirstValidation(syncEngine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Commit LATE_ROW, once, as soon as a report's validation pass has checked its rows."""
+    checkReportInput = corpt00c.CheckReportInput
+    pendingRows = [LATE_ROW]
+
+    def CheckThenCommit(rows, typeDescriptions, categoryDescriptions) -> None:
+        checkReportInput(rows, typeDescriptions, categoryDescriptions)
+        if pendingRows:
+            CommitTransactionRows(syncEngine, [pendingRows.pop()])
+
+    monkeypatch.setattr(corpt00c, "CheckReportInput", CheckThenCommit)
+
+
+async def FailReportFetch(
+    repository: TransactionRepository, rows: AsyncMappingResult, batchRows: int
 ) -> NoReturn:
-    """Stand in for the TRANSACT report read, failing as a CICS IOERR on TRANSACT."""
+    """Stand in for a fetch of the TRANSACT report cursor, failing as a CICS IOERR on TRANSACT."""
     raise FileIoError(TRANSACT_FILE_NAME)
+
+
+async def DrainReport(reportStream: corpt00c.ReportStream) -> bytes:
+    """Run a confirmed report through StreamReport, reading its chunks as its response would."""
+    chunks: list[bytes] = []
+
+    async def ReceiveChunks() -> None:
+        async for chunk in reportStream.chunks:
+            chunks.append(bytes(chunk))
+
+    await corpt00c.StreamReport(reportStream, ReceiveChunks)
+    return b"".join(chunks)
 
 
 @pytest.fixture(name="reportStore")
@@ -353,11 +402,13 @@ async def RenderReport(
     """Return CR00 ENTER as the screen route's JSON bytes (no format) or as that download."""
     query = BuildQuery(overrides)
     if exportFormat is None:
-        return await corpt00c.RenderTransactionReportJson(screen.context, query)
-    documentBytes, _, _ = await corpt00c.ExportTransactionReport(
-        screen.context, query, exportFormat
-    )
-    return documentBytes
+        reportScreen = corpt00c.PrepareTransactionReportJson(screen.context, query)
+    else:
+        reportExport = corpt00c.ExportTransactionReport(screen.context, query, exportFormat)
+        reportScreen = reportExport.reportStream
+    if isinstance(reportScreen, bytes):
+        return reportScreen
+    return await DrainReport(reportScreen)
 
 
 def AssertTransactsKept(screen: ReportScreen) -> None:
@@ -664,10 +715,49 @@ async def test_unsupported_range_message_2513_is_accepted(reportScreen):
 
 async def test_failed_transact_read_answers_the_tdq_write_literal(reportScreen):
     """A repository failure of the report read answers 503 with the WHEN OTHER literal."""
-    reportScreen.monkeypatch.setattr(TransactionRepository, "GetReportTransactions", FailReportRead)
+    reportScreen.monkeypatch.setattr(TransactionRepository, "_FetchReportBatch", FailReportFetch)
 
     error = await RunReportExpectingError(reportScreen, {**MONTHLY_FIELDS, CURSOR_CONFIRM: "Y"})
 
     expectedOutcome = (FILE_ERROR_STATUS, UNABLE_TO_WRITE_TDQ_MESSAGE, CURSOR_REPORT_TYPE)
     assert ErrorOutcome(error) == expectedOutcome
     AssertTransactsKept(reportScreen)
+
+
+@pytest.mark.parametrize("exportFormat", REPORT_OUTPUT_CASES)
+async def test_the_build_pass_reads_the_snapshot_its_validation_pass_checked(
+    reportScreen, exportFormat
+):
+    """A row committed between the two TRANSACT passes is in neither, as both read one snapshot.
+
+    So the build reads exactly the rows the validation pass checked, and never half of a
+    TRANBKP run; a report confirmed afterwards holds the row, which lies in its range.
+    """
+    CommitAfterFirstValidation(reportScreen.store.syncEngine, reportScreen.monkeypatch)
+    yearlyConfirmedFields = {**YEARLY_FIELDS, CURSOR_CONFIRM: "Y"}
+
+    snapshotBytes = await RenderReport(reportScreen, yearlyConfirmedFields, exportFormat)
+    laterBytes = await RenderReport(reportScreen, yearlyConfirmedFields, exportFormat)
+
+    assert all(tranId.encode() in snapshotBytes for tranId in YEARLY_TRAN_IDS)
+    assert LATE_TRAN_ID.encode() not in snapshotBytes
+    assert LATE_TRAN_ID.encode() in laterBytes
+    assert WriteStatements(reportScreen.issuedStatements) == []
+
+
+async def test_the_report_snapshot_ends_with_its_request(makeOnlineContext, databaseUrls):
+    """The pooled connection a report read on serves the next request READ COMMITTED, writable."""
+    singleConnectionEngine = create_async_engine(databaseUrls.asyncUrl, pool_size=1, max_overflow=0)
+    try:
+        onlineContext = await makeOnlineContext(REGULAR_USER_TYPE)
+        reportSession = AsyncSession(singleConnectionEngine)
+        reportContext = dataclasses.replace(onlineContext, session=reportSession)
+        confirmedQuery = BuildQuery({CURSOR_CONFIRM: "Y"})
+        response = await corpt00c.RunTransactionReport(reportContext, confirmedQuery)
+        async with AsyncSession(singleConnectionEngine) as nextSession:
+            characteristics = (await nextSession.execute(TRANSACTION_CHARACTERISTICS_SQL)).one()
+    finally:
+        await singleConnectionEngine.dispose()
+
+    assert response.message == CUSTOM_SUBMITTED_MESSAGE
+    assert tuple(characteristics) == POOLED_CHARACTERISTICS

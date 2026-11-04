@@ -56,6 +56,9 @@ const CUSTOMER_DETAILS_HEADING = "Customer Details";
 const CUSTOMER_DETAILS_HEADING_ID = "account-view-customer-details";
 const ADDRESS_LABEL = "Address:";
 const DISPLAY_FIELD_ID_PREFIX = "account-view-";
+// Each display field is one native textarea row, which wraps a value wider than the field.
+const DISPLAY_FIELD_ELEMENT = "textarea";
+const DISPLAY_FIELD_ROWS = 1;
 
 const HALF_ROW: GridProps["size"] = { xs: 12, md: 6 };
 const THIRD_ROW: GridProps["size"] = { xs: 12, md: 4 };
@@ -130,18 +133,23 @@ interface RecordProps {
 }
 
 // COACTVW rows 5-10 in reading order. Active Y/N shares the Account Number row, then the dates
-// fill the left column and the amounts the right, as on the map.
+// fill the left column and the amounts the right, as on the map. Each amount shows the server's
+// *_edited text, the PICOUT +ZZZ,ZZZ,ZZZ.99 picture of its map field.
 const ACCOUNT_FIELD_DEFINITIONS: readonly DisplayFieldDefinition[] = [
     { label: "Active Y/N:", field: "active_status" },
     { label: "Opened:", field: "open_date" },
-    { label: "Credit Limit        :", field: "credit_limit" },
+    { label: "Credit Limit        :", field: "credit_limit_edited" },
     { label: "Expiry:", field: "expiration_date" },
-    { label: "Cash credit Limit   :", field: "cash_credit_limit" },
+    { label: "Cash credit Limit   :", field: "cash_credit_limit_edited" },
     { label: "Reissue:", field: "reissue_date" },
-    { label: "Current Balance     :", field: "curr_balance" },
-    { label: "Current Cycle Credit:", field: "curr_cycle_credit", offset: AMOUNTS_COLUMN_OFFSET },
+    { label: "Current Balance     :", field: "curr_balance_edited" },
+    {
+        label: "Current Cycle Credit:",
+        field: "curr_cycle_credit_edited",
+        offset: AMOUNTS_COLUMN_OFFSET,
+    },
     { label: "Account Group:", field: "group_id" },
-    { label: "Current Cycle Debit :", field: "curr_cycle_debit" },
+    { label: "Current Cycle Debit :", field: "curr_cycle_debit_edited" },
 ];
 
 // The SSN is only ever the server's masked value.
@@ -211,7 +219,8 @@ function DisplayText(value: string | number | null | undefined): string {
     return String(value);
 }
 
-// Amounts and dates are shown exactly as served; only a numeric PIC 9(n) code is zero-padded.
+// Amounts (their edited text) and dates are shown exactly as served, never parsed or reformatted;
+// only a numeric PIC 9(n) code is zero-padded.
 function FieldText(
     account: AccountViewResponse | null,
     definition: DisplayFieldDefinition,
@@ -367,7 +376,11 @@ function BuildFunctionKeys(
 }
 
 // Filled and read-only, as the map's protected fields are, yet focusable and labelled. The label
-// stays raised, so a blank value shows as an empty field under it.
+// stays raised, so a blank value shows as an empty field under it. The value is a native textarea,
+// which the theme sizes to its content: it keeps one row while it fits and wraps onto further rows
+// where it does not, so a 25-character name or a 50-character address line is never cut off, with
+// no hidden copy of the field rendered to measure it. A textarea takes no type, so the input type
+// MUI passes is dropped.
 function ReadOnlyField({ definition, value }: ReadOnlyFieldProps) {
     return (
         <TextField
@@ -376,7 +389,13 @@ function ReadOnlyField({ definition, value }: ReadOnlyFieldProps) {
             value={value}
             variant="filled"
             fullWidth
-            slotProps={{ input: { readOnly: true }, inputLabel: { shrink: true } }}
+            multiline
+            rows={DISPLAY_FIELD_ROWS}
+            slotProps={{
+                input: { readOnly: true, inputComponent: DISPLAY_FIELD_ELEMENT },
+                htmlInput: { type: undefined },
+                inputLabel: { shrink: true },
+            }}
         />
     );
 }

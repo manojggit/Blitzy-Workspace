@@ -4,9 +4,10 @@ Replaces: COACTVWC (CAVW) and COACTUPC (CAUP), BMS maps COACTVW and COACTUP
 (cpy-bms/COACTVW.CPY, cpy-bms/COACTUP.CPY), copybooks CVACT01Y (account record) and CVCUS01Y
 (customer record).
 
-CAVW answers with typed values: exact decimal amounts and a masked SSN. CAUP exchanges every
-COACTUP input as raw screen text, because COACTUPC runs its edits (TEST-NUMVAL-C, the CSUTLDPY
-date edits, NANP area codes, state and ZIP) on the text as keyed.
+CAVW answers with typed values: exact decimal amounts, each beside the edited text its map
+shows, and a masked SSN. CAUP exchanges every COACTUP input as raw screen text, because COACTUPC
+runs its edits (TEST-NUMVAL-C, the CSUTLDPY date edits, NANP area codes, state and ZIP) on the
+text as keyed.
 
 Field names are snake_case JSON keys that mirror the database column names. They depart from
 the MK_Modernization Rule's camelCase variables because the API contract fixes one key style.
@@ -31,7 +32,8 @@ class AccountViewResponse(ScreenFeedback):
 
     The account comes from CVACT01Y and the customer from CVCUS01Y, found through the card
     cross-reference as COACTVWC reads CXACAIX, ACCTDAT and CUSTDAT. Field names are the
-    ``accounts.accounts`` and ``customers.customers`` column names, in COACTVW map order. Dates
+    ``accounts.accounts`` and ``customers.customers`` column names, in COACTVW map order. Each
+    amount is followed by its ``_edited`` text, the value as the map's PICOUT shows it. Dates
     are ISO ``YYYY-MM-DD`` text, empty when the stored date is NULL. The SSN is masked, and the
     screen carries no card number, CVV or password.
     """
@@ -46,11 +48,23 @@ class AccountViewResponse(ScreenFeedback):
     credit_limit: MoneyAmount(10) = Field(
         description="ACRDLIM: ACCT-CREDIT-LIMIT, S9(10)V99, serialised as a JSON string."
     )
+    credit_limit_edited: str = Field(
+        description=(
+            "ACRDLIMO: ACCT-CREDIT-LIMIT as the COACTVW PICOUT +ZZZ,ZZZ,ZZZ.99 shows it, "
+            "15 characters."
+        )
+    )
     expiration_date: str = Field(
         description="AEXPDT: ACCT-EXPIRAION-DATE as YYYY-MM-DD; empty when the date is NULL."
     )
     cash_credit_limit: MoneyAmount(10) = Field(
         description="ACSHLIM: ACCT-CASH-CREDIT-LIMIT, S9(10)V99, serialised as a JSON string."
+    )
+    cash_credit_limit_edited: str = Field(
+        description=(
+            "ACSHLIMO: ACCT-CASH-CREDIT-LIMIT as the COACTVW PICOUT +ZZZ,ZZZ,ZZZ.99 shows it, "
+            "15 characters."
+        )
     )
     reissue_date: str = Field(
         description="AREISDT: ACCT-REISSUE-DATE as YYYY-MM-DD; empty when the date is NULL."
@@ -58,12 +72,29 @@ class AccountViewResponse(ScreenFeedback):
     curr_balance: MoneyAmount(10) = Field(
         description="ACURBAL: ACCT-CURR-BAL, S9(10)V99, serialised as a JSON string."
     )
+    curr_balance_edited: str = Field(
+        description=(
+            "ACURBALO: ACCT-CURR-BAL as the COACTVW PICOUT +ZZZ,ZZZ,ZZZ.99 shows it, 15 characters."
+        )
+    )
     curr_cycle_credit: MoneyAmount(10) = Field(
         description="ACRCYCR: ACCT-CURR-CYC-CREDIT, S9(10)V99, serialised as a JSON string."
+    )
+    curr_cycle_credit_edited: str = Field(
+        description=(
+            "ACRCYCRO: ACCT-CURR-CYC-CREDIT as the COACTVW PICOUT +ZZZ,ZZZ,ZZZ.99 shows it, "
+            "15 characters."
+        )
     )
     group_id: str = Field(description="AADDGRP: the account group (ACCT-GROUP-ID).")
     curr_cycle_debit: MoneyAmount(10) = Field(
         description="ACRCYDB: ACCT-CURR-CYC-DEBIT, S9(10)V99, serialised as a JSON string."
+    )
+    curr_cycle_debit_edited: str = Field(
+        description=(
+            "ACRCYDBO: ACCT-CURR-CYC-DEBIT as the COACTVW PICOUT +ZZZ,ZZZ,ZZZ.99 shows it, "
+            "15 characters."
+        )
     )
     cust_id: str = Field(description="ACSTNUM: the 9-digit customer number (CUST-ID).")
     ssn_masked: str = Field(

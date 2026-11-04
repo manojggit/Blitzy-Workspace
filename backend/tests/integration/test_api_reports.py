@@ -34,16 +34,18 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NoReturn
 
 import httpx
 import pytest
 from batch.config import LoadBatchSettings
 from fastapi import FastAPI
 from sqlalchemy import Connection, Engine, Table, event, select, text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncMappingResult
 
+from app.core.errors import FileIoError
 from app.models import CYCLE_STEPS, CYCLES, GDG_GENERATIONS, JOB_RUNS, Transaction
+from app.repositories.transaction_repository import TransactionRepository
 from app.services.reports import corpt00c
 
 pytestmark = pytest.mark.usefixtures("restoreSeedState")
@@ -55,6 +57,7 @@ HTTP_OK = 200
 HTTP_EDIT_FAILURE = 400
 HTTP_SIGN_ON_FAILURE = 401
 HTTP_ACCESS_REFUSED = 403
+HTTP_FILE_ERROR = 503
 # The 401 session refusal and the 403 refusal of an admin carry no message.
 NO_MESSAGE = ""
 
@@ -93,6 +96,9 @@ CONFIRM_PROMPT_TEMPLATE = "Please confirm to print the {reportName} report..."
 REPORT_SUBMITTED_TEMPLATE = "{reportName} report submitted for printing ..."
 INVALID_CONFIRM_VALUE = "X"
 INVALID_CONFIRM_MESSAGE = '"X" is not a valid value to confirm...'
+# WIRTE-JOBSUB-TDQ WHEN OTHER (line 531): the literal of a failed report read, a WHEN OTHER
+# file error.
+UNABLE_TO_WRITE_TDQ_MESSAGE = "Unable to Write TDQ (JOBS)..."
 
 # The ReportQuery wire names CR00 marks, replacing MOVE -1 TO MONTHLYL and CONFIRML.
 CURSOR_REPORT_TYPE = "reportType"
@@ -164,8 +170,10 @@ REPORT_TRANSACTIONS = (
     ),
     ReportTransaction(UNPROCESSED_TRAN_ID, None, Decimal("3.00")),
 )
+# A July row whose source and amount both start with a formula prefix: the CSV guards the
+# source text and leaves the amount a plain decimal.
 FORMULA_TRANSACTION = ReportTransaction(
-    FORMULA_TRAN_ID, datetime(2022, 7, 10, 8, 0), Decimal("1.00"), FORMULA_SOURCE
+    FORMULA_TRAN_ID, datetime(2022, 7, 10, 8, 0), Decimal("-1.00"), FORMULA_SOURCE
 )
 
 # --- Expected CBTRN03C lines ---------------------------------------------------------------------
@@ -195,16 +203,48 @@ MONTHLY_TOTAL = Decimal("51.00")
 # TRAN-REPORT-TYPE-DESC X(15) and TRAN-REPORT-CAT-DESC X(29) (cpy/CVTRA07Y.cpy).
 TYPE_DESC_WIDTH = 15
 CAT_DESC_WIDTH = 29
+# The TRAN-SOURCE the screen shows, unguarded, for each row a test may commit.
+SOURCE_BY_TRAN_ID = {row.tranId: row.source for row in (*REPORT_TRANSACTIONS, FORMULA_TRANSACTION)}
+# The monthly report once FORMULA_TRANSACTION is on file: July 5, 10 and 18 in EBCDIC TRAN-ID
+# order between the same headers and totals.
+FORMULA_MONTHLY_LINE_KINDS = [
+    HEADER_KIND,
+    HEADER_KIND,
+    HEADER_KIND,
+    HEADER_KIND,
+    DETAIL_KIND,
+    DETAIL_KIND,
+    DETAIL_KIND,
+    PAGE_TOTAL_KIND,
+    HEADER_KIND,
+    GRAND_TOTAL_KIND,
+]
+FORMULA_MONTHLY_TRAN_IDS = [JULY_05_TRAN_ID, FORMULA_TRAN_ID, JULY_18_TRAN_ID]
 
 # --- Expected downloads --------------------------------------------------------------------------
 CSV_HEADER = "line_kind,tran_id,acct_id,type_cd,type_desc,cat_cd,cat_desc,source,amount"
 CSV_COLUMN_NAMES = CSV_HEADER.split(",")
+CSV_LINE_KIND_COLUMN = "line_kind"
+CSV_CAT_CD_COLUMN = "cat_cd"
+CSV_SOURCE_COLUMN = "source"
+CSV_AMOUNT_COLUMN = "amount"
+CSV_TEXT_COLUMN_NAMES = [name for name in CSV_COLUMN_NAMES if name != CSV_AMOUNT_COLUMN]
 CSV_CONTENT_TYPE = "text/csv"
 PDF_CONTENT_TYPE = "application/pdf"
 PDF_SIGNATURE = b"%PDF"
 MONTHLY_DISPOSITION_TEMPLATE = 'attachment; filename="TRANREPT_2022-07-01_2022-07-31.{extension}"'
 PLAIN_AMOUNT_PATTERN = re.compile(r"-?\d+\.\d{2}")
 CAT_CD_DIGITS = 4
+# A spreadsheet runs a cell starting with one of these as a formula, so every CSV text cell
+# starting with one gets the apostrophe in front; the amount cell never does.
+FORMULA_PREFIXES = ("=", "+", "-", "@")
+FORMULA_GUARD = "'"
+# The CSV cells of the monthly report with FORMULA_TRANSACTION: the detail sources, then the
+# detail, page-total and grand-total amounts, whose totals hold 10.00 - 1.00 + 20.50 plus the
+# last amount added again at end of file (cbl/CBTRN03C.cbl lines 196-202).
+FORMULA_MONTHLY_SOURCE_CELLS = [DEFAULT_SOURCE, GUARDED_FORMULA_SOURCE, DEFAULT_SOURCE]
+AMOUNT_LINE_KINDS = (DETAIL_KIND, PAGE_TOTAL_KIND, GRAND_TOTAL_KIND)
+FORMULA_MONTHLY_AMOUNT_CELLS = ["10.00", "-1.00", "20.50", "50.00", "50.00"]
 
 # --- SQL: values are always bound ----------------------------------------------------------------
 INSERT_TRANSACTION_SQL = text(
@@ -302,6 +342,13 @@ def FreezeToday(monkeypatch: pytest.MonkeyPatch, isoDate: str) -> None:
     monkeypatch.setattr(corpt00c, "CurrentDate", lambda: frozenDate)
 
 
+async def FailReportFetch(
+    repository: TransactionRepository, rows: AsyncMappingResult, batchRows: int
+) -> NoReturn:
+    """Stand in for a fetch of the TRANSACT report cursor, failing as a CICS IOERR."""
+    raise FileIoError("TRANSACT")
+
+
 def TransactionParameters(row: ReportTransaction) -> dict[str, object]:
     """Return the bound INSERT values of ``row``: type 01, category 1, PROC-TS form D or blank."""
     return {
@@ -392,6 +439,49 @@ def ParseCsv(csvText: str) -> list[list[str]]:
     return list(csv.reader(io.StringIO(csvText)))
 
 
+def CsvColumnCells(
+    csvRows: list[list[str]], columnName: str, lineKinds: Sequence[str]
+) -> list[str]:
+    """Return the ``columnName`` cells of the CSV rows whose line_kind is in ``lineKinds``."""
+    columnIndex = CSV_COLUMN_NAMES.index(columnName)
+    lineKindIndex = CSV_COLUMN_NAMES.index(CSV_LINE_KIND_COLUMN)
+    return [row[columnIndex] for row in csvRows if row[lineKindIndex] in lineKinds]
+
+
+def GuardFormulaText(cellText: str) -> str:
+    """Return ``cellText`` behind FORMULA_GUARD when it starts with one of FORMULA_PREFIXES."""
+    if cellText.startswith(FORMULA_PREFIXES):
+        return FORMULA_GUARD + cellText
+    return cellText
+
+
+def ExpectedTextCell(line: dict[str, Any], columnName: str) -> str:
+    """Return the CSV text cell ``columnName`` of a screen line, formula guard applied.
+
+    An absent value is an empty cell, line_kind is the enum value the screen sends, and cat_cd
+    is zero-padded to CAT_CD_DIGITS digits.
+    """
+    value = line[columnName]
+    if value is None:
+        cellText = ""
+    elif columnName == CSV_CAT_CD_COLUMN:
+        cellText = f"{value:0{CAT_CD_DIGITS}d}"
+    else:
+        cellText = str(value)
+    return GuardFormulaText(cellText)
+
+
+def ExpectedCsvCells(line: dict[str, Any]) -> dict[str, str]:
+    """Return the nine CSV cells of a screen line, keyed by CSV column name.
+
+    Every text cell is formula-guarded. The amount is the screen's plain decimal, never guarded,
+    so a negative amount keeps its leading minus; an absent amount is an empty cell.
+    """
+    expectedCells = {name: ExpectedTextCell(line, name) for name in CSV_TEXT_COLUMN_NAMES}
+    expectedCells[CSV_AMOUNT_COLUMN] = "" if line["amount"] is None else line["amount"]
+    return expectedCells
+
+
 def LinesOfKind(body: dict[str, Any], lineKind: str) -> list[dict[str, Any]]:
     """Return the report lines of ``body`` whose line_kind is ``lineKind``, in print order."""
     return [line for line in body["lines"] if line["line_kind"] == lineKind]
@@ -440,7 +530,10 @@ def AssertReportHeader(body: dict[str, Any], rangeCase: RangeCase) -> None:
 
 
 def AssertDetailFields(body: dict[str, Any], descriptions: tuple[str, str]) -> None:
-    """Assert every detail line shows the xref account and the reference descriptions."""
+    """Assert every detail line shows the xref account, the reference descriptions and its source.
+
+    The source is the unguarded TRAN-SOURCE committed for the line's TRAN-ID.
+    """
     typeDescription, categoryDescription = descriptions
     assert typeDescription and categoryDescription
     for detailLine in LinesOfKind(body, DETAIL_KIND):
@@ -449,20 +542,31 @@ def AssertDetailFields(body: dict[str, Any], descriptions: tuple[str, str]) -> N
         assert detailLine["type_desc"] == typeDescription[:TYPE_DESC_WIDTH].rstrip()
         assert detailLine["cat_cd"] == REPORT_CAT_CD
         assert detailLine["cat_desc"] == categoryDescription[:CAT_DESC_WIDTH].rstrip()
-        assert detailLine["source"] == DEFAULT_SOURCE
+        assert detailLine["source"] == SOURCE_BY_TRAN_ID.get(detailLine["tran_id"])
 
 
 def AssertCsvRowMatchesLine(csvRow: list[str], line: dict[str, Any]) -> None:
-    """Assert one CSV row carries the fields of its report line, the amount as a plain decimal."""
+    """Assert one CSV row carries all nine fields of its screen line, the amount a plain decimal."""
     cells = dict(zip(CSV_COLUMN_NAMES, csvRow, strict=True))
-    expectedCatCd = "" if line["cat_cd"] is None else f"{line['cat_cd']:0{CAT_CD_DIGITS}d}"
-    expectedAmount = "" if line["amount"] is None else line["amount"]
-    assert cells["line_kind"] == line["line_kind"]
-    assert cells["tran_id"] == line["tran_id"]
-    assert cells["acct_id"] == line["acct_id"]
-    assert cells["cat_cd"] == expectedCatCd
-    assert cells["amount"] == expectedAmount
-    assert cells["amount"] == "" or PLAIN_AMOUNT_PATTERN.fullmatch(cells["amount"])
+    assert cells == ExpectedCsvCells(line)
+    amountCell = cells[CSV_AMOUNT_COLUMN]
+    assert amountCell == "" or PLAIN_AMOUNT_PATTERN.fullmatch(amountCell)
+
+
+async def ReadFormulaMonthlyScreen(client: httpx.AsyncClient, syncEngine: Engine) -> dict[str, Any]:
+    """Return the confirmed monthly screen once it holds the report FORMULA_TRANSACTION gives.
+
+    The screen must answer 200 with FORMULA_MONTHLY_LINE_KINDS, the details of
+    FORMULA_MONTHLY_TRAN_IDS and the account, codes, TRANTYPE and TRANCATG descriptions and
+    sources on file, so a download cannot match a screen corrupted the same way unnoticed.
+    """
+    response = await RunReport(client, MONTHLY_CONFIRMED)
+    assert response.status_code == HTTP_OK, response.text
+    body = response.json()
+    assert [line["line_kind"] for line in body["lines"]] == FORMULA_MONTHLY_LINE_KINDS
+    assert DetailTranIds(body) == FORMULA_MONTHLY_TRAN_IDS
+    AssertDetailFields(body, ReadReferenceDescriptions(syncEngine))
+    return body
 
 
 # --- Fixtures ------------------------------------------------------------------------------------
@@ -744,9 +848,16 @@ async def test_confirmation_n_clears_the_screen(
 
 # --- Exports -------------------------------------------------------------------------------------
 @pytest.mark.usefixtures("reportData")
-async def test_csv_export_writes_one_row_per_report_line(regularClient: httpx.AsyncClient) -> None:
-    """The CSV attachment holds the header row, then one row per screen line in print order."""
-    screenBody = (await RunReport(regularClient, MONTHLY_CONFIRMED)).json()
+async def test_csv_export_writes_one_row_per_report_line(
+    regularClient: httpx.AsyncClient, syncEngine: Engine
+) -> None:
+    """The CSV holds the header row, then every screen line as one row of all nine columns.
+
+    FORMULA_TRANSACTION sits beside the ordinary rows: its source gets an apostrophe in the
+    CSV, never on the screen, and its negative amount stays a plain decimal.
+    """
+    InsertReportTransactions(syncEngine, (FORMULA_TRANSACTION,))
+    screenBody = await ReadFormulaMonthlyScreen(regularClient, syncEngine)
     response = await DownloadReport(regularClient, MONTHLY_CONFIRMED, "csv")
     assert response.status_code == HTTP_OK, response.text
     assert response.headers["content-type"].startswith(CSV_CONTENT_TYPE)
@@ -757,27 +868,10 @@ async def test_csv_export_writes_one_row_per_report_line(regularClient: httpx.As
     assert len(csvRows) == len(screenBody["lines"])
     for csvRow, line in zip(csvRows, screenBody["lines"], strict=True):
         AssertCsvRowMatchesLine(csvRow, line)
-    amountColumn = CSV_COLUMN_NAMES.index("amount")
-    detailAmounts = [row[amountColumn] for row in csvRows if row[0] == DETAIL_KIND]
-    assert detailAmounts == ["10.00", "20.50"]
-
-
-@pytest.mark.usefixtures("reportData")
-async def test_csv_export_guards_formula_text(
-    regularClient: httpx.AsyncClient, syncEngine: Engine
-) -> None:
-    """A TRAN-SOURCE starting with = gets an apostrophe in the CSV, never on the screen."""
-    InsertReportTransactions(syncEngine, (FORMULA_TRANSACTION,))
-    screenBody = (await RunReport(regularClient, MONTHLY_CONFIRMED)).json()
-    response = await DownloadReport(regularClient, MONTHLY_CONFIRMED, "csv")
-    assert response.status_code == HTTP_OK, response.text
-    tranIdColumn = CSV_COLUMN_NAMES.index("tran_id")
-    sourceColumn = CSV_COLUMN_NAMES.index("source")
-    csvRows = ParseCsv(response.text)
-    formulaRow = next(row for row in csvRows if row[tranIdColumn] == FORMULA_TRAN_ID)
-    assert formulaRow[sourceColumn] == GUARDED_FORMULA_SOURCE
-    formulaLine = next(line for line in screenBody["lines"] if line["tran_id"] == FORMULA_TRAN_ID)
-    assert formulaLine["source"] == FORMULA_SOURCE
+    sourceCells = CsvColumnCells(csvRows, CSV_SOURCE_COLUMN, (DETAIL_KIND,))
+    assert sourceCells == FORMULA_MONTHLY_SOURCE_CELLS
+    amountCells = CsvColumnCells(csvRows, CSV_AMOUNT_COLUMN, AMOUNT_LINE_KINDS)
+    assert amountCells == FORMULA_MONTHLY_AMOUNT_CELLS
 
 
 @pytest.mark.usefixtures("reportData")
@@ -814,6 +908,24 @@ async def test_unconfirmed_export_is_refused_with_the_screen_message(
     query, message, cursorField = unconfirmedCase
     response = await DownloadReport(regularClient, query, "csv")
     AssertLegacyError(response, HTTP_EDIT_FAILURE, message, cursorField)
+
+
+@pytest.mark.parametrize("reportTarget", REFUSAL_TARGETS)
+async def test_a_failed_report_read_answers_the_tdq_literal_before_the_body_starts(
+    regularClient: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    reportTarget: tuple[str, dict[str, str]],
+) -> None:
+    """The streamed screen and both downloads still answer a failed read with the 503 body.
+
+    The confirmed report's reads run inside its streaming response, before any byte is sent,
+    so the legacy error handler still sends the WHEN OTHER literal.
+    """
+    FreezeToday(monkeypatch, FROZEN_TODAY)
+    monkeypatch.setattr(TransactionRepository, "_FetchReportBatch", FailReportFetch)
+    url, formatParameters = reportTarget
+    response = await regularClient.get(url, params={**MONTHLY_CONFIRMED, **formatParameters})
+    AssertLegacyError(response, HTTP_FILE_ERROR, UNABLE_TO_WRITE_TDQ_MESSAGE, CURSOR_REPORT_TYPE)
 
 
 # --- Session and role ----------------------------------------------------------------------------

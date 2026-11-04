@@ -1,9 +1,11 @@
-"""Unit tests for the CUSTDAT, TRANTYPE and TRANCATG reads when the database fails.
+"""Unit tests for the CUSTDAT, TRANTYPE, TRANCATG and CR00 TRANSACT reads when the database fails.
 
 app.repositories.customer_repository ports the CICS READ and READ UPDATE of CUSTDAT (COACTVWC,
-COACTUPC), and app.repositories.reference_repository the CBTRN03C keyed reads of TRANTYPE and
-TRANCATG. A legacy read that fails returns a RESP other than NORMAL, and the program takes its
-WHEN OTHER file-error branch, which the API answers with that program's literal and status 503.
+COACTUPC), app.repositories.reference_repository the CBTRN03C keyed reads of TRANTYPE and
+TRANCATG, and app.repositories.transaction_repository the CR00 report's snapshot and its
+server-side cursor over TRANSACT. A legacy read that fails returns a RESP other than NORMAL, and
+the program takes its WHEN OTHER file-error branch, which the API answers with that program's
+literal and status 503.
 
 SQLAlchemy's asyncpg dialect wraps only the driver errors it registers in DBAPIError. A refused
 or timed-out connect, a server that rejects the connection, a closed connection, the
@@ -14,15 +16,17 @@ rather than an unexpected 500. They also pin that a wrapped 55P03 lock timeout s
 SQLSTATE to RecordLockError, and that cancellation and programming errors propagate unchanged,
 because no catch-all handler may turn them into a file condition.
 
-The request session is a stub whose execute raises the failure, so no database is needed.
+The request session is a stub whose execute and connection raise the failure, and whose report
+cursor raises it from every fetch, so no database is needed.
 """
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import date
 from functools import partial
 from types import SimpleNamespace
 from typing import NamedTuple
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import asyncpg
 import pytest
@@ -37,9 +41,14 @@ from app.repositories.reference_repository import (
     TRANTYPE_FILE_NAME,
     ReferenceRepository,
 )
+from app.repositories.transaction_repository import TRANSACTION_FILE_NAME, TransactionRepository
 
 # CUST-ID 9(09) of a sample customer; the stub session never looks it up.
 CUSTOMER_ID = "000000001"
+# A report range and batch size; the stub cursor never reads them.
+REPORT_START_DATE = date(2022, 1, 1)
+REPORT_END_DATE = date(2022, 12, 31)
+REPORT_BATCH_ROWS = 1000
 # SQLSTATE lock_not_available, which ends a wait for a row locked past the lock timeout.
 LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 
@@ -58,8 +67,18 @@ class ReadCase(NamedTuple):
 
 
 def BuildContext(failure):
-    """Return an online context whose request session raises failure from every execute."""
-    session = SimpleNamespace(execute=AsyncMock(side_effect=failure))
+    """Return an online context whose request session raises failure from every read.
+
+    execute and connection raise it, and the result stream opens a cursor whose every fetch
+    raises it.
+    """
+    reportRows = SimpleNamespace(fetchmany=AsyncMock(side_effect=failure), close=AsyncMock())
+    reportResult = SimpleNamespace(mappings=Mock(return_value=reportRows))
+    session = SimpleNamespace(
+        execute=AsyncMock(side_effect=failure),
+        connection=AsyncMock(side_effect=failure),
+        stream=AsyncMock(return_value=reportResult),
+    )
     return OnlineContext(request=None, session=session, settings=None)
 
 
@@ -83,11 +102,27 @@ async def ReadCategoryDescriptions(context):
     return await ReferenceRepository(context).GetCategoryDescriptions()
 
 
+async def BeginReportSnapshot(context):
+    """Open the CR00 report's snapshot on the request session (CORPT00C's TRANREPT reads)."""
+    return await TransactionRepository(context).BeginReportSnapshot()
+
+
+async def ReadReportBatches(context):
+    """Fetch the CR00 report's TRANSACT rows (TRANREPT STEP05R) from its server-side cursor."""
+    repository = TransactionRepository(context)
+    reportBatches = repository.StreamReportTransactions(
+        REPORT_START_DATE, REPORT_END_DATE, REPORT_BATCH_ROWS
+    )
+    return [rowBatch async for rowBatch in reportBatches]
+
+
 READ_CASES = {
     "GetCustomer": ReadCase(ReadCustomer, CUSTOMER_FILE_NAME),
     "GetCustomerForUpdate": ReadCase(ReadCustomerForUpdate, CUSTOMER_FILE_NAME),
     "GetTypeDescriptions": ReadCase(ReadTypeDescriptions, TRANTYPE_FILE_NAME),
     "GetCategoryDescriptions": ReadCase(ReadCategoryDescriptions, TRANCATG_FILE_NAME),
+    "BeginReportSnapshot": ReadCase(BeginReportSnapshot, TRANSACTION_FILE_NAME),
+    "StreamReportTransactions": ReadCase(ReadReportBatches, TRANSACTION_FILE_NAME),
 }
 
 # Failures the asyncpg dialect passes through unwrapped, each built fresh for its case.

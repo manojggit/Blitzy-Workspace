@@ -15,6 +15,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
+from types import MappingProxyType
 from typing import Any
 
 from app.core.database import RecoverRequestSession
@@ -33,6 +34,7 @@ from app.repositories.account_repository import ACCOUNT_FILE_NAME, AccountReposi
 from app.repositories.card_xref_repository import XREF_ACCOUNT_PATH_NAME, CardXrefRepository
 from app.repositories.customer_repository import CUSTOMER_FILE_NAME, CustomerRepository
 from app.schemas.accounts import AccountViewResponse
+from app.utils.cobol_format import ACCOUNT_AMOUNT_PICTURE, FormatEdited
 
 LOGGER = logging.getLogger(__name__)
 
@@ -106,6 +108,18 @@ ACCOUNT_DISPLAY_COLUMNS = (
     "group_id",
 )
 ACCOUNT_DATE_COLUMNS = ("open_date", "expiration_date", "reissue_date")
+# The S9(10)V99 amounts 1200 moves into ACURBALO, ACRDLIMO, ACSHLIMO, ACRCYCRO and ACRCYDBO
+# (lines 475-485), whose PICOUT '+ZZZ,ZZZ,ZZZ.99' edits them: each column and the response key
+# of the text its map field shows.
+ACCOUNT_EDITED_AMOUNT_KEYS: Mapping[str, str] = MappingProxyType(
+    {
+        "curr_balance": "curr_balance_edited",
+        "credit_limit": "credit_limit_edited",
+        "cash_credit_limit": "cash_credit_limit_edited",
+        "curr_cycle_credit": "curr_cycle_credit_edited",
+        "curr_cycle_debit": "curr_cycle_debit_edited",
+    }
+)
 CUSTOMER_DISPLAY_COLUMNS = (
     "cust_id",
     "fico_credit_score",
@@ -443,12 +457,15 @@ def BuildViewResponse(readResult: AccountReadResult) -> AccountViewResponse:
 def AccountScreenValues(account: Mapping[str, Any]) -> dict[str, Any]:
     """Return the CVACT01Y values 1200 moves to the map (lines 471-491).
 
-    Amounts stay the exact ``Decimal`` of their NUMERIC(12,2) columns. ACCT-GROUP-ID is the
-    group shown, never ACCT-ADDR-ZIP.
+    Amounts stay the exact ``Decimal`` of their NUMERIC(12,2) columns, and each is also served
+    as the MOVE into its ``+ZZZ,ZZZ,ZZZ.99`` output field leaves it: 2020.00 shows as
+    ``+      2,020.00``. ACCT-GROUP-ID is the group shown, never ACCT-ADDR-ZIP.
     """
     screenValues = {column: account[column] for column in ACCOUNT_DISPLAY_COLUMNS}
     for column in ACCOUNT_DATE_COLUMNS:
         screenValues[column] = IsoDateText(account[column])
+    for column, editedKey in ACCOUNT_EDITED_AMOUNT_KEYS.items():
+        screenValues[editedKey] = FormatEdited(account[column], ACCOUNT_AMOUNT_PICTURE)
     return screenValues
 
 

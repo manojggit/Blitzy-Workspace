@@ -33,13 +33,15 @@ POOL_SIZE covers all the connections the admitted requests can hold at once and 
 POOL_HEADROOM_CONNECTIONS can overflow. Steady load at any concurrency therefore reuses warm
 connections rather than opening new PostgreSQL sessions.
 
-CR00 (CORPT00C) takes the admission only for its reads. Its route depends on GetReportSession,
-which admits nothing, and corpt00c runs the three report reads inside AdmittedReads, which ends
-the read transaction and returns the session's connection before it frees the admission. The
-report is then built and rendered holding neither, so a queued or running report never keeps
-other online requests waiting. Its reads hold one connection, within REQUEST_CONNECTION_LIMIT,
-and corpt00c takes its report slot before the admission, never while holding one, so the
-reasoning above still holds. Every other route is admitted by GetSession as described above.
+CR00 (CORPT00C) takes the admission only for its reads and its build. Its route depends on
+GetReportSession, which admits nothing, and corpt00c runs the report's reads, and builds it from
+a second read of the same snapshot, inside AdmittedReads, which ends the read transaction and
+returns the session's connection before it frees the admission. Both are freed the moment the
+build ends, while the response may still be sending the built document, so a queued report or
+a client still reading one never keeps other online requests waiting. The report holds one
+connection, within REQUEST_CONNECTION_LIMIT, and corpt00c takes its report slot before the
+admission, never while holding one, so the reasoning above still holds. Every other route is
+admitted by GetSession as described above.
 
 main.CreateApp keeps the settings, the engine and the session factory on app.state, and
 everything here reads them from there, so tests can swap engines. The admission semaphore is
@@ -190,8 +192,8 @@ async def GetReportSession(request: Request) -> AsyncIterator[AsyncSession]:
     """Yield the CR00 request's session without admitting the request; close it at the end.
 
     The session holds no connection until its first read, and the CR00 service runs every read
-    inside AdmittedReads, which takes the admission only for those reads. Leaving the request
-    closes the session, a no-op once AdmittedReads has closed it.
+    inside AdmittedReads, which takes the admission only for those reads and the report's
+    build. Leaving the request closes the session, a no-op once AdmittedReads has closed it.
     """
     sessionFactory: async_sessionmaker[AsyncSession] = request.app.state.sessionFactory
     async with sessionFactory() as session:

@@ -153,19 +153,25 @@ const SEVERITY_CLASSES: Readonly<Record<MessageSeverity, string>> = {
 };
 
 // Account 00000000004 and its customer, with a distinct value in every field so that a field
-// showing another key's value is caught.
+// showing another key's value is caught. Each *_edited text is the amount as coactvwc.py edits it
+// into the COACTVW PICOUT +ZZZ,ZZZ,ZZZ.99.
 const TEST_ACCOUNT_VIEW: AccountViewResponse = {
     acct_id: TEST_ACCOUNT_ID,
     active_status: "Y",
     open_date: "2012-11-17",
     credit_limit: "3503.00",
+    credit_limit_edited: "+      3,503.00",
     expiration_date: "2023-12-16",
     cash_credit_limit: "2789.00",
+    cash_credit_limit_edited: "+      2,789.00",
     reissue_date: "2021-12-16",
     curr_balance: "194.00",
+    curr_balance_edited: "+        194.00",
     curr_cycle_credit: "120.00",
+    curr_cycle_credit_edited: "+        120.00",
     group_id: "DEFAULT",
     curr_cycle_debit: "75.25",
+    curr_cycle_debit_edited: "+         75.25",
     cust_id: "000000004",
     ssn_masked: MASKED_SSN,
     date_of_birth: "1985-01-13",
@@ -191,18 +197,18 @@ const TEST_ACCOUNT_VIEW: AccountViewResponse = {
 };
 
 // Each read-only field's label on the page (the COACTVW INITIAL without its trailing layout
-// blanks) and the AccountViewResponse key it shows.
+// blanks) and the AccountViewResponse key it shows. An amount shows its edited text verbatim.
 const DISPLAY_FIELD_CASES: readonly (readonly [string, DisplayFieldKey])[] = [
     ["Active Y/N:", "active_status"],
     ["Opened:", "open_date"],
-    ["Credit Limit        :", "credit_limit"],
+    ["Credit Limit        :", "credit_limit_edited"],
     ["Expiry:", "expiration_date"],
-    ["Cash credit Limit   :", "cash_credit_limit"],
+    ["Cash credit Limit   :", "cash_credit_limit_edited"],
     ["Reissue:", "reissue_date"],
-    [BALANCE_LABEL, "curr_balance"],
-    ["Current Cycle Credit:", "curr_cycle_credit"],
+    [BALANCE_LABEL, "curr_balance_edited"],
+    ["Current Cycle Credit:", "curr_cycle_credit_edited"],
     ["Account Group:", "group_id"],
-    ["Current Cycle Debit :", "curr_cycle_debit"],
+    ["Current Cycle Debit :", "curr_cycle_debit_edited"],
     ["Customer id  :", "cust_id"],
     [SSN_LABEL, "ssn_masked"],
     ["Date of birth:", "date_of_birth"],
@@ -291,12 +297,15 @@ function RenderScreen(): UserEvent {
     return user;
 }
 
-function FieldByLabel(label: string): HTMLInputElement {
-    return screen.getByLabelText<HTMLInputElement>(label, { normalizer: KeepRawText });
+// ACCTSID is an input; every display field is a textarea, so a long value wraps.
+function FieldByLabel(label: string): HTMLInputElement | HTMLTextAreaElement {
+    return screen.getByLabelText<HTMLInputElement | HTMLTextAreaElement>(label, {
+        normalizer: KeepRawText,
+    });
 }
 
 function AccountIdInput(): HTMLInputElement {
-    return FieldByLabel(ACCOUNT_ID_LABEL);
+    return screen.getByLabelText<HTMLInputElement>(ACCOUNT_ID_LABEL, { normalizer: KeepRawText });
 }
 
 function SearchButton(): HTMLElement {
@@ -358,9 +367,10 @@ function NavigationWasAttempted(spy: jest.SpyInstance): boolean {
     });
 }
 
-// Waits for the response to settle the screen, so no state update lands after the test.
-async function WaitForBalance(balance: string): Promise<void> {
-    await waitFor(() => expect(FieldByLabel(BALANCE_LABEL)).toHaveValue(balance));
+// Waits for the response to settle the screen, so no state update lands after the test. ACURBAL
+// shows the balance's edited text, leading blanks included.
+async function WaitForBalance(editedBalance: string): Promise<void> {
+    await waitFor(() => expect(FieldByLabel(BALANCE_LABEL)).toHaveValue(editedBalance));
 }
 
 // Opens /accounts/view?acctId=<view.acct_id>, whose mount fetch answers with the view.
@@ -368,7 +378,7 @@ async function RenderPrefilledScreen(view: AccountViewResponse): Promise<UserEve
     mockSearchParams = new URLSearchParams({ acctId: view.acct_id });
     mockViewAccount.mockResolvedValue(view);
     const user = RenderScreen();
-    await WaitForBalance(view.curr_balance);
+    await WaitForBalance(view.curr_balance_edited);
     return user;
 }
 
@@ -496,6 +506,26 @@ function ExpectLabelRaised(label: string): void {
     expect(FieldByLabel(label).labels?.[0]).toHaveAttribute("data-shrink", "true");
 }
 
+const FIELD_BOX_SELECTOR = ".MuiInputBase-root";
+const FILLED_FIELD_CLASS = "MuiFilledInput-root";
+const MULTILINE_FIELD_CLASS = "MuiInputBase-multiline";
+
+// A protected map field shows its value in a filled textarea that grows a row for each line the
+// value wraps onto, so a 25-character name or a 50-character address line is never cut off.
+function ShowsWrappingDisplayField(label: string): void {
+    RenderScreen();
+    const field = FieldByLabel(label);
+    expect(field).toBeInstanceOf(HTMLTextAreaElement);
+    const fieldBox = field.closest(FIELD_BOX_SELECTOR);
+    expect(fieldBox).toHaveClass(FILLED_FIELD_CLASS, MULTILINE_FIELD_CLASS);
+}
+
+// ACCTSID is keyed, so it stays one line: a textarea would take a newline.
+function KeepsAccountIdSingleLine(): void {
+    RenderScreen();
+    expect(AccountIdInput()).toBeInstanceOf(HTMLInputElement);
+}
+
 // ACCT-GROUP-ID is blank in every seed account: its label stays above the empty value, as every
 // other label stays above its value, instead of standing where the value goes.
 async function RaisesBlankGroupLabel(): Promise<void> {
@@ -519,6 +549,52 @@ describe("COACTVWC COACTVW display fields on /accounts/view", () => {
     it(
         "COACTVWC a blank ACCT-GROUP-ID keeps its label raised like the others",
         RaisesBlankGroupLabel,
+    );
+});
+
+describe("COACTVWC COACTVW long values on /accounts/view", () => {
+    it.each(DISPLAY_FIELD_CASES)(
+        "COACTVWC shows %p filled, wrapping a long value",
+        ShowsWrappingDisplayField,
+    );
+    it("COACTVWC keeps ACCTSID, the field keyed, a single-line input", KeepsAccountIdSingleLine);
+});
+
+const DISPLAY_FIELD_ID_PREFIX = "account-view-";
+const DISPLAY_FIELD_ROWS = "1";
+const HIDDEN_TEXTAREA_SELECTOR = "textarea[aria-hidden]";
+
+// How one display field's textarea renders: its id, its rows and whether it takes an input type.
+interface DisplayTextarea {
+    id: string;
+    rows: string | null;
+    hasType: boolean;
+}
+
+function DisplayTextareaOf(field: HTMLElement): DisplayTextarea {
+    return { id: field.id, rows: field.getAttribute("rows"), hasType: field.hasAttribute("type") };
+}
+
+function ExpectedDisplayTextarea(key: DisplayFieldKey): DisplayTextarea {
+    return { id: DISPLAY_FIELD_ID_PREFIX + key, rows: DISPLAY_FIELD_ROWS, hasType: false };
+}
+
+// The browser sizes each native textarea to its value, so no hidden measuring copy of a field is
+// rendered: every textarea on the screen is a display field, one row, with its own id and no type.
+async function RendersNativeDisplayTextareas(): Promise<void> {
+    await RenderPrefilledScreen(TEST_ACCOUNT_VIEW);
+    const displayFields = DISPLAY_FIELD_CASES.map(([label]) => FieldByLabel(label));
+    expect(Array.from(document.querySelectorAll("textarea"))).toEqual(displayFields);
+    expect(document.querySelectorAll(HIDDEN_TEXTAREA_SELECTOR)).toHaveLength(0);
+    expect(displayFields.map(DisplayTextareaOf)).toEqual(
+        DISPLAY_FIELD_CASES.map(([, key]) => ExpectedDisplayTextarea(key)),
+    );
+}
+
+describe("COACTVWC COACTVW display-field elements on /accounts/view", () => {
+    it(
+        "COACTVWC shows each fetched value in one identified textarea row and no hidden copy",
+        RendersNativeDisplayTextareas,
     );
 });
 
@@ -596,7 +672,7 @@ async function ShowsNoPromptUntilLookupAnswers(): Promise<void> {
     await waitFor(() => expect(mockViewAccount).toHaveBeenCalledTimes(1));
     expect(AlertTexts()).toEqual([]);
     await answerLookup(BuildAccountView());
-    await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance);
+    await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance_edited);
     expect(AlertTexts()).toEqual([INFO_PROMPT]);
 }
 
@@ -635,7 +711,7 @@ describe("COACTVWC ENTER on /accounts/view", () => {
         const user = RenderScreen();
         await user.type(AccountIdInput(), "4");
         await method.Press(user);
-        await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance);
+        await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance_edited);
         expect(mockViewAccount).toHaveBeenCalledTimes(1);
         expect(mockViewAccount).toHaveBeenCalledWith("4", READ_OPTIONS);
     });
@@ -739,7 +815,7 @@ async function TiesAccountIdErrorToMessageLine(keys: string, literal: string): P
     expect(document.getElementById(ERRMSG_ID)?.textContent).toBe(literal);
     mockViewAccount.mockResolvedValueOnce(BuildAccountView());
     await ClickButton(user, SEARCH_BUTTON_NAME);
-    await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance);
+    await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance_edited);
     expect(AccountIdInput()).not.toHaveAttribute("aria-describedby");
 }
 
@@ -804,9 +880,14 @@ async function AbortsLookupOnLeaving(lookup: PendingLookupCase): Promise<void> {
     expect(consoleErrorSpy).not.toHaveBeenCalled();
 }
 
+// The answer of the lookup that supersedes another, told apart by its balance.
+const LATEST_LOOKUP_VIEW = BuildAccountView({
+    curr_balance: "250.00",
+    curr_balance_edited: "+        250.00",
+});
+
 // ENTER is disabled while a lookup is in flight, so a new ?acctId= is what supersedes one.
 async function ShowsOnlyLatestLookup(): Promise<void> {
-    const latestView = BuildAccountView({ curr_balance: "250.00" });
     mockViewAccount.mockImplementationOnce(PendingUntilAborted);
     const answerLatest = HoldNextLookup();
     mockSearchParams = new URLSearchParams({ acctId: NOT_FOUND_ACCOUNT_ID });
@@ -819,8 +900,8 @@ async function ShowsOnlyLatestLookup(): Promise<void> {
     // The aborted lookup shows nothing and leaves the busy state to the one in flight.
     expect(SearchButton()).toBeDisabled();
     expect(AlertTexts()).toEqual([]);
-    await answerLatest(latestView);
-    await WaitForBalance(latestView.curr_balance);
+    await answerLatest(LATEST_LOOKUP_VIEW);
+    await WaitForBalance(LATEST_LOOKUP_VIEW.curr_balance_edited);
     expect(mockViewAccount).toHaveBeenNthCalledWith(1, NOT_FOUND_ACCOUNT_ID, READ_OPTIONS);
     expect(mockViewAccount).toHaveBeenNthCalledWith(2, TEST_ACCOUNT_ID, READ_OPTIONS);
     expect(AlertTexts()).toEqual([INFO_PROMPT]);
@@ -866,7 +947,7 @@ async function StrictModeLooksUpAgain(): Promise<void> {
     mockViewAccount.mockImplementationOnce(PendingUntilAborted);
     mockViewAccount.mockResolvedValueOnce(BuildAccountView());
     RenderPage(true);
-    await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance);
+    await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance_edited);
     expect(mockViewAccount.mock.calls).toEqual([
         [TEST_ACCOUNT_ID, READ_OPTIONS],
         [TEST_ACCOUNT_ID, READ_OPTIONS],
@@ -924,13 +1005,18 @@ const NEXT_ACCOUNT_VIEW = BuildAccountView({
     active_status: "N",
     open_date: "2015-04-22",
     credit_limit: "6120.00",
+    credit_limit_edited: "+      6,120.00",
     expiration_date: "2026-08-31",
     cash_credit_limit: "1450.00",
+    cash_credit_limit_edited: "+      1,450.00",
     reissue_date: "2024-08-31",
     curr_balance: "158.00",
+    curr_balance_edited: "+        158.00",
     curr_cycle_credit: "42.10",
+    curr_cycle_credit_edited: "+         42.10",
     group_id: "GOLDCARD",
     curr_cycle_debit: "18.75",
+    curr_cycle_debit_edited: "+         18.75",
     cust_id: "000000005",
     ssn_masked: "***-**-4321",
     date_of_birth: "1979-09-02",
@@ -960,7 +1046,7 @@ async function RenderShownAccountRoute(view: AccountViewResponse): Promise<Query
     mockSearchParams = new URLSearchParams({ acctId: view.acct_id });
     mockViewAccount.mockResolvedValueOnce(view);
     const { rerender } = RenderPage();
-    await WaitForBalance(view.curr_balance);
+    await WaitForBalance(view.curr_balance_edited);
     return (query) => {
         mockSearchParams = query;
         rerender(PageTree());
@@ -980,7 +1066,7 @@ async function ReplacesScreenOnNewAcctId(): Promise<void> {
     expect(AccountIdInput()).toHaveValue(NEXT_ACCOUNT_ID);
     ExpectEveryDisplayFieldBlank();
     await answerNext(NEXT_ACCOUNT_VIEW);
-    await WaitForBalance(NEXT_ACCOUNT_VIEW.curr_balance);
+    await WaitForBalance(NEXT_ACCOUNT_VIEW.curr_balance_edited);
     expect(DisplayedValues()).toEqual(ExpectedValues(NEXT_ACCOUNT_VIEW));
     mockViewAccount.mockResolvedValueOnce(NEXT_ACCOUNT_VIEW);
     await ClickButton(userEvent.setup(), SEARCH_BUTTON_NAME);

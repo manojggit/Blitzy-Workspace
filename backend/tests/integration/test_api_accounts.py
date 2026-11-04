@@ -218,6 +218,17 @@ VIEW_TEXT_COLUMNS = (
     "fico_credit_score",
 )
 VIEW_DATE_COLUMNS = ("open_date", "expiration_date", "reissue_date", "date_of_birth")
+# The CAVW text of each amount of seed account SAMPLE_ACCOUNT_ID, as the COACTVW PICOUT
+# '+ZZZ,ZZZ,ZZZ.99' shows it after 1200's MOVE (cbl/COACTVWC.cbl lines 475-485).
+VIEW_EDITED_AMOUNTS: Mapping[str, str] = MappingProxyType(
+    {
+        "credit_limit_edited": "+      3,503.00",
+        "cash_credit_limit_edited": "+      2,789.00",
+        "curr_balance_edited": "+         40.00",
+        "curr_cycle_credit_edited": "+           .00",
+        "curr_cycle_debit_edited": "+           .00",
+    }
+)
 # WS-RETURN-MSG PIC X(75) (cbl/COACTVWC.cbl line 117).
 RETURN_MESSAGE_LENGTH = 75
 MASKED_SSN_PREFIX = "***-**-"
@@ -467,7 +478,10 @@ async def SaveChange(
 async def test_view_shows_account_and_customer_as_stored(
     regularClient: httpx.AsyncClient, syncEngine: Engine
 ) -> None:
-    """1200-SETUP-SCREEN-VARS: the account and customer as stored, amounts as exact decimals."""
+    """1200-SETUP-SCREEN-VARS: the account and customer as stored, amounts as exact decimals.
+
+    Each amount also comes as the text of its +ZZZ,ZZZ,ZZZ.99 map field.
+    """
     storedRow = ReadAccountRow(syncEngine, SAMPLE_ACCOUNT_ID)
     response = await regularClient.get(f"{ACCOUNTS_URL}/{SAMPLE_ACCOUNT_ID}")
     assert response.status_code == HTTP_OK, response.text
@@ -479,6 +493,8 @@ async def test_view_shows_account_and_customer_as_stored(
     for column in AMOUNT_FIELDS:
         assert isinstance(view[column], str), column
         assert Decimal(view[column]) == storedRow[column], column
+    for editedKey, editedText in VIEW_EDITED_AMOUNTS.items():
+        assert view[editedKey] == editedText, editedKey
     assert view["addr_line_3"] == storedRow["addr_line_3"]
     assert view["message"] == ""
     assert view["info_message"] == INFO_VIEW_PROMPT

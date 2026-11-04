@@ -11,12 +11,15 @@ and their WHEN OTHER branches move WS-FILE-ERROR-MESSAGE (lines 86-105). 1200-SE
 is set; no statement sets WS-INFORM-OUTPUT, so its text is never shown.
 
 Expected values are typed from those lines and from the seed (data/EBCDIC images): account
-00000000004 has customer 000000004, card 2988091353094312, balance 40.00 and FICO score 776,
-and account 00000000099 does not exist. Each test calls coactvwc.ViewAccount with a regular
-user's context against the migrated, seeded test database. CAVW is read-only, so the seed rows
-read back unchanged. The account and customer NOTFND outcomes, which the cross-reference
-foreign keys make unreachable on real data, the batch-window refusal and a CUSTDAT I/O error
-(CICS IOERR, RESP 17) are stubbed on the repository classes.
+00000000004 has customer 000000004, card 2988091353094312, balance 40.00 and FICO score 776;
+account 00000000001 has credit limit 2020.00, cash credit limit 1020.00, balance 194.00 and
+zero cycle amounts; account 00000000099 does not exist. The amounts' edited texts are typed
+from the PICOUT '+ZZZ,ZZZ,ZZZ.99' of bms/COACTVW.bms. Each test calls coactvwc.ViewAccount with
+a regular user's context against the migrated, seeded test database. CAVW is read-only, so the
+seed rows read back unchanged. The account and customer NOTFND outcomes, which the
+cross-reference foreign keys make unreachable on real data, the batch-window refusal, a CUSTDAT
+I/O error (CICS IOERR, RESP 17) and amounts no seed account holds are stubbed on the repository
+classes.
 """
 
 import json
@@ -112,6 +115,25 @@ ACCOUNT_AMOUNT_COLUMNS = (
     "curr_cycle_credit",
     "curr_cycle_debit",
 )
+# 1200 moves each amount into its COACTVW output field (lines 475-485), PICOUT
+# '+ZZZ,ZZZ,ZZZ.99': the response key of that field's text.
+EDITED_AMOUNT_KEYS = {
+    "curr_balance": "curr_balance_edited",
+    "credit_limit": "credit_limit_edited",
+    "cash_credit_limit": "cash_credit_limit_edited",
+    "curr_cycle_credit": "curr_cycle_credit_edited",
+    "curr_cycle_debit": "curr_cycle_debit_edited",
+}
+# Seed account 00000000001, each stored amount and the 15 characters its field shows: Z and the
+# comma are blanks until the first non-zero digit, the point and 99 always show, + is fixed.
+EDITED_ACCT_ID = "00000000001"
+SEED_EDITED_AMOUNTS = [
+    pytest.param("credit_limit", Decimal("2020.00"), "+      2,020.00", id="credit-limit"),
+    pytest.param("cash_credit_limit", Decimal("1020.00"), "+      1,020.00", id="cash-limit"),
+    pytest.param("curr_balance", Decimal("194.00"), "+        194.00", id="balance"),
+    pytest.param("curr_cycle_credit", Decimal("0.00"), "+           .00", id="cycle-credit-zero"),
+    pytest.param("curr_cycle_debit", Decimal("0.00"), "+           .00", id="cycle-debit-zero"),
+]
 ACCOUNT_TEXT_COLUMNS = ("active_status", "group_id")
 ACCOUNT_DATE_COLUMNS = ("open_date", "expiration_date", "reissue_date")
 CUSTOMER_TEXT_COLUMNS = (
@@ -164,6 +186,13 @@ class CustomerIoErrorCase(NamedTuple):
 
     install: Callable[[pytest.MonkeyPatch], None]
     acctIdText: str
+
+
+class EditedAmountCase(NamedTuple):
+    """An amount stored in all five account columns, and the text each COACTVW field shows."""
+
+    storedAmount: Decimal
+    editedText: str
 
 
 def ReadRecord(syncEngine: Engine, sql: str, key: str) -> dict[str, Any]:
@@ -251,6 +280,20 @@ CUSTOMER_IO_ERROR_CASES = [
     CustomerIoErrorCase(InstallAccountMissingThenCustomerIoError, MISSING_ACCT_ID),
 ]
 CUSTOMER_IO_ERROR_CASE_IDS = ["account-found", "account-not-found-replaced"]
+# Amounts no seed account holds, stored in all five columns: the fixed + shows - for a negative
+# value, and an S9(10)V99 amount loses its tenth integer digit in the nine Z positions.
+STUBBED_EDITED_AMOUNT_CASES = [
+    EditedAmountCase(Decimal("-1234.56"), "-      1,234.56"),
+    EditedAmountCase(Decimal("-0.05"), "-           .05"),
+    EditedAmountCase(Decimal("1234567890.12"), "+234,567,890.12"),
+    EditedAmountCase(Decimal("-9999999999.99"), "-999,999,999.99"),
+]
+STUBBED_EDITED_AMOUNT_CASE_IDS = [
+    "negative",
+    "negative-cents",
+    "ten-digits-truncated",
+    "negative-ten-digits-truncated",
+]
 
 
 @pytest_asyncio.fixture(name="regularContext")
@@ -381,6 +424,32 @@ async def test_view_account_shows_the_account_record(viewedAccount, seedAccountR
         assert getattr(viewedAccount, column) == seedAccountRow[column]
     for column in ACCOUNT_DATE_COLUMNS:
         assert getattr(viewedAccount, column) == DisplayedDate(seedAccountRow[column])
+
+
+@pytest.mark.parametrize(("column", "storedAmount", "editedText"), SEED_EDITED_AMOUNTS)
+async def test_view_account_shows_each_seed_amount_in_its_map_picture(
+    regularContext, column, storedAmount, editedText
+):
+    """1200 moves each amount into its +ZZZ,ZZZ,ZZZ.99 field; the Decimal is served unedited."""
+    viewedAccount = await coactvwc.ViewAccount(regularContext, EDITED_ACCT_ID)
+    assert getattr(viewedAccount, column) == storedAmount
+    assert getattr(viewedAccount, EDITED_AMOUNT_KEYS[column]) == editedText
+
+
+@pytest.mark.parametrize(
+    "amountCase", STUBBED_EDITED_AMOUNT_CASES, ids=STUBBED_EDITED_AMOUNT_CASE_IDS
+)
+async def test_view_account_edits_signed_and_ten_digit_amounts(
+    regularContext, monkeypatch, seedAccountRow, amountCase
+):
+    """The fixed + of the picture shows the sign, and the MOVE drops the high-order digit."""
+    storedAmounts = dict.fromkeys(EDITED_AMOUNT_KEYS, amountCase.storedAmount)
+    accountRecord = {**seedAccountRow, **storedAmounts}
+    monkeypatch.setattr(AccountRepository, "GetAccount", StubReturning(accountRecord))
+    viewedAccount = await coactvwc.ViewAccount(regularContext, VIEWED_ACCT_ID)
+    for column, editedKey in EDITED_AMOUNT_KEYS.items():
+        assert getattr(viewedAccount, column) == amountCase.storedAmount, column
+        assert getattr(viewedAccount, editedKey) == amountCase.editedText, editedKey
 
 
 async def test_view_account_shows_the_customer_with_the_ssn_masked(viewedAccount, seedCustomerRow):

@@ -1,7 +1,8 @@
 // Screen tests: BMS COACTUP, program COACTUPC (CAUP), page /accounts/update.
 // Sources: bms/COACTUP.bms and cpy-bms/COACTUP.CPY (labels and LENGTHs); cbl/COACTUPC.cbl
-// (2000-DECIDE-ACTION, 3250-SETUP-INFOMSG, 3300-SETUP-SCREEN-ATTRS, 3320-UNPROTECT-FEW-ATTRS);
-// the literals of backend/app/services/accounts/coactupc.py, copied verbatim.
+// (2000-DECIDE-ACTION, 3250-SETUP-INFOMSG, 3300-SETUP-SCREEN-ATTRS, 3320-UNPROTECT-FEW-ATTRS,
+// 3390-SETUP-INFOMSG-ATTRS); the literals of backend/app/services/accounts/coactupc.py, copied
+// verbatim.
 import { ThemeProvider } from "@mui/material/styles";
 import {
     act,
@@ -48,6 +49,9 @@ type AccountFieldName = keyof AccountScreenFields;
 
 type ThreePartNames = readonly [AccountFieldName, AccountFieldName, AccountFieldName];
 
+// An open COACTUP field is a single-line input; a protected one is a read-only textarea.
+type FieldElement = HTMLInputElement | HTMLTextAreaElement;
+
 // The CAUP error body: the legacy keys plus the screen the page keeps the state machine on.
 type AccountErrorBody = LegacyErrorResponse &
     Partial<Pick<AccountScreen, "fields" | "state" | "screen_token">>;
@@ -83,6 +87,19 @@ interface UpdateKey extends FunctionKey {
 
 interface ActionKeyCase extends UpdateKey {
     method: InputMethod;
+    state: UpdateScreenState;
+}
+
+// A state and the accessible names of the PF-key buttons its legend shows, in screen order.
+interface LegendCase {
+    state: UpdateScreenState;
+    buttonNames: readonly string[];
+}
+
+// A state and a key its legend leaves dark.
+interface HiddenKeyCase {
+    state: UpdateScreenState;
+    updateKey: UpdateKey;
 }
 
 interface OutcomeCase {
@@ -381,9 +398,50 @@ const EXIT_KEY: FunctionKey = { buttonName: "Exit (F3)", key: "F3" };
 // The keys that send a PUT, as opposed to F3, which only navigates.
 const REQUEST_KEYS: readonly UpdateKey[] = [ENTER_KEY, SAVE_KEY, CANCEL_KEY];
 const INPUT_METHODS: readonly InputMethod[] = ["click", "key"];
-// ENTER, F5 and F12, each by its on-screen button and by its physical key.
-const ACTION_KEY_CASES: readonly ActionKeyCase[] = [ENTER_KEY, SAVE_KEY, CANCEL_KEY].flatMap(
-    (updateKey) => INPUT_METHODS.map((method) => ({ ...updateKey, method })),
+
+// The COACTUP PF legend (AAP 0.6.3): FKEYS (ENTER=Process F3=Exit) always; FKEY05 and FKEY12 are
+// ATTRB=(ASKIP,DRK) until 3390-SETUP-INFOMSG-ATTRS brightens FKEY12 for ACUP-CHANGES-MADE AND NOT
+// ACUP-CHANGES-OKAYED-AND-DONE, and FKEY05 with it for PROMPT-FOR-CONFIRMATION, which
+// 3250-SETUP-INFOMSG sets only WHEN ACUP-CHANGES-OK-NOT-CONFIRMED.
+const FKEYS_LEGEND: readonly FunctionKey[] = [ENTER_KEY, EXIT_KEY];
+const CANCEL_LEGEND: readonly FunctionKey[] = [ENTER_KEY, EXIT_KEY, CANCEL_KEY];
+const CONFIRMATION_LEGEND: readonly FunctionKey[] = [ENTER_KEY, EXIT_KEY, SAVE_KEY, CANCEL_KEY];
+const LEGEND_BY_STATE: Readonly<Record<UpdateScreenState, readonly FunctionKey[]>> = {
+    [UpdateScreenState.DETAILS_NOT_FETCHED]: FKEYS_LEGEND,
+    [UpdateScreenState.SHOW_DETAILS]: FKEYS_LEGEND,
+    [UpdateScreenState.CHANGES_NOT_OK]: CANCEL_LEGEND,
+    [UpdateScreenState.CHANGES_OK_NOT_CONFIRMED]: CONFIRMATION_LEGEND,
+    [UpdateScreenState.CHANGES_DONE]: FKEYS_LEGEND,
+    [UpdateScreenState.CHANGES_FAILED]: CANCEL_LEGEND,
+};
+const LEGEND_CASES: readonly LegendCase[] = Object.values(UpdateScreenState).map((state) => ({
+    state,
+    buttonNames: LEGEND_BY_STATE[state].map((functionKey) => functionKey.buttonName),
+}));
+// The FunctionKeyBar group's accessible name.
+const FUNCTION_KEY_BAR_NAME = "Function keys";
+
+// ENTER, F5 and F12, each by its on-screen button in a state whose legend shows it, and by its
+// physical key in SHOW_DETAILS, whose legend leaves F5 and F12 dark.
+const ACTION_KEY_CASES: readonly ActionKeyCase[] = [
+    { ...ENTER_KEY, method: "click", state: UpdateScreenState.SHOW_DETAILS },
+    { ...ENTER_KEY, method: "key", state: UpdateScreenState.SHOW_DETAILS },
+    { ...SAVE_KEY, method: "click", state: UpdateScreenState.CHANGES_OK_NOT_CONFIRMED },
+    { ...SAVE_KEY, method: "key", state: UpdateScreenState.SHOW_DETAILS },
+    { ...CANCEL_KEY, method: "click", state: UpdateScreenState.CHANGES_NOT_OK },
+    { ...CANCEL_KEY, method: "key", state: UpdateScreenState.SHOW_DETAILS },
+];
+
+function IsShownIn(state: UpdateScreenState, functionKey: FunctionKey): boolean {
+    return LEGEND_BY_STATE[state].some((legendKey) => legendKey.key === functionKey.key);
+}
+
+// Every state with each of F5 and F12 its legend leaves dark.
+const HIDDEN_KEY_CASES: readonly HiddenKeyCase[] = Object.values(UpdateScreenState).flatMap(
+    (state) =>
+        [SAVE_KEY, CANCEL_KEY]
+            .filter((updateKey) => !IsShownIn(state, updateKey))
+            .map((updateKey) => ({ state, updateKey })),
 );
 
 function BlankFields(): AccountScreenFields {
@@ -508,17 +566,17 @@ function KeepRawText(text: string): string {
     return text;
 }
 
-function FieldInput(fieldCase: FieldCase): HTMLInputElement {
+function FieldInput(fieldCase: FieldCase): FieldElement {
     const container =
         fieldCase.group === undefined
             ? document.body
             : screen.getByRole("group", { name: fieldCase.group });
-    return within(container).getByLabelText<HTMLInputElement>(fieldCase.label, {
+    return within(container).getByLabelText<FieldElement>(fieldCase.label, {
         normalizer: KeepRawText,
     });
 }
 
-function InputOf(name: AccountFieldName): HTMLInputElement {
+function InputOf(name: AccountFieldName): FieldElement {
     const fieldCase = FIELD_CASES.find((candidate) => candidate.name === name);
     if (fieldCase === undefined) {
         throw new Error(`No COACTUP field case for ${name}`);
@@ -560,11 +618,20 @@ function ExpectAlert(text: string, severity: MessageSeverity): void {
     expect(ShownAlerts()).toContainEqual([text, severity]);
 }
 
-// The page listens for keydown on window; the async act settles the request it starts.
-async function PressKey(key: string): Promise<void> {
+// The page listens for keydown on window; the async act settles the request it starts. The result
+// is false when the page prevented the browser's own action for the key.
+async function PressKey(key: string): Promise<boolean> {
+    let isDefaultAllowed = true;
     await act(async () => {
-        fireEvent.keyDown(window, { key });
+        isDefaultAllowed = fireEvent.keyDown(window, { key });
     });
+    return isDefaultAllowed;
+}
+
+// A key is pressed by its button where the state's legend shows it, else by its physical key,
+// which stays bound while its legend entry is dark.
+function MethodIn(state: UpdateScreenState, functionKey: FunctionKey): InputMethod {
+    return IsShownIn(state, functionKey) ? "click" : "key";
 }
 
 async function PressFunctionKey(
@@ -715,8 +782,8 @@ interface ExpectedFailure {
 
 // ACCT-GROUP-ID: no 1200 edit checks it, so it is never a failing field.
 const UNEDITED_FIELD_NAME: AccountFieldName = "group_id";
-// MUI marks an input whose TextField is in error with aria-invalid="true".
-const MARKED_INPUT_SELECTOR = 'input[aria-invalid="true"]';
+// MUI marks an input or textarea whose TextField is in error with aria-invalid="true".
+const MARKED_INPUT_SELECTOR = 'input[aria-invalid="true"], textarea[aria-invalid="true"]';
 
 // 3203-SHOW-UPDATED-VALUES: a CHANGES_NOT_OK screen shows the values as received, except that an
 // amount which passed TEST-NUMVAL-C is shown edited (WS-EDIT-CURRENCY-9-2-F).
@@ -1516,7 +1583,7 @@ async function ShowsCancelReadFailure(readCase: ReadFailureCase): Promise<void> 
         cursor_field: "acct_id",
     });
     QueueUpdateOutcome(readCase.status, provisionalScreen);
-    await PressFunctionKey(user, CANCEL_KEY);
+    await PressFunctionKey(user, CANCEL_KEY, MethodIn(UpdateScreenState.SHOW_DETAILS, CANCEL_KEY));
     ExpectFailureShown({
         message: readCase.message,
         infoMessage: INFO_PROMPT_FOR_CHANGES,
@@ -1577,44 +1644,231 @@ function LabelsInputWithLength(fieldCase: FieldCase): void {
     expect(FieldInput(fieldCase)).toHaveAttribute("maxlength", String(fieldCase.maxLength));
 }
 
-// One COACTUP input and whether its grid row aligns its entries by their bottom edge.
+// One COACTUP input and whether its grid row aligns its entries by their bottom edge at md, where
+// entries first share a row, and from lg.
 interface RowAlignmentCase {
     name: AccountFieldName;
-    isEndAligned: boolean;
+    isEndAlignedAtMd: boolean;
+    isEndAlignedFromLg: boolean;
+}
+
+// One captioned group: the grid cell sizes it takes and whether its parts sit side by side from
+// sm.
+interface GroupLayoutCase {
+    caption: string;
+    gridSizeClasses: readonly string[];
+    isRowFromSm: boolean;
 }
 
 const GRID_ROW_SELECTOR = ".MuiGrid-container";
+const GRID_CELL_SELECTOR = ".MuiGrid-root";
+const FIELD_ROOT_SELECTOR = ".MuiFormControl-root";
+// MUI 9 marks a Grid cell's size at each breakpoint as MuiGrid-grid-<breakpoint>-<size>.
+const GRID_SIZE_CLASS_PREFIX = "MuiGrid-grid-";
 const END_ALIGNMENT = "flex-end";
+const ROW_DIRECTION = "row";
+// MUI's default sm, md and lg breakpoints, which the theme keeps.
+const SM_MIN_WIDTH_PX = 600;
+const MD_MIN_WIDTH_PX = 900;
+const LG_MIN_WIDTH_PX = 1200;
+// The media text of a rule MUI writes for a style that starts at a breakpoint.
+const MIN_WIDTH_MEDIA_PATTERN = /^\(min-width:\s*(\d+)px\)$/;
 
-// A single field beside a captioned group (Customer id | SSN, Date of birth | FICO Score,
-// Address | City, Phone 1 | Government Issued Id, Phone 2 | EFT Account Id) sits level with the
-// group's inputs only in a bottom-aligned row. The Account Number row keeps the top edge, where
-// the Active Y/N helper text hangs below its input.
+// A single field beside a captioned group sits level with the group's inputs only in a
+// bottom-aligned row: Date of birth | FICO Score from md, and Customer id | SSN, Phone 1 |
+// Government Issued Id and Phone 2 | EFT Account Id from lg, where the SSN and phone groups first
+// take half a row. Below lg, EFT Account Id shares its row with Primary Card Holder Y/N instead,
+// so that row keeps the top edge, as the Account Number row beside Active Y/N does: a Y/N helper
+// text hangs below its input. The address lines span the full row, so City sits beside no group.
 const ROW_ALIGNMENT_CASES: readonly RowAlignmentCase[] = [
-    { name: "cust_id", isEndAligned: true },
-    { name: "fico_credit_score", isEndAligned: true },
-    { name: "addr_line_3", isEndAligned: true },
-    { name: "govt_issued_id", isEndAligned: true },
-    { name: "eft_account_id", isEndAligned: true },
-    { name: "acct_id", isEndAligned: false },
+    { name: "cust_id", isEndAlignedAtMd: true, isEndAlignedFromLg: true },
+    { name: "fico_credit_score", isEndAlignedAtMd: true, isEndAlignedFromLg: true },
+    { name: "addr_line_3", isEndAlignedAtMd: false, isEndAlignedFromLg: false },
+    { name: "govt_issued_id", isEndAlignedAtMd: false, isEndAlignedFromLg: true },
+    { name: "eft_account_id", isEndAlignedAtMd: false, isEndAlignedFromLg: true },
+    { name: "acct_id", isEndAlignedAtMd: false, isEndAlignedFromLg: false },
 ];
 
-function GridRowOf(name: AccountFieldName): Element {
-    const row = InputOf(name).closest(GRID_ROW_SELECTOR);
-    if (row === null) {
-        throw new Error(`No grid row holds COACTUP field ${name}`);
+const HALF_ROW_FROM_MD: readonly string[] = ["MuiGrid-grid-xs-12", "MuiGrid-grid-md-6"];
+const HALF_ROW_FROM_LG: readonly string[] = ["MuiGrid-grid-xs-12", "MuiGrid-grid-lg-6"];
+const FULL_ROW: readonly string[] = ["MuiGrid-grid-xs-12"];
+
+// A date's parts fit half a row from md, as a single field does. Until lg, half a row is
+// narrower than the SSN and phone part labels at full size, which a blank open part shows. ACSADL1
+// and ACSADL2 stand on map rows 16 and 17, so the address lines take a full row each.
+const GROUP_LAYOUT_CASES: readonly GroupLayoutCase[] = [
+    { caption: "Opened :", gridSizeClasses: HALF_ROW_FROM_MD, isRowFromSm: true },
+    { caption: "Expiry :", gridSizeClasses: HALF_ROW_FROM_MD, isRowFromSm: true },
+    { caption: "Reissue:", gridSizeClasses: HALF_ROW_FROM_MD, isRowFromSm: true },
+    { caption: "SSN:", gridSizeClasses: HALF_ROW_FROM_LG, isRowFromSm: true },
+    { caption: "Date of birth:", gridSizeClasses: HALF_ROW_FROM_MD, isRowFromSm: true },
+    { caption: "Address:", gridSizeClasses: FULL_ROW, isRowFromSm: false },
+    { caption: "Phone 1:", gridSizeClasses: HALF_ROW_FROM_LG, isRowFromSm: true },
+    { caption: "Phone 2:", gridSizeClasses: HALF_ROW_FROM_LG, isRowFromSm: true },
+];
+
+// "Line number code" is the longest part label, so a phone number splits its row 3:3:4 by flex
+// grow; the parts of every other group take no share and split their row equally.
+const PART_SHARE_CASES: readonly (readonly [AccountFieldName, string])[] = [
+    ["phone_num_1_area", "3"],
+    ["phone_num_1_prefix", "3"],
+    ["phone_num_1_line", "4"],
+    ["phone_num_2_area", "3"],
+    ["phone_num_2_prefix", "3"],
+    ["phone_num_2_line", "4"],
+    ["ssn_part_2", ""],
+    ["dob_year", ""],
+    ["addr_line_1", ""],
+];
+
+function ClosestOf(element: Element, selector: string): Element {
+    const ancestor = element.closest(selector);
+    if (ancestor === null) {
+        throw new Error(`No ${selector} holds ${element.id || element.tagName}`);
     }
-    return row;
+    return ancestor;
 }
 
-function AlignsRowOfField({ name, isEndAligned }: RowAlignmentCase): void {
+function GridRowOf(name: AccountFieldName): Element {
+    return ClosestOf(InputOf(name), GRID_ROW_SELECTOR);
+}
+
+// The width a min-width media rule starts at, or none for any other media rule.
+function MinWidthOf(rule: CSSMediaRule): number | undefined {
+    const match = MIN_WIDTH_MEDIA_PATTERN.exec(rule.media.mediaText);
+    return match === null ? undefined : Number(match[1]);
+}
+
+function StartsAtOrBelow(rule: CSSMediaRule, widthPx: number): boolean {
+    const startPx = MinWidthOf(rule);
+    return startPx !== undefined && startPx <= widthPx;
+}
+
+// MUI writes a style that starts at a breakpoint, xs included, as an @media (min-width:<px>px)
+// rule, which jsdom's getComputedStyle skips, so the style in effect from a breakpoint up is read
+// from the rules themselves: the last that starts at or below it wins, as in the cascade. Without
+// one, the element keeps its computed value from the breakpoint up.
+function StyleFromBreakpoint(element: Element, property: string, minWidthPx: number): string {
+    const values = [...document.styleSheets]
+        .flatMap((sheet) => [...sheet.cssRules])
+        .filter((rule): rule is CSSMediaRule => rule instanceof CSSMediaRule)
+        .filter((rule) => StartsAtOrBelow(rule, minWidthPx))
+        .flatMap((rule) => [...rule.cssRules])
+        .filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule)
+        .filter((rule) => element.matches(rule.selectorText))
+        .map((rule) => rule.style.getPropertyValue(property))
+        .filter((value) => value !== "");
+    return values.at(-1) ?? getComputedStyle(element).getPropertyValue(property);
+}
+
+function AlignsRowOfField(alignmentCase: RowAlignmentCase): void {
     RenderScreen();
-    expect(getComputedStyle(GridRowOf(name)).alignItems === END_ALIGNMENT).toBe(isEndAligned);
+    const row = GridRowOf(alignmentCase.name);
+    const alignmentAtMd = StyleFromBreakpoint(row, "align-items", MD_MIN_WIDTH_PX);
+    expect(alignmentAtMd === END_ALIGNMENT).toBe(alignmentCase.isEndAlignedAtMd);
+    const alignmentFromLg = StyleFromBreakpoint(row, "align-items", LG_MIN_WIDTH_PX);
+    expect(alignmentFromLg === END_ALIGNMENT).toBe(alignmentCase.isEndAlignedFromLg);
+}
+
+function LaysOutGroup({ caption, gridSizeClasses, isRowFromSm }: GroupLayoutCase): void {
+    RenderScreen();
+    const group = screen.getByRole("group", { name: caption });
+    const cellClasses = [...ClosestOf(group, GRID_CELL_SELECTOR).classList];
+    const sizeClasses = cellClasses.filter((name) => name.startsWith(GRID_SIZE_CLASS_PREFIX));
+    expect(sizeClasses).toEqual(gridSizeClasses);
+    const directionFromSm = StyleFromBreakpoint(group, "flex-direction", SM_MIN_WIDTH_PX);
+    expect(directionFromSm === ROW_DIRECTION).toBe(isRowFromSm);
+}
+
+function SharesGroupRow(name: AccountFieldName, flexGrow: string): void {
+    RenderScreen();
+    expect(getComputedStyle(ClosestOf(InputOf(name), FIELD_ROOT_SELECTOR)).flexGrow).toBe(flexGrow);
 }
 
 async function OpensFieldsOfState(editableCase: EditableByStateCase): Promise<void> {
     await RenderInState(editableCase.state);
     expect(EditableFieldNames()).toEqual(editableCase.editableNames);
+}
+
+// How one field renders: its element, and whether its MUI input wraps, is filled and is read-only.
+interface RenderedField {
+    tagName: string;
+    isMultiline: boolean;
+    isFilled: boolean;
+    isReadOnly: boolean;
+}
+
+const INPUT_ROOT_SELECTOR = ".MuiInputBase-root";
+const MULTILINE_ROOT_CLASS = "MuiInputBase-multiline";
+const FILLED_ROOT_CLASS = "MuiFilledInput-root";
+
+function RenderedFieldOf(fieldCase: FieldCase): RenderedField {
+    const element = FieldInput(fieldCase);
+    const rootClasses = ClosestOf(element, INPUT_ROOT_SELECTOR).classList;
+    return {
+        tagName: element.tagName,
+        isMultiline: rootClasses.contains(MULTILINE_ROOT_CLASS),
+        isFilled: rootClasses.contains(FILLED_ROOT_CLASS),
+        isReadOnly: element.readOnly,
+    };
+}
+
+// A protected field is a filled, read-only textarea that wraps a long value, as CAVW's display
+// fields are; an open field stays a single-line outlined input, which takes no newline.
+function ExpectedRenderedField(isEditable: boolean): RenderedField {
+    return {
+        tagName: isEditable ? "INPUT" : "TEXTAREA",
+        isMultiline: !isEditable,
+        isFilled: !isEditable,
+        isReadOnly: !isEditable,
+    };
+}
+
+async function RendersProtectionAsFieldKind(editableCase: EditableByStateCase): Promise<void> {
+    await RenderInState(editableCase.state);
+    const rendered = FIELD_CASES.map((fieldCase) => [fieldCase.name, RenderedFieldOf(fieldCase)]);
+    const expected = FIELD_CASES.map((fieldCase) => [
+        fieldCase.name,
+        ExpectedRenderedField(editableCase.editableNames.includes(fieldCase.name)),
+    ]);
+    expect(Object.fromEntries(rendered)).toEqual(Object.fromEntries(expected));
+}
+
+const FIELD_ID_PREFIX = "account-update-";
+const PROTECTED_FIELD_ROWS = "1";
+const HIDDEN_TEXTAREA_SELECTOR = "textarea[aria-hidden]";
+
+// How one protected field's textarea renders: its id, its rows and whether it takes an input type.
+interface ProtectedTextarea {
+    id: string;
+    rows: string | null;
+    hasType: boolean;
+}
+
+function ProtectedTextareaOf(field: FieldElement): ProtectedTextarea {
+    return { id: field.id, rows: field.getAttribute("rows"), hasType: field.hasAttribute("type") };
+}
+
+function ExpectedProtectedTextarea(fieldCase: FieldCase): ProtectedTextarea {
+    return { id: FIELD_ID_PREFIX + fieldCase.name, rows: PROTECTED_FIELD_ROWS, hasType: false };
+}
+
+// The browser sizes each native textarea to its value, so no hidden measuring copy of a field is
+// rendered: every textarea on the screen is a protected field, one row, with its own id and no
+// type, and every open field stays an input.
+async function RendersProtectedFieldsAsNativeTextareas(
+    editableCase: EditableByStateCase,
+): Promise<void> {
+    await RenderInState(editableCase.state);
+    const protectedCases = FIELD_CASES.filter(
+        (fieldCase) => !editableCase.editableNames.includes(fieldCase.name),
+    );
+    const protectedFields = protectedCases.map((fieldCase) => FieldInput(fieldCase));
+    expect(Array.from(document.querySelectorAll("textarea"))).toEqual(protectedFields);
+    expect(document.querySelectorAll(HIDDEN_TEXTAREA_SELECTOR)).toHaveLength(0);
+    expect(protectedFields.map(ProtectedTextareaOf)).toEqual(
+        protectedCases.map(ExpectedProtectedTextarea),
+    );
 }
 
 // A state, and whether it leaves ACCT-GROUP-ID (blank in TEST_FIELDS, as in every seed account)
@@ -1752,14 +2006,53 @@ async function SendsBlankKeyToKeyEdit(): Promise<void> {
     expect(InputOf("acct_id")).toHaveAttribute("aria-invalid", "true");
 }
 
+// The inputs the AAP 0.6.9 state table opens in the state.
+function EditableNamesIn(state: UpdateScreenState): readonly AccountFieldName[] {
+    const editableCase = EDITABLE_BY_STATE_CASES.find((candidate) => candidate.state === state);
+    if (editableCase === undefined) {
+        throw new Error(`No COACTUP protection case for ${state}`);
+    }
+    return editableCase.editableNames;
+}
+
 async function SendsActionWithHeldToken(actionKeyCase: ActionKeyCase): Promise<void> {
-    const user = await RenderInState(UpdateScreenState.SHOW_DETAILS);
+    const user = await RenderInState(actionKeyCase.state);
     QueueUpdateOutcome(HTTP_OK, BuildAccountScreen(UpdateScreenState.SHOW_DETAILS));
     await PressFunctionKey(user, actionKeyCase, actionKeyCase.method);
     ExpectUpdateRequest(TEST_ACCOUNT_ID, {
         action: actionKeyCase.action,
         screen_token: FIRST_SCREEN_TOKEN,
-        fields: PickFields(TEST_FIELDS, DETAIL_FIELD_NAMES),
+        fields: PickFields(TEST_FIELDS, EditableNamesIn(actionKeyCase.state)),
+    });
+}
+
+// FunctionKeyBar's buttons in screen order, by their accessible names.
+function ShownLegend(): string[] {
+    const bar = screen.getByRole("group", { name: FUNCTION_KEY_BAR_NAME });
+    return within(bar)
+        .getAllByRole("button")
+        .map((button) => button.getAttribute("aria-label") ?? "");
+}
+
+async function ShowsLegendOfState(legendCase: LegendCase): Promise<void> {
+    await RenderInState(legendCase.state);
+    expect(ShownLegend()).toEqual(legendCase.buttonNames);
+}
+
+// A dark key still sends its AID: its physical key sends its action with the held screen_token,
+// and the page keeps the browser's own F5 reload or F12 devtools from running.
+async function SendsHiddenKeyAction({ state, updateKey }: HiddenKeyCase): Promise<void> {
+    await RenderInState(state);
+    expect(screen.queryByRole("button", { name: updateKey.buttonName })).not.toBeInTheDocument();
+    QueueUpdateOutcome(HTTP_OK, BuildAccountScreen(UpdateScreenState.SHOW_DETAILS));
+    const isDefaultAllowed = await PressKey(updateKey.key);
+    await WaitForIdle();
+    expect(isDefaultAllowed).toBe(false);
+    const heldToken = state === UpdateScreenState.DETAILS_NOT_FETCHED ? "" : FIRST_SCREEN_TOKEN;
+    expect(mockUpdateAccount).toHaveBeenCalledTimes(1);
+    expect(LastUpdateCall()[1]).toMatchObject({
+        action: updateKey.action,
+        screen_token: heldToken,
     });
 }
 
@@ -1798,27 +2091,30 @@ async function SendsTokenOfLatestResponse(): Promise<void> {
     });
 }
 
-function ExpectRequestKeysEnabled(isEnabled: boolean): void {
-    for (const requestKey of REQUEST_KEYS) {
+// Each request key button the state's legend shows is enabled or disabled as given.
+function ExpectRequestKeysEnabled(isEnabled: boolean, state: UpdateScreenState): void {
+    for (const requestKey of REQUEST_KEYS.filter((updateKey) => IsShownIn(state, updateKey))) {
         const button = screen.getByRole("button", { name: requestKey.buttonName });
         expect(button).toHaveProperty("disabled", !isEnabled);
     }
 }
 
 // The PUT stays in flight until the test settles it: meanwhile ENTER, F5 and F12 are disabled
-// and ignore their physical key, while F3 stays available.
+// and ignore their physical key, while F3 stays available. CHANGES_OK_NOT_CONFIRMED shows all
+// four keys, and the confirmation screen that settles the PUT shows them again.
 async function DisablesRequestKeysWhileBusy(updateKey: UpdateKey): Promise<void> {
-    const user = await RenderInState(UpdateScreenState.SHOW_DETAILS);
+    const confirmationState = UpdateScreenState.CHANGES_OK_NOT_CONFIRMED;
+    const user = await RenderInState(confirmationState);
     let settleUpdate: (accountScreen: AccountScreen) => void = () => undefined;
     mockUpdateAccount.mockReturnValueOnce(new Promise((resolve) => (settleUpdate = resolve)));
     await user.click(screen.getByRole("button", { name: updateKey.buttonName }));
-    ExpectRequestKeysEnabled(false);
+    ExpectRequestKeysEnabled(false, confirmationState);
     expect(screen.getByRole("button", { name: EXIT_KEY.buttonName })).toBeEnabled();
     await PressKey(updateKey.key);
     expect(mockUpdateAccount).toHaveBeenCalledTimes(1);
-    await act(async () => settleUpdate(BuildAccountScreen(UpdateScreenState.SHOW_DETAILS)));
+    await act(async () => settleUpdate(BuildAccountScreen(confirmationState)));
     await WaitForIdle();
-    ExpectRequestKeysEnabled(true);
+    ExpectRequestKeysEnabled(true, confirmationState);
 }
 
 async function AdoptsScreenOfErrorBody(adoptionCase: AdoptionCase): Promise<void> {
@@ -1868,7 +2164,10 @@ async function MarksEveryFailingField(): Promise<void> {
 // The MessageLine ERRMSG element id, which an input the server names in error references.
 const ERRMSG_ID = "message-line-errmsg";
 const MSG_ACCOUNT_STATUS_NOT_Y_OR_N = "Account Status must be Y or N.";
-const ERRMSG_REFERENCE_SELECTOR = `input[aria-describedby~="${ERRMSG_ID}"]`;
+const ERRMSG_REFERENCE_SELECTOR = [
+    `input[aria-describedby~="${ERRMSG_ID}"]`,
+    `textarea[aria-describedby~="${ERRMSG_ID}"]`,
+].join(", ");
 
 // An input and the aria-describedby it carries after the answer below; null for none.
 interface ErrorReferenceCase {
@@ -1892,7 +2191,7 @@ const ERROR_REFERENCE_CASES: readonly ErrorReferenceCase[] = [
     { name: "addr_zip", describedBy: null },
 ];
 
-function DescribedByIds(input: HTMLInputElement): string[] {
+function DescribedByIds(input: FieldElement): string[] {
     return input.getAttribute("aria-describedby")?.split(" ") ?? [];
 }
 
@@ -2106,8 +2405,16 @@ describe("COACTUPC /accounts/update COACTUP content", () => {
         LabelsInputWithLength,
     );
     it.each(ROW_ALIGNMENT_CASES)(
-        "COACTUP $name row aligns its entries by the bottom edge: $isEndAligned",
+        "COACTUP $name row aligns to the bottom at md $isEndAlignedAtMd, lg $isEndAlignedFromLg",
         AlignsRowOfField,
+    );
+    it.each(GROUP_LAYOUT_CASES)(
+        "COACTUP $caption takes $gridSizeClasses, parts side by side from sm: $isRowFromSm",
+        LaysOutGroup,
+    );
+    it.each(PART_SHARE_CASES)(
+        "COACTUP %s takes a flex grow of %p in its group row",
+        SharesGroupRow,
     );
 });
 
@@ -2132,9 +2439,31 @@ describe("COACTUPC /accounts/update field protection", () => {
     );
 });
 
+describe("COACTUPC /accounts/update protected field display", () => {
+    it.each(EDITABLE_BY_STATE_CASES)(
+        "COACTUPC in $state wraps each protected field read-only; open fields stay single-line",
+        RendersProtectionAsFieldKind,
+    );
+    it.each(EDITABLE_BY_STATE_CASES)(
+        "COACTUPC in $state shows each protected field in one identified textarea row, no copy",
+        RendersProtectedFieldsAsNativeTextareas,
+    );
+});
+
+describe("COACTUPC /accounts/update PF legend", () => {
+    it.each(LEGEND_CASES)(
+        "COACTUPC in $state shows the PF legend $buttonNames",
+        ShowsLegendOfState,
+    );
+    it.each(HIDDEN_KEY_CASES)(
+        "COACTUPC physical $updateKey.key in $state, its legend dark, sends $updateKey.action",
+        SendsHiddenKeyAction,
+    );
+});
+
 describe("COACTUPC /accounts/update actions", () => {
     it.each(ACTION_KEY_CASES)(
-        "COACTUPC $key by $method sends $action with the held screen_token",
+        "COACTUPC $key by $method in $state sends $action with the held screen_token",
         SendsActionWithHeldToken,
     );
     it("COACTUPC ENTER before the fetch sends only ACCTSID", SendsOnlyKeyBeforeFetch);
@@ -2290,7 +2619,7 @@ async function CancelShowsRereadRecord(startState: UpdateScreenState): Promise<v
     const user = await RenderInState(startState);
     await KeyEdits(user, DISCARDED_EDITS);
     QueueUpdateOutcome(HTTP_OK, REREAD_SCREEN);
-    await PressFunctionKey(user, CANCEL_KEY);
+    await PressFunctionKey(user, CANCEL_KEY, MethodIn(startState, CANCEL_KEY));
     ExpectUpdateRequest(TEST_ACCOUNT_ID, {
         action: UpdateAction.CANCEL,
         screen_token: FIRST_SCREEN_TOKEN,
@@ -2346,7 +2675,8 @@ function ExpectEmptyKeyScreen(): void {
 async function ShowsEmptyKeyScreenAfterFinish(keyCase: TerminalKeyCase): Promise<void> {
     const user = await FinishUpdate(keyCase);
     QueueUpdateOutcome(HTTP_OK, EMPTY_KEY_SCREEN);
-    await PressFunctionKey(user, keyCase.updateKey);
+    const method = MethodIn(keyCase.terminalScreen.state, keyCase.updateKey);
+    await PressFunctionKey(user, keyCase.updateKey, method);
     ExpectUpdateRequest(TEST_ACCOUNT_ID, {
         action: keyCase.updateKey.action,
         screen_token: NEXT_SCREEN_TOKEN,
@@ -2394,13 +2724,14 @@ const CREDIT_LIMIT_FAILURE_SCREEN = BuildAccountScreen(UpdateScreenState.CHANGES
 });
 
 // A rejected ENTER or F5, text keyed after it, then F12: the cancel carries the key and fields
-// the server last showed, never the keyed text.
+// the server last showed, never the keyed text. rejectedState is the state the rejection leaves.
 interface ShownCancelCase {
     description: string;
     startState: UpdateScreenState;
     rejectedKey: UpdateKey;
     rejectedEdits: readonly FieldEdit[];
     rejection: AxiosError<AccountErrorBody>;
+    rejectedState: UpdateScreenState;
     laterEdits: readonly FieldEdit[];
     cancelRequest: AccountUpdateRequest;
     cancelAnswer: AccountScreen;
@@ -2413,6 +2744,7 @@ const SHOWN_CANCEL_CASES: readonly ShownCancelCase[] = [
         rejectedKey: ENTER_KEY,
         rejectedEdits: NON_CP037_EDITS,
         rejection: StructuralRejection("addr_line_1"),
+        rejectedState: UpdateScreenState.SHOW_DETAILS,
         laterEdits: [],
         cancelRequest: {
             action: UpdateAction.CANCEL,
@@ -2427,6 +2759,7 @@ const SHOWN_CANCEL_CASES: readonly ShownCancelCase[] = [
         rejectedKey: ENTER_KEY,
         rejectedEdits: [["credit_limit", "abc"]],
         rejection: BuildAxiosError(HTTP_EDIT_FAILURE, BuildErrorBody(CREDIT_LIMIT_FAILURE_SCREEN)),
+        rejectedState: UpdateScreenState.CHANGES_NOT_OK,
         laterEdits: NON_CP037_EDITS,
         cancelRequest: {
             action: UpdateAction.CANCEL,
@@ -2444,6 +2777,7 @@ const SHOWN_CANCEL_CASES: readonly ShownCancelCase[] = [
             HTTP_RECORD_LOCKED,
             BuildErrorBody(FailedSaveScreen(MSG_LOCK_ACCOUNT)),
         ),
+        rejectedState: UpdateScreenState.CHANGES_FAILED,
         laterEdits: [["acct_id", NON_CP037_ACCOUNT_KEY]],
         cancelRequest: {
             action: UpdateAction.CANCEL,
@@ -2472,10 +2806,11 @@ async function CancelSendsShownFields(cancelCase: ShownCancelCase): Promise<void
     const user = await RenderInState(cancelCase.startState);
     await KeyEdits(user, cancelCase.rejectedEdits);
     mockUpdateAccount.mockRejectedValueOnce(cancelCase.rejection);
-    await PressFunctionKey(user, cancelCase.rejectedKey);
+    const rejectedMethod = MethodIn(cancelCase.startState, cancelCase.rejectedKey);
+    await PressFunctionKey(user, cancelCase.rejectedKey, rejectedMethod);
     await KeyEdits(user, cancelCase.laterEdits);
     QueueUpdateOutcome(HTTP_OK, cancelCase.cancelAnswer);
-    await PressFunctionKey(user, CANCEL_KEY);
+    await PressFunctionKey(user, CANCEL_KEY, MethodIn(cancelCase.rejectedState, CANCEL_KEY));
     ExpectUpdateRequest(TEST_ACCOUNT_ID, cancelCase.cancelRequest);
     expect(FieldValuesShown()).toEqual(cancelCase.cancelAnswer.fields);
 }
@@ -2519,7 +2854,8 @@ async function SendsTextAsKeyed(keyedCase: KeyedRequestCase): Promise<void> {
     const user = await RenderInState(keyedCase.startState);
     await KeyEdits(user, keyedCase.edits);
     QueueUpdateOutcome(HTTP_OK, keyedCase.answer);
-    await PressFunctionKey(user, keyedCase.updateKey);
+    const method = MethodIn(keyedCase.startState, keyedCase.updateKey);
+    await PressFunctionKey(user, keyedCase.updateKey, method);
     ExpectUpdateRequest(TEST_ACCOUNT_ID, keyedCase.request);
 }
 
@@ -2805,7 +3141,7 @@ async function KeepsNewEntryWhilePutPending(): Promise<void> {
     await answerPut(LATE_PUT_ANSWER);
     expect(mockUpdateAccount).toHaveBeenCalledTimes(1);
     ExpectNavigatedAccountScreen();
-    ExpectRequestKeysEnabled(true);
+    ExpectRequestKeysEnabled(true, UpdateScreenState.SHOW_DETAILS);
     await ExpectEnterSendsNavigatedAccount();
 }
 

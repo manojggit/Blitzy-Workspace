@@ -23,8 +23,8 @@ happens per request. Admin is exactly A; every other stored type (U, u, a, X, ..
   whether it succeeds, fails or is cancelled.
 - GetRegularReportContext serves CR00 alone. Its session comes from core.database
   GetReportSession, which admits nothing, because the CR00 service takes the request admission
-  only for its reads (core.database.AdmittedReads); every other context is admitted by
-  GetSession for the whole request.
+  only for its reads and its build (core.database.AdmittedReads); every other context is
+  admitted by GetSession for the whole request.
 
 COMEN01C's own admin-only option check (CDEMO-USRTYP-USER, exactly U) is ported in the menu
 service, not here.
@@ -210,10 +210,11 @@ async def GetRegularReportContext(
     """Yield the CR00 context of a regular user, whose session holds no request admission.
 
     The guard is declared first, so a missing cookie gives 401 and an admin 403 before the
-    session is made. The CR00 service admits itself only for its reads, so the request holds
-    no admission while it waits for a report slot or builds the report. The batch-window lock
-    is released at the end, as GetOnlineContext releases it, although CR00 never enters the
-    window. There is no ``except``, so the endpoint's exceptions reach the handlers.
+    session is made. The CR00 service admits itself only for its reads and its build, so the
+    request holds no admission while it waits for a report slot or while its client reads the
+    built report. The batch-window lock is released at the end, as GetOnlineContext releases
+    it, although CR00 never enters the window. There is no ``except``, so the endpoint's
+    exceptions reach the handlers.
     """
     context = OnlineContext(request=request, session=session, settings=settings, user=user)
     try:

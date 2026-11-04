@@ -26,8 +26,8 @@ export const PF_KEY_ACTIONS: Readonly<Record<PfKey, string>> = Object.freeze({
     F12: "F12",
 });
 
-// FunctionKeyBar renders one button per definition from the same array a page passes here, so
-// the physical keys and the on-screen buttons always run the same onPress.
+// FunctionKeyBar renders one button per definition a page passes here, or per definition of the
+// subset its map's legend shows, so a physical key and its on-screen button run the same onPress.
 export interface FunctionKeyDefinition {
     key: PfKey;
     label: string;

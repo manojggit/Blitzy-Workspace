@@ -718,13 +718,18 @@ body:
     "active_status": "Y",
     "open_date": "2012-11-17",
     "credit_limit": "3503.00",
+    "credit_limit_edited": "+      3,503.00",
     "expiration_date": "2023-12-16",
     "cash_credit_limit": "2789.00",
+    "cash_credit_limit_edited": "+      2,789.00",
     "reissue_date": "2023-12-16",
     "curr_balance": "40.00",
+    "curr_balance_edited": "+         40.00",
     "curr_cycle_credit": "0.00",
+    "curr_cycle_credit_edited": "+           .00",
     "group_id": "",
     "curr_cycle_debit": "0.00",
+    "curr_cycle_debit_edited": "+           .00",
     "cust_id": "000000004",
     "ssn_masked": "***-**-4258",
     "date_of_birth": "1985-01-13",
@@ -746,8 +751,10 @@ body:
 }
 ```
 
-Dates are ISO text, or empty when the stored date is blank. Every error body also carries
-`info_message` `Enter or update id of account to display`. Other outcomes, each naming `acct_id`:
+Each amount comes twice: as the exact decimal, and under its name with `_edited` as the
+15-character text of the map's `+ZZZ,ZZZ,ZZZ.99` picture, which the screen shows. Dates are ISO
+text, or empty when the stored date is blank. Every error body also carries `info_message`
+`Enter or update id of account to display`. Other outcomes, each naming `acct_id`:
 
 - 400 `No input received`: the key is blank.
 - 400 `Account Filter must  be a non-zero 11 digit number`: the key is not 11 digits, or is all

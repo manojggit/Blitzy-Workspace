@@ -1,31 +1,38 @@
-"""Unit tests for the CR00 report slots, admission release, client-disconnect stops and the
-screen JSON.
+"""Unit tests for the CR00 report slots, admissions, row batches, streamed chunks,
+client-disconnect stops and the screen JSON.
 
 app.services.reports.corpt00c runs CORPT00C's edits and confirmation first, waiting for
-nothing. A confirmed report then takes one of REPORT_WORKER_LIMIT report slots before its three
-TRANREPT reads, holds a request admission for those reads only (core.database.AdmittedReads,
-which ends the read transaction and returns the connection first), and builds, and for the
-screen JSON or a download renders, the report on a report thread holding neither. A report
-whose client has gone stops when its slot is granted, after its reads, or at the next line check
-on the thread, with the 499 no client receives and one INFO record. cbtrn03c.IterateReport
-yields BuildReport's lines lazily, and the report_export renderers read them once. The screen
-JSON of RenderTransactionReportJson is byte for byte what FastAPI sends for the response model
+nothing. A confirmed report then takes one of REPORT_WORKER_LIMIT report slots, then a request
+admission (core.database.AdmittedReads), and reads TRANTYPE, TRANCATG and a validation pass of
+TRANSACT, so a read failure, an abend or a gone client still sets the status before any byte is
+sent. Its build pass then reads TRANSACT again and builds, and for the screen JSON or a download
+renders, the report on a report thread. Both passes fetch their rows a batch at a time, the
+renderers yield the document in chunks as it is built, and the slot, the admission and the
+connection are freed as soon as the build ends, before the response has sent every chunk. A
+report whose client has gone stops when its slot is granted or after its validation pass, with
+the 499 no client receives and one INFO record; a listed report also stops at the next line
+check on the thread, and a streamed one at its next chunk, logging the same record. A build pass
+that fails after the response started raises, so the body never ends normally.
+cbtrn03c.IterateReport yields BuildReport's lines lazily, and the report_export renderers read
+them once. The screen JSON is byte for byte what FastAPI sends for the response model
 RunTransactionReport returns (TypeAdapter.dump_json by alias), built without a line list.
 
-The repositories and the ASGI receive channel are stubbed, so no HTTP request is made, except
-in the first case, which reads the seeded test database (holding no transaction) through
-makeOnlineContext. Expected literals are typed from cbl/CORPT00C.cbl: ``Please confirm to print
-the Custom report...`` (lines 464-474), ``"X" is not a valid value to confirm...`` (lines
-489-494), ``Start Date - Not a valid Month...`` (lines 329-337), ``Custom report submitted for
-printing ...`` (lines 445-455) and the WHEN OTHER ``Unable to Write TDQ (JOBS)...`` (line 531).
+The repositories and the ASGI receive channel are stubbed, and ChunkCollector plays the
+response that drains a report stream, so no HTTP request is made, except in the first case,
+which reads the seeded test database (holding no transaction) through makeOnlineContext.
+Expected literals are typed from cbl/CORPT00C.cbl: ``Please confirm to print the Custom
+report...`` (lines 464-474), ``"X" is not a valid value to confirm...`` (lines 489-494),
+``Start Date - Not a valid Month...`` (lines 329-337), ``Custom report submitted for printing
+...`` (lines 445-455) and the WHEN OTHER ``Unable to Write TDQ (JOBS)...`` (line 531).
 """
 
 import asyncio
 import functools
+import itertools
 import logging
 import threading
 import weakref
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
@@ -77,8 +84,12 @@ STOP_LOG_MESSAGE = "CR00 report stopped: the client disconnected"
 SCREEN_ENTRY = "screen"
 JSON_ENTRY = "json"
 ENTRIES = (SCREEN_ENTRY, JSON_ENTRY, ExportFormat.CSV.value, ExportFormat.PDF.value)
+# The entries whose confirmed report is a stream the response sends while it is built, each
+# sending its first chunk while the rows are still being read: the PDF one page at a time.
+STREAM_ENTRIES = ENTRIES[1:]
 # FastAPI 0.136 sends a response model as its TypeAdapter's dump_json by alias, nothing excluded.
 RESPONSE_MODEL_ADAPTER = TypeAdapter(TransactionReportResponse)
+CONFIRMED_RANGE = corpt00c.ReportRange("Custom", "2022-01-01", "2022-12-31")
 
 TYPE_CODE = "01"
 CATEGORY_CODE = 1
@@ -95,6 +106,9 @@ LINES_MEMBER_SOURCE = '"lines":[]'
 # Report sizes: none, one detail, and seven cards across several report and PDF pages.
 ROW_COUNTS = (0, 1, 45)
 LARGEST_ROW_COUNT = max(ROW_COUNTS)
+# Rows whose report runs to 151 lines, three PDF pages, so even a PDF has lines left to build
+# when the chunk after its first, a page later, finds that the response stopped reading.
+THREE_PDF_PAGE_ROW_COUNT = 90
 STUB_ROW_COUNT = 12
 
 CONCURRENT_REPORTS = 6
@@ -103,6 +117,14 @@ EDIT_DEADLINE_SECONDS = 1.0
 MID_BUILD_CHECK_LINES = 3
 # No report slot borrowed and every request admission free.
 NOTHING_HELD = (0, ADMITTED_REQUEST_LIMIT)
+# Rows per fetch and bytes per chunk small enough that a LARGEST_ROW_COUNT report spans many.
+SMALL_BATCH_ROWS = 5
+SMALL_CHUNK_BYTES = 256
+# A report's first TRANSACT pass is its validation pass and its second its build pass.
+BUILD_PASS_READ = 2
+BUILD_DEADLINE_SECONDS = 5.0
+POLL_SECONDS = 0.005
+TRANSACT_FILE_NAME = "TRANSACT"
 
 
 class ReportProgress(NamedTuple):
@@ -125,7 +147,7 @@ class Holdings(NamedTuple):
 def BuildRows(
     rowCount: int, typeCode: str = TYPE_CODE, source: str = ROW_SOURCE
 ) -> list[dict[str, Any]]:
-    """Return rowCount report rows, ROWS_PER_CARD per card, in GetReportTransactions order.
+    """Return rowCount report rows, ROWS_PER_CARD per card, in StreamReportTransactions order.
 
     Card numbers and accounts are built from the card index, and the amounts step through
     negative, zero and positive values.
@@ -166,17 +188,54 @@ class ClientChannel:
         return {"type": "http.disconnect"}
 
 
+class TrackedRow(dict[str, Any]):
+    """A stub report row that, unlike a plain dict, a weak reference can watch."""
+
+
+class BatchPosition(NamedTuple):
+    """Where a row fetch is: the report's read number, the batch index and the batch count."""
+
+    readNumber: int
+    batchIndex: int
+    batchCount: int
+
+
+def RunHook(hook: Callable[[], None] | None) -> None:
+    """Run hook when one is set."""
+    if hook is not None:
+        hook()
+
+
 @dataclass
 class ReadLog:
-    """What the stub repositories of one test return, and what their row reads observed."""
+    """What the stub repositories of one test return, and what their row reads observed.
+
+    ``failure`` fails every row read as it starts; ``beforeBatch`` runs before each batch.
+    """
 
     rows: Sequence[Mapping[str, Any]]
     readDelaySeconds: float = 0.0
     failure: Exception | None = None
-    onReadStart: Callable[[], None] | None = None
+    onReadsStart: Callable[[], None] | None = None
     afterRowsRead: Callable[[], None] | None = None
+    beforeBatch: Callable[[BatchPosition], Awaitable[None]] | None = None
     rowReads: int = 0
     freeAdmissions: list[int] = field(default_factory=list)
+    rowReferences: list[weakref.ref[TrackedRow]] = field(default_factory=list)
+    liveRowCounts: list[int] = field(default_factory=list)
+
+    def TrackBatch(self, batch: Sequence[Mapping[str, Any]]) -> list[TrackedRow]:
+        """Return watched copies of batch, recording how many watched rows are then alive."""
+        trackedRows = [TrackedRow(row) for row in batch]
+        self.rowReferences.extend(weakref.ref(row) for row in trackedRows)
+        liveRows = sum(rowReference() is not None for rowReference in self.rowReferences)
+        self.liveRowCounts.append(liveRows)
+        return trackedRows
+
+    async def BeforeBatch(self, position: BatchPosition) -> None:
+        """Run the beforeBatch hook for the fetch at position, when one is set."""
+        if self.beforeBatch is not None:
+            await self.beforeBatch(position)
 
 
 class StubRepository:
@@ -185,6 +244,11 @@ class StubRepository:
     def __init__(self, readLog: ReadLog, context: OnlineContext) -> None:
         self.readLog = readLog
         self.context = context
+        self.readsStarted = 0
+
+    async def BeginReportSnapshot(self) -> None:
+        """Run the onReadsStart hook: the report, in its slot, begins its reads."""
+        RunHook(self.readLog.onReadsStart)
 
     async def GetTypeDescriptions(self) -> dict[str, str]:
         """Return the TRANTYPE descriptions of the stub rows."""
@@ -194,21 +258,30 @@ class StubRepository:
         """Return the TRANCATG descriptions of the stub rows."""
         return dict(CATEGORY_DESCRIPTIONS)
 
-    async def GetReportTransactions(
-        self, startDate: date, endDate: date
-    ) -> Sequence[Mapping[str, Any]]:
-        """Record the free admissions, wait, then return the rows or raise the failure."""
+    async def StartRowRead(self) -> int:
+        """Record the free admissions, wait, then count the read or raise the failure.
+
+        Returns the read's number among this report's TRANSACT passes.
+        """
         readLog = self.readLog
         readLog.freeAdmissions.append(RequestAdmission(self.context.request).value)
-        if readLog.onReadStart is not None:
-            readLog.onReadStart()
         await anyio.sleep(readLog.readDelaySeconds)
         readLog.rowReads += 1
         if readLog.failure is not None:
             raise readLog.failure
-        if readLog.afterRowsRead is not None:
-            readLog.afterRowsRead()
-        return readLog.rows
+        self.readsStarted += 1
+        return self.readsStarted
+
+    async def StreamReportTransactions(
+        self, startDate: date, endDate: date, batchRows: int
+    ) -> AsyncIterator[list[TrackedRow]]:
+        """Yield watched copies of the stub rows in batches of batchRows, running the hooks."""
+        readNumber = await self.StartRowRead()
+        batches = list(itertools.batched(self.readLog.rows, batchRows))
+        for batchIndex, batch in enumerate(batches):
+            await self.readLog.BeforeBatch(BatchPosition(readNumber, batchIndex, len(batches)))
+            yield self.readLog.TrackBatch(batch)
+        RunHook(self.readLog.afterRowsRead)
 
 
 class BuildObserver:
@@ -251,7 +324,7 @@ class BuildObserver:
 
 
 class SlotGauge:
-    """Counts the reports between the start of their row read and the end of their build."""
+    """Counts the reports between the start of their reads and the end of their build."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -328,16 +401,82 @@ def ReportHarnessFixture(
     return ReportHarness(readLog, buildObserver, application, testSettings, monkeypatch)
 
 
+@dataclass
+class ChunkCollector:
+    """Plays the response that drains one report stream through corpt00c.StreamReport.
+
+    ``stopAfterChunks`` makes it stop reading early, as the response does once its client has
+    gone; ``beforeReceiving`` runs before it reads the first chunk.
+    """
+
+    reportStream: corpt00c.ReportStream
+    stopAfterChunks: int | None = None
+    beforeReceiving: Callable[[], Awaitable[None]] | None = None
+    chunks: list[bytes] = field(default_factory=list)
+    endedNormally: bool = False
+    firstChunk: anyio.Event = field(default_factory=anyio.Event)
+
+    async def Run(self) -> None:
+        """Run the report with this collector as its response."""
+        await corpt00c.StreamReport(self.reportStream, self.Receive)
+
+    async def Receive(self) -> None:
+        """Read the chunks as they come, noting whether the stream ended normally."""
+        if self.beforeReceiving is not None:
+            await self.beforeReceiving()
+        async for chunk in self.reportStream.chunks:
+            self.chunks.append(bytes(chunk))
+            self.firstChunk.set()
+            if len(self.chunks) == self.stopAfterChunks:
+                return
+        self.endedNormally = True
+
+    def Document(self) -> bytes:
+        """Return the chunks received so far, joined."""
+        return b"".join(self.chunks)
+
+
+def StreamOf(
+    entryName: str, context: OnlineContext, query: ReportQuery
+) -> bytes | corpt00c.ReportStream:
+    """Return what the route of a stream entry sends: a pending screen's bytes or a stream."""
+    if entryName == JSON_ENTRY:
+        return corpt00c.PrepareTransactionReportJson(context, query)
+    exportFormat = ExportFormat(entryName)
+    return corpt00c.ExportTransactionReport(context, query, exportFormat).reportStream
+
+
 async def RunEntry(entryName: str, context: OnlineContext, query: ReportQuery) -> object:
     """Run CR00 through the entry point entryName names.
 
-    The entries are the screen model, the screen JSON the route sends, and each download format.
+    The entries are the screen model, the screen JSON the route sends, and each download format;
+    a confirmed report's stream is drained as its response would drain it.
     """
     if entryName == SCREEN_ENTRY:
         return await corpt00c.RunTransactionReport(context, query)
+    screen = StreamOf(entryName, context, query)
+    if isinstance(screen, bytes):
+        return screen
+    collector = ChunkCollector(screen)
+    await collector.Run()
+    return collector.Document()
+
+
+def ExpectedResult(entryName: str, rows: Sequence[Mapping[str, Any]]) -> object:
+    """Return what RunEntry gives for the confirmed report over rows through entryName."""
+    screen = corpt00c.SubmittedResponse(CONFIRMED_RANGE, ReportLinesOf(rows))
+    if entryName == SCREEN_ENTRY:
+        return screen
     if entryName == JSON_ENTRY:
-        return await corpt00c.RenderTransactionReportJson(context, query)
-    return await corpt00c.ExportTransactionReport(context, query, ExportFormat(entryName))
+        return RESPONSE_MODEL_ADAPTER.dump_json(screen, by_alias=True)
+    render = RenderCsv if entryName == ExportFormat.CSV.value else RenderPdf
+    return render(screen.lines)
+
+
+def UseSmallBatchesAndChunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fetch SMALL_BATCH_ROWS rows at a time and send SMALL_CHUNK_BYTES chunks."""
+    monkeypatch.setattr(corpt00c, "REPORT_BATCH_ROWS", SMALL_BATCH_ROWS)
+    monkeypatch.setattr(report_export, "REPORT_CHUNK_BYTES", SMALL_CHUNK_BYTES)
 
 
 def HoldingsOf(context: OnlineContext) -> Holdings:
@@ -350,35 +489,62 @@ def HoldingsOf(context: OnlineContext) -> Holdings:
     )
 
 
-async def test_only_the_reads_hold_an_admission_and_a_connection(
-    makeOnlineContext, buildObserver, monkeypatch
+def ObserveReadHoldings(
+    monkeypatch: pytest.MonkeyPatch, context: OnlineContext, readHoldings: list[Holdings]
+) -> None:
+    """Record what the request holds as each TRANSACT pass of its report starts."""
+    streamRead = TransactionRepository.StreamReportTransactions
+
+    async def ObservedRead(repository, startDate, endDate, batchRows):
+        readHoldings.append(HoldingsOf(context))
+        async for rowBatch in streamRead(repository, startDate, endDate, batchRows):
+            yield rowBatch
+
+    monkeypatch.setattr(TransactionRepository, "StreamReportTransactions", ObservedRead)
+
+
+async def WaitForBuildEnd(context: OnlineContext, idleHoldings: list[Holdings]) -> None:
+    """Wait, reading no chunk, until the report frees its slot; then record what it holds."""
+    with anyio.fail_after(BUILD_DEADLINE_SECONDS):
+        while corpt00c.REPORT_SLOTS.borrowed_tokens:
+            await anyio.sleep(POLL_SECONDS)
+    idleHoldings.append(HoldingsOf(context))
+
+
+@pytest.mark.parametrize("entryName", STREAM_ENTRIES)
+async def test_reads_and_build_hold_one_admission_and_connection_until_the_build_ends(
+    makeOnlineContext, buildObserver, monkeypatch, entryName
 ):
-    """The reads hold one admission and one connection; the report thread holds neither."""
+    """Both passes and the build share one admission and one connection in a transaction.
+
+    Nothing is held once the build ends, although the response has read no chunk yet.
+    """
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     readHoldings: list[Holdings] = []
     buildHoldings: list[Holdings] = []
-    readRows = TransactionRepository.GetReportTransactions
-
-    async def ObservedRead(repository, startDate, endDate):
-        readHoldings.append(HoldingsOf(context))
-        return await readRows(repository, startDate, endDate)
-
-    monkeypatch.setattr(TransactionRepository, "GetReportTransactions", ObservedRead)
+    idleHoldings: list[Holdings] = []
+    ObserveReadHoldings(monkeypatch, context, readHoldings)
     buildObserver.onBuildStart = lambda: buildHoldings.append(HoldingsOf(context))
+    reportStream = StreamOf(entryName, context, CONFIRMED_QUERY)
+    waitForBuildEnd = functools.partial(WaitForBuildEnd, context, idleHoldings)
+    collector = ChunkCollector(reportStream, beforeReceiving=waitForBuildEnd)
 
-    response = await corpt00c.RunTransactionReport(context, CONFIRMED_QUERY)
+    await collector.Run()
 
-    assert (response.message, response.lines) == (SUBMITTED_MESSAGE, [])
-    assert readHoldings == [Holdings(ADMITTED_REQUEST_LIMIT - 1, 1, True, True)]
-    assert buildHoldings == [Holdings(ADMITTED_REQUEST_LIMIT, 0, False, False)]
-    assert HoldingsOf(context) == Holdings(ADMITTED_REQUEST_LIMIT, 0, False, True)
+    readHolding = Holdings(ADMITTED_REQUEST_LIMIT - 1, 1, True, True)
+    assert readHoldings == [readHolding, readHolding]
+    assert buildHoldings == [readHolding._replace(onMainThread=False)]
+    assert idleHoldings == [Holdings(ADMITTED_REQUEST_LIMIT, 0, False, True)]
+    assert collector.endedNormally
+    assert collector.Document() == ExpectedResult(entryName, [])
+    assert HoldingsOf(context) == idleHoldings[0]
 
 
 async def test_at_most_report_worker_limit_reports_read_and_build_at_once(harness):
     """Concurrent reports pass through the slots; a report waiting for one holds no admission."""
     gauge = SlotGauge()
     harness.readLog.readDelaySeconds = READ_DELAY_SECONDS
-    harness.readLog.onReadStart = gauge.Enter
+    harness.readLog.onReadsStart = gauge.Enter
     harness.buildObserver.onBuildEnd = gauge.Leave
     contexts = [harness.Context() for _ in range(CONCURRENT_REPORTS)]
 
@@ -409,12 +575,23 @@ class DisconnectCase(NamedTuple):
     expectedLinesBuilt: int
 
 
-# The client is gone when the slot is granted, goes during the reads, or goes once the first
-# line is built, with a line check every MID_BUILD_CHECK_LINES lines.
-DISCONNECT_CASES = [
+# The client is gone when the slot is granted or goes during the validation pass, through every
+# entry; or, for the listed screen, whose response has not started, it goes once the first line
+# is built, with a line check every MID_BUILD_CHECK_LINES lines of the build pass.
+EARLY_DISCONNECT_CASES = (
     DisconnectCase("slot-granted", ReportProgress(0, 0, 0), 0),
     DisconnectCase("after-reads", ReportProgress(1, 0, 0), 0),
-    DisconnectCase("mid-build", ReportProgress(1, 1, 0), MID_BUILD_CHECK_LINES),
+)
+MID_BUILD_DISCONNECT_CASE = DisconnectCase(
+    "mid-build", ReportProgress(BUILD_PASS_READ, 1, 0), MID_BUILD_CHECK_LINES
+)
+CLIENT_CLOSED_CASES = [
+    *(
+        pytest.param(case, entryName, id=f"{case.stage}-{entryName}")
+        for case in EARLY_DISCONNECT_CASES
+        for entryName in ENTRIES
+    ),
+    pytest.param(MID_BUILD_DISCONNECT_CASE, SCREEN_ENTRY, id=f"mid-build-{SCREEN_ENTRY}"),
 ]
 
 
@@ -429,10 +606,7 @@ def ArmDisconnect(stage: str, harness: ReportHarness, channel: ClientChannel) ->
         harness.buildObserver.onLine = functools.partial(DisconnectOnFirstLine, channel)
 
 
-@pytest.mark.parametrize("entryName", ENTRIES)
-@pytest.mark.parametrize(
-    "disconnectCase", DISCONNECT_CASES, ids=[case.stage for case in DISCONNECT_CASES]
-)
+@pytest.mark.parametrize(("disconnectCase", "entryName"), CLIENT_CLOSED_CASES)
 async def test_a_gone_client_stops_the_report_with_499_and_one_info_record(
     harness, caplog, disconnectCase, entryName
 ):
@@ -479,7 +653,10 @@ async def RaisedBy(entryName: str, context: OnlineContext) -> BaseException | No
 async def test_a_failed_read_or_an_abend_keeps_its_outcome_and_frees_slot_and_admission(
     harness, failureName, entryName
 ):
-    """The 503 literal and the abend 999 propagate unwrapped, and nothing stays held."""
+    """The 503 literal and the abend 999 propagate unwrapped, and nothing stays held.
+
+    No line is built: the validation pass meets both before the build pass starts.
+    """
     ArmFailure(failureName, harness)
 
     raisedError = await RaisedBy(entryName, harness.Context())
@@ -490,6 +667,7 @@ async def test_a_failed_read_or_an_abend_keeps_its_outcome_and_frees_slot_and_ad
         assert outcome == (FILE_ERROR_STATUS, UNABLE_TO_WRITE_TDQ_MESSAGE)
     else:
         assert type(raisedError) is cbtrn03c.ReportAbendError
+    assert harness.buildObserver.buildsStarted == 0
     assert harness.Held() == NOTHING_HELD
 
 
@@ -624,11 +802,11 @@ JSON_PARITY_IDS = [
 async def test_screen_json_is_byte_for_byte_the_response_model_fastapi_would_send(
     harness, parityCase
 ):
-    """RenderTransactionReportJson gives the dump_json of RunTransactionReport's response."""
+    """The screen route's JSON is the dump_json of RunTransactionReport's response."""
     harness.readLog.rows = parityCase.rows
     query = ReportQuery.model_validate({**CONFIRMED_QUERY_FIELDS, **parityCase.queryFields})
 
-    screenJson = await corpt00c.RenderTransactionReportJson(harness.Context(), query)
+    screenJson = await RunEntry(JSON_ENTRY, harness.Context(), query)
     response = await corpt00c.RunTransactionReport(harness.Context(), query)
 
     assert response.lines == parityCase.expectedLines
@@ -636,7 +814,7 @@ async def test_screen_json_is_byte_for_byte_the_response_model_fastapi_would_sen
     assert harness.Held() == NOTHING_HELD
 
 
-def FailListing(job: corpt00c.ReportJob) -> list[ReportLine]:
+def FailListing(job: corpt00c.ReportJob, rows: corpt00c.PassRows) -> list[ReportLine]:
     """Stand in for ListReportLines, which the screen JSON must never call."""
     raise AssertionError(f"the whole line list of {job.requestData} was built")
 
@@ -667,7 +845,7 @@ async def test_screen_json_encodes_each_line_as_it_is_built_without_a_line_list(
     liveCounts: list[int] = []
     observer.onLine = lambda lineNumber: liveCounts.append(observer.LiveLines())
 
-    screenJson = await corpt00c.RenderTransactionReportJson(harness.Context(), CONFIRMED_QUERY)
+    screenJson = await RunEntry(JSON_ENTRY, harness.Context(), CONFIRMED_QUERY)
 
     screenLines = TransactionReportResponse.model_validate_json(screenJson).lines
     assert observer.linesBuilt == len(screenLines) == len(liveCounts)
@@ -710,3 +888,123 @@ def test_render_json_refuses_an_envelope_without_exactly_one_empty_lines_member(
         report_export.RenderJson(envelopeCase.envelope, ReportLinesOf(BuildRows(1)))
 
     assert str(raised.value).endswith(f"found {envelopeCase.memberCount}")
+
+
+async def AwaitFirstChunkBeforeLastBuildBatch(
+    collector: ChunkCollector, position: BatchPosition
+) -> None:
+    """Hold the build pass's last row batch back until the response has received a chunk."""
+    isLastBuildBatch = position.readNumber == BUILD_PASS_READ and (
+        position.batchIndex == position.batchCount - 1
+    )
+    if isLastBuildBatch:
+        with anyio.fail_after(BUILD_DEADLINE_SECONDS):
+            await collector.firstChunk.wait()
+
+
+@pytest.mark.parametrize("entryName", STREAM_ENTRIES)
+async def test_the_first_chunk_is_sent_before_the_last_row_batch_is_read(
+    harness, monkeypatch, entryName
+):
+    """The screen JSON, the CSV and the PDF go out as they are built.
+
+    The last row batch of the build pass is held back until a chunk arrives, so a build that
+    sent nothing before reading every row would time out. The PDF's first page is drawn from
+    rows read before that batch.
+    """
+    UseSmallBatchesAndChunks(monkeypatch)
+    harness.readLog.rows = BuildRows(LARGEST_ROW_COUNT)
+    collector = ChunkCollector(StreamOf(entryName, harness.Context(), CONFIRMED_QUERY))
+    harness.readLog.beforeBatch = functools.partial(AwaitFirstChunkBeforeLastBuildBatch, collector)
+
+    await collector.Run()
+
+    assert collector.endedNormally
+    assert collector.Document() == ExpectedResult(entryName, harness.readLog.rows)
+    assert harness.Held() == NOTHING_HELD
+
+
+@pytest.mark.parametrize("entryName", ENTRIES)
+async def test_a_report_never_holds_more_than_two_row_batches(harness, monkeypatch, entryName):
+    """Each pass holds the batch it reads, and the one before while it fetches the next."""
+    UseSmallBatchesAndChunks(monkeypatch)
+    harness.readLog.rows = BuildRows(LARGEST_ROW_COUNT)
+
+    result = await RunEntry(entryName, harness.Context(), CONFIRMED_QUERY)
+
+    assert result == ExpectedResult(entryName, harness.readLog.rows)
+    assert harness.readLog.rowReads == BUILD_PASS_READ
+    assert max(harness.readLog.liveRowCounts) <= 2 * SMALL_BATCH_ROWS < LARGEST_ROW_COUNT
+
+
+@pytest.mark.parametrize("entryName", STREAM_ENTRIES)
+async def test_a_document_larger_than_a_chunk_is_sent_in_chunks_of_the_chunk_size(
+    harness, monkeypatch, entryName
+):
+    """Every chunk but the last holds at least REPORT_CHUNK_BYTES; joined, they are the document."""
+    monkeypatch.setattr(report_export, "REPORT_CHUNK_BYTES", SMALL_CHUNK_BYTES)
+    harness.readLog.rows = BuildRows(LARGEST_ROW_COUNT)
+    collector = ChunkCollector(StreamOf(entryName, harness.Context(), CONFIRMED_QUERY))
+
+    await collector.Run()
+
+    chunkSizes = [len(chunk) for chunk in collector.chunks]
+    assert len(chunkSizes) > 1
+    assert all(chunkSize >= SMALL_CHUNK_BYTES for chunkSize in chunkSizes[:-1])
+    assert chunkSizes[-1] > 0
+    assert collector.Document() == ExpectedResult(entryName, harness.readLog.rows)
+
+
+@pytest.mark.parametrize("entryName", STREAM_ENTRIES)
+async def test_a_client_gone_mid_build_stops_the_stream_with_one_info_record(
+    harness, caplog, monkeypatch, entryName
+):
+    """The build stops at its next chunk once the response stops reading and logs once at INFO.
+
+    Slot and admission are freed, and nothing is raised, because the response has started.
+    """
+    caplog.set_level(logging.INFO, logger=corpt00c.LOGGER.name)
+    monkeypatch.setattr(report_export, "REPORT_CHUNK_BYTES", SMALL_CHUNK_BYTES)
+    harness.readLog.rows = BuildRows(THREE_PDF_PAGE_ROW_COUNT)
+    assert len(ReportLinesOf(harness.readLog.rows)) > 2 * report_export.LinesPerPage()
+    reportStream = StreamOf(entryName, harness.Context(), CONFIRMED_QUERY)
+    collector = ChunkCollector(reportStream, stopAfterChunks=1)
+
+    await collector.Run()
+
+    observer = harness.buildObserver
+    assert (len(collector.chunks), collector.endedNormally) == (1, False)
+    assert (observer.buildsStarted, observer.buildsFinished) == (1, 0)
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.INFO, STOP_LOG_MESSAGE)
+    ]
+    assert harness.Held() == NOTHING_HELD
+
+
+async def FailTheBuildPassAtItsSecondBatch(position: BatchPosition) -> None:
+    """Fail the build pass as a CICS IOERR on TRANSACT once its first batch has been read."""
+    if (position.readNumber, position.batchIndex) == (BUILD_PASS_READ, 1):
+        raise FileIoError(TRANSACT_FILE_NAME)
+
+
+@pytest.mark.parametrize("entryName", STREAM_ENTRIES)
+async def test_a_failed_build_pass_raises_and_never_ends_the_body(
+    harness, caplog, monkeypatch, entryName
+):
+    """A read failure after the response started logs the file condition and raises.
+
+    The body never gets its last chunk, so the client sees an incomplete transfer; nothing
+    stays held.
+    """
+    UseSmallBatchesAndChunks(monkeypatch)
+    harness.readLog.rows = BuildRows(LARGEST_ROW_COUNT)
+    harness.readLog.beforeBatch = FailTheBuildPassAtItsSecondBatch
+    collector = ChunkCollector(StreamOf(entryName, harness.Context(), CONFIRMED_QUERY))
+
+    with pytest.RaisesGroup(FileIoError):
+        await collector.Run()
+
+    assert not collector.endedNormally
+    serviceRecords = [record for record in caplog.records if record.name == corpt00c.LOGGER.name]
+    assert [record.levelno for record in serviceRecords] == [logging.ERROR]
+    assert harness.Held() == NOTHING_HELD

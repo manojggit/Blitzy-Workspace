@@ -123,11 +123,17 @@ const STEP_TITLES = {
 // The whole trimmed amount text, matched before any digit is read. At most one sign: a leading
 // "+" or "-", which blanks may separate from the digits, or a trailing "-" directly after the
 // decimals, as the 9(9).99- and Z(9).99- pictures print a negative value. Those pictures print
-// a blank, never "+", for a positive value, so a trailing "+" is rejected, and the lookahead
-// rejects a leading sign together with a trailing "-". Then contiguous integer digits, blank
-// when Z(9).99- prints a zero integer part (".00"), one decimal point and exactly two decimals.
-// Groups: leading sign, integer digits, decimals, trailing sign.
-const AMOUNT_PATTERN = /^(?![+-].*-$)(?:([+-]) *)?(\d*)\.(\d{2})(-)?$/;
+// a blank, never "+", for a positive value, so a trailing "+" is rejected, and the first
+// lookahead rejects a leading sign together with a trailing "-". The integer part is contiguous
+// digits, blank when Z(9).99- or +ZZZ,ZZZ,ZZZ.99 prints a zero integer part (".00"), or the
+// grouping of the CAVW map picture +ZZZ,ZZZ,ZZZ.99 (COACTVW ACURBAL and the other amounts):
+// one to three digits, then one or more groups of a comma and three digits (+      1,686.98).
+// The second lookahead accepts a comma only after a leading sign, as that picture always prints
+// one. Then one decimal point and exactly two decimals.
+// Groups: leading sign, integer part (grouping commas included), decimals, trailing sign.
+const AMOUNT_PATTERN =
+    /^(?![+-].*-$)(?=[+-]|[^,]*$)(?:([+-]) *)?(\d{1,3}(?:,\d{3})+|\d*)\.(\d{2})(-)?$/;
+const GROUPING_COMMA_PATTERN = /,/g;
 const NEGATIVE_SIGN = "-";
 const CENTS_PER_UNIT = BigInt(100);
 const TRAILING_CR_PATTERN = /\r$/;
@@ -150,18 +156,22 @@ interface StatementTotals {
 }
 
 /**
- * Exact cents of an amount text, once whitespace around it is trimmed: a CSV or Account View
- * decimal (40.00, -12.34), a sign-led screen amount (+         40.00), or a statement picture,
- * 9(9).99- (000001945.87 , 000000040.00-) or Z(9).99- (       50.00 ,        47.88-, and
+ * Exact cents of an amount text, once whitespace around it is trimmed: a CSV decimal (40.00,
+ * -12.34), the Account View amount in its map picture +ZZZ,ZZZ,ZZZ.99 (+         40.00,
+ * +      1,686.98, -      1,234.56, +234,567,890.12), or a statement picture, 9(9).99-
+ * (000001945.87 , 000000040.00-) or Z(9).99- (       50.00 ,        47.88-, and
  *          .00  for zero). AMOUNT_PATTERN gives the grammar; any other text, including a
- * currency sign, grouping commas, embedded blanks or a repeated sign, is rejected.
+ * currency sign, a misplaced or empty comma group, a comma with no leading sign, embedded
+ * blanks or a repeated sign, is rejected. Grouping commas are removed only after the whole
+ * text has matched.
  */
 function ParseAmountCents(text: string): bigint {
     const match = AMOUNT_PATTERN.exec(text.trim());
     if (match === null) {
         throw new Error(`Unrecognised amount text ${JSON.stringify(text)}`);
     }
-    const [, leadingSign, integerDigits = "", decimalDigits = "", trailingSign] = match;
+    const [, leadingSign, integerPart = "", decimalDigits = "", trailingSign] = match;
+    const integerDigits = integerPart.replace(GROUPING_COMMA_PATTERN, "");
     const cents = BigInt(integerDigits || "0") * CENTS_PER_UNIT + BigInt(decimalDigits);
     const isNegative = leadingSign === NEGATIVE_SIGN || trailingSign === NEGATIVE_SIGN;
     return isNegative ? -cents : cents;
@@ -394,9 +404,10 @@ interface AmountCase {
     cents: bigint;
 }
 
-// Every amount form the flow reads, with its exact cents: the fixture CSV and Account View
-// decimals, the sign-led screen amount, the ST-CURR-BAL 9(9).99- slice and the ST-TRANAMT and
-// ST-TOTAL-TRAMT Z(9).99- slice, with negatives in leading and trailing position and both zeros.
+// Every amount form the flow reads, with its exact cents: the fixture CSV decimals, the Account
+// View +ZZZ,ZZZ,ZZZ.99 amount with and without grouping commas, the ST-CURR-BAL 9(9).99- slice
+// and the ST-TRANAMT and ST-TOTAL-TRAMT Z(9).99- slice, with negatives in leading and trailing
+// position and both zeros.
 const ACCEPTED_AMOUNT_CASES: readonly AmountCase[] = [
     { text: "40.00", cents: BigInt(4000) },
     { text: "1686.98", cents: BigInt(168698) },
@@ -405,6 +416,10 @@ const ACCEPTED_AMOUNT_CASES: readonly AmountCase[] = [
     { text: "+         40.00", cents: BigInt(4000) },
     { text: "-         40.00", cents: BigInt(-4000) },
     { text: "+           .00", cents: BigInt(0) },
+    { text: "+      1,686.98", cents: BigInt(168698) },
+    { text: "+      2,020.00", cents: BigInt(202000) },
+    { text: "-      1,234.56", cents: BigInt(-123456) },
+    { text: "+234,567,890.12", cents: BigInt(23456789012) },
     { text: "000001945.87 ", cents: BigInt(194587) },
     { text: "000000040.00-", cents: BigInt(-4000) },
     { text: "     1472.64 ", cents: BigInt(147264) },
@@ -416,7 +431,8 @@ const ACCEPTED_AMOUNT_CASES: readonly AmountCase[] = [
 ];
 
 // Embedded, repeated, doubled or detached signs, a trailing "+", split digit groups, the wrong
-// number of decimals, no decimal point, blank text, a currency sign and a grouping comma.
+// number of decimals, no decimal point, blank text, a currency sign, comma groups that are
+// short, long, empty or misplaced, and grouping commas in a form with no leading sign.
 const REJECTED_AMOUNT_TEXTS: readonly string[] = [
     "5-0.00",
     "5 0.00",
@@ -436,6 +452,18 @@ const REJECTED_AMOUNT_TEXTS: readonly string[] = [
     "   ",
     "$50.00",
     "5,0.00",
+    "+      5,0.00",
+    "+     1,23.00",
+    "+      ,123.00",
+    "+    1,2345.00",
+    "+    1,,000.00",
+    "+  1,000,00.00",
+    "+   1234,567.00",
+    "+      1,686.98,",
+    "+      1, 686.98",
+    "+     $1,686.98",
+    "1,686.98",
+    "1,686.98-",
 ];
 
 function ExpectAcceptedAmount(amountCase: AmountCase): void {

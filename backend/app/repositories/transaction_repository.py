@@ -6,8 +6,9 @@ The cluster is KEYS(16 0) (catlg/LISTCAT.txt) and the CICS file TRANSACT (csd/CA
 Its table is ``transactions.transactions``, and every key-ordered read orders by the generated
 ``tran_id_sort`` column, which holds EBCDIC key order (``ebcdic_sort_key(tran_id)``).
 
-CLOSEFIL closes TRANSACT, so every method except GetReportTransactions first enters the online
-batch window, and a refusal raises FileNotOpenError (NOTOPEN, RESP 19, RESP2 60) unchanged. Reads
+CLOSEFIL closes TRANSACT, so every method except the two CR00 report methods,
+BeginReportSnapshot and StreamReportTransactions, first enters the online batch window, and a
+refusal raises FileNotOpenError (NOTOPEN, RESP 19, RESP2 60) unchanged. Reads
 run on the request session. AllocateNextTranId and InsertTransaction run on the caller's
 ``WriteUnit(context.engine, "TRANSACT")`` connection, so the TRAN-ID allocation lock lasts until
 that unit commits. The repository never commits, rolls back or opens a unit, and binds every
@@ -19,10 +20,12 @@ be opened, is FileIoError. Records are returned as dictionaries keyed by column 
 ``tran_amt`` stays a Decimal and the timestamps stay datetimes beside their format codes. Browse
 rows hold only the CT00 list columns (BROWSE_COLUMNS). Report rows are read-only row mappings
 keyed the same way, rather than dictionary copies, and hold only the columns the report builder
-reads, plus ``xref_acct_id``.
+reads, plus ``xref_acct_id``. They are fetched from a server-side cursor a batch at a time, so a
+report never holds its whole row set.
 """
 
-from collections.abc import Mapping, Sequence
+import contextlib
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
@@ -40,7 +43,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncMappingResult, AsyncSession
 
 from app.core.database import CONNECTION_FAILURES
 from app.core.dependencies import OnlineContext
@@ -77,6 +80,11 @@ REPORT_COLUMNS = (
 )
 # The label stays snake_case like the column names; cbtrn03c.BuildReport reads it.
 XREF_ACCT_ID_LABEL = "xref_acct_id"
+# The CR00 report's transaction: one snapshot for all its reads, so its build pass reads exactly
+# the rows its validation pass checked. PostgreSQL takes the snapshot at the first statement;
+# the asyncpg driver begins the transaction itself, so no SQL text sets these characteristics,
+# and SQLAlchemy resets both when the connection returns to the pool.
+REPORT_SNAPSHOT_OPTIONS = {"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
 
 # The key exceeds 32 bits, so it is bound as BIGINT, the single-key advisory-lock form.
 TRAN_ID_ALLOCATION_LOCK_STATEMENT = select(
@@ -166,6 +174,22 @@ def ReportStatement(startDate: date, endDate: date) -> Select[Any]:
         .where(ProcTsEndBound(endDate))
         .order_by(Card.card_num_sort, Transaction.tran_id_sort)
     )
+
+
+@contextlib.contextmanager
+def TransactFileConditions() -> Iterator[None]:
+    """Raise a database error of the block as its CICS file condition on TRANSACT.
+
+    The mapping is ``TransactionRepository._Execute``'s: a wrapped DBAPIError maps by its
+    SQLSTATE (MapDatabaseError), and a connection the asyncpg dialect fails unwrapped
+    (CONNECTION_FAILURES) is FileIoError (IOERR).
+    """
+    try:
+        yield
+    except DBAPIError as exc:
+        raise MapDatabaseError(exc, TRANSACTION_FILE_NAME) from exc
+    except CONNECTION_FAILURES as exc:
+        raise FileIoError(TRANSACTION_FILE_NAME) from exc
 
 
 class TransactionRepository:
@@ -286,18 +310,48 @@ class TransactionRepository:
         }
         await self._Execute(unit, insert(Transaction).values(insertValues))
 
-    async def GetReportTransactions(self, startDate: date, endDate: date) -> Sequence[RowMapping]:
+    async def BeginReportSnapshot(self) -> None:
+        """Open the request session's transaction as the CR00 report's read-only snapshot.
+
+        Must run before the session's first statement. Every later read of the request,
+        each StreamReportTransactions pass included, then sees the rows committed when the
+        first of them ran, so TRANBKP archiving and emptying TRANSACT in between changes
+        nothing the report reads. Like the report reads, it never enters the batch window.
+        """
+        with TransactFileConditions():
+            await self.context.session.connection(execution_options=REPORT_SNAPSHOT_OPTIONS)
+
+    async def StreamReportTransactions(
+        self, startDate: date, endDate: date, batchRows: int
+    ) -> AsyncIterator[Sequence[RowMapping]]:
         """Replace the TRANREPT STEP05R SORT and the CBTRN03C 1500-A-LOOKUP-XREF reads.
 
-        Returns the transactions whose PROC-TS date lies from startDate to endDate inclusive,
-        in TRAN-CARD-NUM order and then TRANSACT key order. Each row carries only the fields
+        Yields, in batches of at most batchRows fetched from a server-side cursor, the
+        transactions whose PROC-TS date lies from startDate to endDate inclusive, in
+        TRAN-CARD-NUM order and then TRANSACT key order. Each row carries only the fields
         cbtrn03c.BuildReport reads, tran_id, card_num, tran_type_cd, tran_cat_cd, tran_source and
         tran_amt, and ``xref_acct_id``, the XREF-ACCT-ID of its card, or None when the card has
-        no cross-reference (INVALID KEY). The rows are the read-only mappings the result
-        fetched, not dictionary copies, because a yearly report holds many thousands of them.
+        no cross-reference (INVALID KEY). The rows are read-only mappings, not dictionary
+        copies, and only the batch in hand is held. Closing the generator closes the cursor.
 
         This read never enters the batch window: CR00 only submitted a job to TDQ JOBS and never
         opened TRANSACT, so a closed window does not stop the report.
         """
-        result = await self._Execute(self.context.session, ReportStatement(startDate, endDate))
-        return result.mappings().all()
+        statement = ReportStatement(startDate, endDate)
+        with TransactFileConditions():
+            result = await self.context.session.stream(
+                statement, execution_options={"yield_per": batchRows}
+            )
+        rows = result.mappings()
+        try:
+            while rowBatch := await self._FetchReportBatch(rows, batchRows):
+                yield rowBatch
+        finally:
+            await rows.close()
+
+    async def _FetchReportBatch(
+        self, rows: AsyncMappingResult, batchRows: int
+    ) -> Sequence[RowMapping]:
+        """Fetch the next batch of at most batchRows report rows; an empty one is the end."""
+        with TransactFileConditions():
+            return await rows.fetchmany(batchRows)

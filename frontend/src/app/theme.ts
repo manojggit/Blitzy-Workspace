@@ -3,6 +3,7 @@ import type { CSSProperties } from "react";
 import {
     alpha,
     createTheme,
+    type Breakpoint,
     type CSSObject,
     type Shadows,
     type SxProps,
@@ -1163,6 +1164,22 @@ export const CARD_DEMO_THEME = createTheme({
         },
     },
 });
+
+/**
+ * One item of a flex row its siblings divide by shares, as an sx style: each grows from no width
+ * to its shares of the row, so the item whose content needs the most room can be given the most.
+ */
+export function RowShareStyle(shares: number): SxProps<Theme> {
+    return { flex: shares };
+}
+
+/**
+ * A grid row whose items align by their bottom edge from the given breakpoint up, as an sx style.
+ * Below that breakpoint the row keeps its default alignment.
+ */
+export function RowEndAlignmentFrom(breakpoint: Breakpoint): SxProps<Theme> {
+    return { alignItems: { [breakpoint]: "flex-end" } };
+}
 
 /**
  * Keeps text out of sight but in the accessibility tree, so screen readers still read it: the

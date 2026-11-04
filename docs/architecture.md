@@ -668,9 +668,11 @@ Backend utilities, seed and rules (`backend/app/`):
     ([Timestamps](data-model.md#timestamps)). Used by the image reader, loaders,
     `orchestration/gdg.py`, the TRANBKP, POSTTRAN, INTCALC and COMBTRAN jobs, and the services
     that display timestamps.
-- `utils/cobol_format.py`: edited-picture formatting (`FormatEdited`) for `-ZZZ,ZZZ,ZZZ.ZZ`,
-    `+ZZZ,ZZZ,ZZZ.ZZ`, `Z(9).99-` and `9(9).99-`. Used by `services/reports/` and
-    `batch/jobs/statement_gen/`.
+- `utils/cobol_format.py`: edited-picture formatting (`FormatEdited`) for `-ZZZ,ZZZ,ZZZ.ZZ` and
+    `+ZZZ,ZZZ,ZZZ.ZZ` (CBTRN03C report), `Z(9).99-` and `9(9).99-` (CBSTM03A statement),
+    `+ZZZ,ZZZ,ZZZ.99` (CAVW and CAUP amounts) and `+99999999.99` (CT02 amount). Used by the
+    COACTVWC, COACTUPC and COTRN02C services, `utils/record_layouts.py`, whose `RenderLine`
+    edits the CBTRN03C report lines, and `batch/jobs/statement_gen/`.
 - `utils/date_validation.py`: the CSUTLDTC and CSUTLDPY date edits. Used by the COACTUPC,
     COTRN02C and CORPT00C services.
 - `utils/lookup_codes.py`: the CSLKPCDY state, ZIP-prefix and area-code tables. Used by the
@@ -678,7 +680,11 @@ Backend utilities, seed and rules (`backend/app/`):
 - `seed/image_reader.py`: `ReadImage`. Used by Alembic revision `0002` and `batch/loaders/`.
 - `services/transactions/cbtrn02c.py`: `ValidateDailyTransaction` and `ApplyPosting`, the
     CBTRN02C posting rules. Used by `batch/jobs/posttran.py`.
-- `services/reports/cbtrn03c.py`: `BuildReport`. Used by `corpt00c.py` and `report_export.py`.
+- `services/reports/cbtrn03c.py`: `CheckReportInput`, `IterateReport` and `BuildReport`. Used by
+    `corpt00c.py`, which calls `CheckReportInput` before any byte is sent and then
+    `IterateReport`, whose lines `report_export.py` renders without importing the module.
+    `BuildReport`, the same lines as one list, is called only by the backend tests, the CBTRN03C
+    parity case among them.
 - `repositories/transaction_repository.py`: `AllocateNextTranId`. Used by `cotrn02c.py` and
     `cobil00c.py`.
 - `services/menu/menu_options.py`: the COMEN02Y and COADM02Y option tables. Used by the menu

@@ -3,7 +3,8 @@
 The CBTRN03C transaction detail report as a pure line builder. BuildReport turns the report input
 into the 133-column TRANREPT print lines (CVTRA07Y layouts), each with the structured fields the
 CR00 screen table, the CSV export and the PDF export show. IterateReport yields the same lines
-one record at a time, so an export never holds the whole report. The module reads no database,
+one record at a time, so an export never holds the whole report, and CheckReportInput raises
+the abend IterateReport would raise without building any line. The module reads no database,
 file, clock or setting and logs nothing: the CBTRN03C DISPLAY of every TRAN-RECORD and TRAN-AMT
 has no counterpart, because it would log card numbers.
 
@@ -186,6 +187,33 @@ def IterateReport(
         return
     FinishReport(state, lastRow)
     yield from DrainLines(state)
+
+
+def CheckReportInput(
+    rows: Iterable[Mapping[str, Any]],
+    typeDescriptions: Mapping[str, str],
+    categoryDescriptions: Mapping[tuple[str, int], str],
+) -> None:
+    """Run IterateReport's key lookups over rows without building a line, raising its abend.
+
+    The input contract is BuildReport's. Each record is looked up as ProcessRecord looks it up:
+    the cross-reference on a change of card, then the type and the category. So an input
+    raises here exactly the ReportAbendError, at exactly the record, that IterateReport would
+    raise, and an input that passes builds every line, which lets a report be checked before
+    any of it is sent.
+
+    Raises:
+        ReportAbendError: A card, transaction type or category key is not on file (abend 999).
+    """
+    lookups = ReportLookups(typeDescriptions, categoryDescriptions)
+    currentCardNum = INITIAL_CARD_NUM
+    for row in rows:
+        cardNum = row["card_num"].ljust(CARD_NUM_LENGTH)
+        if cardNum != currentCardNum:
+            currentCardNum = cardNum
+            LookupXref(row)
+        LookupTransactionType(row, lookups)
+        LookupTransactionCategory(row, lookups)
 
 
 def DrainLines(state: ReportState) -> list[ReportLine]:

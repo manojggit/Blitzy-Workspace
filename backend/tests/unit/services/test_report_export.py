@@ -14,7 +14,9 @@ module:
     new physical page only when a page is full; the document is deterministic and uncompressed,
     so a small decoder here follows the page tree from the trailer's /Root and reads back the
     strings each page's content stream shows. The tests compare those drawn lines, page by
-    page, with the expected print text; metadata and unreferenced objects never count;
+    page, with the expected print text; metadata and unreferenced objects never count. Each
+    page's content stream is sent once its lines are read, the cross-reference table locates
+    every object, and each page defines the Courier font its content selects;
 - both downloads are built in memory: rendering them with every file-system audit event
     refused and recorded must succeed with no attempt recorded.
 """
@@ -23,6 +25,7 @@ import contextlib
 import contextvars
 import csv
 import io
+import itertools
 import os
 import pathlib
 import re
@@ -202,6 +205,18 @@ PAGE_SPLIT_CASES = (
     (LINES_PER_PAGE + 1, ((0, LINES_PER_PAGE), (LINES_PER_PAGE, LINES_PER_PAGE + 1))),
 )
 PAGE_SPLIT_IDS = ("empty-report", "full-page", "one-line-over")
+# (detail line count, how many lines had been read when each page's content stream was sent)
+PAGE_BY_PAGE_CASES = (
+    (2 * LINES_PER_PAGE + 1, (LINES_PER_PAGE, 2 * LINES_PER_PAGE, 2 * LINES_PER_PAGE + 1)),
+    (3 * LINES_PER_PAGE, (LINES_PER_PAGE, 2 * LINES_PER_PAGE, 3 * LINES_PER_PAGE)),
+)
+PAGE_BY_PAGE_IDS = ("two-pages-and-a-line", "three-full-pages")
+# (detail line count, page count)
+PDF_STRUCTURE_CASES = ((0, 1), (LINES_PER_PAGE, 1), (2 * LINES_PER_PAGE + 1, 3))
+PDF_STRUCTURE_IDS = ("empty-report", "full-page", "three-pages")
+# Every report page selects Courier, as the TRANREPT print lines are drawn in it.
+EXPECTED_PAGE_FONT_FACES = {(b"Courier", b"WinAnsiEncoding")}
+EXPECTED_TITLE = b"DALYREPT"
 
 # The report fonts use /WinAnsiEncoding, which is Windows code page 1252.
 PDF_TEXT_ENCODING = "cp1252"
@@ -216,6 +231,17 @@ PDF_CONTENT_TOKEN_PATTERN = re.compile(rb"\((?:[^\\()]|\\.)*\)|[^\s()]+", re.DOT
 # A literal-string escape: one to three octal digits, a line end (a continuation), or one byte.
 PDF_ESCAPE_PATTERN = re.compile(rb"\\(?:([0-7]{1,3})|(\r\n|\r|\n)|(.))", re.DOTALL)
 PDF_ESCAPED_BYTES = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f"}
+# The last startxref of the file, which gives the offset of its cross-reference table.
+PDF_STARTXREF_PATTERN = re.compile(rb"startxref\s+(\d+)\s+%%EOF\s*\Z")
+# The table's one subsection, from object 0, and its entry count.
+PDF_XREF_SUBSECTION_PATTERN = re.compile(rb"xref\r?\n0 (\d+)\r?\n")
+# A 20-byte table entry: offset, generation, n (in use) or f (free), and a two-byte line end.
+PDF_XREF_ENTRY_BYTES = 20
+PDF_XREF_ENTRY_PATTERN = re.compile(rb"(\d{10}) (\d{5}) ([nf])(?: \r| \n|\r\n)")
+# A name and the object it refers to, as /F1 4 0 R in a font resource dictionary.
+PDF_NAMED_REFERENCE_PATTERN = re.compile(rb"/([^\s/\[\]()<>]+)\s+(\d+)\s+0\s+R")
+# A font selection in a content stream: the resource name, then the size, then Tf.
+PDF_FONT_SELECTION_PATTERN = re.compile(rb"/([^\s/\[\]()<>]+)\s+[-+.\d]+\s+Tf\b")
 
 # The audit events (sys.addaudithook) raised when a file is opened, a directory is read, or a
 # file-system entry is created, changed, copied, moved or removed. In-memory buffers such as
@@ -411,6 +437,88 @@ def PdfPageLines(pdfBytes: bytes) -> list[list[str]]:
     return [ShownStrings(content) for content in pageContents]
 
 
+class LineReader:
+    """Hands out report lines one at a time, counting how many have been taken."""
+
+    def __init__(self, lines: list[ReportLine]) -> None:
+        self.lines = lines
+        self.linesTaken = 0
+
+    def Lines(self) -> Iterator[ReportLine]:
+        """Yield the lines in order, counting each one as it is taken."""
+        for line in self.lines:
+            self.linesTaken += 1
+            yield line
+
+
+def PdfXrefEntries(pdfBytes: bytes) -> list[tuple[int, bytes]]:
+    """Return the (offset, n or f) of each entry of the table the PDF's startxref points at.
+
+    The table must sit at that offset, hold one subsection from object 0, and end at the
+    trailer.
+    """
+    startxref = PDF_STARTXREF_PATTERN.search(pdfBytes)
+    assert startxref is not None
+    subsection = PDF_XREF_SUBSECTION_PATTERN.match(pdfBytes, int(startxref.group(1)))
+    assert subsection is not None
+    tableEnd = subsection.end() + int(subsection.group(1)) * PDF_XREF_ENTRY_BYTES
+    assert pdfBytes.startswith(b"trailer", tableEnd)
+    entries: list[tuple[int, bytes]] = []
+    for entryStart in range(subsection.end(), tableEnd, PDF_XREF_ENTRY_BYTES):
+        entryEnd = entryStart + PDF_XREF_ENTRY_BYTES
+        entry = PDF_XREF_ENTRY_PATTERN.fullmatch(pdfBytes, entryStart, entryEnd)
+        assert entry is not None
+        entries.append((int(entry.group(1)), entry.group(3)))
+    return entries
+
+
+def PdfPageDictionaries(objects: dict[int, bytes], nodeNumber: int) -> list[bytes]:
+    """Return every page dictionary under page-tree node nodeNumber, in /Kids order."""
+    node = objects[nodeNumber]
+    if PdfHasType(node, b"Page"):
+        return [node]
+    assert PdfHasType(node, b"Pages")
+    kids = re.search(rb"/Kids\s*\[([^\]]*)\]", node)
+    assert kids is not None
+    kidNumbers = PDF_REFERENCE_PATTERN.findall(kids.group(1))
+    return [page for kid in kidNumbers for page in PdfPageDictionaries(objects, int(kid))]
+
+
+def PdfNameValue(dictionary: bytes, key: bytes) -> bytes | None:
+    """Return the name dictionary holds under key, as Courier for /BaseFont /Courier."""
+    value = re.search(rb"/" + re.escape(key) + rb"\s*/([^\s/\[\]()<>]+)", dictionary)
+    return None if value is None else value.group(1)
+
+
+def PageFontFaces(objects: dict[int, bytes], page: bytes) -> set[tuple[bytes | None, bytes | None]]:
+    """Return the (/BaseFont, /Encoding) of each font the content of page selects with Tf.
+
+    Each selected name is looked up in the page's /Resources /Font dictionary, written inline
+    or as a reference; a name the page does not define gives (None, None).
+    """
+    fontResource = re.search(rb"/Font\s*(<<.*?>>|\d+\s+0\s+R)", page, re.DOTALL)
+    assert fontResource is not None
+    fontMap = fontResource.group(1)
+    if not fontMap.startswith(b"<<"):
+        fontMap = objects[int(fontMap.split()[0])]
+    fontReferences = PDF_NAMED_REFERENCE_PATTERN.findall(fontMap)
+    fonts = {name: objects[int(number)] for name, number in fontReferences}
+    selectedFonts = [
+        fonts.get(name, b"")
+        for name in PDF_FONT_SELECTION_PATTERN.findall(PdfPageContent(objects, page))
+    ]
+    return {
+        (PdfNameValue(font, b"BaseFont"), PdfNameValue(font, b"Encoding")) for font in selectedFonts
+    }
+
+
+def PdfMediaBox(page: bytes) -> tuple[float, ...]:
+    """Return the four numbers of the /MediaBox of the page dictionary page."""
+    mediaBox = re.search(rb"/MediaBox\s*\[([^\]]*)\]", page)
+    assert mediaBox is not None
+    return tuple(float(number) for number in mediaBox.group(1).split())
+
+
 def RefuseGuardedFilesystemEvent(event: str, eventArgs: tuple[Any, ...]) -> None:
     """Audit hook: inside a FilesystemDenied block, record a file-system event, then refuse it.
 
@@ -568,6 +676,80 @@ def test_pdf_starts_a_new_page_only_when_a_page_is_full(lineCount, pageSpans):
     pdfPages = PdfPageLines(report_export.RenderPdf(lines))
 
     assert pdfPages == [lineTexts[start:stop] for start, stop in pageSpans]
+
+
+@pytest.mark.parametrize("lineCount, linesReadAtEachPage", PAGE_BY_PAGE_CASES, ids=PAGE_BY_PAGE_IDS)
+def test_pdf_sends_each_page_once_its_lines_are_read(monkeypatch, lineCount, linesReadAtEachPage):
+    """Each page's content stream is sent after its own lines are read, before any later line.
+
+    With one-byte chunks every piece of the file goes out alone, as soon as it is written.
+    """
+    monkeypatch.setattr(report_export, "REPORT_CHUNK_BYTES", 1)
+    lines = NumberedDetailLines(lineCount)
+    lineReader = LineReader(lines)
+    chunks: list[bytes] = []
+    linesReadAtContent: list[int] = []
+
+    for chunk in report_export.IteratePdf(lineReader.Lines()):
+        chunks.append(chunk)
+        if PDF_STREAM_HEAD_PATTERN.search(chunk):
+            linesReadAtContent.append(lineReader.linesTaken)
+
+    assert tuple(linesReadAtContent) == linesReadAtEachPage
+    pageSpans = itertools.pairwise((0, *linesReadAtEachPage))
+    lineTexts = [line.text for line in lines]
+    assert PdfPageLines(b"".join(chunks)) == [lineTexts[start:stop] for start, stop in pageSpans]
+
+
+@pytest.mark.parametrize("lineCount, pageCount", PDF_STRUCTURE_CASES, ids=PDF_STRUCTURE_IDS)
+def test_pdf_cross_reference_table_locates_every_object(lineCount, pageCount):
+    """startxref finds the table, whose in-use entries each give the offset of their object.
+
+    /Size counts the entries, and the page tree's /Count counts every page object.
+    """
+    pdfBytes = report_export.RenderPdf(NumberedDetailLines(lineCount))
+    entries = PdfXrefEntries(pdfBytes)
+    trailer = pdfBytes[pdfBytes.rindex(b"trailer") :]
+    objects = PdfObjects(pdfBytes)
+
+    tableSize = re.search(rb"/Size\s+(\d+)", trailer)
+    assert tableSize is not None and int(tableSize.group(1)) == len(entries)
+    assert entries[0] == (0, b"f")
+    misplacedObjects = [
+        objectNumber
+        for objectNumber, (objectOffset, entryKind) in enumerate(entries[1:], start=1)
+        if entryKind != b"n" or not pdfBytes.startswith(b"%d 0 obj" % objectNumber, objectOffset)
+    ]
+    assert misplacedObjects == []
+    pageTree = objects[PdfReference(objects[PdfReference(trailer, b"Root")], b"Pages")]
+    pageObjects = [body for body in objects.values() if PdfHasType(body, b"Page")]
+    assert re.search(rb"/Count\s+%d\b" % len(pageObjects), pageTree)
+    assert len(pageObjects) == pageCount
+
+
+@pytest.mark.parametrize("lineCount, pageCount", PDF_STRUCTURE_CASES, ids=PDF_STRUCTURE_IDS)
+def test_pdf_pages_define_the_courier_font_they_select_on_the_report_page_size(
+    lineCount, pageCount
+):
+    """Each font a page's content selects is Courier in WinAnsiEncoding in its /Resources.
+
+    Every /MediaBox is the page size the lines are drawn on, and the document is titled
+    DALYREPT.
+    """
+    pdfBytes = report_export.RenderPdf(NumberedDetailLines(lineCount))
+    trailer = pdfBytes[pdfBytes.rindex(b"trailer") :]
+    objects = PdfObjects(pdfBytes)
+    rootNodeNumber = PdfReference(objects[PdfReference(trailer, b"Root")], b"Pages")
+
+    pages = PdfPageDictionaries(objects, rootNodeNumber)
+
+    assert len(pages) == pageCount
+    pageFontFaces = [PageFontFaces(objects, page) for page in pages]
+    assert pageFontFaces == [EXPECTED_PAGE_FONT_FACES] * pageCount
+    pageBox = (0.0, 0.0, *report_export.PDF_PAGE_SIZE)
+    assert [PdfMediaBox(page) for page in pages] == [pageBox] * pageCount
+    documentInfo = objects[PdfReference(trailer, b"Info")]
+    assert re.search(rb"/Title\s*\(" + EXPECTED_TITLE + rb"\)", documentInfo)
 
 
 def test_csv_and_pdf_exports_are_built_with_every_file_access_refused():

@@ -38,6 +38,7 @@ from app.core.paths import REPO_ROOT
 from app.schemas.reports import ReportLine, ReportLineKind
 from app.services.reports.cbtrn03c import (
     BuildReport,
+    CheckReportInput,
     ProcessRecord,
     ReportAbendError,
     ReportLookups,
@@ -408,6 +409,62 @@ def test_key_not_on_file_abends_with_code_999(overrides: dict[str, object]) -> N
     assert raised.value.abendCode == ABEND_CODE
     # The abend text names the failing key, but never the full card number.
     assert CARD_A not in str(raised.value)
+
+
+def TwoCardRows(rowOverrides: Mapping[int, Mapping[str, object]]) -> list[dict[str, object]]:
+    """Three rows of card A, then two of card B on account 27, each index's overrides applied."""
+    cardBRows = [
+        {**row, "xref_acct_id": ACCOUNT_B} for row in BuildCardRows(CARD_B, ["4.00", "5.00"])
+    ]
+    rows = [*BuildCardRows(CARD_A, ["1.00", "2.00", "3.00"]), *cardBRows]
+    return [{**row, **rowOverrides.get(rowIndex, {})} for rowIndex, row in enumerate(rows)]
+
+
+def RaisedAbendText(rows: Sequence[Mapping[str, object]], checkOnly: bool) -> str | None:
+    """Return the abend text CheckReportInput (checkOnly) or BuildReport raises, or None."""
+    try:
+        if checkOnly:
+            CheckReportInput(rows, TYPE_DESCRIPTIONS, CATEGORY_DESCRIPTIONS)
+        else:
+            RunReport(rows)
+    except ReportAbendError as abend:
+        return str(abend)
+    return None
+
+
+# Each case overrides rows of TwoCardRows by index (card B's rows are 3 and 4) and gives the
+# abend text of lines 484-512, the card masked. 1500-A reads CARDXREF only on a change of card,
+# so a key missing from a later row of the same card is never read and never abends.
+CHECK_INPUT_CASES = [
+    pytest.param({}, None, id="every-key-on-file"),
+    pytest.param(
+        {3: {"xref_acct_id": None}, 4: {"xref_acct_id": None}},
+        "CBTRN03C ABEND 999: INVALID CARD NUMBER : ************1516",
+        id="card-not-on-cardxref",
+    ),
+    pytest.param(
+        {4: {"tran_type_cd": "09"}},
+        "CBTRN03C ABEND 999: INVALID TRANSACTION TYPE : 09",
+        id="type-not-on-trantype",
+    ),
+    pytest.param(
+        {1: {"tran_cat_cd": 2}},
+        "CBTRN03C ABEND 999: INVALID TRAN CATG KEY : 010002",
+        id="category-not-on-trancatg",
+    ),
+    pytest.param({4: {"xref_acct_id": None}}, None, id="cardxref-read-only-on-a-card-change"),
+]
+
+
+@pytest.mark.parametrize(("rowOverrides", "expectedAbendText"), CHECK_INPUT_CASES)
+def test_check_report_input_raises_exactly_the_abend_build_report_raises(
+    rowOverrides: dict[int, dict[str, object]], expectedAbendText: str | None
+) -> None:
+    rows = TwoCardRows(rowOverrides)
+
+    checkedAbendText = RaisedAbendText(rows, checkOnly=True)
+
+    assert checkedAbendText == RaisedAbendText(rows, checkOnly=False) == expectedAbendText
 
 
 def test_negative_amounts_print_the_minus_sign_of_both_edited_pictures() -> None:
