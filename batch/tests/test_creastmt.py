@@ -4,27 +4,55 @@ Pins cbl/CBSTM03A.CBL (STATEMENT-LINES and HTML-LINES, lines 86-223; WS-TRNX-TAB
 226-233; 8100-TRNXFILE-OPEN to 8599-EXIT, lines 758-850) and jcl/CREASTMT.JCL, as ported to
 STATEMNT.PS records of 80 columns and STATEMNT.HTML records of exactly 100 columns, with the
 51-card by 10-transaction table bound (Technical Specification, Sections 0.6.11 and 0.6.12).
+
+The unit tests drive the builder, the reads and the publication directly. The tests at the end
+run ``carddemo-batch job statement-gen`` (chain step 17) on the seeded test database: after
+chain steps 6 and 13-16 the files equal the committed fixtures byte for byte, and on edited or
+synthetic tables they equal the independent oracle's CREASTMT, legacy_oracle.RunCreastmt.
 """
 
 import errno
+import hashlib
 import logging
 import os
 import secrets
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import NamedTuple
 from unittest import mock
 
 import pytest
+from app.models import Card, CardXref, Customer, Transaction
 from app.utils.cobol_format import PictureError
 from jinja2.exceptions import UndefinedError
-from sqlalchemy import Select
+from sqlalchemy import Engine, Select, delete, func, select, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 
+from batch.config import STATEMENTS_SUBDIRECTORY
 from batch.jobs.statement_gen import cbstm03a, cbstm03b, creastmt
-from batch.orchestration.job_context import EXIT_ABEND, JobContext, JobFailure
+from batch.orchestration import run_ledger
+from batch.orchestration.job_context import (
+    EXIT_ABEND,
+    EXIT_OK,
+    EXIT_REJECTS,
+    JobContext,
+    JobFailure,
+)
+from batch.tests.conftest import (
+    EXPECTED_DIR,
+    FIXED_AS_OF_TEXT,
+    BatchEnvironment,
+    CliOutcome,
+    CountJobRuns,
+    InsertSyntheticCards,
+    InsertSyntheticTransactions,
+    InvokeCli,
+    StepRow,
+    SyntheticTransactionSpec,
+)
+from batch.tests.reconciliation import compare, legacy_oracle
 
 CARD_NUM = "0000000000000101"
 CUST_ID = "000000001"
@@ -893,3 +921,289 @@ def test_read_abend_after_recovery_leaves_the_previous_statements(
     failure = PublicationRunJob(statementsDir, TableInput(cardTransactionCounts))
     assert failure.exitCode == EXIT_ABEND
     assert PublicationFiles(statementsDir) == previous
+
+
+# --- CREASTMT through the CLI on the seeded test database ----------------------------------------
+# Chain steps 6 and 13-16 as standalone jobs, with the status each ends with on the sample data:
+# POSTTRAN rejects records, the legacy RC 4. TRANSACT then holds the COMBTRAN records.
+CHAIN_SET_UP_JOBS = (
+    (("job", "tran-backup"), EXIT_OK),
+    (("job", "post-tran", "--as-of", FIXED_AS_OF_TEXT), EXIT_REJECTS),
+    (("job", "interest-calc", "--as-of", FIXED_AS_OF_TEXT), EXIT_OK),
+    (("job", "tran-backup"), EXIT_OK),
+    (("job", "comb-tran"), EXIT_OK),
+)
+STATEMENT_JOB_ARGUMENTS = ("job", creastmt.JOB_NAME)
+FORCE_OPTION = "--force"
+COMBTRAN_STEP_NO = 16
+STATEMENT_STEP_NO = 17
+# WS-CARD-TBL OCCURS 51 and WS-TRAN-TBL OCCURS 10 (cbl/CBSTM03A.CBL lines 226-228), written out
+# rather than read from cbstm03a, so a changed bound in the module under test fails here.
+STATEMENT_CAPACITY_CARDS = 51
+STATEMENT_CAPACITY_TRANSACTIONS = 10
+SYNTHETIC_AMOUNT = Decimal("12.34")
+SYNTHETIC_TRANSACTIONS_PER_CARD = 2
+PS_LAYOUT_NAME = "STATEMNT.PS"
+HTML_LAYOUT_NAME = "STATEMNT.HTML"
+EXPECTED_STATEMENT_PATHS = (
+    EXPECTED_DIR / "creastmt_STATEMNT.PS",
+    EXPECTED_DIR / "creastmt_STATEMNT.HTML",
+)
+ORACLE_DIRECTORY_NAME = "oracle"
+# The entities a default HTML autoescape would write for an apostrophe; CBSTM03A writes it raw.
+APOSTROPHE_ENTITIES = ("&#39;", "&#x27;")
+# ST-LINE1, the second STATEMNT.PS record of every statement, holds ST-NAME X(75). STRING keeps
+# each name part up to its first space and follows it with one space (5000-CREATE-STATEMENT).
+PS_NAME_LINE_INDEX = 1
+MULTI_WORD_NAMES = {"first_name": "MARY ANN", "middle_name": "JO BETH", "last_name": "VAN DYKE"}
+EXPECTED_STATEMENT_NAME = "MARY JO VAN "
+MARKUP_ADDRESS = "O'NEIL & <SONS>"
+MARKUP_DESCRIPTION = "CAFE 'A' & <B>"
+ESCAPED_MARKUP_VALUES = ("O'NEIL &amp; &lt;SONS&gt;", "CAFE 'A' &amp; &lt;B&gt;")
+
+
+def StatementPaths(outputDir: Path) -> tuple[Path, Path]:
+    """Return STATEMNT.PS and STATEMNT.HTML under outputDir/statements, where CREASTMT writes."""
+    statementsDir = outputDir / STATEMENTS_SUBDIRECTORY
+    return statementsDir / creastmt.STATEMENT_FILE_NAME, statementsDir / creastmt.HTML_FILE_NAME
+
+
+def RunChainThroughCombtran(batchEnvironment: BatchEnvironment) -> None:
+    """Run chain steps 6 and 13-16 of the seed cycle with the frozen clock, as the fixtures did."""
+    for arguments, expectedExitCode in CHAIN_SET_UP_JOBS:
+        outcome = InvokeCli(arguments)
+        assert outcome.exitCode == expectedExitCode, outcome.output
+    combtranStep = StepRow(batchEnvironment.engine, COMBTRAN_STEP_NO)
+    assert combtranStep["state"] == run_ledger.STEP_COMPLETED
+
+
+def RunStatementJob(expectedExitCode: int, force: bool = False) -> CliOutcome:
+    """Run ``job statement-gen``, chain step 17, and assert it ends with expectedExitCode."""
+    arguments = [*STATEMENT_JOB_ARGUMENTS, *((FORCE_OPTION,) if force else ())]
+    outcome = InvokeCli(arguments)
+    assert outcome.exitCode == expectedExitCode, outcome.output
+    return outcome
+
+
+def ReadLines(path: Path) -> list[str]:
+    """Return a statement file's records, each without its LF terminator."""
+    return compare.ReadFixedWidthRecords(path)
+
+
+def FileDigests(paths: tuple[Path, ...]) -> list[str]:
+    """Return the SHA-256 of each file's bytes."""
+    return [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]
+
+
+def StatementDifferences(
+    actualPaths: tuple[Path, Path], expectedPaths: tuple[Path, Path]
+) -> list[str]:
+    """Return every line difference of STATEMNT.PS and STATEMNT.HTML from the expected files."""
+    layoutNames = (PS_LAYOUT_NAME, HTML_LAYOUT_NAME)
+    return [
+        difference
+        for actualPath, expectedPath, layoutName in zip(
+            actualPaths, expectedPaths, layoutNames, strict=True
+        )
+        for difference in compare.CompareFixedWidthFiles(actualPath, expectedPath, layoutName)
+    ]
+
+
+def WriteOracleStatements(engine: Engine, oracleDir: Path) -> tuple[Path, Path]:
+    """Run the oracle's CREASTMT over the tables as they stand and write its two files.
+
+    The tables are read through compare's plain SQL, and the lines are written as the fixtures
+    are: Latin-1, one LF after every record. Returns the paths, as StatementPaths(oracleDir).
+    """
+    with engine.connect() as connection:
+        outcome = legacy_oracle.RunCreastmt(compare.ReadTableAsOracleState(connection))
+    assert outcome.exitCode == legacy_oracle.EXIT_OK
+    oraclePaths = StatementPaths(oracleDir)
+    oraclePaths[0].parent.mkdir(parents=True)
+    for oraclePath, lines in zip(oraclePaths, (outcome.psLines, outcome.htmlLines), strict=True):
+        recordText = "".join(line + compare.RECORD_TERMINATOR for line in lines)
+        oraclePath.write_bytes(recordText.encode(compare.FILE_ENCODING))
+    return oraclePaths
+
+
+def FirstStatementXref(engine: Engine) -> dict[str, str]:
+    """Return the card and customer of the first statement: the lowest card in key order."""
+    statement = (
+        select(CardXref.card_num, CardXref.cust_id)
+        .join(Card, Card.card_num == CardXref.card_num)
+        .order_by(Card.card_num_sort)
+        .limit(1)
+    )
+    with engine.connect() as connection:
+        return dict(connection.execute(statement).mappings().one())
+
+
+def CardNumbers(engine: Engine) -> list[str]:
+    """Return every card number in CARDDATA key order."""
+    statement = select(Card.card_num).order_by(Card.card_num_sort)
+    with engine.connect() as connection:
+        return list(connection.execute(statement).scalars())
+
+
+def SetCustomerColumns(engine: Engine, custId: str, values: dict[str, str]) -> None:
+    """Overwrite columns of one customer, as bound parameters."""
+    with engine.begin() as connection:
+        connection.execute(update(Customer).where(Customer.cust_id == custId).values(**values))
+
+
+def SetFirstTransactionDescription(engine: Engine, cardNum: str, description: str) -> None:
+    """Overwrite TRAN-DESC of the card's lowest TRAN-ID, as a bound parameter."""
+    firstTranId = (
+        select(func.min(Transaction.tran_id))
+        .where(Transaction.card_num == cardNum)
+        .scalar_subquery()
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            update(Transaction)
+            .where(Transaction.tran_id == firstTranId)
+            .values(tran_desc=description)
+        )
+
+
+def InsertCardTransactions(engine: Engine, cardNums: Sequence[str], perCard: int) -> None:
+    """Insert perCard synthetic transactions of SYNTHETIC_AMOUNT for each card of cardNums."""
+    spec = SyntheticTransactionSpec(cardNums=cardNums, perCard=perCard, amount=SYNTHETIC_AMOUNT)
+    InsertSyntheticTransactions(engine, spec)
+
+
+def FillFiftyTwoCards(engine: Engine) -> None:
+    """Give 52 cards one transaction each, one card past WS-CARD-TBL OCCURS 51."""
+    InsertSyntheticCards(engine, STATEMENT_CAPACITY_CARDS + 1 - len(CardNumbers(engine)))
+    InsertCardTransactions(engine, CardNumbers(engine), 1)
+
+
+def FillElevenTransactionsForOneCard(engine: Engine) -> None:
+    """Give the first card eleven transactions, one past WS-TRAN-TBL OCCURS 10."""
+    elevenTransactions = STATEMENT_CAPACITY_TRANSACTIONS + 1
+    InsertCardTransactions(engine, CardNumbers(engine)[:1], elevenTransactions)
+
+
+def test_statement_files_equal_expected_fixtures_byte_for_byte(
+    batchEnvironment: BatchEnvironment,
+) -> None:
+    """After chain steps 6 and 13-16, STEP040 writes both files exactly as the fixtures hold
+    them, the sample apostrophes (custdata.txt record 31, dailytran.txt record 76) raw."""
+    RunChainThroughCombtran(batchEnvironment)
+    RunStatementJob(EXIT_OK)
+    actualPaths = StatementPaths(batchEnvironment.outputDir)
+    assert StatementDifferences(actualPaths, EXPECTED_STATEMENT_PATHS) == []
+    htmlText = actualPaths[1].read_text(encoding=compare.FILE_ENCODING)
+    assert "'" in htmlText
+    assert [entity for entity in APOSTROPHE_ENTITIES if entity in htmlText] == []
+    statementStep = StepRow(batchEnvironment.engine, STATEMENT_STEP_NO)
+    assert statementStep["state"] == run_ledger.STEP_COMPLETED
+
+
+def test_statement_lines_have_legacy_widths(batchEnvironment: BatchEnvironment) -> None:
+    """Every STATEMNT.PS record is LRECL 80 and every STATEMNT.HTML record LRECL 100."""
+    RunChainThroughCombtran(batchEnvironment)
+    RunStatementJob(EXIT_OK)
+    psPath, htmlPath = StatementPaths(batchEnvironment.outputDir)
+    assert {len(line) for line in ReadLines(psPath)} == {PS_LINE_WIDTH}
+    assert {len(line) for line in ReadLines(htmlPath)} == {HTML_LINE_WIDTH}
+
+
+def test_statement_rerun_overwrites_files_with_identical_content(
+    batchEnvironment: BatchEnvironment,
+) -> None:
+    """A forced rerun of the completed step 17 writes new files with the same bytes."""
+    RunChainThroughCombtran(batchEnvironment)
+    RunStatementJob(EXIT_OK)
+    paths = StatementPaths(batchEnvironment.outputDir)
+    firstDigests = FileDigests(paths)
+    firstInodes = [path.stat().st_ino for path in paths]
+    RunStatementJob(EXIT_OK, force=True)
+    assert FileDigests(paths) == firstDigests
+    assert [path.stat().st_ino for path in paths] != firstInodes
+    engine = batchEnvironment.engine
+    assert CountJobRuns(engine, STATEMENT_STEP_NO, run_ledger.RUN_COMPLETED) == 2
+
+
+def test_statement_name_keeps_only_first_word_of_each_name_part(
+    batchEnvironment: BatchEnvironment, tmp_path: Path
+) -> None:
+    """ST-NAME holds the first word of the first, middle and last names, each then a space."""
+    engine = batchEnvironment.engine
+    xref = FirstStatementXref(engine)
+    SetCustomerColumns(engine, xref["cust_id"], MULTI_WORD_NAMES)
+    InsertCardTransactions(engine, [xref["card_num"]], SYNTHETIC_TRANSACTIONS_PER_CARD)
+    RunStatementJob(EXIT_OK)
+    actualPaths = StatementPaths(batchEnvironment.outputDir)
+    nameLine = ReadLines(actualPaths[0])[PS_NAME_LINE_INDEX]
+    assert nameLine == EXPECTED_STATEMENT_NAME.ljust(PS_LINE_WIDTH)
+    oraclePaths = WriteOracleStatements(engine, tmp_path / ORACLE_DIRECTORY_NAME)
+    assert StatementDifferences(actualPaths, oraclePaths) == []
+
+
+def test_html_escapes_only_ampersand_and_angle_brackets_and_keeps_apostrophes(
+    batchEnvironment: BatchEnvironment, tmp_path: Path
+) -> None:
+    """User text reaches STATEMNT.HTML with &, < and > escaped and nothing else changed, and
+    STATEMNT.PS raw: the input-cleaning pin of the statement template."""
+    engine = batchEnvironment.engine
+    xref = FirstStatementXref(engine)
+    SetCustomerColumns(engine, xref["cust_id"], {"addr_line_1": MARKUP_ADDRESS})
+    InsertCardTransactions(engine, [xref["card_num"]], SYNTHETIC_TRANSACTIONS_PER_CARD)
+    SetFirstTransactionDescription(engine, xref["card_num"], MARKUP_DESCRIPTION)
+    RunStatementJob(EXIT_OK)
+    actualPaths = StatementPaths(batchEnvironment.outputDir)
+    psText, htmlText = (path.read_text(encoding=compare.FILE_ENCODING) for path in actualPaths)
+    assert [value for value in ESCAPED_MARKUP_VALUES if value not in htmlText] == []
+    assert [entity for entity in APOSTROPHE_ENTITIES if entity in htmlText] == []
+    assert [value for value in (MARKUP_ADDRESS, MARKUP_DESCRIPTION) if value not in psText] == []
+    oraclePaths = WriteOracleStatements(engine, tmp_path / ORACLE_DIRECTORY_NAME)
+    assert StatementDifferences(actualPaths, oraclePaths) == []
+
+
+def test_capacity_of_51_cards_by_10_transactions_is_processed_exactly(
+    batchEnvironment: BatchEnvironment, tmp_path: Path
+) -> None:
+    """A full WS-TRNX-TABLE, 51 cards of 10 transactions each, gives the oracle's statements."""
+    engine = batchEnvironment.engine
+    InsertSyntheticCards(engine, STATEMENT_CAPACITY_CARDS - len(CardNumbers(engine)))
+    cardNums = CardNumbers(engine)
+    assert len(cardNums) == STATEMENT_CAPACITY_CARDS
+    with engine.begin() as connection:
+        connection.execute(delete(Transaction))
+    InsertCardTransactions(engine, cardNums, STATEMENT_CAPACITY_TRANSACTIONS)
+    RunStatementJob(EXIT_OK)
+    actualPaths = StatementPaths(batchEnvironment.outputDir)
+    oraclePaths = WriteOracleStatements(engine, tmp_path / ORACLE_DIRECTORY_NAME)
+    assert StatementDifferences(actualPaths, oraclePaths) == []
+    fullTableLines = PS_FIXED_LINE_COUNT + STATEMENT_CAPACITY_TRANSACTIONS
+    assert len(ReadLines(actualPaths[0])) == STATEMENT_CAPACITY_CARDS * fullTableLines
+
+
+# The 52nd-card and 11th-transaction refusals differ only in their input, and the fresh and
+# previous output directories only in what must survive, so one parameterized test covers all.
+@pytest.mark.parametrize(
+    "fillOverCapacity",
+    [
+        pytest.param(FillFiftyTwoCards, id="52nd-card"),
+        pytest.param(FillElevenTransactionsForOneCard, id="11th-transaction"),
+    ],
+)
+@pytest.mark.parametrize(
+    "hasPrevious", [False, True], ids=["fresh-output-directory", "previous-statements"]
+)
+def test_over_capacity_statement_run_exits_16_and_leaves_previous_files_untouched(
+    batchEnvironment: BatchEnvironment,
+    fillOverCapacity: Callable[[Engine], None],
+    hasPrevious: bool,
+) -> None:
+    """Input past the 51 by 10 table exits 16 before any statement is written: a fresh output
+    directory stays without statement files, previous files keep their bytes, step 17 FAILED."""
+    statementsDir = StatementPaths(batchEnvironment.outputDir)[0].parent
+    previous = PublicationWritePair(statementsDir, "PREVIOUS") if hasPrevious else None
+    fillOverCapacity(batchEnvironment.engine)
+    outcome = RunStatementJob(EXIT_ABEND)
+    assert CAPACITY_MESSAGE_PREFIX in outcome.output
+    assert PublicationFiles(statementsDir) == previous
+    statementStep = StepRow(batchEnvironment.engine, STATEMENT_STEP_NO)
+    assert statementStep["state"] == run_ledger.STEP_FAILED
