@@ -84,14 +84,17 @@ LOAD_ROLLED_BACK_TEMPLATE = "{dataset}: LOAD ROLLED BACK: {reason}"
 # psycopg2's message text carries a DETAIL line quoting the offending key, which can be a card
 # number or an SSN, so a rolled-back load reports only these diagnostic fields.
 INTEGRITY_REASON_TEMPLATE = "SQLSTATE {sqlState} ON CONSTRAINT {constraintName}"
-# The message of an ImageFormatError, and of the errors it is raised from, can quote the refused
-# record's text: a zoned-decimal or timestamp decoder names the field text it refused, and a
-# codec names the byte. A rejected image therefore reports a withheld ImageFormatError with the
-# same path and record number, whose reason names only the class of the error that caused the
-# rejection and, when that cause locates it, the field and offset or the byte position and
-# codec. FRAMING_ERROR_CODE stands for the cause of an ImageFormatError raised without one: a
-# length, terminator or size problem.
+# An ImageFormatError raised without a cause is a framing error: a size that is not a multiple
+# of the LRECL, a bare CR or LF inside a record, or a record of the wrong length. image_reader
+# builds its reason from fixed text and lengths only, so a rejected image reports that reason,
+# with FRAMING_ERROR_CODE standing for its cause. The message of an ImageFormatError raised from
+# another error, and that error's own, can quote the refused record's text: a zoned-decimal or
+# timestamp decoder names the field text it refused, and a codec names the byte. Such an image
+# is reported by an ImageFormatError with the same path and record number whose reason withholds
+# that text, naming only the class of the cause and, when the cause locates it, the field and
+# offset or the byte position and codec.
 FRAMING_ERROR_CODE = "FRAMING"
+FRAMING_REASON_TEMPLATE = "{reason}, CAUSE {errorCode}"
 WITHHELD_REASON_TEMPLATE = "CAUSE {errorCode}; RECORD TEXT WITHHELD"
 WITHHELD_FIELD_REASON_TEMPLATE = (
     "FIELD {fieldName} AT OFFSET {fieldOffset}, CAUSE {errorCode}; RECORD TEXT WITHHELD"
@@ -207,16 +210,20 @@ def ImageErrorCode(error: ImageFormatError) -> str:
 
 
 def WithheldImageError(error: ImageFormatError) -> ImageFormatError:
-    """Return an ImageFormatError with error's path and record number but none of its text.
+    """Return an ImageFormatError with error's path and record number, quoting no record text.
 
-    The reason names the cause's class, with the field and offset a RecordFormatError cause
-    locates, or the 1-based byte position in the record and the codec a UnicodeDecodeError
-    cause names. It never quotes error's reason, its causes' messages or any field or byte
-    value.
+    A framing error, raised without a cause, keeps its reason, which image_reader builds from
+    fixed text and lengths only, followed by FRAMING_ERROR_CODE as its cause. For an error with
+    a cause, the reason names the cause's class, with the field and offset a RecordFormatError
+    cause locates, or the 1-based byte position in the record and the codec a
+    UnicodeDecodeError cause names; it never quotes error's reason, its causes' messages or any
+    field or byte value.
     """
     errorCode = ImageErrorCode(error)
     cause = error.__cause__
-    if isinstance(cause, RecordFormatError) and cause.fieldName is not None:
+    if cause is None:
+        reason = FRAMING_REASON_TEMPLATE.format(reason=error.reason, errorCode=errorCode)
+    elif isinstance(cause, RecordFormatError) and cause.fieldName is not None:
         reason = WITHHELD_FIELD_REASON_TEMPLATE.format(
             fieldName=cause.fieldName, fieldOffset=cause.fieldOffset, errorCode=errorCode
         )
@@ -245,7 +252,8 @@ def ReportedImageError(error: ImageFormatError) -> ImageFormatError:
 
     StreamImage reports an absent file as ImageFormatError chained to the FileNotFoundError,
     which names only the path, so that error is kept. Any other is replaced by its
-    WithheldImageError.
+    WithheldImageError, which keeps a framing error's reason and withholds the text of an error
+    with a cause.
     """
     if isinstance(error.__cause__, FileNotFoundError):
         return error
@@ -255,8 +263,9 @@ def ReportedImageError(error: ImageFormatError) -> ImageFormatError:
 def ImageErrorMessage(spec: LoaderSpec, imagePath: Path, error: ImageFormatError) -> str:
     """Return the exit-12 text of error, an ImageFormatError ReportedImageError returned.
 
-    The error kept for an absent file is named as a missing image; any other, being withheld,
-    gives its path, record number and withheld reason as the rejection.
+    The error kept for an absent file is named as a missing image; any other gives its path,
+    record number and reason as the rejection: a framing error's own fixed-text reason, or the
+    withheld reason of an error with a cause.
     """
     if isinstance(error.__cause__, FileNotFoundError):
         return IMAGE_NOT_FOUND_TEMPLATE.format(dataset=spec.dataset, path=imagePath)
@@ -273,9 +282,10 @@ def MappedLoadErrors(spec: LoaderSpec, imagePath: Path) -> Iterator[None]:
     violation at commit, so the context encloses StreamImage and the whole transaction, and
     each error reaches it after the transaction has rolled back. A missing image and an
     integrity violation are chained to their error. A malformed or undecodable image is
-    chained to the withheld ImageFormatError its message reports, so neither the message nor a
-    rendered traceback quotes the refused record's text. JobFailure and every other error
-    propagate unchanged, for batch_chain to record.
+    chained to the ImageFormatError its message reports, which keeps only a framing error's
+    fixed-text reason and withholds any other's, so neither the message nor a rendered
+    traceback quotes the refused record's text. JobFailure and every other error propagate
+    unchanged, for batch_chain to record.
     """
     try:
         yield

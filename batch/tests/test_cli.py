@@ -8,16 +8,20 @@ and 0.9.4 (runtime verification), define it:
 
 - ``carddemo-batch --help`` lists run-all, seed-all, job and load; ``job --help`` and
   ``load --help`` list every documented job and loader name, and ``python -m batch.cli`` serves
-  the same surface.
+  the same surface. Every help page ends with the environment variables batch reads, the exit
+  statuses and examples that parse.
 - Legacy JCL member names (POSTTRAN, ACCTFILE, TRANTYPE ...) are hidden aliases accepted in any
   letter case, and the run history records the job under its JCL name.
-- Malformed --run-date, --occurrence and --as-of values are usage errors, exit 2, and record no
-  run.
+- Malformed --run-date, --occurrence, --as-of and --start-at values are usage errors, exit 2,
+  and record no run.
 - A usage error never shows a typed 16-digit card number unmasked (Section 0.6.5).
 - A relative CARDDEMO_EBCDIC_DIR or CARDDEMO_OUTPUT_DIR resolves against the repository root,
   whatever directory the command starts in.
 - A database error before any step, such as an unmigrated database's missing relation, exits
-  12 with one DATABASE ERROR line naming its classes and SQLSTATE, and no traceback.
+  12 with one DATABASE ERROR line naming its classes and SQLSTATE, and no traceback. A file
+  error there, such as a directory where catalog recovery expects a generation file or an orphan
+  .part, exits 12 with one FILE ERROR line naming its class, errno symbol and path, the path's
+  non-printable characters escaped and its card number masked.
 
 The database tests start from the restored seed state of the batchEnvironment fixture, where
 the Alembic seed cycle is OPEN with steps 1-5 and 7-12 COMPLETED.
@@ -25,6 +29,7 @@ the Alembic seed cycle is OPEN with steps 1-5 and 7-12 COMPLETED.
 
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -38,6 +43,7 @@ from app.core.paths import REPO_ROOT
 from app.models import JOB_RUNS, Account, Transaction, TransactionType
 from sqlalchemy import Engine, Table, select, text, update
 
+from batch import cli
 from batch.orchestration import run_ledger
 from batch.orchestration.job_context import EXIT_FAILURE, EXIT_OK, EXIT_REJECTS, JobContext
 from batch.tests.conftest import (
@@ -133,9 +139,30 @@ HELP_CASES = (
     HelpCase(("load", "daily-transactions"), ("--daily-file", "--encoding")),
 )
 HELP_CASE_IDS = ["-".join(case.arguments) for case in HELP_CASES]
+# The epilog every help page ends with: its block headings, two of the variables BatchSettings
+# reads, and examples that are carddemo-batch command lines.
+EPILOG_HEADINGS = ("Environment:", "Exit status:", "Examples:")
+EPILOG_VARIABLES = ("SYNC_DATABASE_URL", "CARDDEMO_OUTPUT_DIR")
+EXAMPLE_COMMAND_PREFIX = "carddemo-batch "
+EXECUTE_COMMAND_NAME = "ExecuteCommand"
+# One help page of each kind: the top level, both chain commands, both groups, a job, a loader
+# and a legacy JCL alias.
+EPILOG_PAGE_CASES = (
+    (),
+    ("run-all",),
+    ("seed-all",),
+    ("job",),
+    ("load",),
+    ("job", "post-tran"),
+    ("load", "accounts"),
+    ("load", "ACCTFILE"),
+)
+EPILOG_PAGE_IDS = ["-".join(arguments) or "top-level" for arguments in EPILOG_PAGE_CASES]
 
 # --- Click help and usage-error output -----------------------------------------------------------
 COMMANDS_HEADING = "Commands:"
+# Click separates help sections with a blank line; the epilog follows the commands section.
+SECTION_BREAK = "\n\n"
 # Click indents each command entry by two spaces and a wrapped continuation line further.
 ENTRY_INDENT = "  "
 # Click's UsageError exit status: an unknown command or an invalid option value.
@@ -198,6 +225,12 @@ CARD_NUMBER_USAGE_CASES = (
         ZERO_LED_CARD_NUMBER,
         id="occurrence",
     ),
+    pytest.param(
+        ("run-all", "--start-at", TYPED_CARD_NUMBER),
+        INVALID_VALUE_TEMPLATE.format(optionName="--start-at"),
+        TYPED_CARD_NUMBER,
+        id="start-at",
+    ),
 )
 
 # --- Chain steps, run history and generations ----------------------------------------------------
@@ -239,6 +272,31 @@ CLASSIFY_INTERRUPTED_RUNS_NAME = "ClassifyInterruptedRuns"
 MISSING_RELATION_STATEMENT = text("SELECT 1 FROM batch.no_such_table")
 UNDEFINED_TABLE_ERROR_LINE = "DATABASE ERROR ProgrammingError (UndefinedTable) SQLSTATE 42P01"
 TRACEBACK_TEXT = "Traceback"
+# A directory standing where catalog recovery opens or deletes a file. The seed state catalogs
+# no generation, so TRANBKP step 6 commits TRANSACT.BKUP generation 1, whose publication then
+# fails on the directory at its final path and leaves the row COMMITTED for the next command.
+# No row catalogs SYSTRAN generation 50, so its .part is an orphan the next command deletes.
+EISDIR_FILE_ERROR_TEXT = "FILE ERROR IsADirectoryError ERRNO EISDIR"
+FIRST_GENERATION_FILE = "G0001V00.dat"
+ORPHAN_PART_FILE = "G0050V00.dat.part"
+PRELUDE_FILE_ERROR_CASES = (
+    pytest.param(
+        Path(TRANSACT_BKUP_BASE, FIRST_GENERATION_FILE),
+        ("job", "tran-backup", "--occurrence", "1"),
+        ("job", "tran-index"),
+        id="committed-generation-path",
+    ),
+    pytest.param(
+        Path(SYSTRAN_BASE, ORPHAN_PART_FILE), (), ("load", "tran-types"), id="orphan-part"
+    ),
+)
+# An orphan .part directory whose name holds a line feed before forged ERROR text, a card number,
+# a carriage return and an ANSI colour escape, and the name as its FILE ERROR line shows it:
+# each control character as its escape and the card number masked.
+FORGED_LOG_TEXT = "ERROR forged-recovery-success"
+HOSTILE_PART_FILE = f"G0050\n{FORGED_LOG_TEXT} {TYPED_CARD_NUMBER}\r\x1b[31m.dat.part"
+SHOWN_HOSTILE_PART_FILE = f"G0050\\n{FORGED_LOG_TEXT} {MASKED_CARD_NUMBER}\\r\\x1b[31m.dat.part"
+RAW_CONTROL_CHARACTERS = ("\r", "\x1b")
 
 
 @dataclass(frozen=True)
@@ -272,10 +330,12 @@ LOAD_ALIAS_CASES = (
 def ListedCommands(helpOutput: str) -> list[str]:
     """Return the command names a Click help page lists under "Commands:", in listed order.
 
-    Only a line indented by exactly two spaces starts an entry; a deeper one continues it. A
-    page with no commands section gives [].
+    Only the commands section is read: it ends at its first blank line, where the epilog, also
+    indented, begins. Only a line indented by exactly two spaces starts an entry; a deeper one
+    continues it. A page with no commands section gives [].
     """
-    commandLines = helpOutput.partition(COMMANDS_HEADING)[2].splitlines()
+    commandsSection = helpOutput.partition(COMMANDS_HEADING)[2].partition(SECTION_BREAK)[0]
+    commandLines = commandsSection.splitlines()
     return [
         line.split()[0]
         for line in commandLines
@@ -346,6 +406,15 @@ def RemoveTreeIfPresent(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def RemoveDirectoryIfEmpty(path: Path) -> None:
+    """Delete a directory a test caused to exist, only while it holds no entry.
+
+    A directory that is absent, or that holds any file or subdirectory, is left as it is.
+    """
+    if path.is_dir() and not any(path.iterdir()):
+        path.rmdir()
+
+
 def QueryMissingRelation(context: JobContext) -> int:
     """Stand in for ClassifyInterruptedRuns, failing as it does on an unmigrated database.
 
@@ -364,13 +433,21 @@ def RelativeOutputDir(
 
     Requested after batchEnvironment, so this value overrides that fixture's absolute one. The
     copy under backend/ exists only if the CLI resolved against its working directory.
+
+    A var/ under the root or backend/ that was absent before the test is also deleted when it
+    is left empty, so the run leaves nothing in the checkout. A var/ that existed before the
+    test, or that holds anything else (such as var/batch-output), is kept.
     """
     directoryName = RELATIVE_OUTPUT_PREFIX + secrets.token_hex(OUTPUT_TOKEN_BYTES)
     relativeDir = Path(VAR_DIRECTORY, directoryName)
+    varDirs = (REPO_ROOT / VAR_DIRECTORY, BACKEND_DIR / VAR_DIRECTORY)
+    absentVarDirs = [varDir for varDir in varDirs if not varDir.exists()]
     monkeypatch.setenv(OUTPUT_DIR_VARIABLE, relativeDir.as_posix())
     yield relativeDir
     RemoveTreeIfPresent(REPO_ROOT / relativeDir)
     RemoveTreeIfPresent(BACKEND_DIR / relativeDir)
+    for varDir in absentVarDirs:
+        RemoveDirectoryIfEmpty(varDir)
 
 
 # --- Phase 1: help and naming --------------------------------------------------------------------
@@ -422,6 +499,32 @@ def test_command_help_lists_its_documented_options(helpCase: HelpCase) -> None:
         assert optionName in outcome.output
     for optionName in helpCase.absentOptions:
         assert optionName not in outcome.output
+
+
+@pytest.mark.parametrize("pageArguments", EPILOG_PAGE_CASES, ids=EPILOG_PAGE_IDS)
+def test_every_help_page_shows_environment_exit_statuses_and_examples(
+    pageArguments: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each help page ends with the variables batch reads, the exit statuses and examples.
+
+    Every example the page shows parses: with ExecuteCommand replaced, so nothing runs, each one
+    reaches its command and exits 0, where a usage error would exit 2.
+    """
+    outcome = InvokeCli([*pageArguments, HELP_OPTION])
+    assert outcome.exitCode == EXIT_OK, outcome.output
+    pageLines = [line.strip() for line in outcome.output.splitlines()]
+    for heading in EPILOG_HEADINGS:
+        assert heading in pageLines
+    for variableName in EPILOG_VARIABLES:
+        assert variableName in outcome.output
+    exampleLines = [line for line in pageLines if line.startswith(EXAMPLE_COMMAND_PREFIX)]
+    assert exampleLines, outcome.output
+    invocations: list[cli.CommandInvocation] = []
+    monkeypatch.setattr(cli, EXECUTE_COMMAND_NAME, invocations.append)
+    for exampleLine in exampleLines:
+        exampleOutcome = InvokeCli(shlex.split(exampleLine)[1:])
+        assert exampleOutcome.exitCode == EXIT_OK, exampleLine + "\n" + exampleOutcome.output
+    assert len(invocations) == len(exampleLines)
 
 
 # --- Phase 2: legacy JCL aliases -----------------------------------------------------------------
@@ -544,8 +647,9 @@ def test_usage_error_never_shows_a_typed_card_number(
 
     Click prints it before ConfigureLogging installs the masking filter, so the top-level group
     masks it: a repeated operand reads as twelve asterisks and its last four digits, and the
-    --as-of, --run-date and --occurrence rules do not repeat the value at all. The digits the
-    mask hides never appear, not even as the shorter run int() leaves of a zero-led operand.
+    --as-of, --run-date, --occurrence and --start-at rules do not repeat the value at all. The
+    digits the mask hides never appear, not even as the shorter run int() leaves of a zero-led
+    operand.
     """
     hiddenDigits = typedCardNumber.lstrip("0")[:-4]
     outcome = InvokeCli(arguments)
@@ -612,5 +716,68 @@ def test_prelude_database_error_exits_12_naming_classes_and_sqlstate(
     assert outcome.exitCode == EXIT_FAILURE, outcome.output
     assert UNDEFINED_TABLE_ERROR_LINE in outcome.output
     assert TRACEBACK_TEXT not in outcome.output
+    assert CountJobRuns(engine) == runsBefore
+    assert not IsBatchWindowHeld(engine)
+
+
+@pytest.mark.parametrize(
+    ("obstructedPath", "setupArguments", "failingArguments"), PRELUDE_FILE_ERROR_CASES
+)
+def test_prelude_file_error_exits_12_naming_class_errno_and_path(
+    batchEnvironment: BatchEnvironment,
+    obstructedPath: Path,
+    setupArguments: tuple[str, ...],
+    failingArguments: tuple[str, ...],
+) -> None:
+    """A directory where the prelude's catalog recovery expects a file gives exit 12.
+
+    gdg.ReconcileCatalog meets the directory while it hashes a COMMITTED generation's final
+    file, or deletes an orphan .part. One ERROR line names the class, errno symbol and path,
+    through the masked logging path rather than a traceback. No run is recorded, and the
+    window is released. The setup command, when there is one, leaves the generation COMMITTED.
+    """
+    engine = batchEnvironment.engine
+    obstruction = batchEnvironment.outputDir / GDG_DIRECTORY / obstructedPath
+    obstruction.mkdir(parents=True)
+    if setupArguments:
+        setupOutcome = InvokeCli(setupArguments)
+        assert setupOutcome.exitCode == EXIT_FAILURE, setupOutcome.output
+        assert EISDIR_FILE_ERROR_TEXT in setupOutcome.output
+    runsBefore = CountJobRuns(engine)
+    outcome = InvokeCli(failingArguments)
+    assert outcome.exitCode == EXIT_FAILURE, outcome.output
+    assert outcome.output.count(f"{EISDIR_FILE_ERROR_TEXT} ON {obstruction}") == 1, outcome.output
+    assert TRACEBACK_TEXT not in outcome.output
+    assert CountJobRuns(engine) == runsBefore
+    assert not IsBatchWindowHeld(engine)
+
+
+def test_prelude_file_error_escapes_control_characters_and_masks_card_number_in_path(
+    batchEnvironment: BatchEnvironment,
+) -> None:
+    """A file name's control characters are escaped in its one FILE ERROR line, its PAN masked.
+
+    The orphan .part directory's name holds a line feed before forged ERROR text, a carriage
+    return and an ANSI escape, so a path shown verbatim would split the line and forge a second
+    one. The FILE ERROR line ends with the name instead, each control character escaped and the
+    card number masked. No run is recorded, and the window is released. Failure messages show
+    the output through ascii(), so no raw escape reaches the terminal.
+    """
+    engine = batchEnvironment.engine
+    systranDir = batchEnvironment.outputDir / GDG_DIRECTORY / SYSTRAN_BASE
+    (systranDir / HOSTILE_PART_FILE).mkdir(parents=True)
+    runsBefore = CountJobRuns(engine)
+    outcome = InvokeCli(["load", "tran-types"])
+    shownOutput = ascii(outcome.output)
+    assert outcome.exitCode == EXIT_FAILURE, shownOutput
+    outputLines = outcome.output.splitlines()
+    fileErrorLines = [line for line in outputLines if EISDIR_FILE_ERROR_TEXT in line]
+    assert len(fileErrorLines) == 1, shownOutput
+    shownLineEnd = f"{EISDIR_FILE_ERROR_TEXT} ON {systranDir}/{SHOWN_HOSTILE_PART_FILE}"
+    assert fileErrorLines[0].endswith(shownLineEnd), shownOutput
+    assert not any(line.startswith(FORGED_LOG_TEXT) for line in outputLines), shownOutput
+    assert not any(character in outcome.output for character in RAW_CONTROL_CHARACTERS)
+    assert TYPED_CARD_NUMBER not in outcome.output, shownOutput
+    assert TRACEBACK_TEXT not in outcome.output, shownOutput
     assert CountJobRuns(engine) == runsBefore
     assert not IsBatchWindowHeld(engine)

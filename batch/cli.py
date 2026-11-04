@@ -23,9 +23,11 @@ carddemo-batch load LOADER_NAME
 Replace STEP with a chain step number from 1 to 18 or a job name, JOB_NAME with a processing
 job such as post-tran, OCCURRENCE with 1 or 2 (tran-backup only), and LOADER_NAME with a loader
 such as accounts. Legacy JCL names such as POSTTRAN and ACCTFILE are accepted in any letter
-case. Each command's --help lists its options.
+case. Each command's --help lists its options, and every help page ends with the environment
+variables batch reads, the exit statuses and examples (HelpEpilog).
 """
 
+import errno
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -49,10 +51,13 @@ from batch.orchestration import gdg, run_ledger
 from batch.orchestration.batch_chain import (
     LOADER_JOB_NAMES,
     PROCESSING_JOB_NAMES,
+    START_AT_RULE_MESSAGE,
     UNKNOWN_CODE,
     ChainOptions,
     FindJobDefinition,
     JobRequest,
+    ParseStartAt,
+    PrintableText,
     RunChain,
     RunSeedAll,
     RunStandaloneJob,
@@ -79,12 +84,19 @@ LOGGER = logging.getLogger(__name__)
 # message or a rejected setting value: only exception class names, SQLSTATEs and setting names
 # are logged. DATABASE ERROR names a database error that no step mapped to an exit status, for
 # example a missing relation in an unmigrated database: its wrapper class, driver class and
-# SQLSTATE, UNKNOWN_CODE standing in for either one the driver did not supply.
+# SQLSTATE, UNKNOWN_CODE standing in for either one the driver did not supply. FILE ERROR names
+# a file error that no step mapped, for example a directory where catalog recovery expects a
+# generation file or an orphan .part: its class, its errno symbol (UNKNOWN_CODE when it has
+# none) and the path it names, the one the operator repairs, but never the OS error text. The
+# path is shown with every non-printable character escaped, so it stays on the one line.
 DATABASE_UNAVAILABLE_MESSAGE = "DATABASE NOT AVAILABLE"
 DATABASE_ERROR_MESSAGE = "DATABASE ERROR"
+FILE_ERROR_MESSAGE = "FILE ERROR"
 SETTINGS_INVALID_MESSAGE = "BATCH SETTINGS INVALID"
 DATABASE_UNAVAILABLE_LOG = DATABASE_UNAVAILABLE_MESSAGE + " (%s)"
 DATABASE_ERROR_LOG = DATABASE_ERROR_MESSAGE + " %s (%s) SQLSTATE %s"
+FILE_ERROR_LOG = FILE_ERROR_MESSAGE + " %s ERRNO %s"
+FILE_ERROR_PATH_LOG = FILE_ERROR_LOG + " ON %s"
 SETTINGS_INVALID_LOG = SETTINGS_INVALID_MESSAGE + ": %d error(s) in %s"
 SETTINGS_INVALID_DETAIL_LOG = SETTINGS_INVALID_MESSAGE + ": %s"
 SETTING_NAME_SEPARATOR = ", "
@@ -151,6 +163,67 @@ class MaskedUsageErrorGroup(TyperGroup):
             raise
 
 
+# The epilog every help page ends with: the variables BatchSettings reads, the exit statuses
+# and the page's examples. Click rewraps a help paragraph to the terminal width unless its first
+# line is "\b", a backspace it drops from the output, so each paragraph below opens with one
+# and keeps its columns. Every line fits 76 columns with the epilog's indentation.
+ENVIRONMENT_EPILOG = """\b
+Environment:
+  Process variables override backend/.env under the repository root, and
+  relative directories resolve against the repository root. SECRET_KEY is
+  not needed.
+
+\b
+  SYNC_DATABASE_URL    psycopg2 database URL; required, no default
+  CARDDEMO_OUTPUT_DIR  GDG archives, statements; default var/batch-output
+  CARDDEMO_EBCDIC_DIR  EBCDIC seed images; default data/EBCDIC
+  CARDDEMO_ASCII_DIR   ASCII seed images; default data/ASCII
+  APP_ENV              local (default), test or production; production
+                       makes load init-users exit 12
+  BCRYPT_ROUNDS        bcrypt cost of load init-users, 4-31; default 12"""
+EXIT_STATUS_EPILOG = """\b
+Exit status:
+  0   success
+  4   POSTTRAN rejected records; a chain continues
+  12  refusal or recoverable failure; a chain stops
+  16  abend; a chain stops
+  2   usage error: unknown command or option, or invalid option value"""
+EXAMPLES_HEADING = "\b\nExamples:"
+EXAMPLE_PREFIX = "  carddemo-batch "
+EPILOG_PARAGRAPH_BREAK = "\n\n"
+EPILOG_LINE_BREAK = "\n"
+
+# The examples of the top-level, job and load help pages: each is the command line after
+# carddemo-batch, and every one parses.
+APP_EXAMPLES = (
+    "seed-all",
+    "run-all --start-at POSTTRAN --as-of 2022-07-18T00:00:00",
+    "job tran-backup --occurrence 1",
+    "load accounts --encoding ascii",
+)
+JOB_GROUP_EXAMPLES = (
+    "job post-tran --as-of 2022-07-18T00:00:00",
+    "job interest-calc --run-date 2022071800",
+    "job tran-backup --occurrence 2 --force",
+)
+LOAD_GROUP_EXAMPLES = (
+    "load accounts --encoding ascii",
+    "load daily-transactions --daily-file PATH",
+    "load init-users",
+)
+
+
+def HelpEpilog(examples: tuple[str, ...]) -> str:
+    """Return a help page's epilog: the environment and exit-status blocks, then its examples.
+
+    Each example is a command line without its leading carddemo-batch, which is added here.
+    """
+    exampleLines = [EXAMPLES_HEADING, *(EXAMPLE_PREFIX + example for example in examples)]
+    return EPILOG_PARAGRAPH_BREAK.join(
+        (ENVIRONMENT_EPILOG, EXIT_STATUS_EPILOG, EPILOG_LINE_BREAK.join(exampleLines))
+    )
+
+
 # Plain Click help and error output (rich_markup_mode=None): help text is never read as Rich
 # markup, and the output stays the same in a terminal, a pipe and a test runner. Tracebacks of
 # unexpected errors never show local variables, which hold the settings and fetched rows. Usage
@@ -160,6 +233,7 @@ APP = typer.Typer(
     cls=MaskedUsageErrorGroup,
     help="CardDemo batch jobs: the chain, the loaders and the processing jobs, run in the"
     " batch window.",
+    epilog=HelpEpilog(APP_EXAMPLES),
     no_args_is_help=True,
     add_completion=False,
     context_settings=NORMALIZED_CONTEXT,
@@ -176,11 +250,13 @@ APP.add_typer(
     JOB_APP,
     name="job",
     help="Run one processing job as its step of the OPEN cycle.",
+    epilog=HelpEpilog(JOB_GROUP_EXAMPLES),
 )
 APP.add_typer(
     LOAD_APP,
     name="load",
     help="Run one loader, recorded against its step of the OPEN cycle when there is one.",
+    epilog=HelpEpilog(LOAD_GROUP_EXAMPLES),
 )
 
 # The help of every command; each names the legacy job it replaces.
@@ -204,6 +280,38 @@ COMMAND_HELP = {
     "tran-cat-balances": "TCATBALF: replace the category balances from the TCATBALF image.",
     "init-users": "DUSRSECJ: replace the users from USRSEC.PS, passwords hashed (EBCDIC only).",
     DAILY_TRANSACTIONS_LOADER: "DALYTRAN: stage the daily transaction file for POSTTRAN.",
+}
+
+# The examples of every command's help page, keyed like COMMAND_HELP: each is the command line
+# after carddemo-batch, using only options the command takes, and every one parses. A legacy JCL
+# alias shows its command's examples.
+COMMAND_EXAMPLES = {
+    "run-all": (
+        "run-all",
+        "run-all --new-cycle",
+        "run-all --start-at POSTTRAN --as-of 2022-07-18T00:00:00",
+    ),
+    "seed-all": ("seed-all", "seed-all --daily-file PATH"),
+    POST_TRAN_JOB: ("job post-tran", "job post-tran --as-of 2022-07-18T00:00:00"),
+    INTEREST_CALC_JOB: ("job interest-calc --run-date 2022071800", "job interest-calc --force"),
+    TRAN_BACKUP_JOB: ("job tran-backup", "job tran-backup --occurrence 2 --force"),
+    COMB_TRAN_JOB: ("job comb-tran", "job comb-tran --force"),
+    STATEMENT_GEN_JOB: ("job statement-gen", "job statement-gen --force"),
+    TRAN_INDEX_JOB: ("job tran-index", "job tran-index --force"),
+    "accounts": ("load accounts", "load accounts --encoding ascii"),
+    "cards": ("load cards", "load cards --encoding ascii"),
+    "customers": ("load customers", "load customers --encoding ascii"),
+    "card-xref": ("load card-xref", "load card-xref --encoding ascii"),
+    "transactions": ("load transactions", "load transactions --source-dir data/EBCDIC"),
+    "tran-types": ("load tran-types", "load tran-types --encoding ascii"),
+    "tran-categories": ("load tran-categories", "load tran-categories --encoding ascii"),
+    "disclosure-groups": ("load disclosure-groups", "load disclosure-groups --encoding ascii"),
+    "tran-cat-balances": ("load tran-cat-balances", "load tran-cat-balances --encoding ascii"),
+    "init-users": ("load init-users", "load init-users --source-dir data/EBCDIC"),
+    DAILY_TRANSACTIONS_LOADER: (
+        "load daily-transactions --daily-file PATH",
+        "load daily-transactions --encoding ascii",
+    ),
 }
 
 
@@ -238,6 +346,22 @@ def ParseOccurrenceOption(text: str) -> int:
         return JobParameters(occurrence=int(text)).occurrence
     except ValueError as error:
         raise typer.BadParameter(OCCURRENCE_RULE_MESSAGE) from error
+
+
+def ParseStartAtOption(text: str) -> str:
+    """Return a --start-at STEP the chain resolves; any other value is a usage error, exit 2.
+
+    The rule is ParseStartAt's own: a step number in the chain, leading zeros allowed, or a job
+    or loader name or JCL alias in any letter case. The text is returned unchanged, so RunChain
+    resolves it, TRANBKP's first incomplete occurrence included, as for a ChainOptions built in
+    code. The refusal states the rule without repeating the value, before the settings load,
+    the database is reached or the batch window is taken.
+    """
+    try:
+        ParseStartAt(text)
+    except KeyError as error:
+        raise typer.BadParameter(START_AT_RULE_MESSAGE) from error
+    return text
 
 
 # Option declarations shared by several commands. Every name is declared explicitly, and the
@@ -349,6 +473,37 @@ def LogDatabaseError(error: DBAPIError) -> None:
     LOGGER.error(DATABASE_ERROR_LOG, type(error).__name__, driverClass, sqlState)
 
 
+def LogFileError(error: OSError) -> None:
+    """Log a file error by its class, errno symbol and the path it names, if any, at ERROR.
+
+    Never str(error) or its strerror, which batch_chain.DescribeIoError leaves out too: only
+    names reach the log, as the batch diagnostics policy of batch/db.py requires. The path is
+    the one the operator repairs, such as a directory standing where catalog recovery expects
+    a generation file. Anyone who can write to the output directory chooses its name, so the
+    path, a str, bytes, path-like or file descriptor, is shown with every non-printable
+    character escaped: a line break or terminal escape in it neither splits the line nor forges
+    another. The logging filter then masks a card number in it as in any other line.
+    """
+    errnoName = errno.errorcode.get(error.errno, UNKNOWN_CODE) if error.errno else UNKNOWN_CODE
+    errorClass = type(error).__name__
+    if error.filename is None:
+        LOGGER.error(FILE_ERROR_LOG, errorClass, errnoName)
+        return
+    LOGGER.error(FILE_ERROR_PATH_LOG, errorClass, errnoName, PrintableText(str(error.filename)))
+
+
+def BuildCommandContext(
+    settings: BatchSettings, engine: Engine, invocation: CommandInvocation
+) -> JobContext:
+    """Return the context a command's prelude and action share, before any run is started."""
+    return JobContext(
+        engine=engine,
+        settings=settings,
+        clock=Clock(invocation.asOf),
+        parameters=invocation.parameters,
+    )
+
+
 def RunInBatchWindow(settings: BatchSettings, engine: Engine, invocation: CommandInvocation) -> int:
     """Run the invocation's prelude and action inside the batch window; return its status.
 
@@ -357,14 +512,11 @@ def RunInBatchWindow(settings: BatchSettings, engine: Engine, invocation: Comman
     its lock timeout, or a database that cannot be reached, gives EXIT_FAILURE. So does any
     other database error that neither the prelude nor the action mapped to a status, such as
     the missing relations of an unmigrated database: it is logged by class and SQLSTATE only.
+    A file error neither mapped, such as a directory where catalog recovery expects a generation
+    file or an orphan .part, gives EXIT_FAILURE too, logged by class, errno symbol and path.
     In each case BatchWindow has then already released whatever it held.
     """
-    context = JobContext(
-        engine=engine,
-        settings=settings,
-        clock=Clock(invocation.asOf),
-        parameters=invocation.parameters,
-    )
+    context = BuildCommandContext(settings, engine, invocation)
     try:
         with BatchWindow(settings):
             run_ledger.ClassifyInterruptedRuns(context)
@@ -378,6 +530,9 @@ def RunInBatchWindow(settings: BatchSettings, engine: Engine, invocation: Comman
         return EXIT_FAILURE
     except DBAPIError as error:
         LogDatabaseError(error)
+        return EXIT_FAILURE
+    except OSError as error:
+        LogFileError(error)
         return EXIT_FAILURE
 
 
@@ -419,7 +574,9 @@ def ExecuteLoad(loaderName: str, parameters: JobParameters) -> None:
     )
 
 
-@APP.command("run-all", help=COMMAND_HELP["run-all"])
+@APP.command(
+    "run-all", help=COMMAND_HELP["run-all"], epilog=HelpEpilog(COMMAND_EXAMPLES["run-all"])
+)
 def RunAllCommand(
     newCycle: Annotated[
         bool,
@@ -429,6 +586,7 @@ def RunAllCommand(
         str | None,
         typer.Option(
             "--start-at",
+            parser=ParseStartAtOption,
             metavar="STEP",
             help="Resume the OPEN cycle at a step number 1-18 or a job name; for TRANBKP, its"
             " first incomplete occurrence. A new cycle starts at step 1.",
@@ -450,7 +608,9 @@ def RunAllCommand(
 
 # seed-all takes no --encoding: the TRANFILE and DUSRSECJ images exist in EBCDIC only, so an
 # ASCII seed-all could only abandon the OPEN cycle, reload steps 1-4 and stop at step 5.
-@APP.command("seed-all", help=COMMAND_HELP["seed-all"])
+@APP.command(
+    "seed-all", help=COMMAND_HELP["seed-all"], epilog=HelpEpilog(COMMAND_EXAMPLES["seed-all"])
+)
 def SeedAllCommand(
     sourceDir: SOURCE_DIR_OPTION = None, dailyFile: DAILY_FILE_OPTION = None
 ) -> None:
@@ -541,12 +701,14 @@ def LoadCommandFor(loaderName: str) -> Callable[..., None]:
 def RegisterCommand(group: typer.Typer, canonicalName: str, function: Callable[..., None]) -> None:
     """Register a command under its canonical name and, hidden, under its legacy JCL names.
 
-    Aliases are registered lowercase; NORMALIZED_CONTEXT lowercases what the operator types.
+    Aliases are registered lowercase; NORMALIZED_CONTEXT lowercases what the operator types. An
+    alias shares its command's help and epilog, so only its usage line differs.
     """
     helpText = COMMAND_HELP[canonicalName]
-    group.command(canonicalName, help=helpText)(function)
+    epilogText = HelpEpilog(COMMAND_EXAMPLES[canonicalName])
+    group.command(canonicalName, help=helpText, epilog=epilogText)(function)
     for alias in FindJobDefinition(canonicalName).aliases:
-        group.command(alias.lower(), help=helpText, hidden=True)(function)
+        group.command(alias.lower(), help=helpText, epilog=epilogText, hidden=True)(function)
 
 
 JOB_COMMANDS = {

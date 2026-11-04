@@ -18,8 +18,10 @@ exceed LOGIN_MAX_ATTEMPTS, and an attempt over the limit waits for the checks in
 - once the lock has expired the correct password signs on and deletes the row, and a wrong one
     restarts the count at one;
 - a success after one failure short of the limit deletes the row;
-- the blank-field edits (``Please enter User ID ...``, ``Please enter Password ...``) count
-    once each, so LOGIN_MAX_ATTEMPTS of them lock the ID;
+- each blank-password edit (``Please enter Password ...``) counts one failure, so
+    LOGIN_MAX_ATTEMPTS of them lock the ID;
+- a blank user ID (``Please enter User ID ...``) is answered before the throttle, so however
+    many are sent it is never counted, never refused with 429 and never checks a password;
 - an attempt still waiting at the throttle's wait limit answers 503
     ``Unable to verify the User ...``, uncounted and unchecked;
 - an admitted attempt whose USRSEC read or reset fails answers that 503 and counts one failure;
@@ -86,7 +88,7 @@ FILE_ERROR_STATUS = 503
 SIGNED_ON_STATUS = 200
 NO_MESSAGE = ""
 NO_FIELD = ""
-# A blank map field: empty, or spaces only. A blank user ID is throttled as the blank ID.
+# A blank map field: empty, or spaces only. A blank user ID is never throttled: no row is keyed.
 BLANK_FIELD = ""
 SPACES_FIELD = "        "
 # The no-failure row an admission inserts, left by an attempt whose failure write failed.
@@ -320,8 +322,13 @@ def LowerCaseUserIdAttempt(harness: ThrottleHarness) -> AttemptInput:
 
 
 def BlankUserIdAttempt(harness: ThrottleHarness) -> AttemptInput:
-    """An empty user ID field with the generated user's password; counted as the blank ID."""
+    """An empty user ID field with the generated user's password; the blank ID is never keyed."""
     return AttemptInput(BLANK_FIELD, harness.user.password, BLANK_FIELD)
+
+
+def SpacesUserIdAttempt(harness: ThrottleHarness) -> AttemptInput:
+    """A user ID field of spaces only with the generated user's password; never keyed either."""
+    return AttemptInput(SPACES_FIELD, harness.user.password, BLANK_FIELD)
 
 
 class BlankFieldCase(NamedTuple):
@@ -388,9 +395,10 @@ FAILED_OPERATION_IDS = ["usrsec-read", "reset-delete"]
 BLANK_FIELD_CASES = [
     BlankFieldCase(BlankPasswordAttempt, BLANK_CREDENTIAL_OUTCOME, CorrectPasswordAttempt),
     BlankFieldCase(SpacesPasswordAttempt, BLANK_CREDENTIAL_OUTCOME, CorrectPasswordAttempt),
-    BlankFieldCase(BlankUserIdAttempt, BLANK_USER_ID_OUTCOME, BlankUserIdAttempt),
 ]
-BLANK_FIELD_CASE_IDS = ["empty-password", "spaces-password", "empty-user-id"]
+BLANK_FIELD_CASE_IDS = ["empty-password", "spaces-password"]
+BLANK_USER_ID_ATTEMPTS = [BlankUserIdAttempt, SpacesUserIdAttempt]
+BLANK_USER_ID_ATTEMPT_IDS = ["empty-user-id", "spaces-user-id"]
 
 
 @pytest_asyncio.fixture(name="throttle")
@@ -577,10 +585,10 @@ async def test_success_one_failure_short_of_the_limit_deletes_the_row(throttle, 
 
 
 @pytest.mark.parametrize("blankFieldCase", BLANK_FIELD_CASES, ids=BLANK_FIELD_CASE_IDS)
-async def test_blank_field_edits_count_once_each_and_lock_the_id(
+async def test_blank_password_edits_count_once_each_and_lock_the_id(
     throttle, syncEngine, blankFieldCase
 ):
-    """Each blank-field edit adds exactly one; the edit that reaches the limit locks the ID."""
+    """Each blank-password edit adds exactly one; the edit that reaches the limit locks the ID."""
     attemptInput = blankFieldCase.buildAttempt(throttle)
     for attemptNumber in range(1, throttle.settings.LOGIN_MAX_ATTEMPTS + 1):
         assert await throttle.Attempt(attemptInput) == blankFieldCase.outcome
@@ -588,6 +596,20 @@ async def test_blank_field_edits_count_once_each_and_lock_the_id(
         assert storedRow.failureCount == attemptNumber
     AssertLockedAtTheLimit(throttle.settings, storedRow)
     assert await throttle.Attempt(blankFieldCase.buildProbe(throttle)) == LOCKED_OUTCOME
+    assert throttle.checkSpy.await_count == 0
+
+
+@pytest.mark.parametrize("buildAttempt", BLANK_USER_ID_ATTEMPTS, ids=BLANK_USER_ID_ATTEMPT_IDS)
+async def test_blank_user_id_past_the_limit_is_never_counted_or_refused_with_429(
+    throttle, syncEngine, buildAttempt
+):
+    """Every blank user ID gets its edit literal; the blank ID keeps no row and no marker."""
+    attemptInput = buildAttempt(throttle)
+    attempts = OneOverTheLimit(throttle.settings.LOGIN_MAX_ATTEMPTS)
+    outcomes = [await throttle.Attempt(attemptInput) for _ in range(attempts)]
+    assert outcomes == [BLANK_USER_ID_OUTCOME] * attempts
+    assert StoredAttemptRow(syncEngine, attemptInput.throttledUserId) is None
+    assert CheckMarkersOf(syncEngine, attemptInput.throttledUserId) == 0
     assert throttle.checkSpy.await_count == 0
 
 

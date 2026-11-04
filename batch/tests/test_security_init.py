@@ -10,15 +10,21 @@ The expected values are independent of the production decoder: the fixture users
 legacy_oracle.ReadUsers, which reads the same image with its own copybook offsets. The image
 passwords are read at test time and never written here, and wrong candidates come from
 secrets.token_urlsafe, so this module holds no credential (MK_Modernization Rule, clause 3).
+
+The restored seed already holds the image's users with valid hashes, so every positive load
+first disturbs security.users: one user's last name changes, another's hash becomes that of a
+random secret, and a generated user the image lacks is added. A pass therefore proves the load
+replaced every row: exactly the image's users remain, the extra user is gone, and each stored
+hash is new and verifies its image password.
 """
 
 import secrets
 from collections import Counter
 
 import pytest
-from app.core.security import VerifyPassword
+from app.core.security import HashPassword, VerifyPassword
 from app.models import User
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, insert, select, update
 
 from batch import cli
 from batch.loaders import security_init
@@ -26,6 +32,7 @@ from batch.tests.conftest import (
     APP_ENV_VARIABLE,
     LOADER_ROWS_DIR,
     REPO_ROOT,
+    TEST_BCRYPT_ROUNDS,
     BatchEnvironment,
     CliOutcome,
     CountJobRuns,
@@ -62,6 +69,17 @@ EXPECTED_TYPE_COUNTS = {ADMIN_USER_TYPE: 5, REGULAR_USER_TYPE: 5}
 # Every passlib bcrypt hash starts $2a$, $2b$ or $2y$.
 BCRYPT_HASH_PREFIX = "$2"
 WRONG_CANDIDATE_BYTES = 12
+
+# The restored seed already holds the image's users, so a positive load first makes the table
+# stale: a changed last name, a hash of a random secret and a generated user the image lacks,
+# whose "ZZ" ID prefix no USRSEC ID (ADMIN..., USER...) shares.
+DISTURBED_LAST_NAME = "DISTURBED"
+EXTRA_USER_ID_PREFIX = "ZZ"
+EXTRA_USER_ID_HEX_BYTES = 3
+EXTRA_USER_FIRST_NAME = "EXTRA"
+EXTRA_USER_LAST_NAME = "GENERATED"
+STALE_SECRET_BYTES = 12
+TEST_HASH_ROUNDS = int(TEST_BCRYPT_ROUNDS)
 
 # The two code paths that hash SEC-USR-PWD: the DUSRSECJ loader and Alembic revision 0002.
 LOADER_HASH_SOURCE = "init-users-load"
@@ -110,21 +128,109 @@ def ExpectedUserType(userId: str) -> str:
     return REGULAR_USER_TYPE
 
 
+def RandomSecretHash() -> str:
+    """Return the bcrypt hash of a fresh secrets.token_urlsafe value at the test BCRYPT_ROUNDS."""
+    return HashPassword(secrets.token_urlsafe(STALE_SECRET_BYTES), TEST_HASH_ROUNDS)
+
+
+def ExtraUserRow() -> dict[str, object]:
+    """Return a type U security.users row whose generated 8-character ID the image lacks."""
+    return {
+        "user_id": EXTRA_USER_ID_PREFIX + secrets.token_hex(EXTRA_USER_ID_HEX_BYTES).upper(),
+        "first_name": EXTRA_USER_FIRST_NAME,
+        "last_name": EXTRA_USER_LAST_NAME,
+        "password_hash": RandomSecretHash(),
+        "user_type": REGULAR_USER_TYPE,
+    }
+
+
+def DisturbUsers(engine: Engine, imageUsers: list[dict[str, object]]) -> str:
+    """Make security.users stale against the image in one transaction; return the extra user ID.
+
+    The first image user's last name changes, the second one's hash becomes that of a random
+    secret, and a generated user the image lacks is added.
+    """
+    renamedId, rehashedId = imageUsers[0]["user_id"], imageUsers[1]["user_id"]
+    extraRow = ExtraUserRow()
+    staleHash = RandomSecretHash()
+    with engine.begin() as connection:
+        connection.execute(
+            update(USERS).where(USERS.c.user_id == renamedId).values(last_name=DISTURBED_LAST_NAME)
+        )
+        connection.execute(
+            update(USERS).where(USERS.c.user_id == rehashedId).values(password_hash=staleHash)
+        )
+        connection.execute(insert(USERS).values(extraRow))
+    return extraRow["user_id"]
+
+
+def AssertUsersStale(
+    engine: Engine, imageUsers: list[dict[str, object]], extraUserId: str
+) -> dict[str, str]:
+    """Assert DisturbUsers took effect and return every stored hash, keyed by user_id.
+
+    Results are asserted as booleans, so a failure names user IDs and never a password or hash.
+    """
+    storedHashes = StoredHashes(engine)
+    storedIds = set(storedHashes)
+    rehashedId = imageUsers[1]["user_id"]
+    staleHashVerifies = VerifyPassword(imageUsers[1][IMAGE_SECRET_FIELD], storedHashes[rehashedId])
+    assert CompareUsersWithFixture(engine) != []
+    assert extraUserId in storedIds
+    assert not staleHashVerifies, rehashedId
+    return storedHashes
+
+
+def AssertUsersReplacedFromImage(
+    engine: Engine, imageUsers: list[dict[str, object]], hashesBefore: dict[str, str]
+) -> None:
+    """Assert only the image's users remain, equal to users.csv, each with a fresh valid hash.
+
+    Results are asserted as booleans, so a failure names user IDs and never a password or hash.
+    """
+    storedHashes = StoredHashes(engine)
+    storedIds = sorted(storedHashes)
+    imageIds = sorted(record["user_id"] for record in imageUsers)
+    assert storedIds == imageIds
+    assert CompareUsersWithFixture(engine) == []
+    for record in imageUsers:
+        userId = record["user_id"]
+        hashRewritten = storedHashes[userId] != hashesBefore[userId]
+        hashVerifies = VerifyPassword(record[IMAGE_SECRET_FIELD], storedHashes[userId])
+        assert hashRewritten, userId
+        assert hashVerifies, userId
+
+
+def RunDisturbedInitUsersLoad(engine: Engine) -> None:
+    """Disturb security.users, run `load init-users`, and assert the image replaced every row.
+
+    Bcrypt salts are random, so a hash the load rewrote always differs from the one before it.
+    """
+    imageUsers = ImageUsers()
+    assert len(imageUsers) == EXPECTED_USER_COUNT
+    extraUserId = DisturbUsers(engine, imageUsers)
+    hashesBefore = AssertUsersStale(engine, imageUsers, extraUserId)
+    RunInitUsersLoad()
+    remainingIds = set(StoredHashes(engine))
+    assert extraUserId not in remainingIds
+    AssertUsersReplacedFromImage(engine, imageUsers, hashesBefore)
+
+
 @pytest.fixture(name="hashedUsersEngine", params=HASH_SOURCES)
 def HashedUsersEngine(request: pytest.FixtureRequest, batchEnvironment: BatchEnvironment) -> Engine:
     """Return the engine once security.users holds the hashes of the parametrized code path.
 
-    init-users-load runs `load init-users` over the restored seed; alembic-0002-seed keeps the
-    post-migration rows that revision 0002 hashed.
+    init-users-load disturbs the restored seed and runs `load init-users` over it;
+    alembic-0002-seed keeps the post-migration rows that revision 0002 hashed.
     """
     if request.param == LOADER_HASH_SOURCE:
-        RunInitUsersLoad()
+        RunDisturbedInitUsersLoad(batchEnvironment.engine)
     return batchEnvironment.engine
 
 
 def test_init_users_loads_ten_users_equal_to_fixture(batchEnvironment: BatchEnvironment) -> None:
-    RunInitUsersLoad()
     engine = batchEnvironment.engine
+    RunDisturbedInitUsersLoad(engine)
     typesByUser = {userId: row["user_type"] for userId, row in ReadUserRows(engine).items()}
     assert len(typesByUser) == EXPECTED_USER_COUNT
     assert CompareUsersWithFixture(engine) == []
@@ -204,7 +310,7 @@ def test_init_users_rerun_adds_history_row_for_step_11(batchEnvironment: BatchEn
     for _ in range(RERUN_LOAD_COUNT):
         runCountBefore = CountJobRuns(engine, stepNo=DUSRSECJ_STEP_NO)
         completedBefore = CountJobRuns(engine, DUSRSECJ_STEP_NO, COMPLETED_STATE)
-        RunInitUsersLoad()
+        RunDisturbedInitUsersLoad(engine)
         stepRow = StepRow(engine, DUSRSECJ_STEP_NO)
         assert CountJobRuns(engine, stepNo=DUSRSECJ_STEP_NO) == runCountBefore + 1
         assert CountJobRuns(engine, DUSRSECJ_STEP_NO, COMPLETED_STATE) == completedBefore + 1

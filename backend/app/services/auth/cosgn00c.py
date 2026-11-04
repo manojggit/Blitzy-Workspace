@@ -4,12 +4,14 @@ The CC00 sign-on. ENTER (PROCESS-ENTER-KEY) edits the two map fields in first-fa
 blank user ID, then a blank password, ends validation with its literal. Both inputs are then
 upper-cased, letters a-z only as FUNCTION UPPER-CASE does, for the USRSEC read and the password
 compare of READ-USER-SEC-FILE. Type exactly A opens /admin (XCTL COADM01C); every other type
-opens /menu (XCTL COMEN01C). The login throttle is the one added control. Before any edit, an
-attempt waits for a check slot of the upper-cased ID: a locked user ID answers 429, and the
-failures counted since the last reset plus the checks in flight never exceed
+opens /menu (XCTL COMEN01C). The login throttle is the one added control, keyed by the
+upper-cased user ID. A blank user ID reads no USRSEC record and names no key, so its edit
+answers before the throttle: it is never counted or refused with 429. Every other attempt then
+waits for a check slot of the upper-cased ID before the password edit: a locked user ID answers
+429, and the failures counted since the last reset plus the checks in flight never exceed
 LOGIN_MAX_ATTEMPTS, so an attempt over the limit waits for the outcomes in flight instead of
-answering 429. Every admitted attempt that does not sign on, the blank-field edits and the 503
-included, counts one failure before it answers; a successful one clears the count. The
+answering 429. Every admitted attempt that does not sign on, the blank-password edit and the
+503 included, counts one failure before it answers; a successful one clears the count. The
 blank-field edits, NOTFND and the wrong password answer 401; the WHEN OTHER literal
 ``Unable to verify the User ...`` answers 503. The router issues and clears the
 session cookie, so nothing here creates, returns or logs a token. PF3 of MAIN-PARA is SignOff.
@@ -116,15 +118,26 @@ def UnableToVerifyError() -> LegacyMessageError:
     )
 
 
-def EditRequiredFields(request: LoginRequest) -> None:
-    """Port the EVALUATE TRUE of PROCESS-ENTER-KEY (lines 117-130): the first blank field fails.
+def EditUserIdPresent(request: LoginRequest) -> None:
+    """Port the first WHEN of PROCESS-ENTER-KEY's EVALUATE TRUE (lines 117-122): a blank user ID.
 
-    Raise the 401 failure of a blank user ID, else of a blank password. The attempt holds a
-    check slot of the upper-cased user ID and SignOn counts the failure against it, so a blank
-    password counts against the keyed ID and a blank user ID against the blank ID, once each.
+    Raise the 401 failure of a USERID of SPACES OR LOW-VALUES. SignOn runs this edit before the
+    throttle, so it is never counted or answered with 429. A blank user ID sets ERR-FLG-ON, which
+    skips READ-USER-SEC-FILE (lines 138-140): it checks no password and names no user ID for the
+    throttle, which is keyed by the upper-cased user ID. Counting it would give every blank
+    sign-on one shared key that any client could lock.
     """
     if IsBlank(request.user_id):
         raise SignOnError(USER_ID_REQUIRED_MESSAGE, USER_ID_FIELD)
+
+
+def EditCredentialPresent(request: LoginRequest) -> None:
+    """Port the second WHEN of PROCESS-ENTER-KEY's EVALUATE TRUE (lines 123-127): a blank password.
+
+    Raise the 401 failure of a PASSWD of SPACES OR LOW-VALUES. It runs only once the user ID edit
+    has passed, inside the attempt's check slot, so CheckSignOn counts it once against the
+    upper-cased user ID, and a locked user ID answers the throttle's 429 instead.
+    """
     if IsBlank(request.password):
         raise SignOnError(CREDENTIAL_REQUIRED_MESSAGE, CREDENTIAL_FIELD)
 
@@ -156,7 +169,7 @@ def BuildLoginResponse(userRow: Mapping[str, Any]) -> LoginResponse:
 
 
 async def AcquireSignOnSlot(context: OnlineContext, upperUserId: str) -> login_throttle.CheckSlot:
-    """Wait for a check slot of the upper-cased user ID before any edit runs.
+    """Wait for a check slot of the upper-cased user ID once the user ID edit has passed.
 
     The failures counted since the last reset plus the checks in flight never exceed
     LOGIN_MAX_ATTEMPTS, so concurrent attempts of one ID never check more passwords than that
@@ -243,13 +256,14 @@ async def VerifyUser(
 async def CheckSignOn(
     context: OnlineContext, request: LoginRequest, upperUserId: str, upperCredential: str
 ) -> LoginResponse:
-    """Run the edits, the USRSEC read and compare, and the reset of one admitted attempt.
+    """Run the password edit, the USRSEC read and compare, and the reset of one admitted attempt.
 
-    Every failure, the 503 of USRSEC or of the reset included, counts once against the
-    upper-cased user ID before it is raised again: a 503 is not a sign-on.
+    The user ID edit has already passed. Every failure here, the blank password and the 503 of
+    USRSEC or of the reset included, counts once against the upper-cased user ID before it is
+    raised again: a 503 is not a sign-on.
     """
     try:
-        EditRequiredFields(request)
+        EditCredentialPresent(request)
         userRow = await VerifyUser(context, upperUserId, upperCredential)
         await ClearFailures(context, upperUserId)
     except LegacyMessageError:
@@ -261,17 +275,22 @@ async def CheckSignOn(
 async def SignOn(context: OnlineContext, request: LoginRequest) -> LoginResponse:
     """Port PROCESS-ENTER-KEY (lines 108-140) and READ-USER-SEC-FILE (lines 209-257).
 
-    The attempt first waits for a check slot of the upper-cased ID, so the failures counted
-    since the last reset plus the checks in flight never exceed LOGIN_MAX_ATTEMPTS. The
-    admitted attempt then runs the edits and the check; a failure counts once and a successful
-    sign-on clears the count. The slot is released only after that outcome has committed.
+    The user ID edit runs first, before the throttle: a blank user ID names no key, so it holds
+    no check slot and counts nothing. Any other attempt then waits for a check slot of the
+    upper-cased ID, so the failures counted since the last reset plus the checks in flight never
+    exceed LOGIN_MAX_ATTEMPTS. The admitted attempt then runs the password edit and the check; a
+    failure counts once and a successful sign-on clears the count. The slot is released only
+    after that outcome has committed.
 
     Raises:
-        LegacyMessageError: 429 with the lockout literal while the user ID is locked, counting
-            nothing; 503 with ``Unable to verify the User ...`` when USRSEC or the throttle
-            fails, the batch window and the throttle's wait limit included; 401 with the
-            COSGN00C literal and its cursor field for every other sign-on failure.
+        LegacyMessageError: 401 ``Please enter User ID ...`` for a blank user ID, answered
+            before the throttle, counting nothing and never refused with 429; 429 with the
+            lockout literal while the user ID is locked, counting nothing; 503 with
+            ``Unable to verify the User ...`` when USRSEC or the throttle fails, the batch
+            window and the throttle's wait limit included; 401 with the COSGN00C literal and
+            its cursor field for every other sign-on failure.
     """
+    EditUserIdPresent(request)
     upperUserId = NormaliseSignOnInput(request.user_id)
     upperCredential = NormaliseSignOnInput(request.password)
     checkSlot = await AcquireSignOnSlot(context, upperUserId)

@@ -8,7 +8,10 @@ only as the atomic loader a SIGKILL interrupts.
 
 - Parity (Section 0.9.1, success item 2): each EBCDIC load leaves rows equal, field for field, to
   batch/tests/fixtures/expected/loader_rows/*.csv: 50, 50, 50, 50, 7, 18, 51 and 50 rows.
-  TRANFILE skips the DALYTRAN.PS.INIT priming record and loads no row.
+  TRANFILE skips the DALYTRAN.PS.INIT priming record and loads no row. The Alembic seed already
+  equals every CSV, so each positive EBCDIC, ASCII and TRANFILE case first disturbs the seeded
+  rows: it adds one valid row no other row references and overwrites a non-key column in every
+  row. A pass therefore proves the load deleted and replaced every row.
 - Encodings (Section 0.9.3): the ASCII copies differ from the EBCDIC images the JCL loads in two
   fields only, ACCT-ADDR-ZIP of account 00000000049 and the DEFAULT/07/0001 DIS-INT-RATE.
 - Atomicity: a malformed image, or a failure inside the load's own transaction, exits 12 and
@@ -41,7 +44,7 @@ from app.models import (
     TransactionType,
 )
 from app.seed.image_reader import ENCODING_ASCII, ENCODING_EBCDIC, SAMPLE_IMAGE_NAMES
-from sqlalchemy import Engine, Select, Table, func, select, text
+from sqlalchemy import Engine, Select, Table, func, insert, select, text, update
 
 from batch.loaders import (
     acctfile,
@@ -65,6 +68,7 @@ from batch.orchestration.job_context import EXIT_FAILURE, EXIT_OK, EXIT_REJECTS
 from batch.tests.conftest import (
     INJECTED_ROLLBACK_TEMPLATE,
     LOADER_ROWS_DIR,
+    SYNTHETIC_CARD_TABLES,
     BatchEnvironment,
     CountJobRuns,
     InjectAtomicRollbackFailure,
@@ -72,6 +76,11 @@ from batch.tests.conftest import (
     KillProcess,
     StartCli,
     StepRow,
+    SyntheticAccountRow,
+    SyntheticCardRow,
+    SyntheticCustomerId,
+    SyntheticCustomerRow,
+    SyntheticTransactionRow,
     WaitUntil,
     WriteSyntheticDailyImage,
 )
@@ -86,6 +95,18 @@ class LoaderCase(NamedTuple):
     csvName: str
     expectedCount: int
     stepNo: int
+
+
+class TableDisturbance(NamedTuple):
+    """Valid pre-load changes to a case's seeded table, which only a replace-load undoes.
+
+    extraRows are inserted first, as (table, row) pairs, parents before children. No seeded row
+    references them, so the deferred foreign keys still hold once the load has deleted them.
+    changedValues then overwrite non-key columns in every row of the case's table.
+    """
+
+    extraRows: tuple[tuple[Table, Mapping[str, object]], ...]
+    changedValues: Mapping[str, object]
 
 
 # The eight loaders whose datasets have both an EBCDIC image and an ASCII copy, in chain order.
@@ -163,6 +184,80 @@ ASCII_DIFFERENCE_FRAGMENTS = (
 )
 PINNED_DATASET_CASES = (ACCOUNTS_CASE, DISCLOSURE_CASE)
 
+# The positive load cases disturb the seeded table first, because the Alembic seed already equals
+# every loader_rows CSV. The disturbed values differ from every seeded value: the seed's rates are
+# 0.00, 15.00 and 25.00, and every seeded category balance is 0.00.
+DISTURBED_TEXT = "DISTURBED"
+DISTURBED_RATE = Decimal("99.99")
+DISTURBED_BALANCE = Decimal("123.45")
+EXTRA_TRAN_AMOUNT = Decimal("1.00")
+EXTRA_ROW_INDEX = 1
+EXTRA_TYPE_CD = "99"
+EXTRA_CAT_CD = 9999
+SEED_TYPE_CD = "01"
+SEED_CAT_CD = 1
+# The lowest seeded account and card keys, read by the INSERT that adds an extra child row.
+FIRST_SEED_ACCOUNT_ID = select(func.min(ACCOUNT_COLUMNS.acct_id)).scalar_subquery()
+FIRST_SEED_CARD_NUM = select(func.min(Card.__table__.c.card_num)).scalar_subquery()
+EXTRA_CARD_ROW = {**SyntheticCardRow(EXTRA_ROW_INDEX), "acct_id": FIRST_SEED_ACCOUNT_ID}
+EXTRA_TYPE_ROW = {"tran_type": EXTRA_TYPE_CD, "description": DISTURBED_TEXT}
+EXTRA_CATEGORY_ROW = {
+    "tran_type_cd": SEED_TYPE_CD,
+    "tran_cat_cd": EXTRA_CAT_CD,
+    "description": DISTURBED_TEXT,
+}
+EXTRA_GROUP_ROW = {
+    "group_id": DISTURBED_TEXT,
+    "tran_type_cd": SEED_TYPE_CD,
+    "tran_cat_cd": SEED_CAT_CD,
+    "interest_rate": DISTURBED_RATE,
+}
+EXTRA_BALANCE_ROW = {
+    "acct_id": FIRST_SEED_ACCOUNT_ID,
+    "tran_type_cd": SEED_TYPE_CD,
+    "tran_cat_cd": EXTRA_CAT_CD,
+    "balance": DISTURBED_BALANCE,
+}
+EXTRA_TRANSACTION_ROW = SyntheticTransactionRow(
+    EXTRA_ROW_INDEX, FIRST_SEED_CARD_NUM, EXTRA_TRAN_AMOUNT
+)
+# The extra cross-reference comes with its own synthetic account, customer and card.
+EXTRA_XREF_ROWS = tuple(
+    (modelTable, rowBuilder(EXTRA_ROW_INDEX)) for modelTable, rowBuilder in SYNTHETIC_CARD_TABLES
+)
+DISTURBANCES: dict[str, TableDisturbance] = {
+    "accounts": TableDisturbance(
+        ((Account.__table__, SyntheticAccountRow(EXTRA_ROW_INDEX)),), {"addr_zip": DISTURBED_TEXT}
+    ),
+    "cards": TableDisturbance(
+        ((Card.__table__, EXTRA_CARD_ROW),), {"embossed_name": DISTURBED_TEXT}
+    ),
+    "customers": TableDisturbance(
+        ((Customer.__table__, SyntheticCustomerRow(EXTRA_ROW_INDEX)),),
+        {"first_name": DISTURBED_TEXT},
+    ),
+    # Every column of card_xref is a key, so each row is pointed at the synthetic customer.
+    "card-xref": TableDisturbance(
+        EXTRA_XREF_ROWS, {"cust_id": SyntheticCustomerId(EXTRA_ROW_INDEX)}
+    ),
+    "tran-types": TableDisturbance(
+        ((TransactionType.__table__, EXTRA_TYPE_ROW),), {"description": DISTURBED_TEXT}
+    ),
+    "tran-categories": TableDisturbance(
+        ((TransactionCategory.__table__, EXTRA_CATEGORY_ROW),), {"description": DISTURBED_TEXT}
+    ),
+    "disclosure-groups": TableDisturbance(
+        ((DisclosureGroup.__table__, EXTRA_GROUP_ROW),), {"interest_rate": DISTURBED_RATE}
+    ),
+    "tran-cat-balances": TableDisturbance(
+        ((TransactionCategoryBalance.__table__, EXTRA_BALANCE_ROW),), {"balance": DISTURBED_BALANCE}
+    ),
+    # transactions is empty after the seed, so the extra posted row is the whole disturbance.
+    "transactions": TableDisturbance(
+        ((Transaction.__table__, EXTRA_TRANSACTION_ROW),), {"tran_desc": DISTURBED_TEXT}
+    ),
+}
+
 # A size that is not a multiple of the CVACT01Y LRECL 300 fails the EBCDIC framing check.
 ACCOUNT_LRECL = 300
 TRUNCATED_BYTES = 7
@@ -226,6 +321,52 @@ def TableDifferences(
     csvPath = LOADER_ROWS_DIR / loaderCase.csvName
     with engine.connect() as connection:
         return CompareTableWithCsv(connection, loaderCase.modelTable.fullname, csvPath, overrides)
+
+
+def PrimaryKeys(engine: Engine, modelTable: Table) -> set[tuple]:
+    """Return the primary key of every row of modelTable, each as a tuple."""
+    statement = select(*modelTable.primary_key.columns)
+    with engine.connect() as connection:
+        return {tuple(row) for row in connection.execute(statement)}
+
+
+def DisturbTable(engine: Engine, loaderCase: LoaderCase) -> set[tuple]:
+    """Apply the case's DISTURBANCES entry in one transaction; return the keys it added."""
+    disturbance = DISTURBANCES[loaderCase.cliName]
+    keysBefore = PrimaryKeys(engine, loaderCase.modelTable)
+    with engine.begin() as connection:
+        for modelTable, extraRow in disturbance.extraRows:
+            connection.execute(insert(modelTable).values(extraRow))
+        connection.execute(update(loaderCase.modelTable).values(disturbance.changedValues))
+    return PrimaryKeys(engine, loaderCase.modelTable) - keysBefore
+
+
+def DisturbBeforeLoad(
+    engine: Engine,
+    loaderCase: LoaderCase,
+    overrides: Mapping[tuple[object, str], object] | None = None,
+) -> set[tuple]:
+    """Disturb the case's seeded table, assert it no longer matches its CSV; return the extra key.
+
+    The seed already equals the CSV, so only a load that deletes and reinserts every row can then
+    pass AssertTableReplaced.
+    """
+    extraKeys = DisturbTable(engine, loaderCase)
+    assert len(extraKeys) == 1, extraKeys
+    assert TableDifferences(engine, loaderCase, overrides) != []
+    return extraKeys
+
+
+def AssertTableReplaced(
+    engine: Engine,
+    loaderCase: LoaderCase,
+    extraKeys: set[tuple],
+    overrides: Mapping[tuple[object, str], object] | None = None,
+) -> None:
+    """Assert the table holds exactly its CSV's rows: the count, every field, no extra key."""
+    assert CountRows(engine, loaderCase.modelTable) == loaderCase.expectedCount
+    assert extraKeys & PrimaryKeys(engine, loaderCase.modelTable) == set()
+    assert TableDifferences(engine, loaderCase, overrides) == []
 
 
 def LatestRunId(engine: Engine, stepNo: int) -> int | None:
@@ -360,26 +501,31 @@ def test_ebcdic_loader_rows_equal_expected_fixture(
 ) -> None:
     """The EBCDIC load REPROs every record: the table equals its CSV, row count included.
 
-    Steps 13 and 14 are PENDING after the Alembic seed, so the financial loaders run too.
+    The seeded table is disturbed first, so the load must delete the extra row and restore every
+    changed field. Steps 13 and 14 are PENDING after the Alembic seed, so the financial loaders
+    run too.
     """
     engine = batchEnvironment.engine
+    extraKeys = DisturbBeforeLoad(engine, loaderCase)
     newRunId = AssertLoadAddsHistoryRow(engine, loaderCase)
     expectedCounts = {ROWS_LOADED_KEY: loaderCase.expectedCount, RECORDS_SKIPPED_KEY: 0}
     assert RunRow(engine, newRunId)["counts"] == expectedCounts
-    assert CountRows(engine, loaderCase.modelTable) == loaderCase.expectedCount
-    assert TableDifferences(engine, loaderCase) == []
+    AssertTableReplaced(engine, loaderCase, extraKeys)
 
 
 @pytest.mark.parametrize("loaderCase", LOADER_CASES, ids=CaseId)
 def test_ascii_loader_rows_equal_expected_fixture_except_pinned_differences(
     batchEnvironment: BatchEnvironment, loaderCase: LoaderCase
 ) -> None:
-    """The ASCII copy loads the same rows as the EBCDIC image, apart from the two pinned fields."""
+    """The ASCII copy loads the same rows as the EBCDIC image, apart from the two pinned fields.
+
+    The seeded table is disturbed first, so a pass proves the ASCII load replaced every row.
+    """
     engine = batchEnvironment.engine
-    LoadInEncoding((loaderCase,), ENCODING_ASCII)
     overrides = ASCII_OVERRIDES.get(loaderCase.modelTable.fullname)
-    assert CountRows(engine, loaderCase.modelTable) == loaderCase.expectedCount
-    assert TableDifferences(engine, loaderCase, overrides) == []
+    extraKeys = DisturbBeforeLoad(engine, loaderCase, overrides)
+    LoadInEncoding((loaderCase,), ENCODING_ASCII)
+    AssertTableReplaced(engine, loaderCase, extraKeys, overrides)
 
 
 def test_ebcdic_and_ascii_images_differ_only_in_two_pinned_fields(
@@ -406,14 +552,17 @@ def test_ebcdic_and_ascii_images_differ_only_in_two_pinned_fields(
 def test_tranfile_skips_priming_record_and_loads_no_rows(
     batchEnvironment: BatchEnvironment,
 ) -> None:
-    """TRANFILE's DALYTRAN.PS.INIT priming record is skipped, so transactions stays empty."""
+    """TRANFILE's DALYTRAN.PS.INIT priming record is skipped, so transactions ends up empty.
+
+    The seed leaves transactions empty, so a posted row is added first: the load must delete it.
+    """
     engine = batchEnvironment.engine
+    extraKeys = DisturbBeforeLoad(engine, TRANFILE_CASE)
     newRunId = AssertLoadAddsHistoryRow(engine, TRANFILE_CASE)
     assert RunRow(engine, newRunId)["counts"] == {ROWS_LOADED_KEY: 0, RECORDS_SKIPPED_KEY: 1}
-    assert CountRows(engine, Transaction.__table__) == 0
     _header, expectedRows = ReadExpectedCsv(LOADER_ROWS_DIR / TRANFILE_CASE.csvName)
     assert expectedRows == []
-    assert TableDifferences(engine, TRANFILE_CASE) == []
+    AssertTableReplaced(engine, TRANFILE_CASE, extraKeys)
 
 
 def test_tranfile_has_no_ascii_image_and_exits_12(batchEnvironment: BatchEnvironment) -> None:

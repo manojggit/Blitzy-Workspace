@@ -26,6 +26,7 @@ would send every later command's archives to the repository's var/batch-output.
 
 import errno
 import hashlib
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -50,7 +51,14 @@ from app.models import (
 from sqlalchemy import Connection, Engine, Table, Text, cast, column, func, select
 
 from batch.orchestration import batch_chain, gdg, run_ledger
-from batch.orchestration.job_context import EXIT_ABEND, EXIT_FAILURE, EXIT_OK, EXIT_REJECTS
+from batch.orchestration.batch_window import WINDOW_CLOSED_LOG
+from batch.orchestration.job_context import (
+    EXIT_ABEND,
+    EXIT_FAILURE,
+    EXIT_OK,
+    EXIT_REJECTS,
+    JobContext,
+)
 from batch.tests.conftest import (
     EXPECTED_DIR,
     FIXED_AS_OF_TEXT,
@@ -147,11 +155,15 @@ OVERLONG_STEP_DIGITS = 4301
 UNKNOWN_START_AT_VALUES = [
     pytest.param("0", id="step-0"),
     pytest.param(str(FINAL_STEP + 1), id="step-after-last"),
+    pytest.param("-1", id="negative"),
     pytest.param("NOPE", id="unknown-name"),
     pytest.param("1" * OVERLONG_STEP_DIGITS, id="4301-digits"),
 ]
-# The refusal's text up to the operator's value, which the log may mask or escape.
-UNKNOWN_STEP_PREFIX = batch_chain.UNKNOWN_STEP_TEMPLATE.format(name="")
+# Click's UsageError exit status, and the refusal it shows for an unknown --start-at: the
+# option's rule, never the value.
+USAGE_ERROR_EXIT = 2
+START_AT_USAGE_ERROR = f"Invalid value for '--start-at': {batch_chain.START_AT_RULE_MESSAGE}"
+UNKNOWN_START_AT_NAME = "NOPE"
 TRACEBACK_HEADER = "Traceback (most recent call last)"
 
 # --- Clean-run fixtures and outputs --------------------------------------------------------------
@@ -963,14 +975,36 @@ def test_start_at_tranbkp_resolves_first_incomplete_occurrence(
 
 
 @pytest.mark.parametrize("startAt", UNKNOWN_START_AT_VALUES)
-def test_start_at_refuses_unknown_step_before_any_cycle_change(
+def test_start_at_unknown_step_is_a_usage_error_before_the_batch_window(
     startAt: str, batchEnvironment: BatchEnvironment
 ) -> None:
-    """An unknown --start-at, a number of any length included, exits 12 and changes nothing."""
+    """An unknown --start-at, a number of any length included, exits 2 and changes nothing.
+
+    Click refuses it while parsing the options, naming --start-at and its accepted forms, so
+    the batch window is never taken and no cycle is opened or abandoned.
+    """
     outcome = RunAll(batchEnvironment, "--start-at", startAt)
-    assert outcome.exitCode == EXIT_FAILURE, outcome.output
-    assert UNKNOWN_STEP_PREFIX in outcome.output
+    assert outcome.exitCode == USAGE_ERROR_EXIT, outcome.output
+    assert START_AT_USAGE_ERROR in outcome.output
+    assert WINDOW_CLOSED_LOG not in outcome.output
     assert TRACEBACK_HEADER not in outcome.output
+    assert NewRuns(batchEnvironment) == []
+    AssertCyclesAtSeed(batchEnvironment)
+
+
+def test_run_chain_refuses_unknown_start_at_built_in_code(
+    jobContext: JobContext, batchEnvironment: BatchEnvironment, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RunChain itself refuses a ChainOptions start step the CLI never parsed.
+
+    It logs UNKNOWN STEP at ERROR and returns EXIT_FAILURE before any cycle changes.
+    """
+    caplog.set_level(logging.ERROR, logger=batch_chain.LOGGER.name)
+    options = batch_chain.ChainOptions(startAt=UNKNOWN_START_AT_NAME)
+    exitCode = batch_chain.RunChain(jobContext, options)
+    expectedMessage = batch_chain.UNKNOWN_STEP_TEMPLATE.format(name=UNKNOWN_START_AT_NAME)
+    assert exitCode == EXIT_FAILURE
+    assert caplog.record_tuples == [(batch_chain.LOGGER.name, logging.ERROR, expectedMessage)]
     assert NewRuns(batchEnvironment) == []
     AssertCyclesAtSeed(batchEnvironment)
 

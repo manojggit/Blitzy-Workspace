@@ -32,7 +32,9 @@ def RunLoader(context: JobContext) -> JobResult:
     """Empty transactions.transactions and reload it from the TRANFILE image, atomically.
 
     The priming record is skipped, so the result is rows_loaded 0 and records_skipped 1.
-    Raises JobFailure(EXIT_FAILURE) for --encoding ascii, a missing or malformed image, or an
-    integrity violation, leaving the table unchanged.
+    Raises JobFailure(EXIT_FAILURE) for a run whose parameters ask for ascii, a missing or
+    malformed image, or an integrity violation, leaving the table unchanged. `load transactions`
+    declares no --encoding, so `--encoding ascii` is a usage error, exit 2, and a --source-dir
+    naming the ASCII images exits 12 because no DALYTRAN.PS.INIT image is there.
     """
     return replace_loader.ReplaceTable(context, LOADER_SPEC)

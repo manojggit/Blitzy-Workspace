@@ -1,12 +1,15 @@
 """Integration tests of CU00-CU03 user administration: COUSR00C, COUSR01C, COUSR02C, COUSR03C.
 
 Every case goes through the ASGI app at /api/v1/admin/users against the migrated test database,
-with the clients, generated sign-on users and seed restore of tests/conftest.py:
+with the clients, generated sign-on users and seed restore of tests/conftest.py, except the
+page-walk controls, which answer from a scripted CU00 over httpx.MockTransport:
 
 - CU00 (COUSR00C, map COUSR00): pages of at most 10 rows in EBCDIC user-ID order, which differs
   from ASCII order; the F7 and F8 refusals at either end; the inclusive search (STARTBR GTEQ)
   that resets the page number; the U and D selection routes, taken before any search key, and
-  the invalid-code literal, after which the page is browsed from the search key.
+  the invalid-code literal, after which the page is browsed from the search key. The F8 walk
+  to the bottom literal is bounded by the pages the stored users fill and must pass the last
+  key on every page, so a paging regression fails with its page history instead of hanging.
 - CU01 (COUSR01C, map COUSR01): presence checks in source order, the first blank field ending
   validation; any user type stored as entered; the password hashed as entered, so a lower-case
   one never signs on through COSGN00C's upper-cased input; the duplicate key; the BMS length.
@@ -23,9 +26,9 @@ services, so a service literal that drifts fails here. Every password is generat
 
 import secrets
 import string
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NoReturn
 
 import httpx
 import pytest
@@ -128,6 +131,18 @@ UNBROWSED_PAGE_FIELDS = {
     "message": "",
     "cursor_field": None,
 }
+# Why an F8 walk to the bottom literal fails, each reason followed by every page walked so far,
+# so a paging regression fails with the keys it stalled on rather than paging forever.
+WALK_BOUND_EXCEEDED_REASON = "No bottom literal within the pages the stored users fill"
+WALK_STALLED_REASON = "An F8 page does not follow the last key walked"
+WALK_REFUSED_REASON = "A page request of the walk was not answered with 200"
+# The fields each walked page shows in that history.
+WALK_HISTORY_FIELDS = ("page", "first_key", "last_key", "message")
+# The scripted CU00 of the page-walk controls, which reads no database: 25 stored users fill
+# three pages of 10.
+CONTROL_BASE_URL = "http://cu00-control.invalid"
+CONTROL_STORED_USER_COUNT = 25
+CONTROL_KEY_TEMPLATE = "K{rowNumber:07d}"
 
 # --- CU01 (COUSR01C) -----------------------------------------------------------------------------
 # cbl/COUSR01C.cbl lines 120-144, in source order: (request field and cursor, literal).
@@ -496,20 +511,146 @@ async def PressPagingKey(
     return await client.get(USERS_URL, params=query)
 
 
-async def ReadAllPages(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+def MaxPageCount(storedUserCount: int) -> int:
+    """Return the pages of 10 that ``storedUserCount`` rows fill; ENTER always shows one page."""
+    return max(FIRST_PAGE, (storedUserCount + PAGE_SIZE - 1) // PAGE_SIZE)
+
+
+def WalkHistory(pages: Sequence[Mapping[str, Any]]) -> str:
+    """Return one numbered line per walked page: its page number, first and last keys, literal."""
+    historyLines = [
+        f"  {position}: "
+        + ", ".join(f"{fieldName}={listPage.get(fieldName)!r}" for fieldName in WALK_HISTORY_FIELDS)
+        for position, listPage in enumerate(pages, start=1)
+    ]
+    return "\n".join(historyLines) or "  none"
+
+
+def FailWalk(reason: str, detail: str, pages: Sequence[Mapping[str, Any]]) -> NoReturn:
+    """Fail the CU00 walk with ``reason``, ``detail`` and every page it read, in order."""
+    pytest.fail(f"{reason}: {detail}\nPages walked so far:\n{WalkHistory(pages)}")
+
+
+def ReadListPage(response: httpx.Response, pages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Return the COUSR00 page ``response`` carries; fail the walk of ``pages`` unless a 200."""
+    if response.status_code != HTTP_OK:
+        detail = f"HTTP {response.status_code} {response.text}"
+        FailWalk(WALK_REFUSED_REASON, detail, pages)
+    return response.json()
+
+
+def AssertAdvances(pages: Sequence[Mapping[str, Any]], nextPage: Mapping[str, Any]) -> None:
+    """Fail at once unless both keys of ``nextPage`` sort after the last key walked, in EBCDIC.
+
+    F8 browses exclusively after last_key, so the last keys of a sound walk strictly increase:
+    a page that repeats a key, or does not get past the last one, is a walk that never ends.
+    """
+    lastKey = pages[-1]["last_key"]
+    pageKeys = (nextPage["first_key"], nextPage["last_key"])
+    lastKeyBytes = lastKey.encode(EBCDIC_CODEC)
+    if not all(pageKey.encode(EBCDIC_CODEC) > lastKeyBytes for pageKey in pageKeys):
+        detail = f"keys {pageKeys!r} after last_key {lastKey!r}"
+        FailWalk(WALK_STALLED_REASON, detail, [*pages, nextPage])
+
+
+async def ReadAllPages(client: httpx.AsyncClient, storedUserCount: int) -> list[dict[str, Any]]:
     """Return every COUSR00 page: ENTER from the lowest key, then F8 until the bottom literal.
 
     The last page always carries ``You have reached the bottom of the page...``: the browse
-    reads one row beyond the page, so a full last page reports the end of file as well.
+    reads one row beyond the page, so a full last page reports the end of file as well. The
+    walk is bounded by the pages ``storedUserCount`` rows fill, counted from the database by the
+    caller, and every F8 page must get past the last key: a refused, stalled or overlong walk
+    fails with its page history instead of paging forever.
     """
-    firstResponse = await client.get(USERS_URL)
-    assert firstResponse.status_code == HTTP_OK, firstResponse.text
-    pages = [firstResponse.json()]
+    maxPages = MaxPageCount(storedUserCount)
+    pages = [ReadListPage(await client.get(USERS_URL), [])]
     while pages[-1]["message"] != REACHED_BOTTOM_MESSAGE:
+        if len(pages) >= maxPages:
+            detail = f"{maxPages} pages of {PAGE_SIZE} for {storedUserCount} stored users"
+            FailWalk(WALK_BOUND_EXCEEDED_REASON, detail, pages)
         nextResponse = await PressPagingKey(client, pages[-1], FORWARD_DIRECTION)
-        assert nextResponse.status_code == HTTP_OK, nextResponse.text
-        pages.append(nextResponse.json())
+        nextPage = ReadListPage(nextResponse, pages)
+        AssertAdvances(pages, nextPage)
+        pages.append(nextPage)
     return pages
+
+
+# --- Page-walk controls: a scripted CU00 over httpx.MockTransport, with no database ----------
+@dataclass
+class ScriptedUserList:
+    """A MockTransport handler answering request n with ``answer(n)``, counting the requests."""
+
+    answer: Callable[[int], httpx.Response]
+    requestCount: int = 0
+
+    def Handle(self, request: httpx.Request) -> httpx.Response:
+        """Count ``request`` and answer it as the script's next response."""
+        self.requestCount += 1
+        return self.answer(self.requestCount)
+
+
+def ControlPage(pageNumber: int) -> dict[str, Any]:
+    """Return full scripted page ``pageNumber``, rows after every earlier page's, no literal."""
+    firstRow = (pageNumber - 1) * PAGE_SIZE + 1
+    rowIds = [
+        CONTROL_KEY_TEMPLATE.format(rowNumber=rowNumber)
+        for rowNumber in range(firstRow, firstRow + PAGE_SIZE)
+    ]
+    return {
+        "rows": [{"user_id": rowId} for rowId in rowIds],
+        "page": pageNumber,
+        "first_key": rowIds[0],
+        "last_key": rowIds[-1],
+        "message": NO_MESSAGE,
+        "cursor_field": SEARCH_CURSOR_FIELD,
+    }
+
+
+def RepeatedPageAnswer(requestNumber: int) -> httpx.Response:
+    """Answer every request with the same full first page: an F8 that never moves on."""
+    return httpx.Response(HTTP_OK, json=ControlPage(FIRST_PAGE))
+
+
+def EndlessPageAnswer(requestNumber: int) -> httpx.Response:
+    """Answer request n with full page n: the keys advance, but the bottom literal never comes."""
+    return httpx.Response(HTTP_OK, json=ControlPage(requestNumber))
+
+
+def RefusedForwardAnswer(requestNumber: int) -> httpx.Response:
+    """Answer ENTER with a full first page and every F8 with the 400 bottom refusal."""
+    if requestNumber == FIRST_PAGE:
+        return EndlessPageAnswer(requestNumber)
+    refusalBody = {
+        "message": ALREADY_AT_BOTTOM_MESSAGE,
+        "info_message": "",
+        "field_errors": [],
+        "cursor_field": SEARCH_CURSOR_FIELD,
+    }
+    return httpx.Response(HTTP_EDIT_FAILURE, json=refusalBody)
+
+
+class WalkFailureCase(NamedTuple):
+    """A scripted CU00 answer and how ReadAllPages must fail on it.
+
+    ``requestCount`` is the requests sent before the failure; ``historyLength`` the leading
+    scripted 200 pages its history lists.
+    """
+
+    answer: Callable[[int], httpx.Response]
+    reason: str
+    requestCount: int
+    historyLength: int
+
+
+# CONTROL_STORED_USER_COUNT bounds the endless walk at three pages; the repeated page fails on
+# the first F8, and the refusal on the first F8 lists only page 1.
+WALK_FAILURE_CASES = (
+    pytest.param(WalkFailureCase(RepeatedPageAnswer, WALK_STALLED_REASON, 2, 2), id="same-page"),
+    pytest.param(
+        WalkFailureCase(EndlessPageAnswer, WALK_BOUND_EXCEEDED_REASON, 3, 3), id="never-bottom"
+    ),
+    pytest.param(WalkFailureCase(RefusedForwardAnswer, WALK_REFUSED_REASON, 2, 1), id="refused"),
+)
 
 
 def EndpointBody(endpoint: Endpoint) -> dict[str, Any] | None:
@@ -567,25 +708,52 @@ async def test_cu00_pages_list_every_user_in_ebcdic_key_order(
     """Pages of at most 10 rows list every user in EBCDIC order: a1, AA, ADMIN001, A1, 1A."""
     for userId in MIXED_KEYS:
         AssertAdded(await AddUser(adminClient, NewUserEntry(userId)), userId)
-    pages = await ReadAllPages(adminClient)
+    storedIds = ReadStoredUserIds(syncEngine)
+    pages = await ReadAllPages(adminClient, len(storedIds))
     listedIds = [row["user_id"] for listPage in pages for row in listPage["rows"]]
     assert all(len(listPage["rows"]) <= PAGE_SIZE for listPage in pages)
     assert [listPage["page"] for listPage in pages] == list(range(FIRST_PAGE, len(pages) + 1))
-    assert listedIds == EbcdicOrder(ReadStoredUserIds(syncEngine))
+    assert listedIds == EbcdicOrder(storedIds)
     mixedOrder = [userId for userId in listedIds if userId in EXPECTED_MIXED_ORDER]
     assert mixedOrder == list(EXPECTED_MIXED_ORDER)
     assert sorted(EXPECTED_MIXED_ORDER) != mixedOrder
 
 
-async def test_cu00_paging_keys_refuse_past_either_end(adminClient: httpx.AsyncClient) -> None:
+async def test_cu00_paging_keys_refuse_past_either_end(
+    adminClient: httpx.AsyncClient, syncEngine: Engine
+) -> None:
     """F7 on page 1 and F8 after the last page are refused with 400 and their literals."""
-    pages = await ReadAllPages(adminClient)
+    pages = await ReadAllPages(adminClient, len(ReadStoredUserIds(syncEngine)))
     topResponse = await PressPagingKey(adminClient, pages[0], BACKWARD_DIRECTION)
     AssertLegacyError(topResponse, HTTP_EDIT_FAILURE, ALREADY_AT_TOP_MESSAGE, SEARCH_CURSOR_FIELD)
     bottomResponse = await PressPagingKey(adminClient, pages[-1], FORWARD_DIRECTION)
     AssertLegacyError(
         bottomResponse, HTTP_EDIT_FAILURE, ALREADY_AT_BOTTOM_MESSAGE, SEARCH_CURSOR_FIELD
     )
+
+
+@pytest.mark.parametrize("case", WALK_FAILURE_CASES)
+async def test_cu00_page_walk_fails_with_its_history_instead_of_paging_forever(
+    case: WalkFailureCase,
+) -> None:
+    """A stalled, endless or refused F8 walk fails at once, listing every page it read.
+
+    The scripted CU00 answers through httpx.MockTransport, so no database is read, and the
+    request count shows the walk stopped where it should.
+    """
+    scriptedList = ScriptedUserList(case.answer)
+    transport = httpx.MockTransport(scriptedList.Handle)
+    async with httpx.AsyncClient(transport=transport, base_url=CONTROL_BASE_URL) as client:
+        with pytest.raises(pytest.fail.Exception) as walkFailure:
+            await ReadAllPages(client, CONTROL_STORED_USER_COUNT)
+    failureText = str(walkFailure.value)
+    scriptedPages = [
+        case.answer(requestNumber).json()
+        for requestNumber in range(FIRST_PAGE, case.historyLength + 1)
+    ]
+    assert failureText.startswith(case.reason), failureText
+    assert failureText.endswith(f"Pages walked so far:\n{WalkHistory(scriptedPages)}")
+    assert scriptedList.requestCount == case.requestCount
 
 
 @pytest.mark.parametrize(("searchUserId", "expectedFirstId"), SEARCH_CASES)

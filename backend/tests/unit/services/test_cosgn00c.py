@@ -9,7 +9,7 @@ compares the password: a mismatch gives ``Wrong Password. Try again ...`` (PASSW
 User ...`` (USERIDL). Type exactly A (COCOM01Y CDEMO-USRTYP-ADMIN) is transferred to COADM01C,
 every other type to COMEN01C. F3 answers the CSMSG01Y thank-you literal. The login throttle of
 AAP 0.7.1 locks an upper-cased user ID after LOGIN_MAX_ATTEMPTS failures with
-``Too many failed attempts. Try again later ...``.
+``Too many failed attempts. Try again later ...``; a blank user ID is answered before it.
 
 Every case calls the service directly with a makeOnlineContext context, never over HTTP, and
 re-reads security.users and security.login_attempts with bound SQL through syncEngine. Expected
@@ -22,6 +22,7 @@ import secrets
 import string
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import NamedTuple, Protocol
 
 import pytest
@@ -29,6 +30,7 @@ import pytest_asyncio
 from sqlalchemy import Engine, Row, text
 
 from app.core import messages
+from app.core.config import Settings
 from app.core.dependencies import CurrentUser, OnlineContext
 from app.core.errors import FileIoError, LegacyMessageError
 from app.core.locks import FileNotOpenError
@@ -84,6 +86,11 @@ CREDENTIAL_HEX_BYTES = 4
 LOWER_CREDENTIAL_MIDDLE_HEX_BYTES = 3
 # An unknown user ID: 8 upper-case hex digits, never a seed ID or a "T" or "L" generated one.
 UNKNOWN_USER_ID_HEX_BYTES = 4
+# The failure_count a blank-field edit leaves against the keyed user ID; None for no row.
+ONE_FAILURE = 1
+NO_ATTEMPT_ROW = None
+# The key a blank USERID would have once right-trimmed, which the throttle never stores.
+BLANK_USER_ID_KEY = ""
 LOWER_CASE_USER_FIRST_NAME = "Lower"
 LOWER_CASE_USER_LAST_NAME = "Case Password"
 # The only keys GET /auth/me may carry: no password, hash or token.
@@ -101,6 +108,10 @@ INSERT_USER_STATEMENT = text(
     " VALUES (:userId, :firstName, :lastName, :passwordHash, :userType)"
 )
 DELETE_ATTEMPT_ROW_STATEMENT = text("DELETE FROM security.login_attempts WHERE user_id = :userId")
+INSERT_ATTEMPT_ROW_STATEMENT = text(
+    "INSERT INTO security.login_attempts (user_id, failure_count, locked_until, last_failure_at)"
+    " VALUES (:userId, :failureCount, :lockedUntil, :lastFailureAt)"
+)
 
 
 class GeneratedUser(Protocol):
@@ -139,11 +150,17 @@ class SignOnScenario:
 
 
 class BlankFieldCase(NamedTuple):
-    """One row of the first-failure table: the keyed fields, markers allowed, and the failure."""
+    """One row of the first-failure table: the keyed fields, markers allowed, and the failure.
+
+    ``storedFailureCount`` is the failure_count stored against the keyed, right-trimmed user ID
+    afterwards, or None when the edit leaves no row: a blank user ID is answered before the
+    throttle.
+    """
 
     userIdText: str
     credentialText: str
     expected: ExpectedFailure
+    storedFailureCount: int | None
 
 
 class SeedSignOnCase(NamedTuple):
@@ -167,20 +184,30 @@ USER_ID_LOCKED = ExpectedFailure(LOCKED_MESSAGE, USER_ID_FIELD, LOCKED_STATUS)
 
 BLANK_FIELD_CASES = [
     pytest.param(
-        BlankFieldCase(BLANK_FIELD, RANDOM_CREDENTIAL, USER_ID_REQUIRED), id="empty-user-id"
+        BlankFieldCase(BLANK_FIELD, RANDOM_CREDENTIAL, USER_ID_REQUIRED, NO_ATTEMPT_ROW),
+        id="empty-user-id",
     ),
     pytest.param(
-        BlankFieldCase(SPACES_FIELD, RANDOM_CREDENTIAL, USER_ID_REQUIRED), id="spaces-user-id"
+        BlankFieldCase(SPACES_FIELD, RANDOM_CREDENTIAL, USER_ID_REQUIRED, NO_ATTEMPT_ROW),
+        id="spaces-user-id",
     ),
     pytest.param(
-        BlankFieldCase(BLANK_FIELD, BLANK_FIELD, USER_ID_REQUIRED), id="both-empty-user-id-first"
+        BlankFieldCase(BLANK_FIELD, BLANK_FIELD, USER_ID_REQUIRED, NO_ATTEMPT_ROW),
+        id="both-empty-user-id-first",
     ),
     pytest.param(
-        BlankFieldCase(GENERATED_USER_ID, BLANK_FIELD, CREDENTIAL_REQUIRED), id="empty-password"
+        BlankFieldCase(GENERATED_USER_ID, BLANK_FIELD, CREDENTIAL_REQUIRED, ONE_FAILURE),
+        id="empty-password",
     ),
     pytest.param(
-        BlankFieldCase(GENERATED_USER_ID, SPACES_FIELD, CREDENTIAL_REQUIRED), id="spaces-password"
+        BlankFieldCase(GENERATED_USER_ID, SPACES_FIELD, CREDENTIAL_REQUIRED, ONE_FAILURE),
+        id="spaces-password",
     ),
+]
+# The blank USERID fields a locked blank ID is probed with.
+BLANK_USER_ID_CASES = [
+    pytest.param(BLANK_FIELD, id="empty-user-id"),
+    pytest.param(SPACES_FIELD, id="spaces-user-id"),
 ]
 SEED_SIGN_ON_CASES = [
     pytest.param(
@@ -270,6 +297,30 @@ def ReadAttemptRow(syncEngine: Engine, userId: str) -> Row | None:
         return connection.execute(ATTEMPT_ROW_QUERY, {"userId": userId}).one_or_none()
 
 
+def StoredFailureCount(syncEngine: Engine, userId: str) -> int | None:
+    """Return the committed failure_count of ``userId``, or None when it has no row."""
+    attemptRow = ReadAttemptRow(syncEngine, userId)
+    if attemptRow is None:
+        return NO_ATTEMPT_ROW
+    return attemptRow.failure_count
+
+
+def InsertLockedAttemptRow(syncEngine: Engine, userId: str, settings: Settings) -> None:
+    """Commit a security.login_attempts row of ``userId`` locked at LOGIN_MAX_ATTEMPTS failures.
+
+    The lock runs LOGIN_LOCKOUT_SECONDS from the last failure, now, as the throttle sets it.
+    """
+    lastFailureAt = datetime.now(UTC)
+    attemptValues = {
+        "userId": userId,
+        "failureCount": settings.LOGIN_MAX_ATTEMPTS,
+        "lockedUntil": lastFailureAt + timedelta(seconds=settings.LOGIN_LOCKOUT_SECONDS),
+        "lastFailureAt": lastFailureAt,
+    }
+    with syncEngine.begin() as connection:
+        connection.execute(INSERT_ATTEMPT_ROW_STATEMENT, attemptValues)
+
+
 def ReadStoredUser(syncEngine: Engine, userId: str) -> Row:
     """Return the committed security.users row of ``userId``."""
     with syncEngine.connect() as connection:
@@ -357,10 +408,25 @@ async def test_blank_field_gives_its_literal_with_the_user_id_edited_first(
 ):
     request = KeyedFields(signOnScenario, blankFieldCase)
     await AssertSignOnFails(signOnScenario.context, request, blankFieldCase.expected)
-    # The refusal counts once against the upper-cased, right-trimmed user ID it was keyed with.
-    attemptRow = ReadAttemptRow(syncEngine, request.user_id.rstrip(FIELD_PADDING))
-    assert attemptRow is not None
-    assert attemptRow.failure_count == 1
+    # A blank password counts once against the upper-cased, right-trimmed user ID it was keyed
+    # with; a blank user ID is answered before the throttle, so the blank ID keeps no row.
+    keyedUserId = request.user_id.rstrip(FIELD_PADDING)
+    assert StoredFailureCount(syncEngine, keyedUserId) == blankFieldCase.storedFailureCount
+
+
+@pytest.mark.parametrize("blankUserId", BLANK_USER_ID_CASES)
+async def test_blank_user_id_gives_its_literal_while_the_blank_id_holds_a_lock(
+    makeOnlineContext, syncEngine, throttleCleanup, blankUserId
+):
+    # Whatever row the blank ID holds, even one locked at the limit, the blank user ID edit
+    # answers 401 ahead of the throttle and leaves that row untouched.
+    context = await SignOnContext(makeOnlineContext)
+    throttleCleanup.append(BLANK_USER_ID_KEY)
+    InsertLockedAttemptRow(syncEngine, BLANK_USER_ID_KEY, context.settings)
+    lockedRow = ReadAttemptRow(syncEngine, BLANK_USER_ID_KEY)
+    request = LoginRequest(user_id=blankUserId, password=RandomUpperPassword())
+    await AssertSignOnFails(context, request, USER_ID_REQUIRED)
+    assert ReadAttemptRow(syncEngine, BLANK_USER_ID_KEY) == lockedRow
 
 
 async def test_unknown_user_id_gives_user_not_found_on_the_user_id(makeOnlineContext, syncEngine):

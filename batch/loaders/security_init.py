@@ -6,7 +6,10 @@ DUSRSECJ deleted USRSEC.PS (PREDEL IEFBR14), rebuilt it from in-stream data (STE
 LRECL 80), defined the USRSEC KSDS keyed KEYS(8,0) on SEC-USR-ID (STEP02 IDCAMS) and REPROed
 the file into it (STEP03). This loader, chain step 11 and the CLI's `load init-users`, reads
 the AWS.M2.CARDDEMO.USRSEC.PS image in the CSUSR01Y layout and replaces the table atomically
-through replace_loader. The image exists only in EBCDIC, so `--encoding ascii` exits 12.
+through replace_loader. The image exists only in EBCDIC, so `load init-users` declares no
+--encoding and `--encoding ascii` is a usage error, exit 2. A run whose parameters ask for ascii
+is refused by replace_loader with exit 12, and a --source-dir naming the ASCII images exits 12
+because no USRSEC.PS image is there.
 
 Each SEC-USR-PWD is bcrypt-hashed at BCRYPT_ROUNDS exactly as decoded, case kept, by the row
 builder the Alembic sample seed uses; the plaintext never reaches a row, the ledger counts or a

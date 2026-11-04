@@ -111,44 +111,104 @@ COMPOSITE_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
 }
 PRIMARY_KEY_PREFIX = "pk_"
 
+
 # --- Indexes: the EBCDIC sort columns, the AIX replacements and the run-history index ------------
-EXPECTED_INDEXES = frozenset(
-    {
-        "ix_users_user_id_sort",
-        "ix_cards_card_num_sort",
-        "ix_transactions_tran_id_sort",
-        "ix_cards_acct_id",
-        "ix_card_xref_acct_id",
-        "ix_card_xref_cust_id",
-        "ix_transactions_card_num",
-        "ix_transactions_proc_ts",
-        "ix_daily_transactions_tran_id",
-        "ix_job_runs_cycle_id_step_no",
-    }
-)
+class IndexDefinition(NamedTuple):
+    """A planned index: its table full name, its columns in key order and whether it is partial."""
+
+    tableName: str
+    keyColumns: tuple[str, ...]
+    isPartial: bool = False
+
+
+# Stated here from the plan, not read from revisions 0003 and 0008 or from app.models, so an
+# index that keeps its name on another table or column fails. Each covers its whole table.
+INDEX_DEFINITIONS: dict[str, IndexDefinition] = {
+    "ix_users_user_id_sort": IndexDefinition("security.users", ("user_id_sort",)),
+    "ix_cards_card_num_sort": IndexDefinition("cards.cards", ("card_num_sort",)),
+    "ix_transactions_tran_id_sort": IndexDefinition("transactions.transactions", ("tran_id_sort",)),
+    # CARDAIX KEYS(11 16): CARD-ACCT-ID.
+    "ix_cards_acct_id": IndexDefinition("cards.cards", ("acct_id",)),
+    # CXACAIX KEYS(11,25): XREF-ACCT-ID.
+    "ix_card_xref_acct_id": IndexDefinition("xref.card_xref", ("acct_id",)),
+    "ix_card_xref_cust_id": IndexDefinition("xref.card_xref", ("cust_id",)),
+    "ix_transactions_card_num": IndexDefinition("transactions.transactions", ("card_num",)),
+    # TRANSACT AIX KEYS(26 304): TRAN-PROC-TS.
+    "ix_transactions_proc_ts": IndexDefinition("transactions.transactions", ("proc_ts",)),
+    "ix_daily_transactions_tran_id": IndexDefinition(
+        "transactions.daily_transactions", ("tran_id",)
+    ),
+    "ix_job_runs_cycle_id_step_no": IndexDefinition("batch.job_runs", ("cycle_id", "step_no")),
+}
+EXPECTED_INDEXES = frozenset(INDEX_DEFINITIONS)
 
 # --- Constraints ---------------------------------------------------------------------------------
 PRIMARY_KEY_TYPE = "p"
 FOREIGN_KEY_TYPE = "f"
 CHECK_TYPE = "c"
 
-# Revision 0004 (the eight dataset relationships), 0008 and 0009 (the batch ledger and catalog).
-EXPECTED_FOREIGN_KEYS = frozenset(
-    {
-        "fk_cards_acct_id_accounts",
-        "fk_card_xref_card_num_cards",
-        "fk_card_xref_cust_id_customers",
-        "fk_card_xref_acct_id_accounts",
-        "fk_transactions_card_num_cards",
-        "fk_transaction_category_balances_acct_id_accounts",
-        "fk_disclosure_groups_tran_type_cd_transaction_categories",
-        "fk_transaction_categories_tran_type_cd_transaction_types",
-        "fk_job_runs_cycle_id_cycles",
-        "fk_cycle_steps_cycle_id_cycles",
-        "fk_cycle_steps_last_run_id_job_runs",
-        "fk_gdg_generations_run_id_job_runs",
-    }
-)
+
+class ForeignKeyDefinition(NamedTuple):
+    """A planned relationship: the referencing table and columns, the referenced table and key."""
+
+    tableName: str
+    localColumns: tuple[str, ...]
+    referencedTable: str
+    referencedColumns: tuple[str, ...]
+
+
+# Revision 0004 (the eight dataset relationships), 0008 and 0009 (the batch ledger and catalog),
+# stated here from the plan rather than read from those revisions or app.models, so a key that
+# keeps its name on another column or referenced key fails.
+FOREIGN_KEY_DEFINITIONS: dict[str, ForeignKeyDefinition] = {
+    "fk_cards_acct_id_accounts": ForeignKeyDefinition(
+        "cards.cards", ("acct_id",), "accounts.accounts", ("acct_id",)
+    ),
+    "fk_card_xref_card_num_cards": ForeignKeyDefinition(
+        "xref.card_xref", ("card_num",), "cards.cards", ("card_num",)
+    ),
+    "fk_card_xref_cust_id_customers": ForeignKeyDefinition(
+        "xref.card_xref", ("cust_id",), "customers.customers", ("cust_id",)
+    ),
+    "fk_card_xref_acct_id_accounts": ForeignKeyDefinition(
+        "xref.card_xref", ("acct_id",), "accounts.accounts", ("acct_id",)
+    ),
+    "fk_transactions_card_num_cards": ForeignKeyDefinition(
+        "transactions.transactions", ("card_num",), "cards.cards", ("card_num",)
+    ),
+    "fk_transaction_category_balances_acct_id_accounts": ForeignKeyDefinition(
+        "transactions.transaction_category_balances",
+        ("acct_id",),
+        "accounts.accounts",
+        ("acct_id",),
+    ),
+    "fk_disclosure_groups_tran_type_cd_transaction_categories": ForeignKeyDefinition(
+        "disclosure.disclosure_groups",
+        ("tran_type_cd", "tran_cat_cd"),
+        "reference.transaction_categories",
+        ("tran_type_cd", "tran_cat_cd"),
+    ),
+    # The TRANTYPE key column is tran_type, not tran_type_cd.
+    "fk_transaction_categories_tran_type_cd_transaction_types": ForeignKeyDefinition(
+        "reference.transaction_categories",
+        ("tran_type_cd",),
+        "reference.transaction_types",
+        ("tran_type",),
+    ),
+    "fk_job_runs_cycle_id_cycles": ForeignKeyDefinition(
+        "batch.job_runs", ("cycle_id",), "batch.cycles", ("cycle_id",)
+    ),
+    "fk_cycle_steps_cycle_id_cycles": ForeignKeyDefinition(
+        "batch.cycle_steps", ("cycle_id",), "batch.cycles", ("cycle_id",)
+    ),
+    "fk_cycle_steps_last_run_id_job_runs": ForeignKeyDefinition(
+        "batch.cycle_steps", ("last_run_id",), "batch.job_runs", ("run_id",)
+    ),
+    "fk_gdg_generations_run_id_job_runs": ForeignKeyDefinition(
+        "batch.gdg_generations", ("run_id",), "batch.job_runs", ("run_id",)
+    ),
+}
+EXPECTED_FOREIGN_KEYS = frozenset(FOREIGN_KEY_DEFINITIONS)
 
 # Revision 0005: each PIC 9(n) identifier and its exact-width digit pattern. The tenth check,
 # on the TCATBALF account key, is the revision's and the model's own.
@@ -199,6 +259,92 @@ UNCONSTRAINED_COLUMNS: tuple[UnconstrainedColumn, ...] = (
     ),
     UnconstrainedColumn(
         "transactions.transaction_category_balances", "tran_cat_cd", FOREIGN_KEY_TYPE
+    ),
+)
+
+
+# --- Negative controls: a reflected definition changed while its name is kept --------------------
+class DefinitionChange(NamedTuple):
+    """One field of a reflected row replaced, and the definition field the comparison must name."""
+
+    caseName: str
+    objectName: str
+    rowField: str
+    changedValue: object
+    reportedField: str
+
+
+FOREIGN_KEY_CHANGES: tuple[DefinitionChange, ...] = (
+    DefinitionChange(
+        "wrong_local_table",
+        "fk_transactions_card_num_cards",
+        "tableName",
+        "transactions.daily_transactions",
+        "tableName",
+    ),
+    DefinitionChange(
+        "wrong_local_column",
+        "fk_card_xref_acct_id_accounts",
+        "keyColumns",
+        ("cust_id",),
+        "localColumns",
+    ),
+    DefinitionChange(
+        "wrong_local_column_order",
+        "fk_disclosure_groups_tran_type_cd_transaction_categories",
+        "keyColumns",
+        ("tran_cat_cd", "tran_type_cd"),
+        "localColumns",
+    ),
+    DefinitionChange(
+        "wrong_referenced_table",
+        "fk_card_xref_card_num_cards",
+        "referencedTable",
+        "transactions.transactions",
+        "referencedTable",
+    ),
+    DefinitionChange(
+        "wrong_referenced_column",
+        "fk_transaction_categories_tran_type_cd_transaction_types",
+        "referencedColumns",
+        ("tran_type_cd",),
+        "referencedColumns",
+    ),
+)
+INDEX_CHANGES: tuple[DefinitionChange, ...] = (
+    DefinitionChange(
+        "wrong_table",
+        "ix_transactions_card_num",
+        "tableName",
+        "transactions.daily_transactions",
+        "tableName",
+    ),
+    DefinitionChange(
+        "wrong_column", "ix_cards_acct_id", "indexColumns", ("card_num",), "keyColumns"
+    ),
+    DefinitionChange(
+        "wrong_column_order",
+        "ix_job_runs_cycle_id_step_no",
+        "indexColumns",
+        ("step_no", "cycle_id"),
+        "keyColumns",
+    ),
+    DefinitionChange(
+        "expression_key",
+        "ix_card_xref_acct_id",
+        "indexColumns",
+        ("lower(acct_id::text)",),
+        "keyColumns",
+    ),
+    DefinitionChange(
+        "included_column",
+        "ix_card_xref_cust_id",
+        "indexColumns",
+        ("cust_id", "acct_id"),
+        "keyColumns",
+    ),
+    DefinitionChange(
+        "partial_predicate", "ix_transactions_proc_ts", "isPartial", True, "isPartial"
     ),
 )
 
@@ -338,7 +484,14 @@ CONSTRAINTS_SQL = text(
     " con.contype::text AS constraint_type, con.condeferrable AS is_deferrable,"
     " con.condeferred AS is_initially_deferred,"
     " array_agg(a.attname::text ORDER BY k.ordinality) AS key_columns,"
-    " pg_catalog.pg_get_constraintdef(con.oid) AS definition"
+    " pg_catalog.pg_get_constraintdef(con.oid) AS definition,"
+    " coalesce((SELECT rn.nspname || '.' || rc.relname FROM pg_catalog.pg_class AS rc"
+    " JOIN pg_catalog.pg_namespace AS rn ON rn.oid = rc.relnamespace"
+    " WHERE rc.oid = con.confrelid), '') AS referenced_table,"
+    " ARRAY(SELECT ra.attname::text"
+    " FROM unnest(con.confkey) WITH ORDINALITY AS rk(attnum, ordinality)"
+    " JOIN pg_catalog.pg_attribute AS ra ON ra.attrelid = con.confrelid AND ra.attnum = rk.attnum"
+    " ORDER BY rk.ordinality) AS referenced_columns"
     " FROM pg_catalog.pg_constraint AS con"
     " JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid"
     " JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace"
@@ -346,14 +499,23 @@ CONSTRAINTS_SQL = text(
     " JOIN pg_catalog.pg_attribute AS a ON a.attrelid = con.conrelid AND a.attnum = k.attnum"
     " WHERE n.nspname = ANY(:schemas)"
     " GROUP BY n.nspname, c.relname, con.oid, con.conname, con.contype, con.condeferrable,"
-    " con.condeferred"
+    " con.condeferred, con.confrelid, con.confkey"
 )
+# Each column position renders as its column name, or as its expression for an expression key;
+# INCLUDE columns follow the key columns.
 INDEXES_SQL = text(
     "SELECT ic.relname::text AS index_name, ix.indisunique AS is_unique,"
-    " ix.indisvalid AS is_valid, ix.indisprimary AS is_primary"
+    " ix.indisvalid AS is_valid, ix.indisprimary AS is_primary,"
+    " tn.nspname || '.' || tc.relname AS table_name,"
+    " ARRAY(SELECT pg_catalog.pg_get_indexdef(ix.indexrelid, indexed.column_no, TRUE)"
+    " FROM generate_series(1, ix.indnatts) AS indexed(column_no)"
+    " ORDER BY indexed.column_no) AS index_columns,"
+    " ix.indpred IS NOT NULL AS is_partial"
     " FROM pg_catalog.pg_index AS ix"
     " JOIN pg_catalog.pg_class AS ic ON ic.oid = ix.indexrelid"
     " JOIN pg_catalog.pg_namespace AS n ON n.oid = ic.relnamespace"
+    " JOIN pg_catalog.pg_class AS tc ON tc.oid = ix.indrelid"
+    " JOIN pg_catalog.pg_namespace AS tn ON tn.oid = tc.relnamespace"
     " WHERE n.nspname = ANY(:schemas)"
 )
 COLUMN_TYPE_SQL = text(
@@ -397,7 +559,11 @@ TRIGGERS_SQL = text(
 
 # --- Value objects -------------------------------------------------------------------------------
 class ConstraintRow(NamedTuple):
-    """One reflected constraint: its table, name, pg_constraint type, deferral and key columns."""
+    """One reflected constraint: its table, name, pg_constraint type, deferral and key columns.
+
+    referencedTable and referencedColumns are a foreign key's referenced table full name and
+    ordered key columns; for every other type they are empty.
+    """
 
     tableName: str
     constraintName: str
@@ -406,15 +572,20 @@ class ConstraintRow(NamedTuple):
     isInitiallyDeferred: bool
     keyColumns: tuple[str, ...]
     definition: str
+    referencedTable: str
+    referencedColumns: tuple[str, ...]
 
 
 class IndexRow(NamedTuple):
-    """One reflected index of a CardDemo schema."""
+    """One reflected index of a CardDemo schema, its table full name and its ordered columns."""
 
     indexName: str
     isUnique: bool
     isValid: bool
     isPrimary: bool
+    tableName: str
+    indexColumns: tuple[str, ...]
+    isPartial: bool
 
 
 class SeedUserRecord(Protocol):
@@ -472,6 +643,47 @@ def ConstraintsOfType(
 ) -> list[ConstraintRow]:
     """Return the reflected constraints whose pg_constraint type is ``constraintType``."""
     return [row for row in constraintRows if row.constraintType == constraintType]
+
+
+def NamedForeignKeys(
+    constraintRows: Sequence[ConstraintRow], foreignKeyName: str
+) -> list[ConstraintRow]:
+    """Return the reflected foreign keys named ``foreignKeyName``: one for a planned key."""
+    foreignKeys = ConstraintsOfType(constraintRows, FOREIGN_KEY_TYPE)
+    return [row for row in foreignKeys if row.constraintName == foreignKeyName]
+
+
+def FieldMismatches(
+    expected: ForeignKeyDefinition | IndexDefinition,
+    reflected: ForeignKeyDefinition | IndexDefinition,
+) -> list[str]:
+    """Return, in field order, the names of the fields ``reflected`` and ``expected`` differ in."""
+    return [
+        fieldName
+        for fieldName, expectedValue, reflectedValue in zip(
+            expected._fields, expected, reflected, strict=True
+        )
+        if expectedValue != reflectedValue
+    ]
+
+
+def ForeignKeyMismatches(
+    definition: ForeignKeyDefinition, constraintRow: ConstraintRow
+) -> list[str]:
+    """Return the fields of ``definition`` that the reflected foreign key does not reproduce."""
+    reflected = ForeignKeyDefinition(
+        constraintRow.tableName,
+        constraintRow.keyColumns,
+        constraintRow.referencedTable,
+        constraintRow.referencedColumns,
+    )
+    return FieldMismatches(definition, reflected)
+
+
+def IndexMismatches(definition: IndexDefinition, indexRow: IndexRow) -> list[str]:
+    """Return the fields of ``definition`` that the reflected index does not reproduce."""
+    reflected = IndexDefinition(indexRow.tableName, indexRow.indexColumns, indexRow.isPartial)
+    return FieldMismatches(definition, reflected)
 
 
 def ModelConstraintNames(constraintClass: type[Constraint]) -> set[str]:
@@ -595,18 +807,24 @@ def MigratedEngine(syncEngine: Engine, migratedDatabase: object) -> Engine:
 
 @pytest.fixture(name="constraintRows", scope="module")
 def ConstraintRows(migratedEngine: Engine) -> tuple[ConstraintRow, ...]:
-    """Return every constraint of the CardDemo schemas, with its ordered key columns."""
+    """Return every constraint of the CardDemo schemas, its key columns and referenced key."""
     return tuple(
-        ConstraintRow(*row[:5], tuple(row.key_columns), row.definition)
+        ConstraintRow(
+            *row[:5],
+            tuple(row.key_columns),
+            row.definition,
+            row.referenced_table,
+            tuple(row.referenced_columns),
+        )
         for row in FetchRows(migratedEngine, CONSTRAINTS_SQL, SchemaParameters())
     )
 
 
 @pytest.fixture(name="indexRows", scope="module")
 def IndexRows(migratedEngine: Engine) -> dict[str, IndexRow]:
-    """Return every index of the CardDemo schemas, by name."""
+    """Return every index of the CardDemo schemas, with its table and ordered columns, by name."""
     return {
-        row.index_name: IndexRow(*row)
+        row.index_name: IndexRow(*row[:5], tuple(row.index_columns), row.is_partial)
         for row in FetchRows(migratedEngine, INDEXES_SQL, SchemaParameters())
     }
 
@@ -689,6 +907,22 @@ def test_alternate_index_replacement_is_valid_and_not_unique(indexRows, indexNam
     assert (indexRow.isUnique, indexRow.isValid, indexRow.isPrimary) == (False, True, False)
 
 
+@pytest.mark.parametrize("indexName", sorted(EXPECTED_INDEXES))
+def test_planned_index_covers_its_whole_table_on_the_planned_columns(indexRows, indexName):
+    indexRow = indexRows[indexName]
+    assert IndexMismatches(INDEX_DEFINITIONS[indexName], indexRow) == [], indexRow
+
+
+@pytest.mark.parametrize("change", INDEX_CHANGES, ids=[item.caseName for item in INDEX_CHANGES])
+def test_index_comparison_reports_a_changed_definition_under_the_same_name(indexRows, change):
+    definition = INDEX_DEFINITIONS[change.objectName]
+    reflectedRow = indexRows[change.objectName]
+    assert IndexMismatches(definition, reflectedRow) == []
+    changedRow = reflectedRow._replace(**{change.rowField: change.changedValue})
+    assert changedRow.indexName == change.objectName
+    assert IndexMismatches(definition, changedRow) == [change.reportedField]
+
+
 # Names only: the predicates of the partial batch-state indexes are compared with the models by
 # test_batch_state_indexes.py.
 def test_secondary_indexes_match_the_models(indexRows):
@@ -702,6 +936,28 @@ def test_foreign_keys_are_exactly_the_planned_relationships(constraintRows):
     foreignKeys = ConstraintsOfType(constraintRows, FOREIGN_KEY_TYPE)
     assert {row.constraintName for row in foreignKeys} == EXPECTED_FOREIGN_KEYS
     assert ModelConstraintNames(ForeignKeyConstraint) == EXPECTED_FOREIGN_KEYS
+
+
+@pytest.mark.parametrize("foreignKeyName", sorted(EXPECTED_FOREIGN_KEYS))
+def test_foreign_key_joins_the_planned_columns_to_the_planned_key(constraintRows, foreignKeyName):
+    definition = FOREIGN_KEY_DEFINITIONS[foreignKeyName]
+    namedKeys = NamedForeignKeys(constraintRows, foreignKeyName)
+    mismatches = [ForeignKeyMismatches(definition, row) for row in namedKeys]
+    assert mismatches == [[]], namedKeys
+
+
+@pytest.mark.parametrize(
+    "change", FOREIGN_KEY_CHANGES, ids=[item.caseName for item in FOREIGN_KEY_CHANGES]
+)
+def test_foreign_key_comparison_reports_a_changed_definition_under_the_same_name(
+    constraintRows, change
+):
+    definition = FOREIGN_KEY_DEFINITIONS[change.objectName]
+    [reflectedRow] = NamedForeignKeys(constraintRows, change.objectName)
+    assert ForeignKeyMismatches(definition, reflectedRow) == []
+    changedRow = reflectedRow._replace(**{change.rowField: change.changedValue})
+    assert changedRow.constraintName == change.objectName
+    assert ForeignKeyMismatches(definition, changedRow) == [change.reportedField]
 
 
 # All twelve, the four batch keys included: every model key passes FOREIGN_KEY_OPTIONS.

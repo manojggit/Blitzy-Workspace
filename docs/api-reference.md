@@ -444,7 +444,8 @@ Other outcomes, each with `field_errors` and `cursor_field` naming the field sho
 - 401 `Wrong Password. Try again ...` (`password`).
 - 429 `Too many failed attempts. Try again later ...` (`user_id`): after `LOGIN_MAX_ATTEMPTS`
     (default 5) failures for the same upper-cased user ID, known or not, sign-on is refused for
-    `LOGIN_LOCKOUT_SECONDS` (default 900). A successful sign-on resets the count.
+    `LOGIN_LOCKOUT_SECONDS` (default 900). A successful sign-on resets the count. A blank user ID
+    is never counted or refused with 429.
 - 503 `Unable to verify the User ...` (`user_id`): the user file cannot be read, as while the
     batch window is held.
 

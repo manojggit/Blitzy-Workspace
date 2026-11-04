@@ -338,9 +338,12 @@ Status 12 is returned when:
 - outside a step, the database cannot be reached (`DATABASE NOT AVAILABLE`), or it rejects a
     statement the command does not map itself, as an unmigrated database does
     (`DATABASE ERROR`, naming only the error classes and the SQLSTATE);
+- outside a step, a file of the GDG archive cannot be read, renamed or deleted, for example a
+    directory where catalog recovery expects a generation file or an orphan `.part`
+    (`FILE ERROR`, naming the error class, the errno symbol and the path, with non-printable
+    characters escaped);
 - `job` runs with no `OPEN` cycle;
-- `run-all --start-at` names an unknown step, or a step after step 1 for a new cycle
-    ([Resume](#resume));
+- `run-all --start-at` names a step after step 1 for a new cycle ([Resume](#resume));
 - `load init-users` runs with `APP_ENV=production`.
 
 Status 16 is returned when:
@@ -348,6 +351,9 @@ Status 16 is returned when:
 - POSTTRAN meets an I/O error or a duplicate key;
 - INTCALC finds no `DEFAULT` disclosure group, or meets an I/O error;
 - CREASTMT input exceeds the statement table capacity.
+
+A usage error, such as an unknown command or option, or an invalid option value such as an
+unknown `--start-at` `STEP`, exits 2 from Click before the batch window is taken.
 
 Chain rules:
 
@@ -442,8 +448,9 @@ A NEW CYCLE STARTS AT STEP 1, NOT STEP STEP_NUMBER JCL_NAME;
 ```
 
 `STEP_NUMBER` and `JCL_NAME` are the start step's number and legacy JCL name, such as `13` and
-`POSTTRAN`; for TRANBKP the start step is step 6. An unknown `STEP` exits 12 with
-`UNKNOWN STEP: STEP` before any cycle changes.
+`POSTTRAN`; for TRANBKP the start step is step 6. An unknown `STEP` is a usage error: the command
+exits 2, naming `--start-at` and its accepted forms, before the batch window is taken or the
+database is reached.
 
 ### Failure
 
@@ -600,6 +607,13 @@ catalog is consistent, so running it again changes nothing.
 A publication that failed after its step committed ([Publication](#publication)) leaves a
 `COMMITTED` row or an unfinished retention. The next command completes it the same way, before it
 schedules any step, and `run-all` then skips the `COMPLETED` step.
+
+A file that recovery cannot read, rename or delete, such as a directory standing at a `COMMITTED`
+generation's final path or a directory named like a `.part`, stops the command with exit 12
+before it schedules anything. One `FILE ERROR` line names the error class, the errno symbol and
+the path, with non-printable characters escaped, so a line break or terminal escape in a file
+name stays on that line. The batch window is released. Every command stops the same way until
+the path is repaired; the next command then reconciles the catalog as above.
 
 ### Lost generations
 
@@ -889,7 +903,10 @@ To list the command groups:
 .venv/bin/carddemo-batch --help
 ```
 
-The help lists four command groups: `run-all`, `seed-all`, `job` and `load`.
+The help lists four command groups: `run-all`, `seed-all`, `job` and `load`. Every help page,
+each group's and command's included, also lists the environment variables the CLI reads
+([Configuration](#configuration)), the exit statuses ([Exit statuses](#exit-statuses)) and
+examples of that page's commands.
 
 The same CLI runs as a module:
 

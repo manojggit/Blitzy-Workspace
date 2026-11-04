@@ -10,8 +10,11 @@ from SEC-USR-ID DELIMITED BY SPACE, NOTFND answers ``User ID NOT found...``, and
 ``Unable to Update User...`` with the cursor on the first name (line 334).
 
 The services are called directly with an admin context. Users come from ``createUser``, and the
-database is re-read with plain bound SQL through ``syncEngine``. A batch-window NOTOPEN and an
-I/O error are injected by replacing a UserRepository method with an AsyncMock that raises them.
+database is read with plain bound SQL through ``syncEngine``. Each fetch that reaches
+READ-USER-SEC-FILE reads every column of every security.users record, hash and audit timestamps
+included, before the call, takes its expected fields from that before-image only, and finds that
+state unchanged after the call, successful or refused. A batch-window NOTOPEN and an I/O error
+are injected by replacing a UserRepository method with an AsyncMock that raises them.
 Every test that can delete is restored to the seed snapshot by ``restoreSeedState``, and the ten
 seed users of the USRSEC image are counted after each delete.
 """
@@ -54,13 +57,16 @@ FILE_ERROR_STATUS = 503
 
 # The map shows SEC-USR-FNAME, SEC-USR-LNAME and SEC-USR-TYPE; it has no password field.
 PASSWORD_KEYS = ("password", "password_hash")
+# The security.users columns the fetch moves to the map: the keyed ID, the names and the type.
+DISPLAYED_COLUMNS = ("user_id", "first_name", "last_name", "user_type")
 SEED_USER_COUNT = 10
 SEED_ADMIN_PATTERN = "ADMIN%"
 SEED_REGULAR_PATTERN = "USER%"
 
 COUNT_USER_SQL = text("SELECT count(*) FROM security.users WHERE user_id = :userId")
-READ_USER_SQL = text(
-    "SELECT user_id, first_name, last_name, user_type FROM security.users WHERE user_id = :userId"
+READ_USERS_STATE_SQL = text(
+    "SELECT user_id, user_id_sort, first_name, last_name, password_hash, user_type,"
+    " created_at, updated_at FROM security.users"
 )
 COUNT_SEED_USERS_SQL = text(
     "SELECT count(*) FROM security.users"
@@ -94,10 +100,20 @@ def RowExists(syncEngine: Engine, userId: str) -> bool:
         return connection.execute(COUNT_USER_SQL, {"userId": userId}).scalar_one() > 0
 
 
-def ReadUserRow(syncEngine: Engine, userId: str) -> dict[str, object]:
-    """Return the ID, names and type security.users holds for ``userId``."""
+def ReadUsersState(syncEngine: Engine) -> dict[str, dict[str, object]]:
+    """Return every column of every security.users record, keyed by user ID, with plain SQL.
+
+    The hash, the generated sort key and both audit timestamps are included, so an insert, a
+    delete or a rewrite of any column changes the result.
+    """
     with syncEngine.connect() as connection:
-        return dict(connection.execute(READ_USER_SQL, {"userId": userId}).mappings().one())
+        userRecords = connection.execute(READ_USERS_STATE_SQL).mappings()
+        return {userRecord["user_id"]: dict(userRecord) for userRecord in userRecords}
+
+
+def DisplayedFields(userRecord: dict[str, object]) -> dict[str, object]:
+    """Return the ID, names and type of ``userRecord``: the fields the COUSR03 map shows."""
+    return {column: userRecord[column] for column in DISPLAYED_COLUMNS}
 
 
 def SeedUserCount(syncEngine: Engine) -> int:
@@ -152,18 +168,23 @@ def FailingDeleteFixture(
 async def test_fetch_shows_the_stored_user_with_the_pf5_prompt(
     syncEngine, createUser, makeOnlineContext, keyForm
 ):
-    """NORMAL: the stored names and type with the PF5 prompt, never a password or hash."""
+    """NORMAL: the stored names and type with the PF5 prompt, never a password or hash.
+
+    The expected fields come from the record as it stood before the fetch, and every record,
+    hash and audit timestamps included, is unchanged after it.
+    """
     user = createUser(REGULAR_USER_TYPE)
     context = await makeOnlineContext(ADMIN_USER_TYPE)
+    usersBefore = ReadUsersState(syncEngine)
     fetched = await cousr03c.FetchUserForDelete(context, keyForm(user.userId))
     fetchedFields = fetched.model_dump()
     assert fetchedFields == {
-        **ReadUserRow(syncEngine, user.userId),
+        **DisplayedFields(usersBefore[user.userId]),
         "message": PRESS_PF5_TO_DELETE_MESSAGE,
     }
     assert fetched.user_type == REGULAR_USER_TYPE
     assert not set(PASSWORD_KEYS) & set(fetchedFields)
-    assert RowExists(syncEngine, user.userId)
+    assert ReadUsersState(syncEngine) == usersBefore
 
 
 @pytest.mark.parametrize("blankUserId", BLANK_USER_IDS, ids=BLANK_USER_ID_IDS)
@@ -183,26 +204,34 @@ async def test_blank_user_id_is_refused_before_any_usrsec_access(
     deleteSpy.assert_not_awaited()
 
 
-async def test_fetch_of_an_unknown_user_id_is_not_found(makeOnlineContext):
-    """NOTFND: 404 ``User ID NOT found...``, cursor on the user ID."""
+async def test_fetch_of_an_unknown_user_id_is_not_found(syncEngine, makeOnlineContext):
+    """NOTFND: 404 ``User ID NOT found...``, cursor on the user ID; nothing written or created."""
     context = await makeOnlineContext(ADMIN_USER_TYPE)
+    usersBefore = ReadUsersState(syncEngine)
     with pytest.raises(LegacyMessageError) as raised:
         await cousr03c.FetchUserForDelete(context, UNKNOWN_USER_ID)
     assert raised.value.httpStatus == NOT_FOUND_STATUS
     assert raised.value.Body() == LegacyBody(USER_NOT_FOUND_MESSAGE, USER_ID_FIELD)
+    assert not RowExists(syncEngine, UNKNOWN_USER_ID)
+    assert ReadUsersState(syncEngine) == usersBefore
 
 
 async def test_fetch_file_condition_answers_unable_to_lookup_user(
-    createUser, makeOnlineContext, failingRead
+    syncEngine, createUser, makeOnlineContext, failingRead
 ):
-    """WHEN OTHER (line 296): 503 ``Unable to lookup User...``, cursor on the first name."""
+    """WHEN OTHER (line 296): 503 ``Unable to lookup User...``, cursor on the first name.
+
+    Every record, the one keyed included, is unchanged after the refused fetch.
+    """
     user = createUser(REGULAR_USER_TYPE)
     context = await makeOnlineContext(ADMIN_USER_TYPE)
+    usersBefore = ReadUsersState(syncEngine)
     with pytest.raises(LegacyMessageError) as raised:
         await cousr03c.FetchUserForDelete(context, user.userId)
     assert raised.value.httpStatus == FILE_ERROR_STATUS
     assert raised.value.Body() == LegacyBody(UNABLE_TO_LOOKUP_USER_MESSAGE, FIRST_NAME_FIELD)
     failingRead.assert_awaited_once_with(user.userId)
+    assert ReadUsersState(syncEngine) == usersBefore
 
 
 # --- F5: DELETE-USER-INFO and DELETE-USER-SEC-FILE -----------------------------------------------

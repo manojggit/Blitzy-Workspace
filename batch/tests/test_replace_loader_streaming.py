@@ -10,9 +10,11 @@ transaction committed or rolled back. run_ledger.FinishAtomicRun is replaced by 
 The daily images are synthetic copies of the first record of
 data/EBCDIC/AWS.M2.CARDDEMO.DALYTRAN.PS, in that EBCDIC form or re-encoded as the CRLF-separated
 lines of an ASCII image; the priming-only TRANFILE image is the shipped
-AWS.M2.CARDDEMO.DALYTRAN.PS.INIT. A rejected image's exit-12 text, and the traceback rendered
-from it, must quote none of the refused text: the field text of a malformed record, the bytes
-the image's codec or a row builder could not decode, or the original error's message.
+AWS.M2.CARDDEMO.DALYTRAN.PS.INIT. A rejected image's exit-12 text names the image, the record
+and, for a framing error, image_reader's own reason, which holds only fixed text and lengths.
+That text, and the traceback rendered from it, must quote none of the refused text: the field
+text of a malformed record, the bytes the image's codec or a row builder could not decode, or
+the message of the error that caused the rejection.
 """
 
 import itertools
@@ -75,8 +77,20 @@ MALFORMED_AMOUNT = MALFORMED_AMOUNT_TEXT.encode(DAILY_IMAGE_CODEC)
 MALFORMED_AMOUNT_REASON = (
     "FIELD tran_amt AT OFFSET 132, CAUSE RecordFormatError; RECORD TEXT WITHHELD"
 )
-# The reason of an image cut short of a whole record, a problem found before any field is read.
-FRAMING_REASON = "CAUSE FRAMING; RECORD TEXT WITHHELD"
+# The framing reasons image_reader gives a daily image hold only fixed text and lengths, so a
+# rejection reports each as it is, followed by the FRAMING cause. CVTRA06Y is a 350-byte record
+# ending in a 20-byte FILLER, so an ASCII record of 330 bytes is accepted too.
+DAILY_LRECL = 350
+LENGTH_FRAMING_REASON = (
+    "length {length}, expected 350 (or 330 without its trailing FILLER), CAUSE FRAMING"
+)
+BARE_TERMINATOR_FRAMING_REASON = "bare CR or LF inside record, CAUSE FRAMING"
+# An image cut short of a whole record, STREAMED_RECORD_COUNT records and then the malformed
+# record up to the end of its amount, is refused on its size before any field is read.
+TRUNCATED_IMAGE_SIZE = STREAMED_RECORD_COUNT * DAILY_LRECL + TRAN_AMT_OFFSET + TRAN_AMT_LENGTH
+FRAMING_REASON = (
+    f"size {TRUNCATED_IMAGE_SIZE} is not a multiple of LRECL {DAILY_LRECL}, CAUSE FRAMING"
+)
 WHOLE_IMAGE_RECORD_NUMBER = 0
 
 # Bytes a row builder decodes as ASCII for the tran_desc column of one record, and that one
@@ -95,6 +109,10 @@ REFUSED_BYTE_REASON = "BYTE 41 IS NOT ascii TEXT, CAUSE UnicodeDecodeError; RECO
 # Decodes each byte to the character of the same ordinal, as a raw byte would show in text.
 RAW_BYTE_CODEC = "latin-1"
 ASCII_RECORD_TERMINATOR = b"\r\n"
+BARE_CR = b"\r"
+LONE_LF = b"\n"
+# One byte past the LRECL makes a daily record over-long.
+OVERLONG_EXTRA_BYTE = b" "
 
 EVENT_DEFER = "DEFER CONSTRAINTS"
 EVENT_DELETE = "DELETE {table}"
@@ -154,6 +172,18 @@ class MalformedImageCase:
     writeImage: Callable[[Path, int, int | None], Path]
     withheldReason: str
     refusedTexts: Callable[[], Iterable[str]]
+
+
+@dataclass(frozen=True)
+class FramingImageCase:
+    """An ASCII daily image framed wrongly at MALFORMED_RECORD_NUMBER, and how it is rejected.
+
+    imageBytes returns the whole image. framingReason is the exact reason the rejection reports:
+    image_reader's own reason for that record, followed by the FRAMING cause.
+    """
+
+    imageBytes: Callable[[], bytes]
+    framingReason: str
 
 
 def StatementEvent(statement: object) -> str:
@@ -330,25 +360,61 @@ def AppendPartialRecord(imagePath: Path) -> None:
         image.write(MalformedDailyRecord()[: TRAN_AMT_OFFSET + TRAN_AMT_LENGTH])
 
 
+def AsciiDailyLines(records: Iterable[bytes]) -> bytes:
+    """Return records as the CRLF-terminated lines of an ASCII daily image."""
+    return b"".join(record + ASCII_RECORD_TERMINATOR for record in records)
+
+
+def FaultyRecordImage(faultyRecord: bytes) -> bytes:
+    """Return STREAMED_RECORD_COUNT ASCII sample records, MALFORMED_RECORD_NUMBER's faultyRecord."""
+    records = [AsciiDailyRecord()] * STREAMED_RECORD_COUNT
+    records[MALFORMED_RECORD_NUMBER - 1] = faultyRecord
+    return AsciiDailyLines(records)
+
+
+def BareCrImage() -> bytes:
+    """Return the ASCII image whose faulty record has a CR over its first tran_desc byte."""
+    asciiRecord = AsciiDailyRecord()
+    descRest = asciiRecord[TRAN_DESC_OFFSET + len(BARE_CR) :]
+    return FaultyRecordImage(asciiRecord[:TRAN_DESC_OFFSET] + BARE_CR + descRest)
+
+
+def OverlongRecordImage() -> bytes:
+    """Return the ASCII image whose faulty record is one byte longer than its LRECL."""
+    return FaultyRecordImage(AsciiDailyRecord() + OVERLONG_EXTRA_BYTE)
+
+
+def DoubledFinalCrlfImage() -> bytes:
+    """Return the records before MALFORMED_RECORD_NUMBER, the final CRLF doubled."""
+    records = [AsciiDailyRecord()] * (MALFORMED_RECORD_NUMBER - 1)
+    return AsciiDailyLines(records) + ASCII_RECORD_TERMINATOR
+
+
+def DoubledFinalLoneLfImage() -> bytes:
+    """Return MALFORMED_RECORD_NUMBER records, the last ending in a doubled lone LF."""
+    records = [AsciiDailyRecord()] * MALFORMED_RECORD_NUMBER
+    return AsciiDailyLines(records[:-1]) + records[-1] + LONE_LF + LONE_LF
+
+
 def RejectedPrefix(imagePath: Path, recordNumber: int) -> str:
     """Return the start of the exit-12 text for a malformed daily record."""
     reason = f"{imagePath}: record {recordNumber}: "
     return IMAGE_REJECTED_TEMPLATE.format(dataset=DAILY_DATASET, reason=reason)
 
 
-def AssertWithheldRejection(
-    failure: JobFailure, imagePath: Path, recordNumber: int, withheldReason: str
+def AssertRejection(
+    failure: JobFailure, imagePath: Path, recordNumber: int, reportedReason: str
 ) -> None:
-    """Assert failure is the exit-12 rejection of imagePath's record by withheldReason alone.
+    """Assert failure is the exit-12 rejection of imagePath's record by reportedReason alone.
 
     It is chained to an ImageFormatError with the same path and record number and that reason.
     """
     assert failure.exitCode == EXIT_FAILURE
-    assert failure.message == RejectedPrefix(imagePath, recordNumber) + withheldReason
+    assert failure.message == RejectedPrefix(imagePath, recordNumber) + reportedReason
     reportedError = failure.__cause__
     assert isinstance(reportedError, ImageFormatError)
     reportedLocation = (reportedError.path, reportedError.recordNumber, reportedError.reason)
-    assert reportedLocation == (imagePath, recordNumber, withheldReason)
+    assert reportedLocation == (imagePath, recordNumber, reportedReason)
 
 
 def AssertQuotesNone(failure: JobFailure, refusedTexts: Iterable[str]) -> None:
@@ -362,7 +428,7 @@ def AssertQuotesNone(failure: JobFailure, refusedTexts: Iterable[str]) -> None:
 
 def AssertAmountWithheld(failure: JobFailure, imagePath: Path, recordNumber: int) -> None:
     """Assert failure rejects the malformed amount by record, column, offset and cause only."""
-    AssertWithheldRejection(failure, imagePath, recordNumber, MALFORMED_AMOUNT_REASON)
+    AssertRejection(failure, imagePath, recordNumber, MALFORMED_AMOUNT_REASON)
     AssertQuotesNone(failure, MalformedAmountTexts())
 
 
@@ -422,7 +488,7 @@ def test_malformed_record_after_a_batch_rolls_back_the_whole_load(
     with pytest.raises(JobFailure) as raised:
         ReplaceTable(context, DailySpec(loadRecord), imagePath)
     withheldReason = malformedCase.withheldReason
-    AssertWithheldRejection(raised.value, imagePath, MALFORMED_RECORD_NUMBER, withheldReason)
+    AssertRejection(raised.value, imagePath, MALFORMED_RECORD_NUMBER, withheldReason)
     AssertQuotesNone(raised.value, malformedCase.refusedTexts())
     assert loadRecord.events == [
         EVENT_DEFER,
@@ -449,11 +515,52 @@ def test_image_cut_short_of_a_record_is_rejected_as_framing(imageDir, loadRecord
     AppendPartialRecord(imagePath)
     with pytest.raises(JobFailure) as raised:
         ReplaceTable(LoadContext(loadRecord), DailySpec(loadRecord), imagePath)
-    AssertWithheldRejection(raised.value, imagePath, WHOLE_IMAGE_RECORD_NUMBER, FRAMING_REASON)
+    AssertRejection(raised.value, imagePath, WHOLE_IMAGE_RECORD_NUMBER, FRAMING_REASON)
     AssertQuotesNone(raised.value, MalformedAmountTexts())
     assert loadRecord.events == [
         EVENT_DEFER,
         EVENT_DELETE.format(table=DAILY_TABLE),
+        EVENT_ROLLBACK,
+    ]
+    assert loadRecord.finishedCounts == []
+
+
+@pytest.mark.parametrize(
+    "framingCase",
+    [
+        pytest.param(
+            FramingImageCase(BareCrImage, BARE_TERMINATOR_FRAMING_REASON),
+            id="bare-cr-inside-record",
+        ),
+        pytest.param(
+            FramingImageCase(
+                OverlongRecordImage, LENGTH_FRAMING_REASON.format(length=DAILY_LRECL + 1)
+            ),
+            id="over-long-record",
+        ),
+        pytest.param(
+            FramingImageCase(DoubledFinalCrlfImage, LENGTH_FRAMING_REASON.format(length=0)),
+            id="doubled-final-crlf",
+        ),
+        pytest.param(
+            FramingImageCase(DoubledFinalLoneLfImage, BARE_TERMINATOR_FRAMING_REASON),
+            id="doubled-final-lone-lf",
+        ),
+    ],
+)
+def test_ascii_framing_error_after_a_batch_is_rejected_with_its_reason(
+    imageDir, loadRecord, framingCase
+):
+    imagePath = imageDir / DAILY_IMAGE_NAME
+    imagePath.write_bytes(framingCase.imageBytes())
+    with pytest.raises(JobFailure) as raised:
+        ReplaceTable(LoadContext(loadRecord, ENCODING_ASCII), DailySpec(loadRecord), imagePath)
+    framingReason = framingCase.framingReason
+    AssertRejection(raised.value, imagePath, MALFORMED_RECORD_NUMBER, framingReason)
+    assert loadRecord.events == [
+        EVENT_DEFER,
+        EVENT_DELETE.format(table=DAILY_TABLE),
+        EVENT_INSERT.format(table=DAILY_TABLE),
         EVENT_ROLLBACK,
     ]
     assert loadRecord.finishedCounts == []
@@ -464,7 +571,7 @@ def test_bytes_a_row_builder_cannot_decode_roll_back_without_being_quoted(imageD
     with pytest.raises(JobFailure) as raised:
         ReplaceTable(LoadContext(loadRecord), UndecodableDailySpec(loadRecord), imagePath)
     failure = raised.value
-    AssertWithheldRejection(failure, imagePath, WHOLE_IMAGE_RECORD_NUMBER, UNDECODABLE_REASON)
+    AssertRejection(failure, imagePath, WHOLE_IMAGE_RECORD_NUMBER, UNDECODABLE_REASON)
     AssertQuotesNone(failure, UNDECODABLE_SENTINELS + (repr(UNDECODABLE_TEXT),))
     assert loadRecord.events == [
         EVENT_DEFER,

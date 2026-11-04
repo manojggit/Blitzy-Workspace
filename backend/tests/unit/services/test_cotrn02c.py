@@ -12,13 +12,23 @@ literals, cursor fields and statuses are typed from cbl/COTRN02C.cbl:
 - the CONFIRMI EVALUATE of PROCESS-ENTER-KEY (lines 169-188);
 - ADD-TRANSACTION and WRITE-TRANSACT-FILE (lines 442-466, 711-749): the next TRAN-ID, the
   stored record, the success STRING with its two spaces and the DUPREC literal (409);
-- COPY-LAST-TRAN-DATA (lines 471-495): the F5 copy of the highest TRANSACT record;
+- COPY-LAST-TRAN-DATA (lines 471-495): VALIDATE-INPUT-KEY-FIELDS, then the F5 copy of the
+  highest TRANSACT record;
 - STARTBR-TRANSACT-FILE and READPREV-TRANSACT-FILE (lines 642-697), which ADD-TRANSACTION and
   COPY-LAST-TRAN-DATA perform: WHEN OTHER (503) before any write.
 
 COTRN02C edits in first-failure mode, so a refusal names one literal and puts the cursor on its
 field. Seed account 00000000004 holds card 2988091353094312, a 40.00 balance and, like every
 account, no transaction; account 00000000099 and card 4000000000000000 do not exist.
+
+Every refused, unconfirmed or copy-only request is guarded by reading every column of every
+TRANSACT, ACCTDAT and TCATBALF row before and after the call, so an in-place rewrite or a
+balance change fails the case as surely as an added record. Each of those cases keeps a TRANSACT
+record on file, so a rewrite has a record to change; only the F5 empty-file case runs on the
+empty seed file, because its READPREV ENDFILE outcome needs one. A confirmed F5 copy likewise
+leaves its source record and every ACCTDAT and TCATBALF row unchanged. The F5 invalid-key cases
+make the TRANSACT browse fail with IOERR, so a browse run ahead of the key edits shows as a 503
+and as an awaited read.
 """
 
 from collections.abc import Awaitable, Callable, Mapping
@@ -222,6 +232,19 @@ STORED_ROW_SQL = text(
 )
 COUNT_TRANSACTIONS_SQL = text("SELECT count(*) FROM transactions.transactions")
 READ_BALANCE_SQL = text("SELECT curr_balance FROM accounts.accounts WHERE acct_id = :acctId")
+# Every column of every TRANSACT, ACCTDAT and TCATBALF row in primary-key order: the stored
+# state a refused, unconfirmed or copy-only request must leave exactly as it found it.
+TRANSACT_TABLE = "transactions.transactions"
+STORED_STATE_SQL = MappingProxyType(
+    {
+        TRANSACT_TABLE: text("SELECT * FROM transactions.transactions ORDER BY tran_id"),
+        "accounts.accounts": text("SELECT * FROM accounts.accounts ORDER BY acct_id"),
+        "transactions.transaction_category_balances": text(
+            "SELECT * FROM transactions.transaction_category_balances"
+            " ORDER BY acct_id, tran_type_cd, tran_cat_cd"
+        ),
+    }
+)
 
 
 class Refusal(NamedTuple):
@@ -246,6 +269,13 @@ class TranLookupFailure(NamedTuple):
 
     methodName: str
     overrides: Mapping[str, str]
+
+
+class KeyedRefusal(NamedTuple):
+    """Map fields keyed over the valid screen, and the refusal COTRN02C answers them with."""
+
+    overrides: Mapping[str, str]
+    refusal: Refusal
 
 
 class ShownField(NamedTuple):
@@ -287,12 +317,15 @@ KEY_EDIT_CASES = [
         Refusal(HTTP_NOT_FOUND, CARD_NOT_FOUND_MESSAGE, "card_num"),
         id="card-not-found",
     ),
-    # F5 runs the key edits before the TRANSACT browse, so a key failure copies nothing.
+]
+
+# F5 runs the same key edits before the TRANSACT browse, so a key failure reads and copies nothing.
+COPY_LAST_KEY_EDIT_CASES = [
     pytest.param(
-        {"action": COPY_LAST_ACTION, "acct_id": "", "card_num": ""},
-        EditFailure(ACCOUNT_OR_CARD_REQUIRED_MESSAGE, "acct_id"),
-        id="copy-last-keys-blank",
-    ),
+        KeyedRefusal({**keyCase.values[0], "action": COPY_LAST_ACTION}, keyCase.values[1]),
+        id=f"copy-last-{keyCase.id}",
+    )
+    for keyCase in KEY_EDIT_CASES
 ]
 
 # --- The presence EVALUATE: each field blanked while every earlier field is valid --------------
@@ -371,14 +404,6 @@ DATA_EDIT_CASES = [
         id="merchant-id-not-numeric",
     ),
     pytest.param({"confirm": "Q"}, EditFailure(CONFIRM_INVALID_MESSAGE, "confirm"), id="confirm-q"),
-    # F5 on the empty seed TRANSACT: READPREV ENDFILE copies the record area's initial spaces
-    # and zeros, so TTYPCDI is blank and PROCESS-ENTER-KEY stops at its presence edit. The
-    # confirm prompt is therefore unreachable on an empty file, as in COPY-LAST-TRAN-DATA.
-    pytest.param(
-        {"action": COPY_LAST_ACTION, "confirm": ""},
-        EditFailure(TYPE_CD_EMPTY_MESSAGE, "type_cd"),
-        id="copy-last-empty-file",
-    ),
 ]
 
 XREF_FAILURE_CASES = [
@@ -477,6 +502,22 @@ def ReadStoredRow(syncEngine: Engine, tranId: str) -> dict[str, Any]:
         return dict(connection.execute(STORED_ROW_SQL, {"tranId": tranId}).mappings().one())
 
 
+def ReadStoredState(syncEngine: Engine) -> dict[str, list[dict[str, Any]]]:
+    """Return every committed TRANSACT, ACCTDAT and TCATBALF row, all columns, keyed by table."""
+    with syncEngine.connect() as connection:
+        return {
+            tableName: [dict(row) for row in connection.execute(statement).mappings()]
+            for tableName, statement in STORED_STATE_SQL.items()
+        }
+
+
+def ReadStoredBalances(syncEngine: Engine) -> dict[str, list[dict[str, Any]]]:
+    """Return every committed ACCTDAT and TCATBALF row, all columns, keyed by table."""
+    storedBalances = ReadStoredState(syncEngine)
+    del storedBalances[TRANSACT_TABLE]
+    return storedBalances
+
+
 def ExpectedBody(refusal: Refusal) -> dict[str, object]:
     """Return the error body of a first-failure screen: one failing field, the cursor on it.
 
@@ -522,13 +563,23 @@ def FailingXrefRead(fileName: str) -> Callable[[CardXrefRepository, str], Awaita
 async def AssertRefusedWithoutWrite(
     context: Any, syncEngine: Engine, request: TransactionAddRequest, refusal: Refusal
 ) -> None:
-    """Assert AddTransaction answers ``request`` with ``refusal`` and stores no transaction."""
-    countBefore = CountTransactions(syncEngine)
+    """Assert AddTransaction answers ``request`` with ``refusal`` and changes no stored row."""
+    stateBefore = ReadStoredState(syncEngine)
     with pytest.raises(LegacyMessageError) as raised:
         await cotrn02c.AddTransaction(context, request)
     outcome = (raised.value.httpStatus, raised.value.Body())
     assert outcome == (refusal.httpStatus, ExpectedBody(refusal))
-    assert CountTransactions(syncEngine) == countBefore
+    assert ReadStoredState(syncEngine) == stateBefore
+
+
+async def RespondWithoutWrite(
+    context: Any, syncEngine: Engine, request: TransactionAddRequest
+) -> TransactionAddResponse:
+    """Return AddTransaction's 200 answer to ``request``, asserting it changed no stored row."""
+    stateBefore = ReadStoredState(syncEngine)
+    response = await cotrn02c.AddTransaction(context, request)
+    assert ReadStoredState(syncEngine) == stateBefore
+    return response
 
 
 @pytest.mark.usefixtures("restoreSeedState")
@@ -539,8 +590,21 @@ async def test_first_failing_edit_is_the_only_message(
     makeOnlineContext, syncEngine, overrides, refusal
 ):
     """Each edit, in source order, ends validation with its literal, status and cursor."""
+    InsertTransactionRow(syncEngine, LAST_TRAN_ID)
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     await AssertRefusedWithoutWrite(context, syncEngine, BuildAddRequest(overrides), refusal)
+
+
+# F5 on the empty seed TRANSACT: READPREV ENDFILE copies the record area's initial spaces
+# and zeros, so TTYPCDI is blank and PROCESS-ENTER-KEY stops at its presence edit. The
+# confirm prompt is therefore unreachable on an empty file, as in COPY-LAST-TRAN-DATA.
+@pytest.mark.usefixtures("restoreSeedState")
+async def test_copy_last_empty_file_stops_at_type_cd(makeOnlineContext, syncEngine):
+    """F5 with no TRANSACT record answers the Type CD presence literal and changes no row."""
+    context = await makeOnlineContext(REGULAR_USER_TYPE)
+    request = BuildAddRequest({"action": COPY_LAST_ACTION, "confirm": ""})
+    refusal = EditFailure(TYPE_CD_EMPTY_MESSAGE, "type_cd")
+    await AssertRefusedWithoutWrite(context, syncEngine, request, refusal)
 
 
 @pytest.mark.usefixtures("restoreSeedState")
@@ -549,6 +613,7 @@ async def test_xref_file_error_is_the_when_other_literal(
     makeOnlineContext, syncEngine, monkeypatch, xrefFailure
 ):
     """A CXACAIX or CCXREF read failing with IOERR gives its WHEN OTHER literal as a 503."""
+    InsertTransactionRow(syncEngine, LAST_TRAN_ID)
     failingRead = FailingXrefRead(xrefFailure.fileName)
     monkeypatch.setattr(CardXrefRepository, xrefFailure.methodName, failingRead)
     context = await makeOnlineContext(REGULAR_USER_TYPE)
@@ -579,6 +644,25 @@ async def test_transact_browse_error_is_unable_to_lookup_transaction(
     assert ReadBalance(syncEngine, ADDING_ACCT_ID) == SEED_BALANCE
 
 
+@pytest.mark.usefixtures("restoreSeedState")
+@pytest.mark.parametrize("keyedRefusal", COPY_LAST_KEY_EDIT_CASES)
+async def test_copy_last_edits_the_keys_before_reading_transact(
+    makeOnlineContext, syncEngine, monkeypatch, keyedRefusal
+):
+    """F5 with an invalid key answers the key literal and never starts the TRANSACT browse.
+
+    A record is on file and the browse fails with IOERR, so a browse run ahead of
+    VALIDATE-INPUT-KEY-FIELDS would answer 503 ``Unable to lookup Transaction...`` instead.
+    """
+    InsertTransactionRow(syncEngine, LAST_TRAN_ID)
+    failingBrowse = AsyncMock(side_effect=FileIoError(TRANSACTION_FILE))
+    monkeypatch.setattr(TransactionRepository, "GetHighestTransaction", failingBrowse)
+    context = await makeOnlineContext(REGULAR_USER_TYPE)
+    request = BuildAddRequest(keyedRefusal.overrides)
+    await AssertRefusedWithoutWrite(context, syncEngine, request, keyedRefusal.refusal)
+    failingBrowse.assert_not_awaited()
+
+
 def test_pre_gregorian_date_is_ceedays_message_2513():
     """CSUTLDTC fails a date before 1582-10-15 with message 2513, the one COTRN02C accepts."""
     result = CheckDate(PRE_GREGORIAN_DATE, CSUTLDTC_DATE_MASK)
@@ -592,23 +676,29 @@ async def test_accepted_entry_reaches_the_confirm_prompt(
     makeOnlineContext, syncEngine, overrides, shownField
 ):
     """Every edit passes, so a blank CONFIRM returns the prompt with the edited map."""
+    InsertTransactionRow(syncEngine, LAST_TRAN_ID)
     context = await makeOnlineContext(REGULAR_USER_TYPE)
-    response = await cotrn02c.AddTransaction(context, BuildAddRequest({**overrides, "confirm": ""}))
+    request = BuildAddRequest({**overrides, "confirm": ""})
+    response = await RespondWithoutWrite(context, syncEngine, request)
     outcome = (response.message, response.cursor_field, response.tran_id)
     assert outcome == (CONFIRM_PROMPT_MESSAGE, "confirm", None)
     assert getattr(response.fields, shownField.fieldName) == shownField.value
-    assert CountTransactions(syncEngine) == 0
+    assert CountTransactions(syncEngine) == 1
+    assert ReadStoredRow(syncEngine, LAST_TRAN_ID) == dict(LAST_ROW_VALUES)
 
 
 @pytest.mark.usefixtures("restoreSeedState")
 @pytest.mark.parametrize("confirm", ["", "N", "n"], ids=["blank", "N", "n"])
 async def test_blank_or_n_confirm_prompts_without_writing(makeOnlineContext, syncEngine, confirm):
     """CONFIRMI N, n or SPACES sends the prompt with the map, the card masked; nothing is added."""
+    InsertTransactionRow(syncEngine, LAST_TRAN_ID)
     context = await makeOnlineContext(REGULAR_USER_TYPE)
-    response = await cotrn02c.AddTransaction(context, BuildAddRequest({"confirm": confirm}))
+    request = BuildAddRequest({"confirm": confirm})
+    response = await RespondWithoutWrite(context, syncEngine, request)
     promptFields = {**VALID_SCREEN_FIELDS, "card_num": MASKED_ADDING_CARD_NUM, "confirm": confirm}
     assert response == PromptResponse(promptFields)
-    assert CountTransactions(syncEngine) == 0
+    assert CountTransactions(syncEngine) == 1
+    assert ReadStoredRow(syncEngine, LAST_TRAN_ID) == dict(LAST_ROW_VALUES)
 
 
 @pytest.mark.usefixtures("restoreSeedState")
@@ -657,18 +747,25 @@ async def test_copy_last_fills_the_screen_from_the_highest_record(makeOnlineCont
     InsertTransactionRow(syncEngine, LAST_TRAN_ID)
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     request = BuildAddRequest({"action": COPY_LAST_ACTION, "confirm": ""})
-    response = await cotrn02c.AddTransaction(context, request)
+    response = await RespondWithoutWrite(context, syncEngine, request)
     assert response == PromptResponse(COPIED_SCREEN_FIELDS)
     assert CountTransactions(syncEngine) == 2
 
 
 @pytest.mark.usefixtures("restoreSeedState")
 async def test_copy_last_confirmed_adds_the_copied_record(makeOnlineContext, syncEngine):
-    """F5 with CONFIRM Y writes the copied fields under the next TRAN-ID."""
+    """F5 with CONFIRM Y writes the copied fields under the next TRAN-ID.
+
+    The copied record and every ACCTDAT and TCATBALF row are left exactly as they were.
+    """
     InsertTransactionRow(syncEngine, LAST_TRAN_ID)
+    balancesBefore = ReadStoredBalances(syncEngine)
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     request = BuildAddRequest({"action": COPY_LAST_ACTION, "confirm": "Y"})
     response = await cotrn02c.AddTransaction(context, request)
     assert response == AddedResponse(NEXT_AFTER_LAST_TRAN_ID)
     assert ReadStoredRow(syncEngine, NEXT_AFTER_LAST_TRAN_ID) == dict(COPIED_ADDED_ROW)
     assert ReadBalance(syncEngine, ADDING_ACCT_ID) == SEED_BALANCE
+    assert ReadStoredRow(syncEngine, LAST_TRAN_ID) == dict(LAST_ROW_VALUES)
+    assert CountTransactions(syncEngine) == 2
+    assert ReadStoredBalances(syncEngine) == balancesBefore

@@ -2,12 +2,14 @@
 key SEC-USR-ID X(08) of copybook CSUSR01Y.
 
 Only failed sign-ons are counted in security.login_attempts, against the upper-cased user ID
-cosgn00c passes, as COSGN00C reads USRSEC, whether or not the user exists. The invariant: the
-failures counted since the last reset plus the password checks in flight never exceed
-LOGIN_MAX_ATTEMPTS. A concurrent burst of wrong passwords therefore checks at most
-LOGIN_MAX_ATTEMPTS of them before the lock, and concurrent correct sign-ons are never refused:
+cosgn00c passes, as COSGN00C reads USRSEC, whether or not the user exists. cosgn00c answers a
+blank user ID with its edit before any admission, as COSGN00C reads no USRSEC record for it, so
+the blank ID is never a key. The invariant: the failures counted since the last reset plus the
+password checks in flight never exceed LOGIN_MAX_ATTEMPTS. A concurrent burst of wrong
+passwords therefore checks at most LOGIN_MAX_ATTEMPTS of them before the lock, and concurrent
+correct sign-ons are never refused:
 
-- AcquireCheckSlot admits an attempt to its edits and its password check. One write unit locks
+- AcquireCheckSlot admits an attempt to its password edit and check. One write unit locks
   the ID's row, inserting it with no failures when absent, so the admissions of one ID, and its
   failure and reset writes, run one after another. A locked ID answers 429 with
   LOGIN_LOCKED_MESSAGE and the attempt is not counted. Otherwise the attempt is admitted while

@@ -64,7 +64,14 @@ PER_WRITE_REFUSED_STATES = (run_ledger.STEP_FAILED, run_ledger.STEP_INTERRUPTED)
 # Operator messages. Each is logged as exactly this text, refusals and failures at ERROR and
 # progress at INFO, so subprocess tests can look for it in the output.
 NO_OPEN_CYCLE_MESSAGE = "NO OPEN CYCLE; RUN run-all OR seed-all"
+# RunChain logs UNKNOWN STEP for a ChainOptions built in code. The CLI refuses the same values
+# while parsing --start-at, as a usage error stating this rule only, never the value: a mistyped
+# card number is not repeated.
 UNKNOWN_STEP_TEMPLATE = "UNKNOWN STEP: {name}"
+START_AT_RULE_MESSAGE = (
+    f"--start-at must be a step number 1-{run_ledger.CHAIN_STEP_COUNT} or a job or loader name,"
+    " such as 13, post-tran or POSTTRAN"
+)
 NEW_CYCLE_START_REFUSED_TEMPLATE = (
     "A NEW CYCLE STARTS AT STEP 1, NOT STEP {stepNo} {jobName}; --start-at RESUMES ONLY AN"
     " OPEN CYCLE"

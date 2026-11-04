@@ -5,16 +5,22 @@ cbl/COTRN01C.cbl PROCESS-ENTER-KEY refuses a blank TRNIDIN with ``Tran ID can NO
 any other RESP with ``Unable to lookup Transaction...`` (line 292), the batch window's NOTOPEN
 included. Every outcome moves -1 to TRNIDINL, so the cursor is on the transaction ID. A found
 record is moved field by field to the map (lines 176-190). Expected values are typed from those
-lines and from the 26-character TRAN-ORIG-TS and TRAN-PROC-TS text forms (copybook CVTRA05Y):
+lines, from the COTRN01 map field lengths (bms/COTRN01.bms) and from the 26-character
+TRAN-ORIG-TS and TRAN-PROC-TS text forms (copybook CVTRA05Y):
 - a blank ID, empty or 16 spaces, answers 400;
 - an ID no record has answers 404;
 - an IOERR or a NOTOPEN from the TRANSACT read answers 503;
 - a record of each timestamp form (S, D, T and blank) is shown with its own values, the amount a
     Decimal, the card number masked and both timestamps as their exact 26-character texts;
+- map widths: TRAN-DESC, TRAN-MERCHANT-NAME and TRAN-MERCHANT-CITY filling their CVTRA05Y
+    widths (100, 50 and 50) are shown cut to the TDESC, MNAME and MCITY lengths (60, 30 and 25);
+- receiver width: MOVE TRAN-AMT TO WS-TRAN-AMT (line 177), a PIC +99999999.99 receiver
+    (line 49), keeps eight integer digits and the sign. 99999999.99 is shown unchanged, while
+    100000000.50 and -123456789.12 lose their ninth integer digit and show 0.50 and -23456789.12;
 - the source's READ ... UPDATE is a plain SELECT, so no case changes a stored record.
 
 Each case calls cotrn01c.ViewTransaction directly against the migrated, seeded test database,
-with four records committed on a seed card; the seed is restored afterwards.
+with the VIEWABLE_ROWS records committed on a seed card; the seed is restored afterwards.
 """
 
 import re
@@ -23,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from operator import itemgetter
+from types import MappingProxyType
 from typing import NamedTuple
 from unittest.mock import AsyncMock
 
@@ -74,18 +81,41 @@ STORED_TRANSACTIONS_SQL = text(
     "proc_ts_format FROM transactions.transactions ORDER BY tran_id"
 )
 
+# CVTRA05Y TRAN-DESC X(100) with all 100 positions filled, and the 60 that TDESC (LENGTH=60)
+# shows. The cut falls inside a word, so a map width off by one shows a different text.
+FULL_WIDTH_TRAN_DESC = (
+    "PYTEST PURCHASE DESCRIPTION FILLING ALL ONE HUNDRED TRAN-DESC "
+    "POSITIONS. TDESC SHOWS THE FIRST SIXTY"
+)
+TDESC_SHOWN_TRAN_DESC = "PYTEST PURCHASE DESCRIPTION FILLING ALL ONE HUNDRED TRAN-DES"
+# TRAN-MERCHANT-NAME X(50) filled, and the 30 that MNAME (LENGTH=30) shows.
+FULL_WIDTH_MERCHANT_NAME = "PYTEST MERCHANT NAME FILLING ALL FIFTY X(50) BYTES"
+MNAME_SHOWN_MERCHANT_NAME = "PYTEST MERCHANT NAME FILLING A"
+# TRAN-MERCHANT-CITY X(50) filled, and the 25 that MCITY (LENGTH=25) shows.
+FULL_WIDTH_MERCHANT_CITY = "PYTEST MERCHANT CITY FILLING ALL FIFTY X(50) BYTES"
+MCITY_SHOWN_MERCHANT_CITY = "PYTEST MERCHANT CITY FILL"
+
 
 class ViewableRow(NamedTuple):
-    """A committed TRANSACT record and the TORIGDT and TPROCDT texts its record held."""
+    """A committed TRANSACT record, the TORIGDT and TPROCDT texts it held, and its shown values.
+
+    ``shownValues`` types each map field COTRN01C shows differently from the stored value:
+    TDESC, MNAME and MCITY cut to their map widths, and TRNAMT as the WS-TRAN-AMT receiver
+    holds it. Every other field is shown as stored.
+    """
 
     values: Mapping[str, object]
     origTsText: str
     procTsText: str
+    shownValues: Mapping[str, object] = MappingProxyType({})
 
 
-# One record per TRAN-ORIG-TS/TRAN-PROC-TS text form, keyed by its format code. TRAN-ID is
-# X(16) and COTRN01C has no numeric edit, so letters in the IDs leave the card number as the
-# only value a 16-digit run could come from. Each text value fits its COTRN01 map field.
+# One record per display case, keyed by its test ID. TRAN-ID is X(16) and COTRN01C has no
+# numeric edit, so letters in the IDs leave the card number as the only value a 16-digit run
+# could come from. The S, D, T and blank records hold one TRAN-ORIG-TS/TRAN-PROC-TS text form
+# each, with text that fits its COTRN01 map field and an amount WS-TRAN-AMT holds whole. The
+# map-width record fills the CVTRA05Y text widths, and the two amount records need a ninth
+# integer digit that WS-TRAN-AMT does not have.
 VIEWABLE_ROWS: Mapping[str, ViewableRow] = {
     # The space-separated form S, as DALYTRAN ORIG-TS and the CB00 clock write it.
     "S": ViewableRow(
@@ -154,7 +184,7 @@ VIEWABLE_ROWS: Mapping[str, ViewableRow] = {
         procTsText="2022-07-17                ",
     ),
     # A blank TRAN-PROC-TS, as every DALYTRAN record carries: NULL with format code blank.
-    " ": ViewableRow(
+    "blank": ViewableRow(
         values={
             "tran_id": "CT01VIEWFORMAT0B",
             "tran_type_cd": "01",
@@ -175,15 +205,89 @@ VIEWABLE_ROWS: Mapping[str, ViewableRow] = {
         origTsText="2022-06-10 19:27:53.000000",
         procTsText="                          ",
     ),
+    # Text filling its CVTRA05Y widths, cut to the map widths; the largest amount the eight
+    # integer digits of WS-TRAN-AMT hold, shown unchanged.
+    "map-width": ViewableRow(
+        values={
+            "tran_id": "CT01VIEWMAPWIDTH",
+            "tran_type_cd": "01",
+            "tran_cat_cd": 1,
+            "tran_source": "POS TERM",
+            "tran_desc": FULL_WIDTH_TRAN_DESC,
+            "tran_amt": Decimal("99999999.99"),
+            "merchant_id": "000000404",
+            "merchant_name": FULL_WIDTH_MERCHANT_NAME,
+            "merchant_city": FULL_WIDTH_MERCHANT_CITY,
+            "merchant_zip": "62703",
+            "card_num": VIEW_CARD_NUM,
+            "orig_ts": datetime(2022, 7, 1, 9, 30, 0),
+            "orig_ts_format": "S",
+            "proc_ts": datetime(2022, 7, 1, 9, 30, 0),
+            "proc_ts_format": "S",
+        },
+        origTsText="2022-07-01 09:30:00.000000",
+        procTsText="2022-07-01 09:30:00.000000",
+        shownValues={
+            "tran_desc": TDESC_SHOWN_TRAN_DESC,
+            "tran_amt": Decimal("99999999.99"),
+            "merchant_name": MNAME_SHOWN_MERCHANT_NAME,
+            "merchant_city": MCITY_SHOWN_MERCHANT_CITY,
+        },
+    ),
+    # A positive TRAN-AMT one past the eight integer digits: WS-TRAN-AMT drops the ninth.
+    "amount-ninth-digit-positive": ViewableRow(
+        values={
+            "tran_id": "CT01VIEWAMOUNTP9",
+            "tran_type_cd": "01",
+            "tran_cat_cd": 1,
+            "tran_source": "POS TERM",
+            "tran_desc": "PYTEST NINE-DIGIT PURCHASE",
+            "tran_amt": Decimal("100000000.50"),
+            "merchant_id": "000000505",
+            "merchant_name": "PYTEST WHOLESALER",
+            "merchant_city": "OGDENVILLE",
+            "merchant_zip": "62704",
+            "card_num": VIEW_CARD_NUM,
+            "orig_ts": datetime(2022, 7, 2, 10, 15, 0),
+            "orig_ts_format": "S",
+            "proc_ts": datetime(2022, 7, 2, 10, 15, 0),
+            "proc_ts_format": "S",
+        },
+        origTsText="2022-07-02 10:15:00.000000",
+        procTsText="2022-07-02 10:15:00.000000",
+        shownValues={"tran_amt": Decimal("0.50")},
+    ),
+    # A negative TRAN-AMT with a ninth integer digit: WS-TRAN-AMT drops it and keeps the sign.
+    "amount-ninth-digit-negative": ViewableRow(
+        values={
+            "tran_id": "CT01VIEWAMOUNTN9",
+            "tran_type_cd": "03",
+            "tran_cat_cd": 1,
+            "tran_source": "OPERATOR",
+            "tran_desc": "PYTEST NINE-DIGIT RETURN",
+            "tran_amt": Decimal("-123456789.12"),
+            "merchant_id": "000000606",
+            "merchant_name": "PYTEST WHOLESALER",
+            "merchant_city": "NORTH HAVERBROOK",
+            "merchant_zip": "62705",
+            "card_num": VIEW_CARD_NUM,
+            "orig_ts": datetime(2022, 7, 3, 11, 45, 0),
+            "orig_ts_format": "S",
+            "proc_ts": datetime(2022, 7, 3, 11, 45, 0),
+            "proc_ts_format": "S",
+        },
+        origTsText="2022-07-03 11:45:00.000000",
+        procTsText="2022-07-03 11:45:00.000000",
+        shownValues={"tran_amt": Decimal("-23456789.12")},
+    ),
 }
-TIMESTAMP_FORMAT_IDS = ["S", "D", "T", "blank"]
 # A record that exists, read in the TRANSACT file-condition cases.
 EXISTING_ROW = VIEWABLE_ROWS["S"]
 
 
 @dataclass(frozen=True)
 class InsertedTransactions:
-    """The committed CT01 records, by format code, and the engine that reads them back."""
+    """The committed CT01 records, by display case, and the engine that reads them back."""
 
     rows: Mapping[str, ViewableRow]
     syncEngine: Engine
@@ -221,7 +325,10 @@ def RefusalBody(message: str) -> dict[str, object]:
 
 
 def ExpectedDetail(row: ViewableRow) -> dict[str, object]:
-    """Return the COTRN01 map fields of ``row``: its values, the card masked, no message."""
+    """Return the COTRN01 map fields of ``row``: its values, the card masked, no message.
+
+    A field in ``row.shownValues`` is expected as that typed value instead of the stored one.
+    """
     values = row.values
     return {
         "tran_id": values["tran_id"],
@@ -238,6 +345,7 @@ def ExpectedDetail(row: ViewableRow) -> dict[str, object]:
         "merchant_city": values["merchant_city"],
         "merchant_zip": values["merchant_zip"],
         "message": "",
+        **row.shownValues,
     }
 
 
@@ -289,12 +397,15 @@ async def test_transact_file_condition_is_refused_with_the_lookup_literal(
     assert viewableTransactions.StoredValues() == viewableTransactions.InsertedValues()
 
 
-@pytest.mark.parametrize("timestampFormat", list(VIEWABLE_ROWS), ids=TIMESTAMP_FORMAT_IDS)
-async def test_record_is_shown_with_its_values_masked_card_and_timestamp_texts(
-    makeOnlineContext, viewableTransactions, timestampFormat
+@pytest.mark.parametrize("viewCase", list(VIEWABLE_ROWS))
+async def test_record_is_shown_in_its_map_fields_with_masked_card_and_timestamp_texts(
+    makeOnlineContext, viewableTransactions, viewCase
 ):
-    """Each record's map fields are its values, with the exact 26-character timestamp texts."""
-    viewedRow = viewableTransactions.rows[timestampFormat]
+    """Each record's map fields are its values, with the exact 26-character timestamp texts.
+
+    A value wider than its map field or the WS-TRAN-AMT receiver is shown as its shownValues.
+    """
+    viewedRow = viewableTransactions.rows[viewCase]
     context = await makeOnlineContext(REGULAR_USER_TYPE)
 
     detail = await cotrn01c.ViewTransaction(context, viewedRow.values["tran_id"])
