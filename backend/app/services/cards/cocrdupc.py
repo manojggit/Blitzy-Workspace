@@ -336,11 +336,14 @@ type ScreenHandler = Callable[
 ]
 
 
-async def FetchCardForEdit(context: OnlineContext, cardKey: str, acctId: str) -> CardScreen:
+async def FetchCardForEdit(
+    context: OnlineContext, cardKey: str, acctId: str, *, isCardRef: bool = False
+) -> CardScreen:
     """Port of the CCUP entry: fetch the card for update, from the card list or typed keys.
 
-    ``cardKey`` is the ``{cardNum}`` path value, a keyed card number or a ``card_ref`` token,
-    and ``acctId`` the account. A ``card_ref`` sent with its list row's account is the
+    ``cardKey`` is the ``{cardNum}`` path value, a keyed card number or a ``card_ref`` token
+    (any length when ``isCardRef`` declares it one, as cocrdslc.DecodeCardKey reads it), and
+    ``acctId`` the account. A ``card_ref`` sent with its list row's account is the
     card-list entry (lines 482-497): both keys are taken as the list sent them and the card is
     read without the 1210 and 1220 edits, so a card keyed all zeros opens. Any other keys,
     typed ones included, run the 1210 and 1220 edits and the card is read as the not-fetched
@@ -354,13 +357,13 @@ async def FetchCardForEdit(context: OnlineContext, cardKey: str, acctId: str) ->
             ``card_ref`` carrying no card key it shows the account as sent and a blank card
             number, so the token is never echoed.
     """
-    cardText = DecodeCardKey(cardKey, context.settings)
+    cardText = DecodeCardKey(cardKey, context.settings, isCardRef=isCardRef)
     if cardText is None:
         reply = ReadFailureReply(
             (acctId, ""), CARD_NOT_FOUND_MESSAGE, (ACCT_ID_FIELD, CARD_NUM_FIELD)
         )
         raise ScreenError(reply, STATUS_NOT_FOUND, context.settings)
-    if IsListEntry(cardKey, acctId):
+    if IsListEntry(cardKey, acctId, isCardRef=isCardRef):
         return await ShowFetchedCard(context, acctId, cardText)
     return await FetchWithKeys(context, acctId, cardText)
 

@@ -50,9 +50,12 @@ export interface CardListQuery {
     selections?: string[];
 }
 
-// The GET /cards/{cardNum} and /cards/{cardNum}/edit query: the ACCTSID field as keyed.
+// The GET /cards/{cardNum} and /cards/{cardNum}/edit query: the ACCTSID field as keyed, and
+// isCardRef, which declares the path a card_ref token whatever its length. Without it the server
+// takes a path of up to 16 characters for the CARDSID text as keyed.
 export interface CardKeyQuery {
     acctId?: string;
+    isCardRef?: boolean;
 }
 
 // One COCRDLI row: ACCTNOn, the masked CRDNUMn and CRDSTSn, with the card's card_ref token.
@@ -152,9 +155,16 @@ export interface CardUpdateRequest {
     fields?: Partial<CardScreenFields>;
 }
 
-// cardNum is the CARDSID text as keyed or a card_ref token; the server tells them apart.
+// cardNum is the CARDSID text as keyed or a card_ref token; a card_ref read says so in its query.
 function CardPath(cardNum: string): string {
     return `${CARDS_PATH}/${EncodePathKey(cardNum)}`;
+}
+
+// The query of a read by a card list selection's card_ref: the server decodes the path as a token
+// whatever its length, so an invalid or expired one gives Did not find cards for this search
+// condition, never the typed card number's key edit.
+function CardRefQuery(acctId: string): CardKeyQuery {
+    return { acctId, isCardRef: true };
 }
 
 // CCLI (COCRDLIC): ENTER, F7 and F8 on the card list. options carries the owning read's
@@ -178,7 +188,7 @@ export async function SelectCards(request: CardSelectionRequest): Promise<CardSe
     return response.data;
 }
 
-// CCDL (COCRDSLC): ENTER on the card view, or the entry from a list selection.
+// CCDL (COCRDSLC): ENTER on the card view with both keys as typed.
 export async function ViewCard(
     cardNum: string,
     acctId: string,
@@ -192,14 +202,29 @@ export async function ViewCard(
     return response.data;
 }
 
-// CCUP (COCRDUPC): the entry from a list selection, fetching the card into the update screen.
+// CCDL (COCRDSLC): the entry from a list selection, and its ENTER re-reads, by the selection's
+// card_ref token and row account.
+export async function ViewSelectedCard(
+    cardRef: string,
+    acctId: string,
+    options?: ReadOptions,
+): Promise<CardDetailResponse> {
+    const response = await API_CLIENT.get<CardDetailResponse>(CardPath(cardRef), {
+        params: CardRefQuery(acctId),
+        signal: options?.signal,
+    });
+    return response.data;
+}
+
+// CCUP (COCRDUPC): the entry from a list selection, fetching the card into the update screen by
+// the selection's card_ref token.
 export async function FetchCardForEdit(
-    cardNum: string,
+    cardRef: string,
     acctId: string,
     options?: ReadOptions,
 ): Promise<CardScreen> {
-    const params: CardKeyQuery = { acctId };
-    const editPath = CardPath(cardNum) + EDIT_SUFFIX;
+    const params = CardRefQuery(acctId);
+    const editPath = CardPath(cardRef) + EDIT_SUFFIX;
     const response = await API_CLIENT.get<CardScreen>(editPath, {
         params,
         signal: options?.signal,

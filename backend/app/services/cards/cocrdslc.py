@@ -1,8 +1,9 @@
 """Replaces: COCRDSLC (CCDL), BMS COCRDSL, copybooks CVCRD01Y, CVACT02Y, CVCUS01Y, CSMSG02Y
 
-The CCDL card detail view, served as ``GET /api/v1/cards/{cardNum}?acctId``. Typed keys are
-edited in all-field mode; a ``card_ref`` sent with its card-list row's account is the entry
-from COCRDLIC and is read without the edits. Either way CARDDAT is read by card number only:
+The CCDL card detail view, served as ``GET /api/v1/cards/{cardNum}?acctId&isCardRef``. Typed
+keys are edited in all-field mode; a ``card_ref`` sent with its card-list row's account is the
+entry from COCRDLIC and is read without the edits. The path is a ``card_ref`` when it is longer
+than CARDSID or the query declares it one. Either way CARDDAT is read by card number only:
 the CARDAIX paragraph 9150-GETCARD-BYACCT is never performed in the source, so no account
 lookup exists and the account entered is never compared with the card's account.
 
@@ -239,18 +240,28 @@ def EditCardKeys(acctText: str, cardText: str) -> CardKeyEdit:
     )
 
 
-def IsListEntry(cardKey: str, acctId: str) -> bool:
+def IsCardRefPath(cardKey: str, isCardRef: bool) -> bool:
+    """Return True when the ``{cardNum}`` path value is a ``card_ref`` token, not CARDSID text.
+
+    A value longer than CARDSID's 16 characters can only be a token. A shorter one is the card
+    number as keyed unless the request declares it a token (``isCardRef``): only the client
+    knows that the value came from a ``cardRef`` URL rather than from the CARDSID field.
+    """
+    return isCardRef or len(cardKey) > CARD_NUM_LENGTH
+
+
+def IsListEntry(cardKey: str, acctId: str, *, isCardRef: bool = False) -> bool:
     """Return True for the entry from the card list: a ``card_ref`` and a list row's account.
 
     COCRDLIC passes the selected row's WS-ROW-ACCTNO and WS-ROW-CARD-NUM in CDEMO-ACCT-ID and
     CDEMO-CARD-NUM (cbl/COCRDLIC.cbl lines 531-534 for S, 559-562 for U), and both COCRDSLC
     (lines 337-348) and COCRDUPC (cbl/COCRDUPC.cbl lines 482-497) read the card with those
-    keys without editing them. Only a ``card_ref`` path value with an account of exactly 11
-    ASCII digits, zeros included, has that shape; with any other account the keys are not list
-    keys and run the key edits.
+    keys without editing them. Only a ``card_ref`` path value (``IsCardRefPath``) with an
+    account of exactly 11 ASCII digits, zeros included, has that shape; with any other account
+    the keys are not list keys and run the key edits.
     """
-    isCardRef = len(cardKey) > CARD_NUM_LENGTH
-    return isCardRef and len(acctId) == ACCT_ID_LENGTH and IsAsciiDigits(acctId)
+    isListAccount = len(acctId) == ACCT_ID_LENGTH and IsAsciiDigits(acctId)
+    return IsCardRefPath(cardKey, isCardRef) and isListAccount
 
 
 def ListEntryKeys(acctId: str, cardText: str) -> CardKeyEdit:
@@ -270,15 +281,16 @@ def ListEntryKeys(acctId: str, cardText: str) -> CardKeyEdit:
     )
 
 
-def DecodeCardKey(cardKey: str, settings: "Settings") -> str | None:
+def DecodeCardKey(cardKey: str, settings: "Settings", *, isCardRef: bool = False) -> str | None:
     """Return the card text of the ``{cardNum}`` path value, replacing COMMAREA CDEMO-CARD-NUM.
 
-    A value of up to 16 characters is the CARDSID text as keyed and is returned unchanged for
-    the key edits. A longer value is a ``card_ref`` token. None answers a token that is invalid
-    or expired, or that does not carry a card key of at most 16 characters (such as a CCLI page
+    A ``card_ref`` token (``IsCardRefPath``: longer than 16 characters, or declared with
+    ``isCardRef`` whatever its length) is decoded. Any other value is the CARDSID text as keyed
+    and is returned unchanged for the key edits. None answers a token that is invalid or
+    expired, or that does not carry a card key of at most 16 characters (such as a CCLI page
     key).
     """
-    if len(cardKey) <= CARD_NUM_LENGTH:
+    if not IsCardRefPath(cardKey, isCardRef):
         return cardKey
     try:
         cardText = DecodeCardRef(cardKey, settings)
@@ -289,13 +301,13 @@ def DecodeCardKey(cardKey: str, settings: "Settings") -> str | None:
     return cardText
 
 
-def ResolveCardKey(cardKey: str, settings: "Settings") -> str:
+def ResolveCardKey(cardKey: str, settings: "Settings", *, isCardRef: bool = False) -> str:
     """Return the card text ``DecodeCardKey`` finds in the ``{cardNum}`` path value.
 
     A path value carrying no card key raises the 404 ``Did not find cards for this search
     condition``.
     """
-    cardText = DecodeCardKey(cardKey, settings)
+    cardText = DecodeCardKey(cardKey, settings, isCardRef=isCardRef)
     if cardText is None:
         raise NotFoundError()
     return cardText
@@ -347,14 +359,17 @@ def ExpiryParts(expirationDate: date | None) -> tuple[str, str, str]:
     )
 
 
-async def ViewCard(context: OnlineContext, cardKey: str, acctId: str) -> CardDetailResponse:
+async def ViewCard(
+    context: OnlineContext, cardKey: str, acctId: str, *, isCardRef: bool = False
+) -> CardDetailResponse:
     """Port of the CCDL entry from the card list and of its ENTER: 9000-READ-DATA, 1000-SEND-MAP.
 
-    ``cardKey`` is the ``{cardNum}`` path value, a keyed card number or a ``card_ref`` token,
-    and ``acctId`` the account. A ``card_ref`` sent with its list row's account is the
-    card-list entry (lines 337-348): both keys are taken as the list sent them and the card is
-    read without 2200-EDIT-MAP-INPUTS, so a card keyed all zeros opens. Any other keys, typed
-    ones included, run 2000-PROCESS-INPUTS: both key edits in all-field mode before the read.
+    ``cardKey`` is the ``{cardNum}`` path value, a keyed card number or a ``card_ref`` token
+    (any length when ``isCardRef`` declares it one), and ``acctId`` the account. A ``card_ref``
+    sent with its list row's account is the card-list entry (lines 337-348): both keys are
+    taken as the list sent them and the card is read without 2200-EDIT-MAP-INPUTS, so a card
+    keyed all zeros opens. Any other keys, typed ones included, run 2000-PROCESS-INPUTS: both
+    key edits in all-field mode before the read.
 
     Raises:
         LegacyMessageError: 404 ``Did not find cards for this search condition`` for an
@@ -362,8 +377,8 @@ async def ViewCard(context: OnlineContext, cardKey: str, acctId: str) -> CardDet
             exist; 400 with the key edit literal, never for the card-list entry; 503 with the
             CARDDAT READ file-error text.
     """
-    cardText = ResolveCardKey(cardKey, context.settings)
-    if IsListEntry(cardKey, acctId):
+    cardText = ResolveCardKey(cardKey, context.settings, isCardRef=isCardRef)
+    if IsListEntry(cardKey, acctId, isCardRef=isCardRef):
         keys = ListEntryKeys(acctId, cardText)
     else:
         keys = EditCardKeys(acctId, cardText)

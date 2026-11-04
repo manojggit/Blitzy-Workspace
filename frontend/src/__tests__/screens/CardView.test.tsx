@@ -15,7 +15,7 @@ import type { ReactElement, ReactNode } from "react";
 
 import CardViewPage from "@/app/cards/view/page";
 import { CARD_DEMO_THEME } from "@/app/theme";
-import { ViewCard, type CardDetailResponse } from "@/lib/api/cards";
+import { ViewCard, ViewSelectedCard, type CardDetailResponse } from "@/lib/api/cards";
 import {
     ABEND_MESSAGE,
     SIGN_ON_ROUTE,
@@ -33,6 +33,14 @@ type ScreenAction = (user: ScreenUser) => Promise<void>;
 interface FieldErrorCase {
     body: LegacyErrorResponse;
     cursorLabel: string;
+}
+
+// A card list selection's read refused for its keys: the answer, the literal and marked keys.
+interface KeyRefusalCase {
+    status: number;
+    body: object;
+    message: string;
+    fieldErrors: readonly string[];
 }
 
 // Stable router and query doubles; the "mock" prefix lets the hoisted factories read them.
@@ -79,11 +87,15 @@ jest.mock("@/lib/api/cards", () => ({
     ListCards: jest.fn(),
     SelectCards: jest.fn(),
     ViewCard: jest.fn(),
+    ViewSelectedCard: jest.fn(),
     FetchCardForEdit: jest.fn(),
     UpdateCard: jest.fn(),
 }));
 
+// Typed keys are read by ViewCard; a COCRDLIC selection, in list-entry mode, by ViewSelectedCard.
 const mockViewCard = jest.mocked(ViewCard);
+const mockViewSelectedCard = jest.mocked(ViewSelectedCard);
+type CardReadMock = typeof mockViewCard;
 
 // Test keys only: the card digits are built at runtime, so no card number is written in code.
 const TEST_ACCOUNT_ID = "00000000004";
@@ -103,6 +115,12 @@ const TEST_EXPIRY_MONTH = "07";
 const TEST_EXPIRY_YEAR = "2027";
 // The name an answer abandoned by a newer lookup carries; it must never reach the screen.
 const STALE_EMBOSSED_NAME = "STALE CARD HOLDER";
+// A cardRef query value no server issued, as short as a typed card number.
+const GARBLED_CARD_REF = "garbage";
+// Text keyed into a key while its read is pending; the key must keep the text that was sent.
+const KEYED_DURING_READ = "9";
+// MUI 9 marks an outlined (typable) and a filled (protected) TextField on its InputBase root.
+const OUTLINED_INPUT_CLASS = "MuiOutlinedInput-root";
 // Every read is handed the signal of the AbortController that owns it.
 const READ_SIGNAL_OPTIONS = expect.objectContaining({ signal: expect.any(AbortSignal) });
 
@@ -153,6 +171,7 @@ const PENDING_REFUSAL = "No access - Admin Only option... ";
 const HTTP_EDIT_FAILURE = 400;
 const HTTP_UNAUTHORIZED = 401;
 const HTTP_NOT_FOUND = 404;
+const HTTP_UNPROCESSABLE_CONTENT = 422;
 const HTTP_INTERNAL_SERVER_ERROR = 500;
 const HTTP_FILE_ERROR = 503;
 
@@ -233,6 +252,49 @@ const FIELD_ERROR_CASES: readonly FieldErrorCase[] = [
     },
 ];
 
+// A card_ref no server issued: Did not find cards for this search condition, both keys failing.
+const NOT_FOUND_REFUSAL: KeyRefusalCase = {
+    status: HTTP_NOT_FOUND,
+    body: BuildErrorBody({
+        message: CARD_NOT_FOUND_MESSAGE,
+        field_errors: [ACCT_ID_FIELD, CARD_NUM_FIELD],
+    }),
+    message: CARD_NOT_FOUND_MESSAGE,
+    fieldErrors: [ACCT_ID_FIELD, CARD_NUM_FIELD],
+};
+// The answers that refuse the selection's keys: a retry of the same card_ref cannot be read. A
+// 422 names the query parameter it rejects, which is no screen field.
+const KEY_REFUSAL_CASES: readonly KeyRefusalCase[] = [
+    NOT_FOUND_REFUSAL,
+    {
+        status: HTTP_EDIT_FAILURE,
+        body: BuildErrorBody({ message: ACCOUNT_FILTER_MESSAGE, field_errors: [ACCT_ID_FIELD] }),
+        message: ACCOUNT_FILTER_MESSAGE,
+        fieldErrors: [ACCT_ID_FIELD],
+    },
+    {
+        status: HTTP_UNPROCESSABLE_CONTENT,
+        body: { detail: [], message: "", field_errors: ["acctId"], cursor_field: "acctId" },
+        message: ABEND_MESSAGE,
+        fieldErrors: [],
+    },
+];
+// [failure, its rejection, the literal shown] of a selection's read that a retry may still read.
+const RETRYABLE_READ_FAILURES: readonly [string, () => AxiosError, string][] = [
+    [
+        "HTTP 503",
+        () =>
+            BuildAxiosError(HTTP_FILE_ERROR, BuildErrorBody({ message: CARD_FILE_ERROR_MESSAGE })),
+        CARD_FILE_ERROR_MESSAGE,
+    ],
+    [
+        "HTTP 500",
+        () => BuildAxiosError(HTTP_INTERNAL_SERVER_ERROR, { detail: "Internal Server Error" }),
+        ABEND_MESSAGE,
+    ],
+    ["a lost connection", BuildNetworkError, ABEND_MESSAGE],
+];
+
 // The ENTER and F3 legend actions, each by its button and by its physical key.
 const SEARCH_ACTIONS: readonly [string, ScreenAction][] = [
     [SEARCH_BUTTON_NAME, (user) => ClickButton(user, SEARCH_BUTTON_NAME)],
@@ -280,16 +342,16 @@ function RenderScreen(reactStrictMode = false): ScreenUser {
 // A COCRDLIC selection opens the page with the card_ref token and the account as its query.
 function RenderFromCardList(reactStrictMode = false): ScreenUser {
     mockSearchParams = new URLSearchParams({ cardRef: TEST_CARD_REF, acctId: TEST_ACCOUNT_ID });
-    mockViewCard.mockResolvedValue(BuildCardDetail());
+    mockViewSelectedCard.mockResolvedValue(BuildCardDetail());
     return RenderScreen(reactStrictMode);
 }
 
-// Every ViewCard read waits until the test calls the returned release. The executor runs at
+// Every read of readMock waits until the test calls the returned release. The executor runs at
 // once, so the resolver is assigned before it is returned. The answer then settles inside the
 // next Testing Library wait, as the page's other answers do.
-function HoldReads(): (detail: CardDetailResponse) => void {
+function HoldReads(readMock: CardReadMock): (detail: CardDetailResponse) => void {
     let releaseRead: (detail: CardDetailResponse) => void = () => undefined;
-    mockViewCard.mockReturnValue(
+    readMock.mockReturnValue(
         new Promise<CardDetailResponse>((resolve) => {
             releaseRead = resolve;
         }),
@@ -319,20 +381,20 @@ function PendUntilAborted(options?: ReadOptions): Promise<never> {
     });
 }
 
-// The arguments of one ViewCard call: both keys as sent, and the read's own signal.
+// The arguments of one ViewCard or ViewSelectedCard call: both keys as sent, and the read's own
+// signal.
 function ReadCall(cardKey: string, acctKey: string): unknown[] {
     return [cardKey, acctKey, READ_SIGNAL_OPTIONS];
 }
 
-// The signal ViewCard was handed on the call with this index.
-function SignalOfCall(callIndex: number): AbortSignal | undefined {
-    return mockViewCard.mock.calls[callIndex]?.[2]?.signal;
+// The signal readMock was handed on the call with this index.
+function SignalOfCall(readMock: CardReadMock, callIndex: number): AbortSignal | undefined {
+    return readMock.mock.calls[callIndex]?.[2]?.signal;
 }
 
-// The ViewCard calls whose read is still live: neither abandoned nor sent without a signal.
-function LiveReadCount(): number {
-    return mockViewCard.mock.calls.filter(([, , options]) => options?.signal?.aborted === false)
-        .length;
+// The readMock calls whose read is still live: neither abandoned nor sent without a signal.
+function LiveReadCount(readMock: CardReadMock): number {
+    return readMock.mock.calls.filter(([, , options]) => options?.signal?.aborted === false).length;
 }
 
 // The 1200-SETUP-SCREEN-VARS answer for a found card: the number masked and no CVV.
@@ -384,6 +446,51 @@ function BuildAxiosError(status: number, body: object): AxiosError<object> {
     );
 }
 
+// The rejection API_CLIENT gives when a request was sent and no answer came back.
+function BuildNetworkError(): AxiosError {
+    const config: InternalAxiosRequestConfig = { headers: new AxiosHeaders() };
+    return new AxiosError("Network Error", AxiosError.ERR_NETWORK, config, {});
+}
+
+// Both keys are UNPROT fields the user can type into: editable and outlined.
+function ExpectTypableKeys(): void {
+    for (const label of KEY_LABELS) {
+        expect(InputFor(label)).not.toHaveAttribute("readonly");
+        expect(InputFor(label).closest(`.${OUTLINED_INPUT_CLASS}`)).not.toBeNull();
+    }
+}
+
+// While a read is pending both typable keys are read-only, keeping their outlined look.
+function ExpectLockedTypableKeys(): void {
+    for (const label of KEY_LABELS) {
+        expect(InputFor(label)).toHaveAttribute("readonly");
+        expect(InputFor(label).closest(`.${OUTLINED_INPUT_CLASS}`)).not.toBeNull();
+    }
+}
+
+function ExpectKeyValues(acctText: string, cardText: string): void {
+    expect(InputFor(ACCOUNT_LABEL)).toHaveValue(acctText);
+    expect(InputFor(CARD_LABEL)).toHaveValue(cardText);
+}
+
+// A COCRDLIC arrival whose card_ref the server refuses for its keys, shown with its literal.
+async function RenderRefusedSelection(refusal: KeyRefusalCase): Promise<ScreenUser> {
+    mockSearchParams = new URLSearchParams({ cardRef: GARBLED_CARD_REF, acctId: TEST_ACCOUNT_ID });
+    mockViewSelectedCard.mockRejectedValueOnce(BuildAxiosError(refusal.status, refusal.body));
+    const user = RenderScreen();
+    await ExpectAlert(refusal.message, "error");
+    return user;
+}
+
+// Text keyed into both keys while their read is pending: by the keyboard, which a read-only
+// input ignores, and by a change event, which only the page's pending-read guard refuses.
+async function KeyIntoBothKeys(user: ScreenUser): Promise<void> {
+    for (const label of KEY_LABELS) {
+        await user.type(InputFor(label), KEYED_DURING_READ);
+        fireEvent.change(InputFor(label), { target: { value: KEYED_DURING_READ } });
+    }
+}
+
 // Waits for the message-line Alert holding the exact raw text (ERRMSG has role alert, INFOMSG
 // role status) and checks its colour.
 async function ExpectAlert(text: string, severity: MessageSeverity): Promise<void> {
@@ -432,11 +539,13 @@ async function WaitForLookupEnd(): Promise<void> {
     });
 }
 
-// clearMocks keeps queued answers, so each case starts from an empty ViewCard queue.
+// clearMocks keeps queued answers, so each case starts from empty ViewCard and ViewSelectedCard
+// queues.
 beforeEach(() => {
     jest.useFakeTimers(CLOCK_ONLY_FAKE_TIMERS);
     mockSearchParams = new URLSearchParams();
     mockViewCard.mockReset();
+    mockViewSelectedCard.mockReset();
     window.sessionStorage.clear();
 });
 
@@ -504,6 +613,7 @@ describe("COCRDSLC BMS COCRDSL attributes from the menu on /cards/view", () => {
         expect(InputFor(ACCOUNT_LABEL)).toHaveFocus();
         await ExpectAlert(PROMPT_FOR_KEYS_INFO, "info");
         expect(mockViewCard).not.toHaveBeenCalled();
+        expect(mockViewSelectedCard).not.toHaveBeenCalled();
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
     });
 });
@@ -523,8 +633,8 @@ describe("COCRDSLC entered from the COCRDLIC card list on /cards/view", () => {
     it("COCRDSLC reads the selected card once on mount by card_ref and account", async () => {
         RenderFromCardList();
         await ExpectAlert(DETAILS_SHOWN_INFO, "info");
-        expect(mockViewCard).toHaveBeenCalledTimes(1);
-        expect(mockViewCard).toHaveBeenCalledWith(...ReadCall(TEST_CARD_REF, TEST_ACCOUNT_ID));
+        expect(mockViewSelectedCard.mock.calls).toEqual([ReadCall(TEST_CARD_REF, TEST_ACCOUNT_ID)]);
+        expect(mockViewCard).not.toHaveBeenCalled();
     });
 
     it("COCRDSLC protects both keys and shows the card number only masked", async () => {
@@ -542,7 +652,7 @@ describe("COCRDSLC entered from the COCRDLIC card list on /cards/view", () => {
 // The read on arrival answers with its own information line, so no key prompt is set first.
 describe("COCRDSLC information line from the COCRDLIC card list on /cards/view", () => {
     it("COCRDSLC shows no key prompt while or after the selected card is read", async () => {
-        const releaseRead = HoldReads();
+        const releaseRead = HoldReads(mockViewSelectedCard);
         SelectFromCardList();
         RenderScreen();
         expect(screen.queryAllByRole("status")).toHaveLength(0);
@@ -556,23 +666,23 @@ describe("COCRDSLC entered from the COCRDLIC card list under StrictMode on /card
     it("COCRDSLC keeps one live read of the selected card under the double effect run", async () => {
         RenderFromCardList(true);
         await ExpectAlert(DETAILS_SHOWN_INFO, "info");
-        expect(mockViewCard.mock.calls).toEqual([
+        expect(mockViewSelectedCard.mock.calls).toEqual([
             ReadCall(TEST_CARD_REF, TEST_ACCOUNT_ID),
             ReadCall(TEST_CARD_REF, TEST_ACCOUNT_ID),
         ]);
-        expect(LiveReadCount()).toBe(1);
+        expect(LiveReadCount(mockViewSelectedCard)).toBe(1);
     });
 });
 
 describe("COCRDSLC entered again with another COCRDLIC selection on /cards/view", () => {
     it("COCRDSLC reads a newly selected card while the previous read is pending", async () => {
-        const releaseRead = HoldReads();
+        const releaseRead = HoldReads(mockViewSelectedCard);
         SelectFromCardList();
         const { rerender } = render(ScreenTree());
         SelectOtherFromCardList();
         rerender(ScreenTree());
-        expect(mockViewCard).toHaveBeenCalledTimes(2);
-        expect(mockViewCard).toHaveBeenLastCalledWith(
+        expect(mockViewSelectedCard).toHaveBeenCalledTimes(2);
+        expect(mockViewSelectedCard).toHaveBeenLastCalledWith(
             ...ReadCall(OTHER_CARD_REF, OTHER_ACCOUNT_ID),
         );
         releaseRead(BuildCardDetail());
@@ -598,11 +708,66 @@ describe("COCRDSLC ENTER after a COCRDLIC selection on /cards/view", () => {
             const user = RenderFromCardList();
             await ExpectAlert(DETAILS_SHOWN_INFO, "info");
             await action(user);
-            await waitFor(() => expect(mockViewCard).toHaveBeenCalledTimes(2));
+            await waitFor(() => expect(mockViewSelectedCard).toHaveBeenCalledTimes(2));
             await ExpectAlert(DETAILS_SHOWN_INFO, "info");
-            expect(mockViewCard).toHaveBeenLastCalledWith(
+            expect(mockViewSelectedCard).toHaveBeenLastCalledWith(
                 ...ReadCall(TEST_CARD_REF, TEST_ACCOUNT_ID),
             );
+            expect(mockViewCard).not.toHaveBeenCalled();
+        },
+    );
+});
+
+// A refusal of the selection's keys ends list-entry mode: the keys become the user's to type,
+// ACCTSID keeps the selection's account, and CARDSID starts blank, never echoing the card_ref.
+describe("COCRDSLC a COCRDLIC selection refused for its keys on /cards/view", () => {
+    it.each(KEY_REFUSAL_CASES)(
+        "COCRDSLC HTTP $status hands typable keys over, account kept and card number blank",
+        async (refusal) => {
+            await RenderRefusedSelection(refusal);
+            expect(mockViewSelectedCard).toHaveBeenCalledWith(
+                ...ReadCall(GARBLED_CARD_REF, TEST_ACCOUNT_ID),
+            );
+            ExpectTypableKeys();
+            ExpectKeyValues(TEST_ACCOUNT_ID, "");
+            ExpectInvalidKeys(refusal.fieldErrors);
+        },
+    );
+});
+
+describe("COCRDSLC ENTER after a refused COCRDLIC selection on /cards/view", () => {
+    it("COCRDSLC ENTER after the refusal reads the keys as typed, not the card_ref", async () => {
+        const user = await RenderRefusedSelection(NOT_FOUND_REFUSAL);
+        await waitFor(() => expect(InputFor(ACCOUNT_LABEL)).toHaveFocus());
+        mockViewCard.mockResolvedValue(BuildCardDetail());
+        await user.type(InputFor(CARD_LABEL), TYPED_CARD_NUMBER);
+        await PressKey(user, "Enter");
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        expect(mockViewCard).toHaveBeenCalledWith(...ReadCall(TYPED_CARD_NUMBER, TEST_ACCOUNT_ID));
+        expect(mockViewSelectedCard).toHaveBeenCalledTimes(1);
+        ExpectKeyValues(TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+        ExpectNoCardNumberInUrls();
+    });
+});
+
+// A 503, a 500 or a lost connection says nothing about the keys, so list-entry mode holds.
+describe("COCRDSLC a COCRDLIC selection whose read fails on /cards/view", () => {
+    it.each(RETRYABLE_READ_FAILURES)(
+        "COCRDSLC after %s keeps both keys protected and ENTER retries the card_ref",
+        async (_, buildError, message) => {
+            SelectFromCardList();
+            mockViewSelectedCard.mockRejectedValueOnce(buildError());
+            mockViewSelectedCard.mockResolvedValueOnce(BuildCardDetail());
+            const user = RenderScreen();
+            await ExpectAlert(message, "error");
+            for (const label of KEY_LABELS) {
+                expect(InputFor(label)).toHaveAttribute("readonly");
+            }
+            await PressKey(user, "Enter");
+            await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+            const selectedRead = ReadCall(TEST_CARD_REF, TEST_ACCOUNT_ID);
+            expect(mockViewSelectedCard.mock.calls).toEqual([selectedRead, selectedRead]);
+            expect(mockViewCard).not.toHaveBeenCalled();
         },
     );
 });
@@ -666,7 +831,7 @@ describe("COCRDSLC one read at a time from the main menu on /cards/view", () => 
     it.each(SAME_TURN_SEARCH_PRESSES)(
         "COCRDSLC ENTER by %s twice in one turn reads the card once",
         async (_, press) => {
-            const releaseRead = HoldReads();
+            const releaseRead = HoldReads(mockViewCard);
             const user = RenderScreen();
             await TypeKeys(user, TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
             act(() => {
@@ -683,7 +848,7 @@ describe("COCRDSLC one read at a time from the main menu on /cards/view", () => 
 
 describe("COCRDSLC busy Search Cards key from the main menu on /cards/view", () => {
     it("COCRDSLC disables Search Cards only while a read is pending", async () => {
-        const releaseRead = HoldReads();
+        const releaseRead = HoldReads(mockViewCard);
         const user = RenderScreen();
         await TypeKeys(user, TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
         await PressKey(user, "Enter");
@@ -697,18 +862,55 @@ describe("COCRDSLC busy Search Cards key from the main menu on /cards/view", () 
     });
 });
 
+// The 3270 keyboard locks while the host runs the task: the keys keep the text that was sent, so
+// the answer is shown under the keys it was read for.
+describe("COCRDSLC typed keys during a pending read from the main menu on /cards/view", () => {
+    it("COCRDSLC locks both keys while the read is pending, then shows its answer", async () => {
+        const releaseRead = HoldReads(mockViewCard);
+        const user = RenderScreen();
+        await TypeKeys(user, TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+        await PressKey(user, "Enter");
+        ExpectLockedTypableKeys();
+        await KeyIntoBothKeys(user);
+        ExpectKeyValues(TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+        releaseRead(BuildCardDetail());
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        ExpectKeyValues(TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+        expect(InputFor(NAME_LABEL)).toHaveValue(TEST_EMBOSSED_NAME);
+        ExpectTypableKeys();
+        expect(mockViewCard).toHaveBeenCalledWith(...ReadCall(TYPED_CARD_NUMBER, TEST_ACCOUNT_ID));
+    });
+});
+
+describe("COCRDSLC text keyed with ENTER from the main menu on /cards/view", () => {
+    it("COCRDSLC refuses text keyed in the turn of ENTER, before the keys re-render", async () => {
+        const releaseRead = HoldReads(mockViewCard);
+        const user = RenderScreen();
+        await TypeKeys(user, TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+        act(() => {
+            fireEvent.keyDown(InputFor(CARD_LABEL), { key: "Enter" });
+            fireEvent.change(InputFor(CARD_LABEL), { target: { value: KEYED_DURING_READ } });
+        });
+        ExpectKeyValues(TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+        expect(mockViewCard).toHaveBeenCalledWith(...ReadCall(TYPED_CARD_NUMBER, TEST_ACCOUNT_ID));
+        releaseRead(BuildCardDetail());
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        ExpectKeyValues(TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+    });
+});
+
 describe("COCRDSLC F3 during a pending read from the main menu on /cards/view", () => {
     it.each(EXIT_ACTIONS)(
         "COCRDSLC F3 by %s returns to /menu while a read is pending and abandons it",
         async (_, action) => {
-            const releaseRead = HoldReads();
+            const releaseRead = HoldReads(mockViewCard);
             const user = RenderScreen();
             await TypeKeys(user, TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
             await PressKey(user, "Enter");
             await action(user);
             expect(mockRouterPush).toHaveBeenCalledTimes(1);
             expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
-            expect(SignalOfCall(0)?.aborted).toBe(true);
+            expect(SignalOfCall(mockViewCard, 0)?.aborted).toBe(true);
             await act(async () => releaseRead(BuildCardDetail()));
             await WaitForLookupEnd();
             expect(InputFor(NAME_LABEL)).toHaveValue("");
@@ -760,7 +962,7 @@ describe("COCRDSLC not-found after a shown card on /cards/view", () => {
         const body = BuildErrorBody({ message: CARD_NOT_FOUND_MESSAGE });
         const user = RenderFromCardList();
         await ExpectAlert(DETAILS_SHOWN_INFO, "info");
-        mockViewCard.mockRejectedValue(BuildAxiosError(HTTP_NOT_FOUND, body));
+        mockViewSelectedCard.mockRejectedValue(BuildAxiosError(HTTP_NOT_FOUND, body));
         await ClickButton(user, SEARCH_BUTTON_NAME);
         await ExpectAlert(CARD_NOT_FOUND_MESSAGE, "error");
         for (const label of DETAIL_LABELS) {
@@ -801,14 +1003,15 @@ describe("COCRDSLC field errors and cursor on /cards/view", () => {
 
 describe("COCRDSLC entry read under React StrictMode on /cards/view", () => {
     it("COCRDSLC under StrictMode abandons the first entry read and shows the second", async () => {
-        mockViewCard.mockImplementationOnce((_cardNum, _acctId, options) =>
+        mockViewSelectedCard.mockImplementationOnce((_cardRef, _acctId, options) =>
             PendUntilAborted(options),
         );
         RenderFromCardList(true);
         await ExpectAlert(DETAILS_SHOWN_INFO, "info");
         await WaitForLookupEnd();
-        expect(mockViewCard).toHaveBeenCalledTimes(2);
-        expect([SignalOfCall(0)?.aborted, SignalOfCall(1)?.aborted]).toEqual([true, false]);
+        expect(mockViewSelectedCard).toHaveBeenCalledTimes(2);
+        const signals = [0, 1].map((callIndex) => SignalOfCall(mockViewSelectedCard, callIndex));
+        expect(signals.map((signal) => signal?.aborted)).toEqual([true, false]);
         expect(screen.queryByText(ABEND_MESSAGE)).not.toBeInTheDocument();
     });
 });
@@ -817,14 +1020,14 @@ describe("COCRDSLC leaving the screen during a read on /cards/view", () => {
     it("COCRDSLC leaving the screen aborts the pending read and logs nothing", async () => {
         const consoleErrorSpy = jest.spyOn(console, "error");
         SelectFromCardList();
-        mockViewCard.mockImplementationOnce((_cardNum, _acctId, options) =>
+        mockViewSelectedCard.mockImplementationOnce((_cardRef, _acctId, options) =>
             PendUntilAborted(options),
         );
         const unmount = RenderUnmountableScreen();
-        await waitFor(() => expect(mockViewCard).toHaveBeenCalledTimes(1));
-        expect(SignalOfCall(0)?.aborted).toBe(false);
+        await waitFor(() => expect(mockViewSelectedCard).toHaveBeenCalledTimes(1));
+        expect(SignalOfCall(mockViewSelectedCard, 0)?.aborted).toBe(false);
         unmount();
-        expect(SignalOfCall(0)?.aborted).toBe(true);
+        expect(SignalOfCall(mockViewSelectedCard, 0)?.aborted).toBe(true);
         await act(async () => undefined);
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
         expect(screen.queryAllByRole("status")).toHaveLength(0);
@@ -836,13 +1039,13 @@ describe("COCRDSLC leaving the screen during a read on /cards/view", () => {
 describe("COCRDSLC F3 during a pending read on /cards/view", () => {
     it("COCRDSLC F3 aborts the pending read before the route changes", async () => {
         SelectFromCardList();
-        mockViewCard.mockImplementationOnce((_cardNum, _acctId, options) =>
+        mockViewSelectedCard.mockImplementationOnce((_cardRef, _acctId, options) =>
             PendUntilAborted(options),
         );
         const user = RenderScreen();
-        await waitFor(() => expect(mockViewCard).toHaveBeenCalledTimes(1));
+        await waitFor(() => expect(mockViewSelectedCard).toHaveBeenCalledTimes(1));
         await PressKey(user, "F3");
-        expect(SignalOfCall(0)?.aborted).toBe(true);
+        expect(SignalOfCall(mockViewSelectedCard, 0)?.aborted).toBe(true);
         expect(mockRouterPush).toHaveBeenCalledWith(MENU_ROUTE);
         await WaitForLookupEnd();
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
@@ -855,14 +1058,15 @@ describe("COCRDSLC F3 during a pending read on /cards/view", () => {
 describe("COCRDSLC a superseded read on /cards/view", () => {
     it("COCRDSLC a new selection aborts the pending read and only its own answer shows", async () => {
         const staleRead = Promise.withResolvers<CardDetailResponse>();
-        mockViewCard.mockReturnValueOnce(staleRead.promise);
-        mockViewCard.mockResolvedValueOnce(BuildCardDetail());
+        mockViewSelectedCard.mockReturnValueOnce(staleRead.promise);
+        mockViewSelectedCard.mockResolvedValueOnce(BuildCardDetail());
         SelectFromCardList();
         const { rerender } = render(ScreenTree());
         SelectOtherFromCardList();
         rerender(ScreenTree());
         await ExpectAlert(DETAILS_SHOWN_INFO, "info");
-        expect([SignalOfCall(0)?.aborted, SignalOfCall(1)?.aborted]).toEqual([true, false]);
+        const signals = [0, 1].map((callIndex) => SignalOfCall(mockViewSelectedCard, callIndex));
+        expect(signals.map((signal) => signal?.aborted)).toEqual([true, false]);
         await act(async () =>
             staleRead.resolve(BuildCardDetail({ embossed_name: STALE_EMBOSSED_NAME })),
         );

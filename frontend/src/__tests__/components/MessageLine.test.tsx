@@ -1,8 +1,8 @@
 // Tests MessageLine, which replaces the BMS ERRMSG line (COLOR=RED, ERRMSGI PIC X(78)) and the
 // INFOMSG line (INFOMSGI PIC X(45)) of bms/COACTUP.bms, cpy-bms/COACTUP.CPY and COCRDLI.CPY.
-import { TextField } from "@mui/material";
+import { Portal, TextField } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { StrictMode, type ReactElement, type ReactNode } from "react";
 
 import { CARD_DEMO_THEME } from "@/app/theme";
@@ -126,8 +126,9 @@ const PRESERVED_WHITE_SPACE = "pre-wrap";
 
 // The least scroll that shows the whole line, and none while it is already in view.
 const REVEAL_SCROLL_OPTIONS: ScrollIntoViewOptions = { block: "nearest" };
-// One theme spacing unit (4 dp) of scroll margin around the line.
+// One theme spacing unit (4 dp) of scroll margin on the line's top edge, and none on its bottom.
 const REVEAL_MARGIN = "4px";
+const REVEAL_MARGIN_PIXELS = Number.parseFloat(REVEAL_MARGIN);
 
 // Two responses of one screen, as CAUP passes each response's feedback object as outcomeKey.
 const FIRST_OUTCOME = { response: 1 };
@@ -250,18 +251,25 @@ const LINE_HEIGHT = 48;
 const EDGE_GAP = 16;
 const FIELD_ABOVE_FOLD = 200;
 const FAR_OUTSIDE_VIEWPORT = 600;
+// The top of a one-line Alert stuck to the viewport bottom.
+const STUCK_LINE_TOP = VIEWPORT_HEIGHT - LINE_HEIGHT;
 
 // A row laid out in the viewport from its top edge; width plays no part in a block reveal.
 function RowAt(top: number, height: number): DOMRect {
     return new DOMRect(0, top, 0, height);
 }
 
-// Where the focused field and the message line sit, and whether an ERRMSG reveal before any user
-// action happens: only when the field stays wholly in view after the scroll the reveal needs.
-interface FocusLayout {
+// Where the focused field and the message line sit.
+interface RowLayout {
     layout: string;
     field: DOMRect;
     line: DOMRect;
+}
+
+// A layout and whether a reveal happens in it: only when the field stays wholly in view after
+// the scroll the reveal needs. In no layout does the line cover the field, so the reveal frame
+// scrolls the window by nothing but the scrollIntoView it asks for.
+interface FocusLayout extends RowLayout {
     reveals: boolean;
 }
 
@@ -273,7 +281,36 @@ const FIELD_LEFT_ABOVE: FocusLayout = {
     reveals: false,
 };
 
-const PRE_ACTION_LAYOUTS: readonly FocusLayout[] = [
+// CAVW after ENTER: Account Number focused at the top, the line stuck to the viewport bottom,
+// as it is while its place in the layout is below the fold.
+const LINE_STUCK_BELOW_FIELD: FocusLayout = {
+    layout: "a field at the top, the line stuck to the viewport bottom",
+    field: RowAt(EDGE_GAP, FIELD_HEIGHT),
+    line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+    reveals: true,
+};
+
+// CAUP after a refusal: the cursor field ends one scroll margin above the line stuck flush to the
+// viewport bottom, where the clearance leaves it. A stuck line needs no reveal scroll, so the line
+// is revealed even when the field reaches up to the viewport top; a bottom scroll margin would
+// scroll that field's top out of view, and the page further on every outcome.
+const CLEARED_FIELD_BOTTOM = STUCK_LINE_TOP - REVEAL_MARGIN_PIXELS;
+const FIELDS_CLEARED_ABOVE_STUCK_LINE: readonly FocusLayout[] = [
+    {
+        layout: "a field one scroll margin above the stuck line",
+        field: RowAt(CLEARED_FIELD_BOTTOM - FIELD_HEIGHT, FIELD_HEIGHT),
+        line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+        reveals: true,
+    },
+    {
+        layout: "a field from the viewport top to one scroll margin above the stuck line",
+        field: RowAt(0, CLEARED_FIELD_BOTTOM),
+        line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+        reveals: true,
+    },
+];
+
+const FOCUS_LAYOUTS: readonly FocusLayout[] = [
     FIELD_LEFT_ABOVE,
     {
         layout: "a field near the bottom, the line far above the top",
@@ -288,11 +325,13 @@ const PRE_ACTION_LAYOUTS: readonly FocusLayout[] = [
         line: RowAt(VIEWPORT_HEIGHT - LINE_HEIGHT / 2, LINE_HEIGHT),
         reveals: true,
     },
+    LINE_STUCK_BELOW_FIELD,
+    ...FIELDS_CLEARED_ABOVE_STUCK_LINE,
 ];
 
 // Each layout with each new outcome line: an ERRMSG is revealed where the layout allows it, an
 // INFOMSG alone in no layout before the user acts.
-const PRE_ACTION_CASES = PRE_ACTION_LAYOUTS.flatMap((focusLayout) =>
+const PRE_ACTION_CASES = FOCUS_LAYOUTS.flatMap((focusLayout) =>
     OUTCOME_LINE_CASES.map((outcomeCase) => ({
         ...focusLayout,
         ...outcomeCase,
@@ -300,7 +339,7 @@ const PRE_ACTION_CASES = PRE_ACTION_LAYOUTS.flatMap((focusLayout) =>
     })),
 );
 
-// An action of the user's on the screen, after which every new outcome is brought into view.
+// An action of the user's on the screen, after which an INFOMSG change is brought into view too.
 interface UserActionCase {
     action: string;
     Act: (field: HTMLElement) => void;
@@ -311,10 +350,55 @@ const USER_ACTION_CASES: readonly UserActionCase[] = [
     { action: "a pointerdown", Act: (field) => fireEvent.pointerDown(field) },
 ];
 
-// Each action followed by each new outcome line, INFOMSG alone included.
+// Each action followed by each new outcome line, INFOMSG alone included, in each layout: the line
+// is revealed exactly where the layout keeps the focused field in view.
 const ACTED_OUTCOME_CASES = USER_ACTION_CASES.flatMap((actionCase) =>
-    OUTCOME_LINE_CASES.map((outcomeCase) => ({ ...actionCase, ...outcomeCase })),
+    OUTCOME_LINE_CASES.flatMap((outcomeCase) =>
+        FOCUS_LAYOUTS.map((focusLayout) => ({ ...actionCase, ...outcomeCase, ...focusLayout })),
+    ),
 );
+
+// A field the stuck line covers half of, as a browser's focus scroll, which takes no account of
+// the line, can leave one.
+const FIELD_HALF_UNDER_LINE: RowLayout = {
+    layout: "a field half under the stuck line",
+    field: RowAt(STUCK_LINE_TOP - FIELD_HEIGHT / 2, FIELD_HEIGHT),
+    line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+};
+
+const FIELD_TALLER_THAN_ROOM: RowLayout = {
+    layout: "a field taller than the room above the stuck line",
+    field: RowAt(EDGE_GAP, VIEWPORT_HEIGHT),
+    line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+};
+
+// Layouts in which the stuck line covers no part of the focused element.
+const UNCOVERED_LAYOUTS: readonly RowLayout[] = [
+    LINE_STUCK_BELOW_FIELD,
+    {
+        layout: "a field one gap above the stuck line",
+        field: RowAt(STUCK_LINE_TOP - EDGE_GAP - FIELD_HEIGHT, FIELD_HEIGHT),
+        line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+    },
+    {
+        layout: "a key below the line",
+        field: RowAt(VIEWPORT_HEIGHT + EDGE_GAP, FIELD_HEIGHT),
+        line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+    },
+];
+
+// A field in a portal, as a Select menu is, which stacks above the line it overlaps.
+const PORTAL_FIELD_ID = "selection-menu-field";
+const PORTAL_FIELD_LABEL = "Selection:";
+
+// The style that keeps a shown line in view: stuck to the viewport bottom, above the fields'
+// outlined labels, on the screen frame's paper colour.
+const STUCK_LINE_STYLE = {
+    position: "sticky",
+    bottom: "0px",
+    zIndex: String(CARD_DEMO_THEME.zIndex.mobileStepper),
+    backgroundColor: CARD_DEMO_THEME.palette.background.paper,
+};
 
 function RenderWithTheme(ui: ReactElement) {
     return render(<ThemeProvider theme={CARD_DEMO_THEME}>{ui}</ThemeProvider>);
@@ -377,7 +461,8 @@ function NextAnimationFrame(): Promise<void> {
     });
 }
 
-// The wrapper around both lines, which the providers render as the container's only element.
+// The wrapper around both lines, which the providers render as the container's only element;
+// null while both lines are blank, as the line then renders nothing.
 function MessageLineWrapper(container: HTMLElement): Element | null {
     return container.firstElementChild;
 }
@@ -396,23 +481,124 @@ function FieldBesideLine({ line }: FieldBesideLineProps) {
     );
 }
 
-// The message line's wrapper, which follows the field as the container's last element.
-function WrapperAfterField(container: HTMLElement): Element {
+// The message line's wrapper, which follows the field as the container's last element once a
+// line shows.
+function WrapperAfterField(container: HTMLElement, field: HTMLElement): Element {
     const wrapper = container.lastElementChild;
-    if (wrapper === null) {
+    if (wrapper === null || wrapper.contains(field)) {
         throw new Error("The message line wrapper is not rendered.");
     }
     return wrapper;
 }
 
-// Mounts the field and a blank line, then lays both out as focusLayout places them.
-function RenderLaidOutScreen(focusLayout: FocusLayout) {
+// A screen whose focused field is laid out, beside a line that may not be rendered yet.
+interface LaidOutScreen {
+    field: HTMLElement;
+    container: HTMLElement;
+    Rerender: (ui: ReactElement) => void;
+}
+
+// Mounts the field beside a blank line, which renders nothing, and lays the field out.
+function RenderLaidOutScreen(rowLayout: RowLayout): LaidOutScreen {
     const view = render(<FieldBesideLine line={NO_OUTCOME} />, { wrapper: ThemeWrapper });
     const field = screen.getByLabelText(FIELD_LABEL);
-    const wrapper = WrapperAfterField(view.container);
-    jest.spyOn(field, "getBoundingClientRect").mockReturnValue(focusLayout.field);
-    jest.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(focusLayout.line);
-    return { field, wrapper, rerender: view.rerender };
+    jest.spyOn(field, "getBoundingClientRect").mockReturnValue(rowLayout.field);
+    return { field, container: view.container, Rerender: view.rerender };
+}
+
+// Shows the next outcome, lays its line out as rowLayout places it before the frame the reveal
+// runs in, then waits for that frame.
+async function ShowLaidOutOutcome(
+    laidOut: LaidOutScreen,
+    rowLayout: RowLayout,
+    nextOutcome: MessageLineProps,
+): Promise<Element> {
+    laidOut.Rerender(<FieldBesideLine line={nextOutcome} />);
+    const wrapper = WrapperAfterField(laidOut.container, laidOut.field);
+    jest.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(rowLayout.line);
+    await NextAnimationFrame();
+    return wrapper;
+}
+
+// A screen whose field and shown line are laid out.
+interface ShownLineScreen {
+    field: HTMLElement;
+    wrapper: Element;
+    Unmount: () => void;
+}
+
+// Mounts the field beside a shown line and lays both out as rowLayout places them.
+function RenderShownLineScreen(rowLayout: RowLayout): ShownLineScreen {
+    const view = render(<FieldBesideLine line={ADMIN_ONLY_OUTCOME} />, { wrapper: ThemeWrapper });
+    const field = screen.getByLabelText(FIELD_LABEL);
+    const wrapper = WrapperAfterField(view.container, field);
+    jest.spyOn(field, "getBoundingClientRect").mockReturnValue(rowLayout.field);
+    jest.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(rowLayout.line);
+    return { field, wrapper, Unmount: view.unmount };
+}
+
+// Moves focus off the field and back, as Tab and Shift+Tab do.
+function MoveFocusTo(field: HTMLElement): void {
+    act(() => field.blur());
+    act(() => field.focus());
+}
+
+// Focus moving to the laid-out field, then the frame the clearance runs in.
+async function FocusLaidOutField(rowLayout: RowLayout): Promise<Element> {
+    const { field, wrapper } = RenderShownLineScreen(rowLayout);
+    MoveFocusTo(field);
+    await NextAnimationFrame();
+    return wrapper;
+}
+
+// A new ERRMSG outcome beside the laid-out field, whose reveal frame runs the clearance.
+function ShowOutcomeBesideField(rowLayout: RowLayout): Promise<Element> {
+    return ShowLaidOutOutcome(RenderLaidOutScreen(rowLayout), rowLayout, ADMIN_ONLY_OUTCOME);
+}
+
+// What runs the clearance: a move of focus, or a new outcome's reveal.
+interface ClearanceTrigger {
+    trigger: string;
+    Show: (rowLayout: RowLayout) => Promise<Element>;
+}
+
+const CLEARANCE_TRIGGERS: readonly ClearanceTrigger[] = [
+    { trigger: "focus moves to the field", Show: FocusLaidOutField },
+    { trigger: "a new outcome is revealed", Show: ShowOutcomeBesideField },
+];
+
+const UNCOVERED_CASES = CLEARANCE_TRIGGERS.flatMap((triggerCase) =>
+    UNCOVERED_LAYOUTS.map((rowLayout) => ({ ...triggerCase, ...rowLayout })),
+);
+
+// The scroll margin of the line's top edge as the engine computes it, 0 where it is unset.
+function LineScrollMarginTop(wrapper: Element): number {
+    const marginTop = Number.parseFloat(window.getComputedStyle(wrapper).scrollMarginTop);
+    return Number.isNaN(marginTop) ? 0 : marginTop;
+}
+
+// The computed values that could give the line's bottom edge a scroll margin: the longhand, and
+// the shorthands a browser expands into it, which jsdom keeps as declared. Each reads "" unset.
+function BottomScrollMarginsOf(wrapper: Element | null): readonly string[] {
+    if (wrapper === null) {
+        throw new Error("The message line wrapper is not rendered.");
+    }
+    const style = window.getComputedStyle(wrapper);
+    return [style.scrollMarginBottom, style.scrollMarginBlock, style.scrollMargin];
+}
+
+const UNDECLARED_BOTTOM_SCROLL_MARGINS: readonly string[] = ["", "", ""];
+
+// A field a portal renders outside the screen's block, beside the screen's shown line.
+function PortalFieldBesideLine() {
+    return (
+        <>
+            <MessageLine {...ADMIN_ONLY_OUTCOME} />
+            <Portal>
+                <TextField id={PORTAL_FIELD_ID} label={PORTAL_FIELD_LABEL} />
+            </Portal>
+        </>
+    );
 }
 
 // Mounts the line with the case's first outcome, lets the user press a key first when asked,
@@ -487,6 +673,11 @@ describe("MessageLine blank ERRMSG and INFOMSG", () => {
         expect(container.querySelector(LIVE_REGION_SELECTOR)).toBeNull();
     });
 
+    it.each(BLANK_TEXTS)("blank ERRMSG and INFOMSG %p render no wrapper either", (text) => {
+        const { container } = RenderWithTheme(<MessageLine message={text} infoMessage={text} />);
+        expect(container).toBeEmptyDOMElement();
+    });
+
     it.each(BLANK_TEXTS)("INFOMSG renders no info line for blank text %p", (infoMessage) => {
         RenderWithTheme(<MessageLine message={ACCOUNT_FILTER_MESSAGE} infoMessage={infoMessage} />);
         expect(screen.getByRole("alert")).toHaveClass("MuiAlert-colorError");
@@ -552,13 +743,17 @@ describe("MessageLine field error description", () => {
 
 // Element.scrollIntoView, spied afresh for every test; jest.setup.ts stubs it, as jsdom has none.
 let scrollIntoViewSpy: jest.SpiedFunction<Element["scrollIntoView"]>;
+// window.scrollBy, which the focus clearance calls; jsdom implements none and reports each call.
+let scrollBySpy: jest.SpiedFunction<typeof window.scrollBy>;
 
 beforeEach(() => {
     scrollIntoViewSpy = jest.spyOn(Element.prototype, "scrollIntoView");
+    scrollBySpy = jest.spyOn(window, "scrollBy").mockImplementation(() => undefined);
 });
 
 afterEach(() => {
     scrollIntoViewSpy.mockRestore();
+    scrollBySpy.mockRestore();
 });
 
 describe("MessageLine on mount", () => {
@@ -593,10 +788,22 @@ describe("MessageLine brings each new outcome into view after a keydown", () => 
 });
 
 describe("MessageLine reveal margin", () => {
-    it("keeps a scroll margin of one spacing unit, so whole-pixel scrolling clips no edge", () => {
+    it("keeps one spacing unit of scroll margin on the top edge only, none on the bottom", () => {
         const { container } = RenderWithTheme(<MessageLine message={ADMIN_ONLY_MESSAGE} />);
-        expect(MessageLineWrapper(container)).toHaveStyle({ scrollMarginBlock: REVEAL_MARGIN });
+        const wrapper = MessageLineWrapper(container);
+        expect(wrapper).toHaveStyle({ scrollMarginTop: REVEAL_MARGIN });
+        expect(BottomScrollMarginsOf(wrapper)).toEqual(UNDECLARED_BOTTOM_SCROLL_MARGINS);
     });
+});
+
+describe("MessageLine stuck to the viewport bottom", () => {
+    it.each(LIVE_REGION_CASES)(
+        "a shown $line sticks to the viewport bottom on the paper colour",
+        ({ props }) => {
+            const { container } = RenderWithTheme(<MessageLine {...props} />);
+            expect(MessageLineWrapper(container)).toHaveStyle(STUCK_LINE_STYLE);
+        },
+    );
 });
 
 describe("MessageLine left before the next frame", () => {
@@ -617,28 +824,92 @@ function ExpectRevealed(wrapper: Element | null, reveals: boolean): void {
     expect(wrapperCalls).toHaveLength(expectedCalls.length);
 }
 
+// A laid-out reveal: the wrapper's reveal calls, and no window scroll of the line's own beside
+// them, as the line covers the field in no FocusLayout.
+function ExpectLaidOutRevealed(wrapper: Element, reveals: boolean): void {
+    ExpectRevealed(wrapper, reveals);
+    expect(scrollBySpy).not.toHaveBeenCalled();
+}
+
 describe("MessageLine before the user acts on the screen", () => {
     it.each(PRE_ACTION_CASES)(
         "$layout: brings $outcome into view = $reveals",
         async (preActionCase) => {
-            const { field, wrapper, rerender } = RenderLaidOutScreen(preActionCase);
-            expect(field).toHaveFocus();
-            rerender(<FieldBesideLine line={preActionCase.nextOutcome} />);
-            await NextAnimationFrame();
-            ExpectRevealed(wrapper, preActionCase.reveals);
+            const laidOut = RenderLaidOutScreen(preActionCase);
+            expect(laidOut.field).toHaveFocus();
+            const { nextOutcome } = preActionCase;
+            const wrapper = await ShowLaidOutOutcome(laidOut, preActionCase, nextOutcome);
+            ExpectLaidOutRevealed(wrapper, preActionCase.reveals);
         },
     );
 });
 
 describe("MessageLine after the user acts on the screen", () => {
     it.each(ACTED_OUTCOME_CASES)(
-        "after $action $outcome is brought into view, though the field leaves it",
-        async ({ Act, nextOutcome }) => {
-            const { field, wrapper, rerender } = RenderLaidOutScreen(FIELD_LEFT_ABOVE);
-            Act(field);
-            rerender(<FieldBesideLine line={nextOutcome} />);
-            await NextAnimationFrame();
-            ExpectRevealed(wrapper, true);
+        "after $action, $layout: brings $outcome into view = $reveals",
+        async (actedCase) => {
+            const laidOut = RenderLaidOutScreen(actedCase);
+            actedCase.Act(laidOut.field);
+            const wrapper = await ShowLaidOutOutcome(laidOut, actedCase, actedCase.nextOutcome);
+            ExpectLaidOutRevealed(wrapper, actedCase.reveals);
         },
     );
+});
+
+// The clearance scrolls the field up by its overlap with the line, widened by the line's margin.
+async function ClearsFieldHalfUnderLine({ Show }: ClearanceTrigger): Promise<void> {
+    const wrapper = await Show(FIELD_HALF_UNDER_LINE);
+    const { field, line } = FIELD_HALF_UNDER_LINE;
+    const overlap = field.bottom + LineScrollMarginTop(wrapper) - line.top;
+    expect(scrollBySpy.mock.calls).toEqual([[{ top: overlap }]]);
+}
+
+async function ClearsTallFieldOnlyToTop({ Show }: ClearanceTrigger): Promise<void> {
+    await Show(FIELD_TALLER_THAN_ROOM);
+    expect(scrollBySpy.mock.calls).toEqual([[{ top: FIELD_TALLER_THAN_ROOM.field.top }]]);
+}
+
+// A Select menu's field, which a portal renders outside the screen's block, over the line.
+async function LeavesPortalFieldOverLine(): Promise<void> {
+    const { container } = render(<PortalFieldBesideLine />, { wrapper: ThemeWrapper });
+    const field = screen.getByLabelText(PORTAL_FIELD_LABEL);
+    const wrapper = WrapperAfterField(container, field);
+    expect(container).not.toContainElement(field);
+    jest.spyOn(field, "getBoundingClientRect").mockReturnValue(FIELD_HALF_UNDER_LINE.field);
+    jest.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(FIELD_HALF_UNDER_LINE.line);
+    MoveFocusTo(field);
+    await NextAnimationFrame();
+    expect(scrollBySpy).not.toHaveBeenCalled();
+}
+
+describe("MessageLine clears a focused field the stuck line covers", () => {
+    it.each(CLEARANCE_TRIGGERS)(
+        "when $trigger, a field half under the line scrolls to just above it",
+        ClearsFieldHalfUnderLine,
+    );
+    it.each(CLEARANCE_TRIGGERS)(
+        "when $trigger, a field taller than the room above the line scrolls only to the top",
+        ClearsTallFieldOnlyToTop,
+    );
+});
+
+describe("MessageLine leaves a focused field the stuck line does not cover", () => {
+    it.each(UNCOVERED_CASES)("when $trigger, $layout: no clearance scroll", async (uncovered) => {
+        await uncovered.Show(uncovered);
+        expect(scrollBySpy).not.toHaveBeenCalled();
+    });
+    it(
+        "a focused field in a portal, which stacks above the line, gets no clearance",
+        LeavesPortalFieldOverLine,
+    );
+});
+
+describe("MessageLine left before the clearance frame", () => {
+    it("a screen left before the next frame cancels the pending clearance", async () => {
+        const { field, Unmount } = RenderShownLineScreen(FIELD_HALF_UNDER_LINE);
+        MoveFocusTo(field);
+        Unmount();
+        await NextAnimationFrame();
+        expect(scrollBySpy).not.toHaveBeenCalled();
+    });
 });

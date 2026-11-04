@@ -1,7 +1,8 @@
 """Unit tests for app.schemas.common.ScreenTextOrToken, the CCDL and CCUP ``{cardNum}`` type.
 
 The value is the CARDSID text as keyed (BMS LENGTH 16) or a longer ``card_ref`` token, as
-app.services.cards.cocrdslc.DecodeCardKey tells them apart. Only screen text must keep to the
+app.services.cards.cocrdslc.DecodeCardKey tells them apart when the query declares no
+``card_ref`` (``isCardRef``). Only screen text must keep to the
 code-page-037 printable repertoire; a token is bounded by length alone, so a garbled one reaches
 its decoder. The cases pin both sides of the 16-character line and the token bound.
 """

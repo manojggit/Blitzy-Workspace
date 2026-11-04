@@ -7,6 +7,7 @@ import {
     Stack,
     TextField,
     Typography,
+    type GridProps,
     type SxProps,
     type TextFieldProps,
     type Theme,
@@ -75,6 +76,8 @@ const SAVE_LABEL = "Save";
 const CANCEL_LABEL = "Cancel";
 
 const ENTRY_GRID_SIZE = { xs: 12, md: 6 } as const;
+// Name on card takes the whole row at every width, as on COCRDSL.
+const FULL_ROW_GRID_SIZE = { xs: 12 } as const;
 // Theme spacing units: room between fields for an outlined field's raised label.
 const FIELD_SPACING = 4;
 const EXPIRY_LABEL_SPACING = 2;
@@ -83,6 +86,11 @@ const EDITABLE_FIELD_KEY = "editable";
 const PROTECTED_FIELD_KEY = "protected";
 // The month and year fields sit level with the separator between them.
 const EXPIRY_ROW_STYLE: SxProps<Theme> = { alignItems: "center" };
+// Every CR and LF, which an <input type="text"> strips from its value.
+const LINE_BREAK_PATTERN = /[\r\n]/g;
+// A multiline field is one native textarea row, which wraps a value wider than the field.
+const MULTILINE_FIELD_ELEMENT = "textarea";
+const MULTILINE_FIELD_ROWS = 1;
 
 type CardFieldName = keyof CardScreenFields;
 
@@ -96,6 +104,11 @@ interface CardFieldDefinition {
     maxLength: number;
     helperText?: string;
     inputMode?: "numeric";
+    // The grid cell the field fills; ENTRY_GRID_SIZE when not given.
+    gridSize?: GridProps["size"];
+    // The value wraps onto further rows instead of being cut off, protected or editable; it never
+    // holds a line break (KeyedValueOf).
+    isMultiline?: boolean;
 }
 
 const ACCT_ID_FIELD: CardFieldName = "acct_id";
@@ -106,7 +119,13 @@ const CARD_NUM_FIELD: CardFieldName = "card_num";
 const CARD_UPDATE_FIELDS: Readonly<Record<RenderedFieldName, CardFieldDefinition>> = Object.freeze({
     acct_id: { name: "acct_id", label: "Account Number    :", maxLength: 11 },
     card_num: { name: "card_num", label: "Card Number       :", maxLength: 16 },
-    embossed_name: { name: "embossed_name", label: "Name on card      :", maxLength: 50 },
+    embossed_name: {
+        name: "embossed_name",
+        label: "Name on card      :",
+        maxLength: 50,
+        gridSize: FULL_ROW_GRID_SIZE,
+        isMultiline: true,
+    },
     active_status: {
         name: "active_status",
         label: "Card Active Y/N   :",
@@ -217,11 +236,14 @@ type RequestRunner = (request: CardRequest, signal?: AbortSignal) => void;
 // The request that holds the screen while it runs, or null when a key may start one.
 type BusyHolderRef = RefObject<object | null>;
 
-type InputRefMap = Partial<Record<CardFieldName, HTMLInputElement | null>>;
+// A multiline field renders a textarea; every other field an input.
+type FieldElement = HTMLInputElement | HTMLTextAreaElement;
 
-type InputRefCallback = (element: HTMLInputElement | null) => void;
+type InputRefMap = Partial<Record<CardFieldName, FieldElement | null>>;
 
-type InputRegistration = (name: CardFieldName, element: HTMLInputElement | null) => void;
+type InputRefCallback = (element: FieldElement | null) => void;
+
+type InputRegistration = (name: CardFieldName, element: FieldElement | null) => void;
 
 interface FieldChange {
     name: CardFieldName;
@@ -644,7 +666,7 @@ function useScreenFunctionKeys(inputs: KeyInputs): readonly FunctionKeyDefinitio
 // Each input registers its element, so a response can move the cursor to it.
 function useInputRegistry(): InputRegistry {
     const inputRefs = useRef<InputRefMap>({});
-    const registerInput = useCallback((name: CardFieldName, element: HTMLInputElement | null) => {
+    const registerInput = useCallback((name: CardFieldName, element: FieldElement | null) => {
         inputRefs.current[name] = element;
     }, []);
     return { inputRefs, registerInput };
@@ -696,21 +718,36 @@ function FieldIdOf(name: RenderedFieldName): string {
 
 // The BMS UNPROT/PROT attribute: a protected field stays focusable, but cannot be changed. While
 // the server names the field in field_errors, it is tied to the ERRMSG line ahead of its hint,
-// so assistive technology reads the literal when the cursor lands on it.
+// so assistive technology reads the literal when the cursor lands on it. A multiline field
+// renders a native textarea, which takes no type, so the input type MUI passes is dropped.
 function FieldSlotProps(
     definition: CardFieldDefinition,
     readOnly: boolean,
     hasError: boolean,
 ): TextFieldProps["slotProps"] {
     const helperTextId = HelperTextIdOf(FieldIdOf(definition.name), definition.helperText);
-    return {
-        htmlInput: {
-            maxLength: definition.maxLength,
-            inputMode: definition.inputMode,
-            ...ErrorMessageReference(hasError, helperTextId),
-        },
-        input: { readOnly },
+    const isMultiline = definition.isMultiline === true;
+    const htmlInput = {
+        maxLength: definition.maxLength,
+        inputMode: definition.inputMode,
+        ...ErrorMessageReference(hasError, helperTextId),
     };
+    return {
+        htmlInput: isMultiline ? { ...htmlInput, type: undefined } : htmlInput,
+        input: { readOnly, inputComponent: isMultiline ? MULTILINE_FIELD_ELEMENT : undefined },
+    };
+}
+
+// A multiline field's textarea wraps a long value, but a 3270 field holds no line break and the
+// server refuses CR and LF as outside the code-page-037 repertoire. A pasted or dropped line break
+// is therefore removed, as an <input type="text"> strips newlines from its value; Enter never
+// inserts one, as useFunctionKeys takes it as the screen's ENTER. Every other field keeps its
+// text exactly as keyed.
+function KeyedValueOf(definition: CardFieldDefinition, value: string): string {
+    if (definition.isMultiline !== true) {
+        return value;
+    }
+    return value.replace(LINE_BREAK_PATTERN, "");
 }
 
 function CardTextFieldPropsFor(
@@ -725,15 +762,18 @@ function CardTextFieldPropsFor(
         isFrozen: view.isFrozen,
         error: view.fieldErrors.includes(name),
         inputRef: (element) => view.registerInput(name, element),
-        onChange: (value) => view.changeField({ name, value }),
+        onChange: (value) => view.changeField({ name, value: KeyedValueOf(definition, value) }),
     };
 }
 
-// The value is kept exactly as keyed; only the BMS LENGTH is enforced. The key remounts the
-// field when its protection changes, because an input replaced while it has focus never blurs,
-// and MUI would keep showing the old field as focused. A frozen field only takes no typing until
-// the answer is adopted, so the values sent are the values the answer validates; its look and
-// its element stay as its protection sets them, and nothing flickers or remounts per request.
+// The value is kept as keyed, a multiline field's line breaks aside; only the BMS LENGTH is
+// enforced. A multiline field is a native textarea, which the theme sizes to its content: it
+// keeps one row while its value fits, and wraps a longer value onto further rows, with no hidden
+// copy of the field rendered to measure it. The key remounts the field when its protection
+// changes, because an input replaced while it has focus never blurs, and MUI would keep showing
+// the old field as focused. A frozen field only takes no typing until the answer is adopted, so
+// the values sent are the values the answer validates; its look and its element stay as its
+// protection sets them, and nothing flickers or remounts per request.
 function CardTextField(props: CardTextFieldProps) {
     const { definition, readOnly } = props;
     return (
@@ -741,6 +781,8 @@ function CardTextField(props: CardTextFieldProps) {
             key={readOnly ? PROTECTED_FIELD_KEY : EDITABLE_FIELD_KEY}
             id={FieldIdOf(definition.name)}
             fullWidth
+            multiline={definition.isMultiline === true}
+            rows={definition.isMultiline === true ? MULTILINE_FIELD_ROWS : undefined}
             label={definition.label}
             value={props.value}
             variant={readOnly ? "filled" : "outlined"}
@@ -757,7 +799,7 @@ function FieldGrid({ definitions, view, children }: FieldGridProps) {
     return (
         <Grid container spacing={FIELD_SPACING}>
             {definitions.map((definition) => (
-                <Grid key={definition.name} size={ENTRY_GRID_SIZE}>
+                <Grid key={definition.name} size={definition.gridSize ?? ENTRY_GRID_SIZE}>
                     <CardTextField {...CardTextFieldPropsFor(definition, view)} />
                 </Grid>
             ))}

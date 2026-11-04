@@ -6,7 +6,13 @@ import { AxiosHeaders, type AxiosResponse } from "axios";
 
 import { FetchAccountForEdit, ViewAccount } from "@/lib/api/accounts";
 import { FetchCurrentUser } from "@/lib/api/auth";
-import { FetchCardForEdit, ListCards, ViewCard, type CardListQuery } from "@/lib/api/cards";
+import {
+    FetchCardForEdit,
+    ListCards,
+    ViewCard,
+    ViewSelectedCard,
+    type CardListQuery,
+} from "@/lib/api/cards";
 import { FetchAdminMenu, FetchMainMenu } from "@/lib/api/menu";
 import { FetchTransactionReport, ReportType, type ReportQuery } from "@/lib/api/reports";
 import {
@@ -19,6 +25,7 @@ import { API_CLIENT, Direction, type ReadOptions } from "@/lib/apiClient";
 
 const ACCOUNT_ID = "00000000001";
 const CARD_REF = "card-ref-1";
+const TYPED_CARD_TEXT = "garbage";
 const TRAN_ID = "0000000000000001";
 const USER_ID = "TSTUSR01";
 const ANSWER_DATA = { answer: "read" };
@@ -61,17 +68,25 @@ const READ_CASES: readonly ReadCase[] = [
         params: CARD_LIST_QUERY,
         paramsSerializer: REPEATED_PARAMS_SERIALIZER,
     },
+    // Typed keys declare no card_ref, so the server edits the card text as CARDSID.
     {
         reader: "ViewCard",
-        CallRead: (options) => ViewCard(CARD_REF, ACCOUNT_ID, options),
-        path: `/cards/${CARD_REF}`,
+        CallRead: (options) => ViewCard(TYPED_CARD_TEXT, ACCOUNT_ID, options),
+        path: `/cards/${TYPED_CARD_TEXT}`,
         params: { acctId: ACCOUNT_ID },
+    },
+    // A card list selection's card_ref is declared, so the server decodes it whatever its length.
+    {
+        reader: "ViewSelectedCard",
+        CallRead: (options) => ViewSelectedCard(CARD_REF, ACCOUNT_ID, options),
+        path: `/cards/${CARD_REF}`,
+        params: { acctId: ACCOUNT_ID, isCardRef: true },
     },
     {
         reader: "FetchCardForEdit",
         CallRead: (options) => FetchCardForEdit(CARD_REF, ACCOUNT_ID, options),
         path: `/cards/${CARD_REF}/edit`,
-        params: { acctId: ACCOUNT_ID },
+        params: { acctId: ACCOUNT_ID, isCardRef: true },
     },
     { reader: "FetchMainMenu", CallRead: FetchMainMenu, path: "/menu/main" },
     { reader: "FetchAdminMenu", CallRead: FetchAdminMenu, path: "/menu/admin" },

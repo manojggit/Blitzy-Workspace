@@ -474,7 +474,9 @@ function ExitToMenu(screen: AccountViewScreenState, router: AppRouter): void {
 }
 
 // COACTVWC accepts ENTER and PF3 only (any other key is processed as ENTER), so no other key is
-// bound. F3 replaces the XCTL back to the main menu.
+// bound. F3 replaces the XCTL back to the main menu. Every response sets a new feedback object, so
+// its identity is the outcome: ENTER answered again with the same literal still brings the
+// message line into view.
 function AccountViewScreen() {
     const router = useRouter();
     const screen = useAccountViewScreen();
@@ -488,6 +490,7 @@ function AccountViewScreen() {
                 message={screen.feedback.message}
                 severity={screen.feedback.severity}
                 infoMessage={screen.feedback.infoMessage}
+                outcomeKey={screen.feedback}
             />
             <FunctionKeyBar keys={keys} />
         </ScreenShell>

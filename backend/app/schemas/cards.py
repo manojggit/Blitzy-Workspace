@@ -109,13 +109,23 @@ class CardKeyQuery(QueryModel):
     CCDL and CCUP edit the account and the card key for a typed card number, so ``Account
     number not provided`` stays reachable, and skip the edits for a ``card_ref`` from the card
     list sent with its row's 11-digit account. The ``{cardNum}`` path value is a 16-digit card
-    number or a ``card_ref`` token.
+    number or a ``card_ref`` token. A value longer than CARDSID is always a token; ``isCardRef``
+    declares a shorter one a token too, so a bad ``card_ref`` from a frontend URL gives ``Did
+    not find cards for this search condition`` rather than the typed card number's key edit.
     """
 
     acct_id: ScreenText(11) = Field(
         default="",
         alias="acctId",
         description="Account number (ACCTSID), as keyed.",
+    )
+    is_card_ref: bool = Field(
+        default=False,
+        alias="isCardRef",
+        description=(
+            "True when the cardNum path value is a card_ref token the server issued, whatever "
+            "its length; false or omitted when it is the card number as keyed."
+        ),
     )
 
 

@@ -34,7 +34,12 @@ import {
     type MessageLineProps,
 } from "@/components/MessageLine";
 import { ScreenShell } from "@/components/ScreenShell";
-import { PROMPT_FOR_KEYS_INFO, ViewCard, type CardDetailResponse } from "@/lib/api/cards";
+import {
+    PROMPT_FOR_KEYS_INFO,
+    ViewCard,
+    ViewSelectedCard,
+    type CardDetailResponse,
+} from "@/lib/api/cards";
 import {
     IsCancelledRequest,
     LegacyErrorBody,
@@ -84,10 +89,24 @@ const ACCT_ID_PARAM = "acctId";
 const ACCT_ID_FIELD = "acct_id";
 const CARD_NUM_FIELD = "card_num";
 
+// The answers that refuse the keys sent rather than the read: a key edit literal (400), Did not
+// find cards for this search condition (404) and a structural rejection of the query (422). The
+// same card_ref is never read on a retry; after a 503, a 500 or a lost connection it may be.
+const KEY_REFUSAL_STATUSES: readonly number[] = [400, 404, 422];
+
 // Each key field takes half the row on wider viewports and a full row on narrow ones.
 const KEY_FIELD_SIZE = { xs: 12, md: 6 };
 // The month and year fields sit level with the separator between them.
 const EXPIRY_ROW_STYLE: SxProps<Theme> = { alignItems: "center" };
+// The detail rows lay out as on COCRDUP: Name on card takes the whole row at every width, and
+// Card Active and the Expiry Date group share the next row on wider viewports.
+const NAME_FIELD_SIZE = { xs: 12 };
+const DETAIL_FIELD_SIZE = { xs: 12, md: 6 };
+// Theme spacing units between the detail fields: room for a field's raised label.
+const DETAIL_FIELD_SPACING = 4;
+// A multiline field is one native textarea row, which wraps a value wider than the field.
+const MULTILINE_FIELD_ELEMENT = "textarea";
+const MULTILINE_FIELD_ROWS = 1;
 
 interface CardViewFeedback {
     message: string;
@@ -97,17 +116,21 @@ interface CardViewFeedback {
     cursorField: string;
 }
 
-// The details are shown only after a successful read (FOUND-CARDS-FOR-ACCOUNT).
+// The details are shown only after a successful read (FOUND-CARDS-FOR-ACCOUNT). isListEntry
+// holds while the keys are a card list selection's: protected, and read again by card_ref.
 interface LookupState {
     detail: CardDetailResponse | null;
     feedback: CardViewFeedback;
     isBusy: boolean;
+    isListEntry: boolean;
 }
 
 // The keys of one CCDL ENTER: the CARDSID text as keyed or a card_ref token, and ACCTSID.
+// isCardRef marks a card list selection's card_ref, which the server decodes whatever its length.
 interface LookupKeys {
     cardKey: string;
     acctKey: string;
+    isCardRef: boolean;
 }
 
 // The query a screen was opened with; a non-empty cardRef means a card list selection.
@@ -138,10 +161,14 @@ type LookupRunner = (keys: LookupKeys) => Promise<void>;
 
 type LookupCanceller = () => void;
 
+// True while a lookup holds the one-at-a-time guard, read at once rather than from a render.
+type LookupPendingCheck = () => boolean;
+
 interface CardLookup {
     lookupState: LookupState;
     RunLookup: LookupRunner;
     CancelLookup: LookupCanceller;
+    IsLookupPending: LookupPendingCheck;
 }
 
 // The ACCTSID and CARDSID texts exactly as keyed: no trim, case change or client validation.
@@ -164,6 +191,7 @@ interface ScreenKeyInputs {
     RunLookup: LookupRunner;
     CancelLookup: LookupCanceller;
     isBusy: boolean;
+    isListEntry: boolean;
 }
 
 interface KeyFieldDefinition {
@@ -186,11 +214,15 @@ interface KeyFieldsSource {
     typedKeys: TypedKeys;
     detail: CardDetailResponse | null;
     inputRefs: KeyInputRefs;
+    isListEntry: boolean;
 }
 
 interface CardKeyFieldsProps {
-    // A card list selection protects both keys (1300-SETUP-SCREEN-ATTRS, DFHBMPRF).
+    // A card list selection protects both keys (1300-SETUP-SCREEN-ATTRS, DFHBMPRF) until the
+    // server refuses them.
     isListEntry: boolean;
+    // The 3270 keyboard locks while the host runs the task, so typed keys wait for the answer.
+    isBusy: boolean;
     fieldErrors: readonly string[];
     fields: readonly KeyFieldModel[];
 }
@@ -198,6 +230,8 @@ interface CardKeyFieldsProps {
 interface KeyFieldProps {
     field: KeyFieldModel;
     isProtected: boolean;
+    // Read-only while a read is pending; a typable key keeps its outlined look.
+    isLocked: boolean;
     fieldErrors: readonly string[];
 }
 
@@ -207,6 +241,8 @@ interface DetailFieldDefinition {
     fieldName: DetailFieldName;
     label: string;
     maxLength: number;
+    // A value that can outgrow its field wraps onto further rows instead of being cut off.
+    isMultiline?: boolean;
 }
 
 interface DetailFieldProps {
@@ -248,6 +284,7 @@ const NAME_FIELD: DetailFieldDefinition = {
     fieldName: "embossed_name",
     label: NAME_LABEL,
     maxLength: NAME_MAX_LENGTH,
+    isMultiline: true,
 };
 const STATUS_FIELD: DetailFieldDefinition = {
     fieldName: "active_status",
@@ -273,7 +310,12 @@ const EMPTY_FEEDBACK: CardViewFeedback = {
     cursorField: "",
 };
 
-const IDLE_LOOKUP_STATE: LookupState = { detail: null, feedback: EMPTY_FEEDBACK, isBusy: false };
+const IDLE_LOOKUP_STATE: LookupState = {
+    detail: null,
+    feedback: EMPTY_FEEDBACK,
+    isBusy: false,
+    isListEntry: false,
+};
 
 // 1200-SETUP-SCREEN-VARS sets the key prompt whenever no information line is set, so a first
 // entry from the menu shows it without a read.
@@ -281,6 +323,7 @@ const MENU_ENTRY_LOOKUP_STATE: LookupState = {
     ...IDLE_LOOKUP_STATE,
     feedback: { ...EMPTY_FEEDBACK, infoMessage: PROMPT_FOR_KEYS_INFO },
 };
+const LIST_ENTRY_LOOKUP_STATE: LookupState = { ...IDLE_LOOKUP_STATE, isListEntry: true };
 
 // The server's lines verbatim: the info line keeps the leading spaces of its literal.
 function ToViewFeedback(screenFeedback: ScreenFeedback, isError: boolean): CardViewFeedback {
@@ -303,36 +346,52 @@ function FeedbackFromError(error: unknown): CardViewFeedback {
     return ToViewFeedback(screenFeedback, true);
 }
 
-// A failed read clears the details, as the map shows them only for a card that was found. An
-// abandoned read answers null: it is neither a legacy outcome nor the abend, so nothing is shown.
+function IsKeyRefusal(error: unknown): boolean {
+    const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+    return status !== undefined && KEY_REFUSAL_STATUSES.includes(status);
+}
+
+// A card list selection is read by its card_ref; typed keys go to the server as keyed.
+function ReadCard(keys: LookupKeys, signal: AbortSignal): Promise<CardDetailResponse> {
+    const readKeys = keys.isCardRef ? ViewSelectedCard : ViewCard;
+    return readKeys(keys.cardKey, keys.acctKey, { signal });
+}
+
+// A failed read clears the details, as the map shows them only for a card that was found. A
+// refusal of a card list selection's keys ends list-entry mode, so the keys can be typed; any
+// other failure keeps it, and ENTER retries the selection. An abandoned read answers null: it is
+// neither a legacy outcome nor the abend, so nothing is shown.
 async function FetchLookupState(
     keys: LookupKeys,
     signal: AbortSignal,
 ): Promise<LookupState | null> {
     try {
-        const detail = await ViewCard(keys.cardKey, keys.acctKey, { signal });
-        return { detail, feedback: ToViewFeedback(detail, false), isBusy: false };
+        const detail = await ReadCard(keys, signal);
+        const feedback = ToViewFeedback(detail, false);
+        return { detail, feedback, isBusy: false, isListEntry: keys.isCardRef };
     } catch (error) {
         if (IsCancelledRequest(error)) {
             return null;
         }
-        return { detail: null, feedback: FeedbackFromError(error), isBusy: false };
+        const isListEntry = keys.isCardRef && !IsKeyRefusal(error);
+        return { detail: null, feedback: FeedbackFromError(error), isBusy: false, isListEntry };
     }
 }
 
-// Each request starts with a clear message line; the details shown stay until the answer.
+// Each request starts with a clear message line; the details shown and the mode stay until the
+// answer.
 function StartLookup(previous: LookupState): LookupState {
-    return { detail: previous.detail, feedback: EMPTY_FEEDBACK, isBusy: true };
+    return { ...previous, feedback: EMPTY_FEEDBACK, isBusy: true };
 }
 
 function EndLookup(previous: LookupState): LookupState {
     return previous.isBusy ? { ...previous, isBusy: false } : previous;
 }
 
-// A card list selection opens with a clear line, as its read on arrival brings the information
-// line; the menu opens with the key prompt.
+// A card list selection opens in list-entry mode with a clear line, as its read on arrival brings
+// the information line; the menu opens with the key prompt.
 function InitialLookupState(entry: EntryKeys): LookupState {
-    return entry.cardRef === "" ? MENU_ENTRY_LOOKUP_STATE : IDLE_LOOKUP_STATE;
+    return entry.cardRef === "" ? MENU_ENTRY_LOOKUP_STATE : LIST_ENTRY_LOOKUP_STATE;
 }
 
 // A pending message is the refusal literal another screen stored: a red ERRMSG line beside the
@@ -385,12 +444,17 @@ async function RunGuardedLookup(run: GuardedLookupRun): Promise<void> {
     }
 }
 
-// A card list selection re-reads its card; otherwise both keys go to the server as typed.
-function LookupKeysFor(entry: EntryKeys, typedTexts: TypedTexts): LookupKeys {
-    if (entry.cardRef !== "") {
-        return { cardKey: entry.cardRef, acctKey: entry.acctId };
+function ListEntryLookupKeys({ cardRef, acctId }: EntryKeys): LookupKeys {
+    return { cardKey: cardRef, acctKey: acctId, isCardRef: true };
+}
+
+// In list-entry mode ENTER re-reads the selected card; otherwise both keys go to the server as
+// typed.
+function LookupKeysFor(entry: EntryKeys, typedTexts: TypedTexts, isListEntry: boolean): LookupKeys {
+    if (isListEntry) {
+        return ListEntryLookupKeys(entry);
     }
-    return { cardKey: typedTexts.cardText, acctKey: typedTexts.acctText };
+    return { cardKey: typedTexts.cardText, acctKey: typedTexts.acctText, isCardRef: false };
 }
 
 // The 3270 keyboard locks while the host runs the task, so Search waits for the answer; Exit
@@ -408,8 +472,8 @@ function BuildFunctionKeys(
 
 // Protected keys show the selected card: the account as read, or the query's until the answer
 // arrives, and the card number only masked. Typable keys show the text exactly as keyed.
-function BuildKeyFields({ entry, typedKeys, detail, inputRefs }: KeyFieldsSource): KeyFieldModel[] {
-    const isListEntry = entry.cardRef !== "";
+function BuildKeyFields(source: KeyFieldsSource): KeyFieldModel[] {
+    const { entry, typedKeys, detail, inputRefs, isListEntry } = source;
     const account: KeyFieldModel = {
         definition: ACCOUNT_KEY_FIELD,
         value: isListEntry ? (detail?.acct_id ?? entry.acctId) : typedKeys.acctText,
@@ -431,15 +495,21 @@ function MessageLineFor({ message, severity, infoMessage }: CardViewFeedback): M
 
 // BMS PROT and ASKIP fields become read-only inputs; every field keeps its BMS LENGTH. A field
 // the server names in field_errors is tied to the ERRMSG line, so assistive technology reads the
-// literal when the cursor lands on it.
+// literal when the cursor lands on it. A multiline field renders a native textarea, which takes
+// no type, so the input type MUI passes is dropped.
 function FieldSlotProps(
     isReadOnly: boolean,
     maxLength: number,
     isInvalid: boolean,
+    isMultiline = false,
 ): TextFieldProps["slotProps"] {
+    const htmlInput = { maxLength, ...ErrorMessageReference(isInvalid) };
     return {
-        input: { readOnly: isReadOnly },
-        htmlInput: { maxLength, ...ErrorMessageReference(isInvalid) },
+        input: {
+            readOnly: isReadOnly,
+            inputComponent: isMultiline ? MULTILINE_FIELD_ELEMENT : undefined,
+        },
+        htmlInput: isMultiline ? { ...htmlInput, type: undefined } : htmlInput,
     };
 }
 
@@ -461,6 +531,19 @@ function usePendingMessage(setLookupState: Dispatch<SetStateAction<LookupState>>
 // Leaving the screen abandons the lookup in flight. Cancelling also frees the one-at-a-time guard
 // and ends the busy state, which no aborted lookup ends itself, so the screen never stays busy
 // once its read is abandoned, and the read React's development remount starts is not refused.
+function useLookupCanceller(
+    lookupControllerRef: LookupControllerRef,
+    setLookupState: Dispatch<SetStateAction<LookupState>>,
+): LookupCanceller {
+    const cancelLookup = useCallback(() => {
+        lookupControllerRef.current?.abort();
+        lookupControllerRef.current = null;
+        setLookupState(EndLookup);
+    }, [lookupControllerRef, setLookupState]);
+    useEffect(() => cancelLookup, [cancelLookup]);
+    return cancelLookup;
+}
+
 function useCardLookup(entry: EntryKeys): CardLookup {
     const [lookupState, setLookupState] = useState<LookupState>(() => InitialLookupState(entry));
     const lookupControllerRef = useRef<AbortController | null>(null);
@@ -468,20 +551,49 @@ function useCardLookup(entry: EntryKeys): CardLookup {
         (keys: LookupKeys) => RunGuardedLookup({ keys, lookupControllerRef, setLookupState }),
         [],
     );
-    const cancelLookup = useCallback(() => {
-        lookupControllerRef.current?.abort();
-        lookupControllerRef.current = null;
-        setLookupState(EndLookup);
-    }, []);
-    useEffect(() => cancelLookup, [cancelLookup]);
+    const cancelLookup = useLookupCanceller(lookupControllerRef, setLookupState);
+    const isLookupPending = useCallback(() => lookupControllerRef.current !== null, []);
     usePendingMessage(setLookupState);
-    return { lookupState, RunLookup: runLookup, CancelLookup: cancelLookup };
+    return {
+        lookupState,
+        RunLookup: runLookup,
+        CancelLookup: cancelLookup,
+        IsLookupPending: isLookupPending,
+    };
 }
 
-function useTypedKeys(): TypedKeys {
-    const [acctText, setAcctText] = useState("");
+// A key setter that refuses text keyed while a lookup is pending, at once and before React
+// re-renders the locked keys, so an answer is always shown under the keys that were sent.
+function GuardedKeySetter(
+    setText: Dispatch<SetStateAction<string>>,
+    isLookupPending: LookupPendingCheck,
+): (text: string) => void {
+    return (text: string) => {
+        if (!isLookupPending()) {
+            setText(text);
+        }
+    };
+}
+
+// A card list selection hands over its account, which ACCTSID shows once a refusal of the
+// selection's keys hands the keys to the user. The card number is never seeded: only its
+// card_ref travels.
+function SeededAccountText({ cardRef, acctId }: EntryKeys): string {
+    return cardRef === "" ? "" : acctId;
+}
+
+function useTypedKeys(entry: EntryKeys, isLookupPending: LookupPendingCheck): TypedKeys {
+    const [acctText, setAcctText] = useState(() => SeededAccountText(entry));
     const [cardText, setCardText] = useState("");
-    return { acctText, cardText, SetAcctText: setAcctText, SetCardText: setCardText };
+    return useMemo(
+        () => ({
+            acctText,
+            cardText,
+            SetAcctText: GuardedKeySetter(setAcctText, isLookupPending),
+            SetCardText: GuardedKeySetter(setCardText, isLookupPending),
+        }),
+        [acctText, cardText, isLookupPending],
+    );
 }
 
 function useKeyInputRefs(): KeyInputRefs {
@@ -511,7 +623,7 @@ function useListEntryLookup(
         if (cardRef === "") {
             return undefined;
         }
-        void runLookup({ cardKey: cardRef, acctKey: acctId });
+        void runLookup(ListEntryLookupKeys({ cardRef, acctId }));
         return cancelLookup;
     }, [cardRef, acctId, runLookup, cancelLookup]);
 }
@@ -527,12 +639,12 @@ function useCursorFocus(inputRefs: KeyInputRefs, feedback: CardViewFeedback): vo
 // F3 abandons the lookup at once, as the screen stays mounted until the next route has loaded.
 function useScreenFunctionKeys(inputs: ScreenKeyInputs): FunctionKeyList {
     const router = useRouter();
-    const { RunLookup, CancelLookup, isBusy } = inputs;
+    const { RunLookup, CancelLookup, isBusy, isListEntry } = inputs;
     const { cardRef, acctId } = inputs.entry;
     const { acctText, cardText } = inputs.typedKeys;
     const handleSearch = useCallback(() => {
-        void RunLookup(LookupKeysFor({ cardRef, acctId }, { acctText, cardText }));
-    }, [RunLookup, cardRef, acctId, acctText, cardText]);
+        void RunLookup(LookupKeysFor({ cardRef, acctId }, { acctText, cardText }, isListEntry));
+    }, [RunLookup, cardRef, acctId, acctText, cardText, isListEntry]);
     const handleExit = useCallback(() => {
         CancelLookup();
         router.push(MENU_ROUTE);
@@ -545,20 +657,20 @@ function useScreenFunctionKeys(inputs: ScreenKeyInputs): FunctionKeyList {
 
 function useCardViewScreen(): CardViewScreenModel {
     const entry = useEntryKeys();
-    const typedKeys = useTypedKeys();
     const inputRefs = useKeyInputRefs();
-    const { lookupState, RunLookup, CancelLookup } = useCardLookup(entry);
-    const { detail, feedback, isBusy } = lookupState;
+    const { lookupState, RunLookup, CancelLookup, IsLookupPending } = useCardLookup(entry);
+    const typedKeys = useTypedKeys(entry, IsLookupPending);
+    const { detail, feedback, isBusy, isListEntry } = lookupState;
     useListEntryLookup(entry, RunLookup, CancelLookup);
     useCursorFocus(inputRefs, feedback);
-    const keys = useScreenFunctionKeys({ entry, typedKeys, RunLookup, CancelLookup, isBusy });
-    const fields = BuildKeyFields({ entry, typedKeys, detail, inputRefs });
-    const isListEntry = entry.cardRef !== "";
-    const keyFields = { isListEntry, fieldErrors: feedback.fieldErrors, fields };
+    const keyInputs = { entry, typedKeys, RunLookup, CancelLookup, isBusy, isListEntry };
+    const keys = useScreenFunctionKeys(keyInputs);
+    const fields = BuildKeyFields({ entry, typedKeys, detail, inputRefs, isListEntry });
+    const keyFields = { isListEntry, isBusy, fieldErrors: feedback.fieldErrors, fields };
     return { keyFields, detail, messageLine: MessageLineFor(feedback), isBusy, keys };
 }
 
-function KeyField({ field, isProtected, fieldErrors }: KeyFieldProps) {
+function KeyField({ field, isProtected, isLocked, fieldErrors }: KeyFieldProps) {
     const { definition } = field;
     const isInvalid = fieldErrors.includes(definition.fieldName);
     return (
@@ -573,17 +685,22 @@ function KeyField({ field, isProtected, fieldErrors }: KeyFieldProps) {
             autoFocus={definition.isInitialCursor && !isProtected}
             inputRef={field.inputRef}
             fullWidth
-            slotProps={FieldSlotProps(isProtected, definition.maxLength, isInvalid)}
+            slotProps={FieldSlotProps(isProtected || isLocked, definition.maxLength, isInvalid)}
         />
     );
 }
 
-function CardKeyFields({ isListEntry, fieldErrors, fields }: CardKeyFieldsProps) {
+function CardKeyFields({ isListEntry, isBusy, fieldErrors, fields }: CardKeyFieldsProps) {
     return (
         <Grid container spacing={4}>
             {fields.map((field) => (
                 <Grid key={field.definition.fieldName} size={KEY_FIELD_SIZE}>
-                    <KeyField field={field} isProtected={isListEntry} fieldErrors={fieldErrors} />
+                    <KeyField
+                        field={field}
+                        isProtected={isListEntry}
+                        isLocked={isBusy}
+                        fieldErrors={fieldErrors}
+                    />
                 </Grid>
             ))}
         </Grid>
@@ -591,14 +708,21 @@ function CardKeyFields({ isListEntry, fieldErrors, fields }: CardKeyFieldsProps)
 }
 
 // Every detail field is ASKIP on the map, so it is shown read-only, and the server never names
-// one in field_errors.
+// one in field_errors. Each fills its grid cell or its share of the expiry row. A multiline one
+// is a native textarea, which the theme sizes to its content: it keeps one row while its value
+// fits, and wraps a longer value onto further rows, with no hidden copy of the field rendered to
+// measure it. maxLength only exposes the BMS LENGTH.
 function DetailField({ definition, detail }: DetailFieldProps) {
+    const isMultiline = definition.isMultiline === true;
     return (
         <TextField
             label={definition.label}
             value={detail?.[definition.fieldName] ?? ""}
             variant="filled"
-            slotProps={FieldSlotProps(true, definition.maxLength, false)}
+            fullWidth
+            multiline={isMultiline}
+            rows={isMultiline ? MULTILINE_FIELD_ROWS : undefined}
+            slotProps={FieldSlotProps(true, definition.maxLength, false, isMultiline)}
         />
     );
 }
@@ -635,13 +759,20 @@ function ExpiryParts({ labelId, detail }: ExpiryPartsProps) {
     );
 }
 
+// CRDNAME (row 11), CRDSTCD (row 13) and the expiry parts (row 15), in the grid COCRDUP uses.
 function CardDetailFields({ detail }: CardDetailFieldsProps) {
     return (
-        <Stack spacing={4}>
-            <DetailField definition={NAME_FIELD} detail={detail} />
-            <DetailField definition={STATUS_FIELD} detail={detail} />
-            <ExpiryFields detail={detail} />
-        </Stack>
+        <Grid container spacing={DETAIL_FIELD_SPACING}>
+            <Grid size={NAME_FIELD_SIZE}>
+                <DetailField definition={NAME_FIELD} detail={detail} />
+            </Grid>
+            <Grid size={DETAIL_FIELD_SIZE}>
+                <DetailField definition={STATUS_FIELD} detail={detail} />
+            </Grid>
+            <Grid size={DETAIL_FIELD_SIZE}>
+                <ExpiryFields detail={detail} />
+            </Grid>
+        </Grid>
     );
 }
 

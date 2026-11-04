@@ -1,7 +1,11 @@
 // Screen tests: BMS COCRDUP, program COCRDUPC (CCUP), page /cards/update. Covers how the map
 // fields render: EXPMON, the "/" literal and EXPYEAR grouped under the Expiry Date label exactly
-// as COCRDSL groups them, and every field the server names in field_errors tied to the ERRMSG
-// line, ahead of the Y/N hint CRDSTCD carries, while a field not in error keeps only its own hint.
+// as COCRDSL groups them; CRDNAME on a full grid row with CRDSTCD and the expiry group beside each
+// other from md, as on COCRDSL; CRDNAME wrapping in one native textarea row, protected or
+// editable, with no hidden copy of the field rendered to measure it, that never holds a line
+// break, with Enter in it running the screen's ENTER, while every other field keeps
+// its text as keyed; and every field the server names in field_errors tied to the ERRMSG line,
+// ahead of the Y/N hint CRDSTCD carries, while a field not in error keeps only its own hint.
 import { ThemeProvider } from "@mui/material/styles";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -16,7 +20,7 @@ import {
     type CardScreen,
     type CardScreenFields,
 } from "@/lib/api/cards";
-import { UpdateScreenState, type LegacyErrorResponse } from "@/lib/apiClient";
+import { UpdateAction, UpdateScreenState, type LegacyErrorResponse } from "@/lib/apiClient";
 import type { SessionContextValue } from "@/lib/session";
 
 type SignedOnUser = NonNullable<SessionContextValue["currentUser"]>;
@@ -37,12 +41,36 @@ interface FieldErrorCase {
     descriptions: FieldDescriptions;
 }
 
+// One screen state the first ENTER is answered with, and whether it protects CRDNAME.
+interface NameElementCase {
+    state: UpdateScreenState;
+    isReadOnly: boolean;
+}
+
+// One text pasted into an editable detail field of the shown card, and the text the field then
+// holds and the next ENTER sends.
+interface KeyedTextCase {
+    caseName: string;
+    label: string;
+    name: keyof CardScreenFields;
+    pasted: string;
+    sent: string;
+}
+
+// One Enter press in the editable CRDNAME, as user-event key descriptors.
+interface EnterPressCase {
+    keyName: string;
+    keys: string;
+}
+
 // Test values only: the card number is shown masked, so no card number is written in code.
 const TEST_ACCOUNT_ID = "00000000004";
 const TEST_CARD_REF = "card-ref-1";
 const TEST_SCREEN_TOKEN = "screen-token-1";
 const MASKED_CARD_NUMBER = "*".repeat(12) + "4312";
 const TEST_EMBOSSED_NAME = "TEST CARD HOLDER";
+// A CRDNAME at its BMS LENGTH of 50, wider than a half-row field.
+const LONG_EMBOSSED_NAME = "ABCDEFGHIJKLMNOPQRSTUVWXYZ ABCDEFGHIJKLMNOPQRSTUVW";
 
 // Stable router and query doubles; the "mock" prefix lets the hoisted factories read them. Every
 // case enters from the main menu, with no query, and fetches its card by the keys it sends.
@@ -125,6 +153,90 @@ const EXPIRY_PART_CASES: readonly (readonly [string, string])[] = [
 const ERRMSG_ID = "message-line-errmsg";
 const STATUS_HELPER_ID = "card-update-active_status-helper-text";
 const STATUS_HELPER_TEXT = "Y/N";
+// CRDNAME keeps its id and BMS LENGTH whether it renders an input or a textarea.
+const NAME_FIELD_ID = "card-update-embossed_name";
+const NAME_MAX_LENGTH = "50";
+
+// MUI 9 Grid classes: every Grid has MuiGrid-root, a container MuiGrid-container and its spacing
+// MuiGrid-spacing-xs-<units>, and each size breakpoint MuiGrid-grid-<breakpoint>-<columns>.
+const GRID_ROOT_CLASS = "MuiGrid-root";
+const GRID_CONTAINER_CLASS = "MuiGrid-container";
+const DETAIL_GRID_SPACING_CLASS = "MuiGrid-spacing-xs-4";
+const GRID_SIZE_CLASS_PREFIX = "MuiGrid-grid-";
+// Sorted for comparison: a full row at every width, and half a row from md.
+const FULL_ROW_SIZE_CLASSES: readonly string[] = ["MuiGrid-grid-xs-12"];
+const HALF_ROW_SIZE_CLASSES: readonly string[] = ["MuiGrid-grid-md-6", "MuiGrid-grid-xs-12"];
+
+// CRDNAME wraps in one native textarea row whether the state leaves it editable or protects it;
+// the browser grows the row to a longer value, so no hidden copy of the field measures it.
+const NAME_ELEMENT_TAG = "TEXTAREA";
+const NAME_ROWS = "1";
+const NAME_ELEMENT_CASES: readonly NameElementCase[] = [
+    { state: UpdateScreenState.SHOW_DETAILS, isReadOnly: false },
+    { state: UpdateScreenState.CHANGES_NOT_OK, isReadOnly: false },
+    { state: UpdateScreenState.CHANGES_OK_NOT_CONFIRMED, isReadOnly: true },
+    { state: UpdateScreenState.CHANGES_DONE, isReadOnly: true },
+];
+
+// CRDNAME loses every CR and LF, as an <input type="text"> strips them, and keeps everything else;
+// the other detail fields keep their text exactly as keyed.
+const KEYED_TEXT_CASES: readonly KeyedTextCase[] = [
+    {
+        caseName: "CRDNAME drops an LF",
+        label: NAME_LABEL,
+        name: "embossed_name",
+        pasted: "TEST\nHOLDER",
+        sent: "TESTHOLDER",
+    },
+    {
+        caseName: "CRDNAME drops a CR LF pair",
+        label: NAME_LABEL,
+        name: "embossed_name",
+        pasted: "TEST\r\nHOLDER",
+        sent: "TESTHOLDER",
+    },
+    {
+        caseName: "CRDNAME drops trailing line breaks",
+        label: NAME_LABEL,
+        name: "embossed_name",
+        pasted: "TEST HOLDER\r\n\n",
+        sent: "TEST HOLDER",
+    },
+    {
+        caseName: "CRDNAME keeps its blanks",
+        label: NAME_LABEL,
+        name: "embossed_name",
+        pasted: " TEST  HOLDER ",
+        sent: " TEST  HOLDER ",
+    },
+    {
+        caseName: "CRDSTCD keeps a lower-case code",
+        label: STATUS_LABEL,
+        name: "active_status",
+        pasted: "n",
+        sent: "n",
+    },
+    {
+        caseName: "EXPMON keeps a trailing blank",
+        label: MONTH_LABEL,
+        name: "expiry_month",
+        pasted: "7 ",
+        sent: "7 ",
+    },
+    {
+        caseName: "EXPYEAR keeps a leading blank",
+        label: YEAR_LABEL,
+        name: "expiry_year",
+        pasted: " 030",
+        sent: " 030",
+    },
+];
+
+// Enter alone, and with Shift held, which in a textarea would otherwise insert a line break.
+const ENTER_PRESS_CASES: readonly EnterPressCase[] = [
+    { keyName: "Enter", keys: "{Enter}" },
+    { keyName: "Shift+Enter", keys: "{Shift>}{Enter}{/Shift}" },
+];
 
 // The cocrdupc.py literals of the failing edits.
 const NO_INPUT_RECEIVED_MESSAGE = "No input received";
@@ -183,6 +295,15 @@ function BuildCardScreen(): CardScreen {
         info_message: DETAILS_SHOWN_INFO,
         field_errors: [],
         cursor_field: "embossed_name",
+    };
+}
+
+// The 50-character name shown in the state the first ENTER is answered with.
+function BuildLongNameScreen(state: UpdateScreenState): CardScreen {
+    return {
+        ...BuildCardScreen(),
+        fields: BuildCardFields({ embossed_name: LONG_EMBOSSED_NAME }),
+        state,
     };
 }
 
@@ -306,6 +427,29 @@ async function ShowFetchedCard(user: ScreenUser): Promise<void> {
     expect(await screen.findByDisplayValue(TEST_EMBOSSED_NAME)).toBeInTheDocument();
 }
 
+// The field keeps its focus after it is cleared, so the paste lands in it.
+async function PasteInto(user: ScreenUser, label: string, text: string): Promise<void> {
+    await user.clear(InputFor(label));
+    await user.paste(text);
+}
+
+// A request holds the screen, ENTER disabled, until its answer is shown.
+async function WaitForScreenFree(): Promise<void> {
+    await waitFor(() => {
+        expect(screen.getByRole("button", { name: ENTER_BUTTON_NAME })).toBeEnabled();
+    });
+}
+
+// The ENTER after the fetch is the second write, carrying the shown card's screen_token.
+function ExpectSecondEnterSent(fields: Partial<CardScreenFields>): void {
+    expect(mockUpdateCard).toHaveBeenCalledTimes(2);
+    expect(mockUpdateCard.mock.lastCall?.[1]).toMatchObject({
+        action: UpdateAction.ENTER,
+        screen_token: TEST_SCREEN_TOKEN,
+        fields,
+    });
+}
+
 async function KeyTexts(user: ScreenUser, keyed: FieldErrorCase["keyed"]): Promise<void> {
     for (const [label, text] of keyed) {
         await user.clear(InputFor(label));
@@ -317,6 +461,28 @@ async function WaitForErrorMessage(message: string): Promise<void> {
     await waitFor(() => {
         expect(screen.getByRole("alert")).toHaveTextContent(message);
     });
+}
+
+function ClosestOf(element: Element, className: string): Element {
+    const ancestor = element.closest(`.${className}`);
+    if (ancestor === null) {
+        throw new Error(`The element sits in no .${className}`);
+    }
+    return ancestor;
+}
+
+// The Grid items of CRDNAME, CRDSTCD and the expiry group, in map order.
+function DetailGridItems(): Element[] {
+    const expiryGroup = screen.getByRole("group", { name: EXPIRY_GROUP_NAME });
+    const elements = [InputFor(NAME_LABEL), InputFor(STATUS_LABEL), expiryGroup];
+    return elements.map((element) => ClosestOf(element, GRID_ROOT_CLASS));
+}
+
+// The Grid size classes the item carries, MuiGrid-grid-<breakpoint>-<columns>, sorted.
+function GridSizeClasses(gridItem: Element): string[] {
+    return Array.from(gridItem.classList)
+        .filter((className) => className.startsWith(GRID_SIZE_CLASS_PREFIX))
+        .sort();
 }
 
 // clearMocks keeps queued answers, so each case starts from empty fetch and write queues, and
@@ -349,6 +515,81 @@ describe("COCRDUPC BMS COCRDUP expiry group on /cards/update", () => {
             expect(part).toHaveAttribute("inputmode", "numeric");
         }
     });
+});
+
+describe("COCRDUPC BMS COCRDUP detail rows on /cards/update", () => {
+    it("COCRDUPC puts CRDNAME on a full row and CRDSTCD beside the expiry group", () => {
+        RenderPage();
+        const gridItems = DetailGridItems();
+        expect(gridItems.map(GridSizeClasses)).toEqual([
+            FULL_ROW_SIZE_CLASSES,
+            HALF_ROW_SIZE_CLASSES,
+            HALF_ROW_SIZE_CLASSES,
+        ]);
+        const container = gridItems[0]?.parentElement;
+        expect(container).toHaveClass(GRID_CONTAINER_CLASS, DETAIL_GRID_SPACING_CLASS);
+        for (const gridItem of gridItems) {
+            expect(gridItem.parentElement).toBe(container);
+        }
+    });
+});
+
+describe("COCRDUPC BMS COCRDUP CRDNAME by protection on /cards/update", () => {
+    it.each(NAME_ELEMENT_CASES)(
+        "COCRDUPC $state shows all 50 CRDNAME characters in a native textarea, no hidden copy",
+        async ({ state, isReadOnly }) => {
+            const user = RenderPage();
+            mockUpdateCard.mockResolvedValueOnce(BuildLongNameScreen(state));
+            await ClickEnter(user);
+            expect(await screen.findByDisplayValue(LONG_EMBOSSED_NAME)).toBeInTheDocument();
+            const nameField = InputFor(NAME_LABEL);
+            expect(nameField.tagName).toBe(NAME_ELEMENT_TAG);
+            expect(nameField).toHaveValue(LONG_EMBOSSED_NAME);
+            expect(nameField.hasAttribute("readonly")).toBe(isReadOnly);
+            expect(nameField).toHaveAttribute("id", NAME_FIELD_ID);
+            expect(nameField).toHaveAttribute("maxlength", NAME_MAX_LENGTH);
+            expect(nameField).toHaveAttribute("rows", NAME_ROWS);
+            expect(nameField).not.toHaveAttribute("type");
+            expect(document.querySelectorAll("textarea[aria-hidden]")).toHaveLength(0);
+        },
+    );
+});
+
+// A 3270 field holds no line break and the server refuses CR and LF, so neither is ever sent.
+describe("COCRDUPC BMS COCRDUP detail text as keyed on /cards/update", () => {
+    it.each(KEYED_TEXT_CASES)(
+        "COCRDUPC $caseName in the field and in the ENTER it sends",
+        async ({ label, name, pasted, sent }) => {
+            const user = RenderPage();
+            await ShowFetchedCard(user);
+            await PasteInto(user, label, pasted);
+            expect(InputFor(label)).toHaveValue(sent);
+            mockUpdateCard.mockResolvedValueOnce(BuildCardScreen());
+            await ClickEnter(user);
+            await WaitForScreenFree();
+            ExpectSecondEnterSent({ [name]: sent });
+        },
+    );
+});
+
+// useFunctionKeys takes Enter in the textarea as the screen's ENTER and blocks its line break.
+describe("COCRDUPC BMS COCRDUP Enter in CRDNAME on /cards/update", () => {
+    it.each(ENTER_PRESS_CASES)(
+        "COCRDUPC $keyName in the editable CRDNAME runs ENTER and inserts no line break",
+        async ({ keys }) => {
+            const user = RenderPage();
+            await ShowFetchedCard(user);
+            const nameField = InputFor(NAME_LABEL);
+            const inputEvents = jest.fn();
+            nameField.addEventListener("input", inputEvents);
+            await user.click(nameField);
+            mockUpdateCard.mockResolvedValueOnce(BuildCardScreen());
+            await user.keyboard(keys);
+            await WaitForScreenFree();
+            expect(inputEvents).not.toHaveBeenCalled();
+            ExpectSecondEnterSent({ embossed_name: TEST_EMBOSSED_NAME });
+        },
+    );
 });
 
 describe("COCRDUPC field errors tied to the ERRMSG line on /cards/update", () => {

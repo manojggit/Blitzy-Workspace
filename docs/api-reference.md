@@ -1293,7 +1293,10 @@ value is corrected in the same request.
 Card responses carry masked card numbers and never the CVV. A card is identified across requests by
 its `card_ref`: an encrypted token that holds the card number and expires after
 `ACCESS_TOKEN_EXPIRE_MINUTES`. Where a path takes `{cardNum}`, it accepts either the card number as
-keyed (at most 16 characters) or a `card_ref` (up to 1024 characters); the length tells them apart.
+keyed (at most 16 characters) or a `card_ref` (up to 1024 characters). A value longer than 16
+characters is a `card_ref`. On the two `GET` routes, `isCardRef=true` declares a value of any
+length a `card_ref`, so a garbled one is refused as a `card_ref` rather than edited as a card
+number.
 
 ### GET /api/v1/cards
 
@@ -1434,16 +1437,18 @@ sent with its row's 11-digit account number, is read with those keys and no key 
 |---|---|---|---|
 | `cardNum` | path | string, at most 1024 | A card number as keyed, or a `card_ref` |
 | `acctId` | query | string, at most 11 | The account number as keyed |
+| `isCardRef` | query | boolean | `true` when `cardNum` is a `card_ref`; default `false` |
 
 This command views a card from the card list:
 
 ```bash
-curl -s -b var/session.cookies \
-    'http://127.0.0.1:8000/api/v1/cards/CARD_REF?acctId=ACCOUNT_ID'
+curl -s -b var/session.cookies -G \
+    http://127.0.0.1:8000/api/v1/cards/CARD_REF \
+    -d acctId=ACCOUNT_ID -d isCardRef=true
 ```
 
-To view a card by its number, replace `CARD_REF` with `CARD_NUMBER`. The response has status 200
-and carries this `CardDetailResponse` body:
+To view a card by its number, replace `CARD_REF` with `CARD_NUMBER` and leave out
+`-d isCardRef=true`. The response has status 200 and carries this `CardDetailResponse` body:
 
 ```json
 {
@@ -1469,8 +1474,11 @@ The information line starts with three spaces. Every error body carries `info_me
 - 400 `Card number not provided` (`card_num`).
 - 400 `ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER` (`acct_id`).
 - 400 `CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER` (`card_num`).
-- 404 `Did not find cards for this search condition`: no such card, or an invalid or expired
-    `card_ref`.
+- 404 `Did not find cards for this search condition` (`acct_id`, `card_num`): no such card, or
+    an invalid or expired `card_ref`. With `isCardRef=true` this holds whatever the length or
+    characters of `cardNum`, so `garbage` or a card number sent as a `card_ref` gives it too;
+    without `isCardRef`, `garbage` is a typed card number and gives the 400 `CARD ID FILTER`
+    literal.
 - 503 with the program's file-error text: the card file cannot be read.
 
 ### GET /api/v1/cards/{cardNum}/edit
@@ -1483,12 +1491,14 @@ row's account number is read without key edits; a typed card number has both key
 |---|---|---|---|
 | `cardNum` | path | string, at most 1024 | A card number as keyed, or a `card_ref` |
 | `acctId` | query | string, at most 11 | The account number as keyed |
+| `isCardRef` | query | boolean | `true` when `cardNum` is a `card_ref`; default `false` |
 
-This command fetches a card for update:
+This command fetches a card from the card list for update:
 
 ```bash
-curl -s -b var/session.cookies \
-    'http://127.0.0.1:8000/api/v1/cards/CARD_REF/edit?acctId=ACCOUNT_ID'
+curl -s -b var/session.cookies -G \
+    http://127.0.0.1:8000/api/v1/cards/CARD_REF/edit \
+    -d acctId=ACCOUNT_ID -d isCardRef=true
 ```
 
 The response has status 200 and carries this `CardScreen` body:
@@ -1529,7 +1539,9 @@ travels only in the encrypted before-image inside `screen_token`, and a save kee
 | `expiry_year` | 4 |
 
 Other outcomes are those of [`GET /api/v1/cards/{cardNum}`](#get-apiv1cardscardnum), each with
-the key screen in state `DETAILS_NOT_FETCHED` (`CardScreenErrorResponse`).
+the key screen in state `DETAILS_NOT_FETCHED` (`CardScreenErrorResponse`). The 404 for an
+invalid `card_ref` shows the account as sent and a blank `fields.card_num`, so the `card_ref` is
+never echoed.
 
 ### PUT /api/v1/cards/{cardNum}
 

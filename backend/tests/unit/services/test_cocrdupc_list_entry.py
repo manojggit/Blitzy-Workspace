@@ -12,8 +12,10 @@ set:
     all-zero card key and the all-zero account included; valid typed keys open it too;
 - the all-zero card typed is ``Card number not provided`` (line 180);
 - a card_ref with an account no list row carries runs 1210 (lines 178, 745);
-- a forged card_ref, and one carrying a CCLI page key, give ``Did not find cards for this
-    search condition`` (line 204) on the not-fetched key screen with the key prompt (line 163);
+- a forged card_ref, one carrying a CCLI page key, and a path declared a card_ref
+    (``isCardRef``) that is no token, give ``Did not find cards for this search condition``
+    (line 204) on the not-fetched key screen with the key prompt (line 163); the same short
+    text typed is ``CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER`` (line 789);
 - a done or failed (C, L, F) token keeps CCUP-NEW-CARDDATA, which 3200-SETUP-SCREEN-VARS shows
     for CCUP-CHANGES-MADE (lines 1113-1123).
 
@@ -50,6 +52,8 @@ SHORT_ACCT_TEXT = "123"
 NON_DIGIT_ACCT_TEXT = "0000000000A"
 # A CCLI page key's payload: both X(16) keys and the two paging flags, 34 characters.
 PAGE_KEY_PAYLOAD = LISTED_CARD_NUM + ZERO_CARD_NUM + "NN"
+# A cardRef query value no server issued, short enough to be CARDSID text when typed.
+SHORT_GARBLED_TEXT = "garbage"
 SECRET_KEY_BYTES = 48
 
 # The CARDDAT record the stub reads, and CCUP-OLD-* as 9000-READ-DATA keeps it (lines 1354-1367).
@@ -72,6 +76,7 @@ PROMPT_FOR_KEYS_INFO = "Please enter Account and Card Number"
 ACCOUNT_NOT_PROVIDED_MESSAGE = "Account number not provided"
 CARD_NOT_PROVIDED_MESSAGE = "Card number not provided"
 ACCOUNT_FILTER_MESSAGE = "ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER"
+CARD_FILTER_MESSAGE = "CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER"
 CARD_NOT_FOUND_MESSAGE = "Did not find cards for this search condition"
 NO_MESSAGE = ""
 ACCT_ID_FIELD = "acct_id"
@@ -134,21 +139,36 @@ def PageKeyCardRef(settings: "Settings") -> str:
     return EncodeCardRef(PAGE_KEY_PAYLOAD, settings)
 
 
+def ShortGarbledCardKey(settings: "Settings") -> str:
+    """Return a cardRef query value no server issued, as short as a typed card number."""
+    return SHORT_GARBLED_TEXT
+
+
+def CardNumberCardKey(settings: "Settings") -> str:
+    """Return a 16-digit card number sent where a card_ref belongs."""
+    return LISTED_CARD_NUM
+
+
 class OpenedCard(NamedTuple):
-    """A CCUP entry that reads its card: keys, whether the card is a card_ref, the mask shown."""
+    """A CCUP entry that reads its card: keys, whether the card is a card_ref, the mask shown.
+
+    ``declaresCardRef`` sends the query's ``isCardRef``, as the frontend does for a card_ref.
+    """
 
     cardNum: str
     acctId: str
     sentAsCardRef: bool
     maskedCardNum: str
+    declaresCardRef: bool = False
 
 
 OPENED_CARDS = [
     OpenedCard(ZERO_CARD_NUM, LIST_ACCT_ID, True, "************0000"),
     OpenedCard(LISTED_CARD_NUM, ZERO_ACCT_ID, True, "************4321"),
+    OpenedCard(LISTED_CARD_NUM, LIST_ACCT_ID, True, "************4321", declaresCardRef=True),
     OpenedCard(LISTED_CARD_NUM, LIST_ACCT_ID, False, "************4321"),
 ]
-OPENED_CARD_IDS = ["list-zero-card", "list-zero-account", "typed-keys"]
+OPENED_CARD_IDS = ["list-zero-card", "list-zero-account", "list-declared-card-ref", "typed-keys"]
 
 
 def ShownFields(openedCard: OpenedCard) -> CardScreenFields:
@@ -170,7 +190,10 @@ async def test_entry_reads_card_into_show_details(cardRepository, testSettings, 
     if openedCard.sentAsCardRef:
         cardKey = EncodeCardRef(openedCard.cardNum, testSettings)
     context = BuildContext(testSettings)
-    screen = await cocrdupc.FetchCardForEdit(context, cardKey, openedCard.acctId)
+    isCardRef = openedCard.declaresCardRef
+    screen = await cocrdupc.FetchCardForEdit(
+        context, cardKey, openedCard.acctId, isCardRef=isCardRef
+    )
     assert screen.state == UpdateScreenState.SHOW_DETAILS
     assert (screen.message, screen.info_message) == (NO_MESSAGE, DETAILS_SHOWN_INFO)
     assert screen.fields == ShownFields(openedCard)
@@ -192,12 +215,14 @@ class RefusedKeys(NamedTuple):
 
 REFUSED_KEYS = [
     RefusedKeys(ZERO_CARD_NUM, LIST_ACCT_ID, False, CARD_NOT_PROVIDED_MESSAGE, CARD_NUM_FIELD),
+    RefusedKeys(SHORT_GARBLED_TEXT, LIST_ACCT_ID, False, CARD_FILTER_MESSAGE, CARD_NUM_FIELD),
     RefusedKeys(LISTED_CARD_NUM, NO_ACCT_TEXT, True, ACCOUNT_NOT_PROVIDED_MESSAGE, ACCT_ID_FIELD),
     RefusedKeys(LISTED_CARD_NUM, SHORT_ACCT_TEXT, True, ACCOUNT_FILTER_MESSAGE, ACCT_ID_FIELD),
     RefusedKeys(LISTED_CARD_NUM, NON_DIGIT_ACCT_TEXT, True, ACCOUNT_FILTER_MESSAGE, ACCT_ID_FIELD),
 ]
 REFUSED_KEY_IDS = [
     "typed-zero-card",
+    "typed-short-text",
     "card-ref-blank-account",
     "card-ref-short-account",
     "card-ref-non-digit-account",
@@ -223,15 +248,27 @@ async def test_keys_not_from_list_run_key_edits(cardRepository, testSettings, re
 
 
 @pytest.mark.parametrize(
-    "cardRefBuilder", [ForgedCardRef, PageKeyCardRef], ids=["forged", "page-key"]
+    ("cardRefBuilder", "isCardRef"),
+    [
+        (ForgedCardRef, False),
+        (PageKeyCardRef, False),
+        (ShortGarbledCardKey, True),
+        (CardNumberCardKey, True),
+    ],
+    ids=["forged", "page-key", "declared-short-text", "declared-card-number"],
 )
 async def test_card_ref_not_carrying_card_key_is_not_found(
-    cardRepository, testSettings, cardRefBuilder
+    cardRepository, testSettings, cardRefBuilder, isCardRef
 ):
-    """A card_ref the server cannot open as a card key is NOTFND before any read or edit."""
+    """A card_ref the server cannot open as a card key is NOTFND before any read or edit.
+
+    A declared card_ref is decoded whatever its length, and the reply shows a blank card
+    number, so the text sent as a card_ref is never echoed.
+    """
     context = BuildContext(testSettings)
+    cardKey = cardRefBuilder(testSettings)
     with pytest.raises(LegacyMessageError) as raised:
-        await cocrdupc.FetchCardForEdit(context, cardRefBuilder(testSettings), LIST_ACCT_ID)
+        await cocrdupc.FetchCardForEdit(context, cardKey, LIST_ACCT_ID, isCardRef=isCardRef)
     body = raised.value.Body()
     assert raised.value.httpStatus == NOT_FOUND_STATUS
     assert set(body) == CARD_SCREEN_ERROR_KEYS

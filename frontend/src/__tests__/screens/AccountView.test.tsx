@@ -762,6 +762,35 @@ describe("COACTVWC ACCTSID field error and cursor on /accounts/view", () => {
     );
 });
 
+// Two ACCTSID texts COACTVWC's key edit answers with the same literal: all zeros and non-digits.
+const SAME_LITERAL_KEYS: readonly string[] = ["00000000000", "abc"];
+
+// Each answer is a new outcome, so ENTER answered again with the literal already shown brings
+// the message line into view again, as the 3270 sent the whole map after every key.
+async function RevealsRepeatedLiteralEachTime(method: KeyPressMethod): Promise<void> {
+    const scrollIntoViewSpy = jest.spyOn(Element.prototype, "scrollIntoView");
+    const body = BuildErrorBody({ message: ACCOUNT_FILTER_MESSAGE });
+    mockViewAccount.mockRejectedValue(BuildAxiosError(HTTP_BAD_REQUEST, body));
+    const user = RenderScreen();
+    for (const [answerIndex, keyedText] of SAME_LITERAL_KEYS.entries()) {
+        await user.clear(AccountIdInput());
+        await user.type(AccountIdInput(), keyedText);
+        await method.Press(user);
+        await waitFor(() => expect(mockViewAccount).toHaveBeenCalledTimes(answerIndex + 1));
+        await ExpectAlert(ACCOUNT_FILTER_MESSAGE, "error");
+        await waitFor(() => expect(scrollIntoViewSpy).toHaveBeenCalledTimes(answerIndex + 1));
+    }
+    const lineWrapper = document.getElementById(ERRMSG_ID)?.parentElement;
+    expect(scrollIntoViewSpy.mock.contexts).toEqual([lineWrapper, lineWrapper]);
+}
+
+describe("COACTVWC message line on every answer on /accounts/view", () => {
+    it.each(ENTER_METHODS)(
+        "COACTVWC the same literal answering two ENTERs by $name is brought into view twice",
+        RevealsRepeatedLiteralEachTime,
+    );
+});
+
 // Leaving the page aborts the lookup in flight; its rejection then reaches no screen and no log.
 async function AbortsLookupOnLeaving(lookup: PendingLookupCase): Promise<void> {
     const consoleErrorSpy = jest.spyOn(console, "error");

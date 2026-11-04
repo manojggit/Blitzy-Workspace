@@ -20,6 +20,8 @@ value, while ``/selection`` and the literal ``/edit`` suffix keep their preceden
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Path, Query
+from fastapi.exceptions import RequestValidationError
+from pydantic import StringConstraints, TypeAdapter, ValidationError
 
 from app.api.v1 import LegacyErrorResponses, LosslessKeyRoute
 from app.core.dependencies import GetRegularContext, OnlineContext
@@ -36,26 +38,35 @@ from app.schemas.cards import (
     CardSelectionResponse,
     CardUpdateRequest,
 )
-from app.schemas.common import CARD_REF_MAX_LENGTH, ScreenTextOrToken
+from app.schemas.common import CARD_REF_MAX_LENGTH, Cp037JsonPattern, ScreenTextOrToken
 from app.services.cards import cocrdlic, cocrdslc, cocrdupc
 
 # BMS CARDSID LENGTH=16 on both COCRDSL and COCRDUP (CARD-NUM X(16) of CVACT02Y).
 CARD_NUM_LENGTH = 16
+CARD_KEY_DESCRIPTION = (
+    "Card number as typed (16 characters) or an opaque card_ref token from the card list."
+)
 # Raw screen text with no digit pattern: the CARDSID text as keyed (a blank key sent as %20, a
 # key holding "/" sent as %2F and kept in one segment by LosslessKeyRoute) must reach the
 # services' ``Card number not provided`` and ``CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT
 # NUMBER`` edits rather than a 422 or a framework 404. A longer value is a ``card_ref`` token,
-# checked for length only, so cocrdslc.DecodeCardKey refuses a garbled one and the service
-# answers ``Did not find cards for this search condition``. The PUT route decodes the path only
-# to bind a fetched screen_token to its card.
-CARD_KEY_PATH = Annotated[
-    ScreenTextOrToken(CARD_NUM_LENGTH, CARD_REF_MAX_LENGTH),
-    Path(
-        description=(
-            "Card number as typed (16 characters) or an opaque card_ref token from the card list."
-        ),
-    ),
+# checked for length only. cocrdslc.DecodeCardKey refuses a garbled token and the service
+# answers ``Did not find cards for this search condition``.
+CARD_KEY_TEXT = ScreenTextOrToken(CARD_NUM_LENGTH, CARD_REF_MAX_LENGTH)
+# The PUT route's path, which it decodes only to bind a fetched screen_token to its card.
+CARD_KEY_PATH = Annotated[CARD_KEY_TEXT, Path(description=CARD_KEY_DESCRIPTION)]
+# The GET routes' path: the CARD_KEY_TEXT bound and published pattern without its repertoire
+# check, because there isCardRef declares a card_ref of any length, and no path validator sees
+# the query. RequirePrintableTypedCardKey applies the check to an undeclared value.
+CARD_LOOKUP_KEY_PATH = Annotated[
+    str,
+    StringConstraints(max_length=CARD_REF_MAX_LENGTH),
+    Cp037JsonPattern(),
+    Path(description=CARD_KEY_DESCRIPTION),
 ]
+TYPED_CARD_KEY_ADAPTER = TypeAdapter(CARD_KEY_TEXT)
+# FastAPI's location of the {cardNum} path parameter in a validation error.
+CARD_KEY_LOCATION = ("path", "cardNum")
 REGULAR_CONTEXT = Annotated[OnlineContext, Depends(GetRegularContext)]
 
 # A CCLI selection error adds the redisplayed rows and page keys (and, on GET /cards, the page)
@@ -84,6 +95,31 @@ UPDATE_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 
 ROUTER = APIRouter(prefix="/cards", tags=["cards"], route_class=LosslessKeyRoute)
+
+
+def RequirePrintableTypedCardKey(cardNum: str, isCardRef: bool) -> None:
+    """Hold a GET ``{cardNum}`` the query does not declare a ``card_ref`` to CARD_KEY_TEXT.
+
+    A declared value (``isCardRef``) is a token whatever its length or characters, which
+    cocrdslc.DecodeCardKey judges, so a garbled one gives ``Did not find cards for this search
+    condition``. An undeclared value of at most 16 characters is CARDSID text, which keeps to
+    the code-page-037 repertoire as on the PUT route; a longer one is a token.
+
+    Raises:
+        RequestValidationError: undeclared CARDSID text holds a character outside the
+            repertoire. The error is located as FastAPI locates a path error, so
+            app.core.errors.HandleRequestValidationError answers the same 422 body.
+    """
+    if isCardRef:
+        return
+    try:
+        TYPED_CARD_KEY_ADAPTER.validate_python(cardNum)
+    except ValidationError as error:
+        pathErrors = [
+            {**detail, "loc": CARD_KEY_LOCATION + detail["loc"]}
+            for detail in error.errors(include_url=False)
+        ]
+        raise RequestValidationError(pathErrors) from None
 
 
 @ROUTER.get(
@@ -135,16 +171,21 @@ async def SelectCard(
     description=(
         "Edits both the account number and the typed card number, then reads the card by card "
         "number only. A card_ref from the card list, sent with its row's 11-digit acctId, is "
-        "read with those list keys and no key edits. The card number is returned masked with "
-        "an opaque card_ref, and the CVV is never returned."
+        "read with those list keys and no key edits. A cardNum longer than 16 characters is a "
+        "card_ref; isCardRef=true declares one of any length, so an invalid or expired "
+        "card_ref is a 404 Did not find cards for this search condition, never a key edit. The "
+        "card number is returned masked with an opaque card_ref, and the CVV is never returned."
     ),
     responses=LegacyErrorResponses(400, 401, 403, 404, 503),
 )
 async def ViewCard(
-    cardNum: CARD_KEY_PATH, query: Annotated[CardKeyQuery, Query()], context: REGULAR_CONTEXT
+    cardNum: CARD_LOOKUP_KEY_PATH,
+    query: Annotated[CardKeyQuery, Query()],
+    context: REGULAR_CONTEXT,
 ) -> CardDetailResponse:
     """Return the COCRDSL details of the card, or raise its key edit, not-found or file outcome."""
-    return await cocrdslc.ViewCard(context, cardNum, query.acct_id)
+    RequirePrintableTypedCardKey(cardNum, query.is_card_ref)
+    return await cocrdslc.ViewCard(context, cardNum, query.acct_id, isCardRef=query.is_card_ref)
 
 
 @ROUTER.get(
@@ -155,17 +196,24 @@ async def ViewCard(
         "Fetches the card into the update screen in state SHOW_DETAILS, with the card number "
         "masked, no CVV, and the screen_token the next PUT sends back. A card_ref from the card "
         "list, sent with its row's 11-digit acctId, is read with those list keys and no key "
-        "edits; a typed card number has both keys edited first. A 400, 404 or 503 body is a "
+        "edits; a typed card number has both keys edited first. As on GET /cards/{cardNum}, "
+        "isCardRef=true declares a cardNum of any length a card_ref, and an invalid or expired "
+        "one is a 404 Did not find cards for this search condition. A 400, 404 or 503 body is a "
         "CardScreenErrorResponse: the screen fields, state and screen_token beside the legacy "
         "message keys."
     ),
     responses=EDIT_FETCH_RESPONSES,
 )
 async def FetchCardForEdit(
-    cardNum: CARD_KEY_PATH, query: Annotated[CardKeyQuery, Query()], context: REGULAR_CONTEXT
+    cardNum: CARD_LOOKUP_KEY_PATH,
+    query: Annotated[CardKeyQuery, Query()],
+    context: REGULAR_CONTEXT,
 ) -> CardScreen:
     """Return the COCRDUP screen of the fetched card, as the card-list entry shows it."""
-    return await cocrdupc.FetchCardForEdit(context, cardNum, query.acct_id)
+    RequirePrintableTypedCardKey(cardNum, query.is_card_ref)
+    return await cocrdupc.FetchCardForEdit(
+        context, cardNum, query.acct_id, isCardRef=query.is_card_ref
+    )
 
 
 @ROUTER.put(

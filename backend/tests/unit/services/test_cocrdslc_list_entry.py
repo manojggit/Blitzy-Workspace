@@ -10,13 +10,16 @@ typed from those lines and the 88 levels they set:
     requested details`` (line 130), the all-zero card key and the all-zero account included;
 - the all-zero card typed is ``Card number not provided`` (line 141);
 - a card_ref with an account no list row carries runs 2210 (lines 139, 670);
-- a forged card_ref gives ``Did not find cards for this search condition`` (line 154).
+- a forged card_ref, or a path declared a card_ref (``isCardRef``) that is no token, gives ``Did
+    not find cards for this search condition`` (line 154); the same short text typed is
+    ``CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER`` (line 711).
 
 app.services.cards.cocrdslc's CardRepository is replaced by a stub whose GetCard is an
 AsyncMock, so no database is needed.
 """
 
 import secrets
+from collections.abc import Callable
 from datetime import date
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple
@@ -42,6 +45,8 @@ ZERO_ACCT_ID = "00000000000"
 NO_ACCT_TEXT = ""
 SHORT_ACCT_TEXT = "123"
 NON_DIGIT_ACCT_TEXT = "0000000000A"
+# A cardRef query value no server issued, short enough to be CARDSID text when typed.
+SHORT_GARBLED_TEXT = "garbage"
 SECRET_KEY_BYTES = 48
 
 # The CARDDAT record the stub reads (CVACT02Y), shown by 1200-SETUP-SCREEN-VARS (lines 474-486).
@@ -58,6 +63,7 @@ PROMPT_FOR_KEYS_INFO = "Please enter Account and Card Number"
 ACCOUNT_NOT_PROVIDED_MESSAGE = "Account number not provided"
 CARD_NOT_PROVIDED_MESSAGE = "Card number not provided"
 ACCOUNT_FILTER_MESSAGE = "ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER"
+CARD_FILTER_MESSAGE = "CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER"
 CARD_NOT_FOUND_MESSAGE = "Did not find cards for this search condition"
 NO_MESSAGE = ""
 ACCT_ID_FIELD = "acct_id"
@@ -140,11 +146,15 @@ def ShownDetail(listedCard: ListedCard, cardRef: str) -> CardDetailResponse:
     )
 
 
+@pytest.mark.parametrize("isCardRef", [False, True], ids=["by-length", "declared"])
 @pytest.mark.parametrize("listedCard", LISTED_CARDS)
-async def test_list_entry_reads_card_without_key_edits(cardRepository, testSettings, listedCard):
-    """A list card_ref with its row account reads the card by number and shows its details."""
+async def test_list_entry_reads_card_without_key_edits(
+    cardRepository, testSettings, listedCard, isCardRef
+):
+    """A list card_ref with its row account, declared or not, reads the card and shows it."""
     cardRef = EncodeCardRef(listedCard.cardNum, testSettings)
-    detail = await cocrdslc.ViewCard(BuildContext(testSettings), cardRef, listedCard.acctId)
+    context = BuildContext(testSettings)
+    detail = await cocrdslc.ViewCard(context, cardRef, listedCard.acctId, isCardRef=isCardRef)
     assert DecodeCardRef(detail.card_ref, testSettings) == listedCard.cardNum
     assert detail == ShownDetail(listedCard, detail.card_ref)
     cardRepository.GetCard.assert_awaited_once_with(listedCard.cardNum)
@@ -162,15 +172,41 @@ class RefusedKeys(NamedTuple):
 
 REFUSED_KEYS = [
     RefusedKeys(ZERO_CARD_NUM, LIST_ACCT_ID, False, CARD_NOT_PROVIDED_MESSAGE, CARD_NUM_FIELD),
+    RefusedKeys(SHORT_GARBLED_TEXT, LIST_ACCT_ID, False, CARD_FILTER_MESSAGE, CARD_NUM_FIELD),
     RefusedKeys(LISTED_CARD_NUM, NO_ACCT_TEXT, True, ACCOUNT_NOT_PROVIDED_MESSAGE, ACCT_ID_FIELD),
     RefusedKeys(LISTED_CARD_NUM, SHORT_ACCT_TEXT, True, ACCOUNT_FILTER_MESSAGE, ACCT_ID_FIELD),
     RefusedKeys(LISTED_CARD_NUM, NON_DIGIT_ACCT_TEXT, True, ACCOUNT_FILTER_MESSAGE, ACCT_ID_FIELD),
 ]
 REFUSED_KEY_IDS = [
     "typed-zero-card",
+    "typed-short-text",
     "card-ref-blank-account",
     "card-ref-short-account",
     "card-ref-non-digit-account",
+]
+
+
+def ShortGarbledCardKey(settings: "Settings") -> str:
+    """Return a cardRef query value no server issued, as short as a typed card number."""
+    return SHORT_GARBLED_TEXT
+
+
+def CardNumberCardKey(settings: "Settings") -> str:
+    """Return a 16-digit card number sent where a card_ref belongs."""
+    return LISTED_CARD_NUM
+
+
+class UnopenableCardRef(NamedTuple):
+    """A ``{cardNum}`` path value no card_ref decode opens, and whether the query declares it."""
+
+    cardKeyBuilder: Callable[["Settings"], str]
+    isCardRef: bool
+
+
+UNOPENABLE_CARD_REFS = [
+    pytest.param(UnopenableCardRef(ForgedCardRef, False), id="forged"),
+    pytest.param(UnopenableCardRef(ShortGarbledCardKey, True), id="declared-short-text"),
+    pytest.param(UnopenableCardRef(CardNumberCardKey, True), id="declared-card-number"),
 ]
 
 
@@ -193,11 +229,17 @@ async def test_keys_not_from_list_run_key_edits(cardRepository, testSettings, re
     cardRepository.GetCard.assert_not_awaited()
 
 
-async def test_forged_card_ref_is_not_found(cardRepository, testSettings):
-    """A card_ref the server cannot open is NOTFND with both keys failing, before any read."""
+@pytest.mark.parametrize("unopenable", UNOPENABLE_CARD_REFS)
+async def test_unopenable_card_ref_is_not_found(cardRepository, testSettings, unopenable):
+    """A card_ref the server cannot open is NOTFND with both keys failing, before any read.
+
+    A declared card_ref is decoded whatever its length, so short text and a card number sent
+    as one are never taken for typed CARDSID text.
+    """
     context = BuildContext(testSettings)
+    cardKey = unopenable.cardKeyBuilder(testSettings)
     with pytest.raises(LegacyMessageError) as raised:
-        await cocrdslc.ViewCard(context, ForgedCardRef(testSettings), LIST_ACCT_ID)
+        await cocrdslc.ViewCard(context, cardKey, LIST_ACCT_ID, isCardRef=unopenable.isCardRef)
     body = raised.value.Body()
     assert raised.value.httpStatus == NOT_FOUND_STATUS
     assert (body["message"], body["info_message"]) == (CARD_NOT_FOUND_MESSAGE, PROMPT_FOR_KEYS_INFO)

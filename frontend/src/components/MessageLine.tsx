@@ -30,12 +30,23 @@ const MUI_HELPER_TEXT_ID_SUFFIX = "-helper-text";
 
 // The least scroll that shows the whole message line, and none while it is already in view.
 const REVEAL_SCROLL_OPTIONS: ScrollIntoViewOptions = { block: "nearest" };
-// The browser keeps whole-pixel scroll offsets, so a line at a fractional position could keep a
-// sliver of its edge outside the viewport. A scroll margin of one theme spacing unit (4 dp) on
-// each side, which only scrolling reads, keeps the whole line inside.
+// The browser keeps whole-pixel scroll offsets, so a line revealed from above the viewport could
+// keep a sliver of its top edge outside it. A scroll margin of one theme spacing unit (4 dp) on
+// the top edge, which only scrolling reads, keeps the whole line inside. The bottom edge carries
+// none: a shown line whose place is below the fold is stuck flush to the viewport bottom, so a
+// bottom margin would scroll the page by its width on every reveal while the line stays stuck.
 const REVEAL_SCROLL_MARGIN_UNITS = 1;
+// A shown line sticks to the viewport bottom while its place in the layout is below the fold, so
+// the outcome of the key just pressed is in view however the page is scrolled, as the 3270 showed
+// the whole map after every key. It stacks above the fields' outlined labels and below menus and
+// dialogs. The paper background, the screen frame's own, keeps scrolled content from showing
+// through the Alerts' rounded corners and the gap between the two lines.
 const MESSAGE_LINE_STYLE: SxProps<Theme> = {
-    scrollMarginBlock: (theme) => theme.spacing(REVEAL_SCROLL_MARGIN_UNITS),
+    position: "sticky",
+    bottom: 0,
+    zIndex: "mobileStepper",
+    bgcolor: "background.paper",
+    scrollMarginTop: (theme) => theme.spacing(REVEAL_SCROLL_MARGIN_UNITS),
 };
 
 /** The input attribute that ties a field in error to the ERRMSG line. */
@@ -120,8 +131,12 @@ function ErrorLineReportsNewOutcome(previous: ShownOutcome, current: ShownOutcom
 const USER_ACTION_EVENTS: readonly (keyof DocumentEventMap)[] = ["keydown", "pointerdown"];
 // Capture-phase listeners see every action, including one a field stops from propagating.
 const LISTEN_IN_CAPTURE_PHASE = true;
+// The document event of focus moving to another element; unlike focus, it bubbles.
+const FOCUS_MOVE_EVENT: keyof DocumentEventMap = "focusin";
 
 // The scroll margin the browser adds above and below the line when it scrolls the line into view.
+// The line's style sets only the top one, so a line stuck flush to the viewport bottom needs no
+// reveal scroll.
 interface BlockScrollMargin {
     top: number;
     bottom: number;
@@ -177,9 +192,48 @@ function RevealKeepsFocusInView(wrapper: HTMLElement): boolean {
     return StaysInView(focused.getBoundingClientRect(), scrollBy, viewportHeight);
 }
 
-// Once the user has acted on the screen the line is always revealed. Before that, only an
-// outcome the ERRMSG line reports is, and only when the reveal leaves the cursor in sight, as the
-// whole reveal or none of it; a change of the INFOMSG prompt alone waits for the user to act.
+// Whether the stuck line can pass over the focused element. A sticky element never leaves its
+// parent, so only content of the line's own block can pass beneath it; the line itself cannot,
+// nor can menus and dialogs, which portals render outside that block and stack above the line.
+function LineCanCover(wrapper: HTMLElement, focused: Element): boolean {
+    const lineBlock = wrapper.parentElement;
+    return lineBlock !== null && lineBlock.contains(focused) && !wrapper.contains(focused);
+}
+
+// How far the window scrolls down for the focused field to end one scroll margin above the stuck
+// line, and 0 while the line covers no part of it. A field taller than the room above the line
+// scrolls only until its top reaches the viewport top, so the field's top stays in sight.
+function FocusClearance(wrapper: HTMLElement): number {
+    const focused = document.activeElement;
+    if (focused === null || !LineCanCover(wrapper, focused)) {
+        return 0;
+    }
+    const field = focused.getBoundingClientRect();
+    const line = wrapper.getBoundingClientRect();
+    if (field.top >= line.bottom) {
+        return 0;
+    }
+    const overlap = field.bottom + ScrollMarginOf(wrapper).top - line.top;
+    return Math.min(overlap, field.top);
+}
+
+// Moves a focused field the stuck line covers to just above the line, so the line never hides
+// the cursor. A line not rendered, as both its texts are blank, covers nothing.
+function KeepFocusClearOfLine(wrapper: HTMLElement | null): void {
+    if (wrapper === null) {
+        return;
+    }
+    const clearance = FocusClearance(wrapper);
+    if (clearance > 0) {
+        window.scrollBy({ top: clearance });
+    }
+}
+
+// A new outcome is brought into view only when the reveal leaves the focused field wholly in
+// sight, as the whole reveal or none of it, so the cursor placed on cursor_field never scrolls
+// away. Before the user acts, only an outcome the ERRMSG line reports is brought into view; a
+// change of the INFOMSG prompt alone waits for the user to act. The focused field is then
+// cleared of the stuck line, whose height the outcome may have changed.
 function RevealLine(
     wrapper: HTMLElement | null,
     userHasActed: boolean,
@@ -188,9 +242,27 @@ function RevealLine(
     if (wrapper === null) {
         return;
     }
-    if (userHasActed || (errorLineReportsOutcome && RevealKeepsFocusInView(wrapper))) {
+    if ((userHasActed || errorLineReportsOutcome) && RevealKeepsFocusInView(wrapper)) {
         wrapper.scrollIntoView(REVEAL_SCROLL_OPTIONS);
     }
+    KeepFocusClearOfLine(wrapper);
+}
+
+// A task run in the next animation frame; a request while one is pending replaces it. Frame
+// handles are positive, so 0 stands for no pending frame, and cancelling it does nothing.
+interface NextFrameTask {
+    Request: () => void;
+    Cancel: () => void;
+}
+
+function NextFrameTaskOf(task: () => void): NextFrameTask {
+    let pendingFrame = 0;
+    const cancel = () => window.cancelAnimationFrame(pendingFrame);
+    const request = () => {
+        cancel();
+        pendingFrame = window.requestAnimationFrame(task);
+    };
+    return { Request: request, Cancel: cancel };
 }
 
 // Reveals the line in the next animation frame, deciding then from the focus and the actions
@@ -230,18 +302,38 @@ function useUserHasActed(): RefObject<boolean> {
     return userHasActedRef;
 }
 
+// Each element focus moves to is cleared of the stuck line in the next animation frame, after the
+// browser's own focus scroll, which takes no account of the line. Leaving the screen cancels a
+// clearance not yet run.
+function useFocusClearance(wrapperRef: RefObject<HTMLDivElement | null>): void {
+    useEffect(() => {
+        const clearance = NextFrameTaskOf(() => KeepFocusClearOfLine(wrapperRef.current));
+        document.addEventListener(FOCUS_MOVE_EVENT, clearance.Request, LISTEN_IN_CAPTURE_PHASE);
+        return () => {
+            document.removeEventListener(
+                FOCUS_MOVE_EVENT,
+                clearance.Request,
+                LISTEN_IN_CAPTURE_PHASE,
+            );
+            clearance.Cancel();
+        };
+    }, [wrapperRef]);
+}
+
 // The outcome shown at mount is only recorded, so entering a screen keeps its top in view and
 // StrictMode's repeated mount effect finds nothing new. Each later outcome that shows a line is
 // revealed in the next animation frame, after the page's own effects of the same commit have
-// moved focus to cursor_field, which may have scrolled the page elsewhere. Until the user acts on
-// the screen it is revealed only when ERRMSG reports it (non-blank message text, either new or
-// under a new outcomeKey) and the focused field stays wholly in view after the scroll. ERRMSG
-// reports an outcome; INFOMSG is the standing prompt, so a change of it alone is not revealed
-// before the user acts. Once the user has acted, every new outcome is revealed, INFOMSG included.
+// moved focus to cursor_field, which may have scrolled the page elsewhere, and only when the
+// focused field stays wholly in view after the scroll. Until the user acts on the screen it is
+// revealed only when ERRMSG reports it (non-blank message text, either new or under a new
+// outcomeKey). ERRMSG reports an outcome; INFOMSG is the standing prompt, so a change of it alone
+// is not revealed before the user acts. Once the user has acted, INFOMSG changes count too. The
+// focused field is kept clear of the stuck line after each reveal and each move of focus.
 function useRevealOnNewOutcome(props: MessageLineProps): RefObject<HTMLDivElement | null> {
     const wrapperRef = useRef<HTMLDivElement | null>(null);
     const previousOutcomeRef = useRef<ShownOutcome | null>(null);
     const userHasActedRef = useUserHasActed();
+    useFocusClearance(wrapperRef);
     const message = ShownText(props.message);
     const infoMessage = ShownText(props.infoMessage);
     const { outcomeKey } = props;
@@ -309,23 +401,32 @@ function MessageAlert({ text, severity, region }: MessageAlertProps) {
 
 /**
  * The screen's message line: two separate live regions, the ERRMSG Alert (role alert,
- * assertive) and the INFOMSG Alert (role status, polite), inside a wrapper that only spaces them.
- * Each carries its stable id, by which ErrorMessageReference ties fields in error to ERRMSG.
- * The error or confirmation message comes first and the information line after it: the maps
- * place INFOMSG above ERRMSG, but the severity line is the screen's primary feedback. Repeated
- * blanks in a literal stay visible through the theme's MuiAlert message white-space override.
- * The line brings itself into view on each new outcome, as the 3270 showed the whole map after
- * every key: other text on either line, or a new outcomeKey with the same text. The lines a
- * screen mounts with are left where they are, so entering a screen keeps its top in view. Until
- * the user presses a key or a pointer on the screen, a new outcome is brought into view only when
- * the ERRMSG line reports it (a refusal, an error or a notice such as the thank-you line) and the
- * focused field stays wholly in view after the scroll, so the outcomes that come with entering a
- * screen never scroll its cursor out of sight. INFOMSG is the screen's standing prompt: a change
- * of it alone is brought into view only once the user has acted, as CAUP's info-line results of
- * ENTER and F5 are.
+ * assertive) and the INFOMSG Alert (role status, polite), inside a wrapper that carries no live
+ * region of its own. Each carries its stable id, by which ErrorMessageReference ties fields in
+ * error to ERRMSG. With both lines blank it renders nothing, so an empty line takes no room in
+ * the screen layout. The error or confirmation message comes first and the information line
+ * after it: the maps place INFOMSG above ERRMSG, but the severity line is the screen's primary
+ * feedback. Repeated blanks in a literal stay visible through the theme's MuiAlert message
+ * white-space override.
+ *
+ * A shown line sticks to the viewport bottom while its place in the layout is below the fold,
+ * so the outcome of the last key stays in view as the 3270 showed the whole map after every key,
+ * and the cursor on cursor_field stays where the page put it. On each new outcome (other text on
+ * either line, or a new outcomeKey with the same text) the line also scrolls itself into view,
+ * but only when the focused field stays wholly in view after the scroll; the lines a screen
+ * mounts with are left where they are, so entering a screen keeps its top in view. Until the
+ * user presses a key or a pointer on the screen, only an outcome the ERRMSG line reports (a
+ * refusal, an error or a notice such as the thank-you line) is scrolled into view. INFOMSG is the
+ * screen's standing prompt: a change of it alone is scrolled into view only once the user has
+ * acted, as CAUP's info-line results of ENTER and F5 are. After each reveal and each move of
+ * focus, a focused field the stuck line covers is scrolled to just above it, so the line never
+ * hides the cursor.
  */
 export function MessageLine(props: MessageLineProps) {
     const wrapperRef = useRevealOnNewOutcome(props);
+    if (IsBlank(props.message) && IsBlank(props.infoMessage)) {
+        return null;
+    }
     return (
         <Stack ref={wrapperRef} spacing={2} useFlexGap sx={MESSAGE_LINE_STYLE}>
             <MessageAlert

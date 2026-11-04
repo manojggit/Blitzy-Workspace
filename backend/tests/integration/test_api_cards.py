@@ -60,6 +60,8 @@ HTTP_SIGN_ON_FAILURE = 401
 HTTP_ACCESS_REFUSED = 403
 HTTP_NOT_FOUND = 404
 HTTP_FILE_ERROR = 503
+# A request no 3270 terminal could send, refused before any edit (AAP 0.6.4).
+HTTP_MALFORMED = 422
 LEGACY_ERROR_KEYS = frozenset({"message", "info_message", "field_errors", "cursor_field"})
 
 # --- Seed data (data/EBCDIC/AWS.M2.CARDDEMO.CARDDATA.PS, one card per account) -------------------
@@ -232,6 +234,23 @@ class CardRefCase(NamedTuple):
     routeSuffix: str
 
 
+class CardKeySourceCase(NamedTuple):
+    """A ``{cardNum}`` value of at most 16 characters, its query, and the outcome they give.
+
+    The query's ``isCardRef`` declares whether the value is a card_ref or the CARDSID text. A
+    legacy outcome shows the key prompt and no ``detail``; a 422 shows no prompt and FastAPI's
+    ``detail``.
+    """
+
+    cardKey: str
+    query: dict[str, str]
+    status: int
+    message: str
+    fieldErrors: list[str]
+    infoMessage: str = PROMPT_FOR_KEYS_INFO
+    detail: list[dict[str, Any]] | None = None
+
+
 class DetailEditCase(NamedTuple):
     """Detail field changes keyed on a fetched CCUP screen and the ENTER outcome."""
 
@@ -338,6 +357,79 @@ DETAIL_EDIT_CASES = [
     ),
 ]
 SAMPLE_KEY_QUERY = {"acctId": SAMPLE_ACCOUNT_ID}
+# The frontend declares a path taken from a cardRef URL a card_ref token, whatever its length.
+CARD_REF_DECLARATION = {"isCardRef": "true"}
+CARD_KEY_DECLARATIONS = [
+    pytest.param({}, id="by-length"),
+    pytest.param(CARD_REF_DECLARATION, id="declared"),
+]
+# A cardRef value no server issued, short enough to be CARDSID text when typed.
+SHORT_GARBLED_TEXT = "garbage"
+# U+2603, which code page 037 lacks; the client sends it as %E2%98%83.
+NON_CP037_SHORT_TEXT = "\u2603"
+# The 422 detail of CARDSID text outside the repertoire (schemas.common.RequireCp037Printable).
+NON_CP037_CARD_KEY_DETAIL = [
+    {
+        "loc": ["path", "cardNum"],
+        "msg": "Value error, text contains characters a 3270 terminal cannot send (code page 037)",
+        "type": "value_error",
+    }
+]
+CARD_KEY_SOURCE_CASES = [
+    pytest.param(
+        CardKeySourceCase(
+            SHORT_GARBLED_TEXT,
+            SAMPLE_KEY_QUERY | CARD_REF_DECLARATION,
+            HTTP_NOT_FOUND,
+            CARD_NOT_FOUND_MESSAGE,
+            [ACCT_ID_FIELD, CARD_NUM_FIELD],
+        ),
+        id="declared-short-text",
+    ),
+    pytest.param(
+        CardKeySourceCase(
+            SAMPLE_CARD_NUMBER,
+            SAMPLE_KEY_QUERY | CARD_REF_DECLARATION,
+            HTTP_NOT_FOUND,
+            CARD_NOT_FOUND_MESSAGE,
+            [ACCT_ID_FIELD, CARD_NUM_FIELD],
+        ),
+        id="declared-card-number",
+    ),
+    pytest.param(
+        CardKeySourceCase(
+            SHORT_GARBLED_TEXT,
+            SAMPLE_KEY_QUERY,
+            HTTP_EDIT_FAILURE,
+            CARD_FILTER_MESSAGE,
+            [CARD_NUM_FIELD],
+        ),
+        id="typed-short-text",
+    ),
+    pytest.param(
+        CardKeySourceCase(
+            NON_CP037_SHORT_TEXT,
+            SAMPLE_KEY_QUERY | CARD_REF_DECLARATION,
+            HTTP_NOT_FOUND,
+            CARD_NOT_FOUND_MESSAGE,
+            [ACCT_ID_FIELD, CARD_NUM_FIELD],
+        ),
+        id="declared-text-outside-cp037",
+    ),
+    pytest.param(
+        CardKeySourceCase(
+            NON_CP037_SHORT_TEXT,
+            SAMPLE_KEY_QUERY,
+            HTTP_MALFORMED,
+            "",
+            [CARD_NUM_FIELD],
+            infoMessage="",
+            detail=NON_CP037_CARD_KEY_DETAIL,
+        ),
+        id="typed-text-outside-cp037",
+    ),
+]
+CARD_KEY_ROUTE_SUFFIXES = [pytest.param("", id="view"), pytest.param(EDIT_SUFFIX, id="edit")]
 SELECTION_CALL = EndpointCall("POST", SELECTION_URL, body={"rows": []})
 UPDATE_CALL = EndpointCall("PUT", SAMPLE_CARD_URL, body={"action": ENTER})
 CARD_ENDPOINTS = [
@@ -723,23 +815,24 @@ async def test_list_enter_with_two_selections_redisplays_the_page(
 
 
 # --- CCLI selection and card_ref navigation (COCRDLIC XCTL, AAP 0.7.1) ---------------------------
+@pytest.mark.parametrize("declaration", CARD_KEY_DECLARATIONS)
 async def test_view_selection_opens_the_card_detail(
-    regularClient: httpx.AsyncClient, syncEngine: Engine
+    regularClient: httpx.AsyncClient, syncEngine: Engine, declaration: dict[str, str]
 ) -> None:
     """``S`` returns action view and a card_ref that CCDL reads with the row's account."""
     listBody = ExpectOk(await ListCards(regularClient, {}))
     selected = ExpectOk(await SelectRow(regularClient, listBody, VIEW_ROW_INDEX, "S"))
     assert selected["action"] == "view"
     row = listBody["rows"][VIEW_ROW_INDEX]
-    response = await GetCard(
-        regularClient, CardUrl(selected["card_ref"]), {"acctId": row["acct_id"]}
-    )
+    query = {"acctId": row["acct_id"]} | declaration
+    response = await GetCard(regularClient, CardUrl(selected["card_ref"]), query)
     cardNum = ReadCardOrder(syncEngine)[VIEW_ROW_INDEX]["card_num"]
     AssertDetailShowsCard(ExpectOk(response), ReadCardRow(syncEngine, cardNum))
 
 
+@pytest.mark.parametrize("declaration", CARD_KEY_DECLARATIONS)
 async def test_update_selection_opens_the_card_update(
-    regularClient: httpx.AsyncClient, syncEngine: Engine
+    regularClient: httpx.AsyncClient, syncEngine: Engine, declaration: dict[str, str]
 ) -> None:
     """``U`` returns action update and a card_ref that CCUP fetches into SHOW_DETAILS."""
     listBody = ExpectOk(await ListCards(regularClient, {}))
@@ -747,7 +840,8 @@ async def test_update_selection_opens_the_card_update(
     assert selected["action"] == "update"
     row = listBody["rows"][UPDATE_ROW_INDEX]
     editPath = CardUrl(selected["card_ref"]) + EDIT_SUFFIX
-    screen = ExpectOk(await GetCard(regularClient, editPath, {"acctId": row["acct_id"]}))
+    query = {"acctId": row["acct_id"]} | declaration
+    screen = ExpectOk(await GetCard(regularClient, editPath, query))
     cardNum = ReadCardOrder(syncEngine)[UPDATE_ROW_INDEX]["card_num"]
     AssertScreenState(screen, SHOW_DETAILS)
     assert screen["fields"][ACCT_ID_FIELD] == row["acct_id"]
@@ -805,6 +899,29 @@ async def test_forged_or_expired_card_ref_is_not_found(
     response = await GetCard(regularClient, path, SAMPLE_KEY_QUERY)
     body = AssertLegacyError(response, HTTP_NOT_FOUND, CARD_NOT_FOUND_MESSAGE, ACCT_ID_FIELD)
     assert body["info_message"] == PROMPT_FOR_KEYS_INFO
+
+
+@pytest.mark.parametrize("routeSuffix", CARD_KEY_ROUTE_SUFFIXES)
+@pytest.mark.parametrize("sourceCase", CARD_KEY_SOURCE_CASES)
+async def test_declared_source_decides_card_ref_or_typed_card_number(
+    regularClient: httpx.AsyncClient, sourceCase: CardKeySourceCase, routeSuffix: str
+) -> None:
+    """A short path declared a card_ref is decoded as one; undeclared, it is CARDSID text.
+
+    A declared value that is no token, whatever its characters, gives the CARDDAT NOTFND literal
+    with both keys failing (AAP 0.7.1), never the typed card number's filter literal or a 422.
+    The same text typed is edited, or, outside code page 037, refused with the 422 of AAP 0.6.4.
+    """
+    path = CardUrl(sourceCase.cardKey) + routeSuffix
+    response = await GetCard(regularClient, path, sourceCase.query)
+    body = AssertLegacyError(
+        response, sourceCase.status, sourceCase.message, sourceCase.fieldErrors[0]
+    )
+    assert body["field_errors"] == sourceCase.fieldErrors
+    assert body["info_message"] == sourceCase.infoMessage
+    assert body.get("detail") == sourceCase.detail
+    if routeSuffix and sourceCase.status == HTTP_NOT_FOUND:
+        assert body["fields"][CARD_NUM_FIELD] == ""
 
 
 @pytest.mark.parametrize("keyCase", KEY_EDIT_CASES)
