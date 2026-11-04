@@ -1,5 +1,5 @@
-"""Unit tests for the CR00 report slots, admissions, row batches, streamed chunks,
-client-disconnect stops and the screen JSON.
+"""Unit tests for the CR00 report slots, output budget, admissions, row batches, bounded chunk
+buffers, client-disconnect stops and the screen JSON.
 
 app.services.reports.corpt00c runs CORPT00C's edits and confirmation first, waiting for
 nothing. A confirmed report then takes one of REPORT_WORKER_LIMIT report slots, then a request
@@ -8,19 +8,25 @@ TRANSACT, so a read failure, an abend or a gone client still sets the status bef
 sent; a report refused admission within DB_CONNECT_TIMEOUT_SECONDS reads nothing and answers
 the WHEN OTHER literal. Its build pass then reads TRANSACT again and builds, and for the screen
 JSON or a download renders, the report on a report thread. Both passes fetch their rows a batch
-at a time, the renderers yield the document in chunks as it is built, and the slot, the
-admission and the connection are freed as soon as the build ends, before the response has sent
-every chunk. A report whose client has gone stops when its slot is granted or after its
-validation pass, with the 499 no client receives and one INFO record; a listed report also stops
-at the next line check on the thread, and a streamed one at its next chunk, logging the same
-record. A build pass that fails after the response started raises, so the body never ends
-normally. cbtrn03c.IterateReport yields BuildReport's lines lazily, and the report_export
-renderers read them once. The screen JSON is byte for byte what FastAPI sends for the response
-model RunTransactionReport returns (TypeAdapter.dump_json by alias), built without a line list.
+at a time, and the renderers yield the document in chunks as it is built. A streamed report
+takes a REPORT_OUTPUT_BUDGET token before its slot, holding nothing else while it waits, and
+keeps it until its response ends; its build waits for room while its buffer of
+REPORT_BUFFER_CHUNKS is full, and frees the slot, the admission and the connection when it ends,
+before the response has sent every chunk. A report whose client has gone stops when its slot is
+granted or after its validation pass, with the 499 no client receives and one INFO record; a
+listed report also stops at the next line check on the thread, and a streamed one at its next
+chunk, or at once while it waits for room, logging the same record. A client that takes no
+message within REPORT_SEND_TIMEOUT_SECONDS stops the report the same way, with one INFO record
+of its own, and its body never ends. A build pass that fails after the response started
+raises, so the body never ends normally. cbtrn03c.IterateReport
+yields BuildReport's lines lazily, and the report_export renderers read them once. The screen
+JSON is byte for byte what FastAPI sends for the response model RunTransactionReport returns
+(TypeAdapter.dump_json by alias), built without a line list.
 
 The repositories and the ASGI receive channel are stubbed, and ChunkCollector plays the
-response that drains a report stream, so no HTTP request is made, except in the first case,
-which reads the seeded test database (holding no transaction) through makeOnlineContext.
+response that drains a report stream, or a stub ASGI client drives the router's
+ReportStreamingResponse, so no HTTP request is made, except in the first case, which reads the
+seeded test database (holding no transaction) through makeOnlineContext.
 Expected literals are typed from cbl/CORPT00C.cbl: ``Please confirm to print the Custom
 report...`` (lines 464-474), ``"X" is not a valid value to confirm...`` (lines 489-494),
 ``Start Date - Not a valid Month...`` (lines 329-337), ``Custom report submitted for printing
@@ -47,7 +53,9 @@ from pydantic import TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import State
 from starlette.requests import Request
+from starlette.types import Message
 
+from app.api.v1.reports import ReportStreamingResponse
 from app.core.config import Settings
 from app.core.database import ADMITTED_REQUEST_LIMIT, RequestAdmission
 from app.core.dependencies import CurrentUser, OnlineContext
@@ -56,7 +64,13 @@ from app.repositories.transaction_repository import TransactionRepository
 from app.schemas.common import ExportFormat
 from app.schemas.reports import ReportLine, ReportQuery, TransactionReportResponse
 from app.services.reports import cbtrn03c, corpt00c, report_export
-from app.services.reports.report_export import RenderCsv, RenderPdf
+from app.services.reports.report_export import (
+    CSV_MEDIA_TYPE,
+    JSON_MEDIA_TYPE,
+    PDF_MEDIA_TYPE,
+    RenderCsv,
+    RenderPdf,
+)
 
 REGULAR_USER_TYPE = "U"
 TEST_USER_ID = "SLOTTEST"
@@ -82,6 +96,7 @@ SCREEN_STATUS = 200
 EDIT_FAILURE_STATUS = 400
 FILE_ERROR_STATUS = 503
 STOP_LOG_MESSAGE = "CR00 report stopped: the client disconnected"
+STALL_LOG_MESSAGE = "CR00 report stopped: the client stopped reading"
 
 SCREEN_ENTRY = "screen"
 JSON_ENTRY = "json"
@@ -117,8 +132,8 @@ CONCURRENT_REPORTS = 6
 READ_DELAY_SECONDS = 0.05
 EDIT_DEADLINE_SECONDS = 1.0
 MID_BUILD_CHECK_LINES = 3
-# No report slot borrowed and every request admission free.
-NOTHING_HELD = (0, ADMITTED_REQUEST_LIMIT)
+# No report slot and no output token borrowed, and every request admission free.
+NOTHING_HELD = (0, 0, ADMITTED_REQUEST_LIMIT)
 # The admission bound of a report whose admissions are all held, far below the default.
 SHORT_ADMISSION_WAIT_SECONDS = 0.05
 # CORPT00C's cursor on the report type (MOVE -1 TO MONTHLYL), as the ReportQuery wire name.
@@ -137,6 +152,19 @@ BUILD_PASS_READ = 2
 BUILD_DEADLINE_SECONDS = 5.0
 POLL_SECONDS = 0.005
 TRANSACT_FILE_NAME = "TRANSACT"
+# A report buffer so small that even a THREE_PDF_PAGE_ROW_COUNT PDF fills it with lines unbuilt.
+ONE_CHUNK_BUFFER = 1
+# A send bound short enough that a client that stops reading stops its report within a test.
+SHORT_SEND_TIMEOUT_SECONDS = 0.05
+RESPONSE_START_MESSAGE: Message = {"type": "http.response.start", "status": SCREEN_STATUS}
+REPORT_MEDIA_TYPES = {
+    JSON_ENTRY: JSON_MEDIA_TYPE,
+    ExportFormat.CSV.value: CSV_MEDIA_TYPE,
+    ExportFormat.PDF.value: PDF_MEDIA_TYPE,
+}
+# The scope uvicorn gives an HTTP request: below ASGI spec 2.4, StreamingResponse sends in a task
+# that runs beside its wait for a disconnect.
+UVICORN_HTTP_SCOPE = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}}
 
 
 class ReportProgress(NamedTuple):
@@ -387,9 +415,13 @@ class ReportHarness:
         """Return how many request admissions of the stub application are free."""
         return RequestAdmission(self.Context().request).value
 
-    def Held(self) -> tuple[int, int]:
-        """Return the borrowed report slots and the free admissions; NOTHING_HELD when idle."""
-        return corpt00c.REPORT_SLOTS.borrowed_tokens, self.FreeAdmissions()
+    def Held(self) -> tuple[int, int, int]:
+        """Return the borrowed report slots and output tokens and the free admissions."""
+        return (
+            corpt00c.REPORT_SLOTS.borrowed_tokens,
+            corpt00c.REPORT_OUTPUT_BUDGET.borrowed_tokens,
+            self.FreeAdmissions(),
+        )
 
 
 @pytest.fixture(name="buildObserver")
@@ -516,12 +548,20 @@ def ObserveReadHoldings(
     monkeypatch.setattr(TransactionRepository, "StreamReportTransactions", ObservedRead)
 
 
-async def WaitForBuildEnd(context: OnlineContext, idleHoldings: list[Holdings]) -> None:
-    """Wait, reading no chunk, until the report frees its slot; then record what it holds."""
+async def WaitUntil(condition: Callable[[], bool]) -> None:
+    """Poll condition every POLL_SECONDS until it holds, failing after BUILD_DEADLINE_SECONDS."""
     with anyio.fail_after(BUILD_DEADLINE_SECONDS):
-        while corpt00c.REPORT_SLOTS.borrowed_tokens:
+        while not condition():
             await anyio.sleep(POLL_SECONDS)
-    idleHoldings.append(HoldingsOf(context))
+
+
+async def WaitForBuildEnd(context: OnlineContext, idleHoldings: list[tuple[Holdings, int]]) -> None:
+    """Wait, reading no chunk, until the report frees its slot; then record what it holds.
+
+    Each record pairs the request's holdings with the borrowed REPORT_OUTPUT_BUDGET tokens.
+    """
+    await WaitUntil(lambda: corpt00c.REPORT_SLOTS.borrowed_tokens == 0)
+    idleHoldings.append((HoldingsOf(context), corpt00c.REPORT_OUTPUT_BUDGET.borrowed_tokens))
 
 
 @pytest.mark.parametrize("entryName", STREAM_ENTRIES)
@@ -530,12 +570,13 @@ async def test_reads_and_build_hold_one_admission_and_connection_until_the_build
 ):
     """Both passes and the build share one admission and one connection in a transaction.
 
-    Nothing is held once the build ends, although the response has read no chunk yet.
+    Once the build ends, before the response has read a chunk, only the report's output token is
+    held, and the response's end returns it.
     """
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     readHoldings: list[Holdings] = []
     buildHoldings: list[Holdings] = []
-    idleHoldings: list[Holdings] = []
+    idleHoldings: list[tuple[Holdings, int]] = []
     ObserveReadHoldings(monkeypatch, context, readHoldings)
     buildObserver.onBuildStart = lambda: buildHoldings.append(HoldingsOf(context))
     reportStream = StreamOf(entryName, context, CONFIRMED_QUERY)
@@ -547,10 +588,11 @@ async def test_reads_and_build_hold_one_admission_and_connection_until_the_build
     readHolding = Holdings(ADMITTED_REQUEST_LIMIT - 1, 1, True, True)
     assert readHoldings == [readHolding, readHolding]
     assert buildHoldings == [readHolding._replace(onMainThread=False)]
-    assert idleHoldings == [Holdings(ADMITTED_REQUEST_LIMIT, 0, False, True)]
+    idleHolding = Holdings(ADMITTED_REQUEST_LIMIT, 0, False, True)
+    assert idleHoldings == [(idleHolding, 1)]
     assert collector.endedNormally
     assert collector.Document() == ExpectedResult(entryName, [])
-    assert HoldingsOf(context) == idleHoldings[0]
+    assert (HoldingsOf(context), corpt00c.REPORT_OUTPUT_BUDGET.borrowed_tokens) == (idleHolding, 0)
 
 
 async def test_at_most_report_worker_limit_reports_read_and_build_at_once(harness):
@@ -761,18 +803,36 @@ async def EditOutcome(editCase: EditCase, context: OnlineContext) -> tuple[int, 
     return SCREEN_STATUS, response.message
 
 
-@pytest.mark.parametrize("editCase", EDIT_CASES, ids=EDIT_IDS)
-async def test_edits_and_confirmation_answer_while_every_report_slot_is_taken(harness, editCase):
-    """A prompt, a cleared screen or an edit failure never waits for a report slot."""
-    borrowers = [object() for _ in range(corpt00c.REPORT_WORKER_LIMIT)]
-    for borrower in borrowers:
-        await corpt00c.REPORT_SLOTS.acquire_on_behalf_of(borrower)
+@contextlib.asynccontextmanager
+async def EveryTokenBorrowed(limiter: anyio.CapacityLimiter) -> AsyncIterator[list[object]]:
+    """Borrow every token of limiter on behalf of plain objects and yield those borrowers.
+
+    On exit each borrower still in the list returns its token; one the caller pops is its own
+    to release.
+    """
+    borrowers: list[object] = []
     try:
-        with anyio.fail_after(EDIT_DEADLINE_SECONDS):
-            outcome = await EditOutcome(editCase, harness.Context())
+        for _ in range(int(limiter.total_tokens)):
+            borrower = object()
+            await limiter.acquire_on_behalf_of(borrower)
+            borrowers.append(borrower)
+        yield borrowers
     finally:
         for borrower in borrowers:
-            corpt00c.REPORT_SLOTS.release_on_behalf_of(borrower)
+            limiter.release_on_behalf_of(borrower)
+
+
+@pytest.mark.parametrize("editCase", EDIT_CASES, ids=EDIT_IDS)
+async def test_edits_and_confirmation_answer_while_every_report_slot_and_output_token_is_taken(
+    harness, editCase
+):
+    """A prompt, a cleared screen or an edit failure waits for no report slot or output token."""
+    async with (
+        EveryTokenBorrowed(corpt00c.REPORT_SLOTS),
+        EveryTokenBorrowed(corpt00c.REPORT_OUTPUT_BUDGET),
+    ):
+        with anyio.fail_after(EDIT_DEADLINE_SECONDS):
+            outcome = await EditOutcome(editCase, harness.Context())
 
     assert outcome == editCase.expectedOutcome
     assert harness.readLog.rowReads == 0
@@ -1043,4 +1103,217 @@ async def test_a_failed_build_pass_raises_and_never_ends_the_body(
     assert not collector.endedNormally
     serviceRecords = [record for record in caplog.records if record.name == corpt00c.LOGGER.name]
     assert [record.levelno for record in serviceRecords] == [logging.ERROR]
+    assert harness.Held() == NOTHING_HELD
+
+
+class BufferWait(NamedTuple):
+    """What a report holds while its build waits for room in its full buffer."""
+
+    buildsFinished: int
+    held: tuple[int, int, int]
+    bufferedChunks: int
+
+
+def BuildWaitsForRoom(reportStream: corpt00c.ReportStream) -> bool:
+    """Return True once the buffer is full and the build is waiting to send one more chunk."""
+    statistics = reportStream.chunks.statistics()
+    isFull = statistics.current_buffer_used == statistics.max_buffer_size
+    return isFull and statistics.tasks_waiting_send == 1
+
+
+def UseOneChunkBuffers(monkeypatch: pytest.MonkeyPatch, harness: ReportHarness) -> None:
+    """Buffer ONE_CHUNK_BUFFER chunks of SMALL_CHUNK_BYTES of a THREE_PDF_PAGE_ROW_COUNT report."""
+    monkeypatch.setattr(corpt00c, "REPORT_BUFFER_CHUNKS", ONE_CHUNK_BUFFER)
+    monkeypatch.setattr(report_export, "REPORT_CHUNK_BYTES", SMALL_CHUNK_BYTES)
+    harness.readLog.rows = BuildRows(THREE_PDF_PAGE_ROW_COUNT)
+
+
+async def RecordBuildWaitingForRoom(
+    harness: ReportHarness, reportStream: corpt00c.ReportStream, bufferWaits: list[BufferWait]
+) -> None:
+    """Wait, reading no chunk, until the build waits for room; then record what is held."""
+    await WaitUntil(functools.partial(BuildWaitsForRoom, reportStream))
+    bufferedChunks = reportStream.chunks.statistics().current_buffer_used
+    buildsFinished = harness.buildObserver.buildsFinished
+    bufferWaits.append(BufferWait(buildsFinished, harness.Held(), bufferedChunks))
+
+
+@pytest.mark.parametrize("entryName", STREAM_ENTRIES)
+async def test_a_full_buffer_makes_the_build_wait_until_the_response_reads(
+    harness, monkeypatch, entryName
+):
+    """While its buffer is full the build waits, keeping its slot, admission and output token.
+
+    Once the response reads, the build goes on and the whole document arrives.
+    """
+    UseOneChunkBuffers(monkeypatch, harness)
+    reportStream = StreamOf(entryName, harness.Context(), CONFIRMED_QUERY)
+    bufferWaits: list[BufferWait] = []
+    recordWait = functools.partial(RecordBuildWaitingForRoom, harness, reportStream, bufferWaits)
+    collector = ChunkCollector(reportStream, beforeReceiving=recordWait)
+
+    await collector.Run()
+
+    heldWhileWaiting = (1, 1, ADMITTED_REQUEST_LIMIT - 1)
+    assert bufferWaits == [BufferWait(0, heldWhileWaiting, ONE_CHUNK_BUFFER)]
+    assert collector.endedNormally
+    assert collector.Document() == ExpectedResult(entryName, harness.readLog.rows)
+    assert harness.Held() == NOTHING_HELD
+
+
+async def StopOnceTheBuildWaits(
+    reportStream: corpt00c.ReportStream, observer: BuildObserver, linesBuilt: list[int]
+) -> None:
+    """Play a response that reads nothing and stops once the build waits for room.
+
+    The lines built by then are recorded in linesBuilt.
+    """
+    await WaitUntil(functools.partial(BuildWaitsForRoom, reportStream))
+    linesBuilt.append(observer.linesBuilt)
+
+
+@pytest.mark.parametrize("entryName", STREAM_ENTRIES)
+async def test_a_build_waiting_for_room_stops_at_once_when_the_response_stops_reading(
+    harness, caplog, monkeypatch, entryName
+):
+    """No line is built after the response stops; one INFO record, and nothing stays held."""
+    caplog.set_level(logging.INFO, logger=corpt00c.LOGGER.name)
+    UseOneChunkBuffers(monkeypatch, harness)
+    reportStream = StreamOf(entryName, harness.Context(), CONFIRMED_QUERY)
+    observer = harness.buildObserver
+    linesBuilt: list[int] = []
+    stopReading = functools.partial(StopOnceTheBuildWaits, reportStream, observer, linesBuilt)
+
+    await corpt00c.StreamReport(reportStream, stopReading)
+
+    assert linesBuilt == [observer.linesBuilt]
+    assert (observer.buildsStarted, observer.buildsFinished) == (1, 0)
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.INFO, STOP_LOG_MESSAGE)
+    ]
+    assert harness.Held() == NOTHING_HELD
+
+
+async def test_a_report_waits_for_an_output_token_holding_no_slot_or_admission(harness):
+    """With every output token borrowed, a confirmed download waits before its slot and reads.
+
+    Once one token is returned, it runs to the whole document.
+    """
+    entryName = ExportFormat.CSV.value
+    collector = ChunkCollector(StreamOf(entryName, harness.Context(), CONFIRMED_QUERY))
+    budget = corpt00c.REPORT_OUTPUT_BUDGET
+    async with EveryTokenBorrowed(budget) as borrowers, anyio.create_task_group() as taskGroup:
+        taskGroup.start_soon(collector.Run)
+        await WaitUntil(lambda: budget.statistics().tasks_waiting == 1)
+        heldWhileWaiting = (harness.readLog.rowReads, harness.Held())
+        budget.release_on_behalf_of(borrowers.pop())
+
+    assert heldWhileWaiting == (0, (0, corpt00c.REPORT_STREAM_LIMIT, ADMITTED_REQUEST_LIMIT))
+    assert collector.endedNormally
+    assert collector.Document() == ExpectedResult(entryName, harness.readLog.rows)
+    assert harness.Held() == NOTHING_HELD
+
+
+async def NeverAccept(message: Message) -> None:
+    """Play a client that has stopped reading without disconnecting: no message is taken."""
+    await anyio.sleep_forever()
+
+
+def BuildSentEveryChunk(reportStream: corpt00c.ReportStream) -> bool:
+    """Return True once the build has sent its last chunk and closed its end of the buffer."""
+    return reportStream.chunks.statistics().open_send_streams == 0
+
+
+class StallCase(NamedTuple):
+    """Where the client stops reading, and how many builds have finished when the report stops."""
+
+    stage: str
+    expectedBuildsFinished: int
+
+
+# The client stops reading while the build waits for room in a full one-chunk buffer, so the
+# build stops unfinished; or once the build has put the whole stub report into its buffer.
+STALL_CASES = [StallCase("build-waiting-for-room", 0), StallCase("build-ended", 1)]
+
+
+def ArmStall(stage: str, harness: ReportHarness) -> Callable[[corpt00c.ReportStream], bool]:
+    """Return the condition on which the client of the STALL_CASES stage named stage stalls."""
+    if stage == "build-waiting-for-room":
+        UseOneChunkBuffers(harness.monkeypatch, harness)
+        return BuildWaitsForRoom
+    return BuildSentEveryChunk
+
+
+async def StallOnce(
+    reportStream: corpt00c.ReportStream, stallCondition: Callable[[corpt00c.ReportStream], bool]
+) -> None:
+    """Play a response that, once stallCondition holds, sends its start to a stalled client."""
+    await WaitUntil(functools.partial(stallCondition, reportStream))
+    await corpt00c.SendWithinTimeout(NeverAccept, RESPONSE_START_MESSAGE)
+
+
+@pytest.mark.parametrize("entryName", STREAM_ENTRIES)
+@pytest.mark.parametrize("stallCase", STALL_CASES, ids=[case.stage for case in STALL_CASES])
+async def test_a_client_that_stops_reading_stops_the_report_with_one_info_record(
+    harness, caplog, stallCase, entryName
+):
+    """Past the send bound the response stops, and a build waiting for room stops with it.
+
+    StreamReport returns, only the stall is logged, and nothing stays held.
+    """
+    caplog.set_level(logging.INFO, logger=corpt00c.LOGGER.name)
+    harness.monkeypatch.setattr(corpt00c, "REPORT_SEND_TIMEOUT_SECONDS", SHORT_SEND_TIMEOUT_SECONDS)
+    stallCondition = ArmStall(stallCase.stage, harness)
+    reportStream = StreamOf(entryName, harness.Context(), CONFIRMED_QUERY)
+
+    with anyio.fail_after(BUILD_DEADLINE_SECONDS):
+        await corpt00c.StreamReport(
+            reportStream, functools.partial(StallOnce, reportStream, stallCondition)
+        )
+
+    observer = harness.buildObserver
+    expectedBuilds = (1, stallCase.expectedBuildsFinished)
+    assert (observer.buildsStarted, observer.buildsFinished) == expectedBuilds
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.INFO, STALL_LOG_MESSAGE)
+    ]
+    assert harness.Held() == NOTHING_HELD
+
+
+@dataclass
+class StalledClient:
+    """Plays a client that takes the response start, then stops reading without disconnecting."""
+
+    messages: list[Message] = field(default_factory=list)
+
+    async def Send(self, message: Message) -> None:
+        """Record message; take the start, and never return for a body message."""
+        self.messages.append(message)
+        if message["type"] != RESPONSE_START_MESSAGE["type"]:
+            await anyio.sleep_forever()
+
+
+@pytest.mark.parametrize("entryName", STREAM_ENTRIES)
+async def test_the_report_response_bounds_every_send_and_never_ends_a_stalled_body(
+    harness, caplog, entryName
+):
+    """Under uvicorn's ASGI spec, the router's response returns once its client stops reading.
+
+    The start is sent and the first chunk never taken, so no last body message follows; the
+    stall is logged once and nothing stays held.
+    """
+    caplog.set_level(logging.INFO, logger=corpt00c.LOGGER.name)
+    harness.monkeypatch.setattr(corpt00c, "REPORT_SEND_TIMEOUT_SECONDS", SHORT_SEND_TIMEOUT_SECONDS)
+    reportStream = StreamOf(entryName, harness.Context(), CONFIRMED_QUERY)
+    response = ReportStreamingResponse(reportStream, REPORT_MEDIA_TYPES[entryName])
+    client = StalledClient()
+
+    with anyio.fail_after(BUILD_DEADLINE_SECONDS):
+        await response(UVICORN_HTTP_SCOPE, ClientChannel().Receive, client.Send)
+
+    sent = [(message["type"], message.get("more_body")) for message in client.messages]
+    assert sent == [(RESPONSE_START_MESSAGE["type"], None), ("http.response.body", True)]
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.INFO, STALL_LOG_MESSAGE)
+    ]
     assert harness.Held() == NOTHING_HELD

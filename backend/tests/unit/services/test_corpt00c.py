@@ -681,7 +681,6 @@ async def test_custom_part_beyond_its_bound_is_refused(
 async def test_unreadable_custom_year_becomes_year_zero_and_passes(
     reportScreen, yearPart, startDate, endDate
 ):
-    """An unreadable year is normalised to 0000 and reaches the confirmation prompt."""
     response = await RunReport(reportScreen, {yearPart: UNREADABLE_YEAR_TEXT})
 
     assert ScreenOutcome(response) == (CUSTOM_PROMPT_MESSAGE, CURSOR_CONFIRM, startDate, endDate)

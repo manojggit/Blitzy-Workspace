@@ -1,4 +1,4 @@
-"""Replaces: CORPT00C (CR00), BMS CORPT00, copybooks CVTRA05Y, CSUTLDTC.
+"""Replaces: CORPT00C (CR00), BMS CORPT00, copybook CVTRA05Y; calls the CSUTLDTC date program.
 
 The CR00 transaction report screen. CORPT00C edited the request and wrote inline JCL to TDQ
 ``JOBS``, which ran ``proc/TRANREPT.prc`` (backup, sort and filter, then CBTRN03C) to print the
@@ -17,11 +17,17 @@ is sent. The build pass then reads the same snapshot again, and builds and rende
 on a report thread, so neither a queued nor a running report keeps other online requests
 waiting. Both passes fetch the rows from a server-side cursor REPORT_BATCH_ROWS at a time, and
 the renderers yield the document in chunks as its lines are built, so a report never holds its
-row set, its line list or, in any format, its whole document. The build puts each chunk
-into an unbounded buffer that the response drains, and frees its slot, admission and
-connection the moment it ends, so a slow client holds only built bytes. A report whose client
-has disconnected stops at the next check: when its slot is granted, after its validation pass,
-at the next chunk of a streamed build, and every DISCONNECT_CHECK_LINES lines of a listed one.
+row set, its line list or a joined copy of its document. A streamed report's unsent chunks wait
+in a buffer of REPORT_BUFFER_CHUNKS, which holds the whole document only when it is that small,
+and while the buffer is full the build waits for room. The report takes a REPORT_OUTPUT_BUDGET
+token before its slot and keeps it until its response ends, so the unsent output of all reports
+together stays within REPORT_STREAM_LIMIT buffers; its slot, admission and connection are freed
+when its build ends. A report whose client has disconnected stops at the next check: when its
+slot is granted, after its validation pass, at the next chunk of a streamed build (at once while
+it waits for room) and every DISCONNECT_CHECK_LINES lines of a listed one. A streamed report's
+response waits at most REPORT_SEND_TIMEOUT_SECONDS for its client to accept each message, so a
+client that stops reading without disconnecting stops the report the same way, and its body
+never ends normally.
 
 The TRANREPT STEP01R backup of TRANSACT is superseded: this module never writes, deletes or
 archives anything and only reads. CR00 never opened a CLOSEFIL file, so the report is not gated
@@ -42,7 +48,6 @@ import calendar
 import contextlib
 import functools
 import logging
-import math
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -52,20 +57,23 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import MINYEAR, date, datetime
 from typing import Any, NamedTuple
 
 from anyio import (
     BrokenResourceError,
     CapacityLimiter,
+    Event,
     create_memory_object_stream,
     create_task_group,
     from_thread,
+    move_on_after,
     to_thread,
 )
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from starlette.requests import Request, empty_receive
+from starlette.types import Message, Send
 
 from app.core.database import AdmittedReads
 from app.core.dependencies import OnlineContext
@@ -185,12 +193,9 @@ NO_REPORT_LINES: tuple[ReportLine, ...] = ()
 # it reads and, while it fetches the next, that one too, so this bounds the rows a report holds:
 # 200 rows keep a report's memory a fraction of even a one-day CSV, while costing few round trips.
 REPORT_BATCH_ROWS = 200
-# What a fetch past the last batch of a report pass gives.
 NO_REPORT_ROWS: tuple[Mapping[str, Any], ...] = ()
 
-# One pass over the TRANREPT STEP05R output: batches of rows from a server-side cursor.
 type RowBatches = AsyncIterator[Sequence[Mapping[str, Any]]]
-# The rows of one pass as a report thread reads them, each batch fetched on the event loop.
 type PassRows = Iterator[Mapping[str, Any]]
 
 
@@ -240,7 +245,9 @@ class ReportStream:
     """A confirmed report whose document is sent while it is built (``StreamReport``).
 
     ``render`` turns the CBTRN03C lines into the document's chunks. The build puts each chunk
-    into ``chunkSender``, an unbounded buffer, and the response reads them from ``chunks``.
+    into ``chunkSender``, a buffer of REPORT_BUFFER_CHUNKS, and the response reads them from
+    ``chunks``. ``clientStalled`` is set once the response has stopped because its client
+    stopped reading (``SendThenClose``).
     """
 
     context: OnlineContext
@@ -248,6 +255,7 @@ class ReportStream:
     render: Callable[[Iterable[ReportLine]], Iterator[ReportChunk]]
     chunkSender: MemoryObjectSendStream[ReportChunk]
     chunks: MemoryObjectReceiveStream[ReportChunk]
+    clientStalled: Event = field(default_factory=Event)
 
 
 class ReportExport(NamedTuple):
@@ -260,6 +268,10 @@ class ReportExport(NamedTuple):
 
 class ReportAbandonedError(Exception):
     """Internal: the report's client has disconnected, so the report is not finished."""
+
+
+class ReportClientStalledError(Exception):
+    """Internal: the report's client accepted no data within REPORT_SEND_TIMEOUT_SECONDS."""
 
 
 class DatePartField(NamedTuple):
@@ -364,18 +376,31 @@ EXPORT_RENDERERS: dict[ExportFormat, ExportRenderer] = {
 
 # The most reports reading, building or rendering at once, across all requests. The work is pure
 # Python that holds the GIL, so more at once adds no throughput and only competes with the event
-# loop; and each report in a slot holds a request admission and a connection, and a batch of
-# rows, until its build ends, so the limit also bounds what reports take from other requests.
+# loop; and each report in a slot holds a request admission, a connection and a batch of rows
+# until its build ends. A build waiting for a slow client keeps its admission and connection, so
+# the limit also bounds what slow clients take from other online requests.
 REPORT_WORKER_LIMIT = 2
 # The report slots, taken before the reads and held until the report is built and rendered. A
-# report waits for its slot holding no admission and no connection, and frees it when its build
-# ends, before its client has read every chunk. Created at import, before any event loop runs,
-# so anyio creates the backend limiter on first use. A token is bound to the task that took it.
+# report waits for its slot holding no admission and no connection, a streamed one only its
+# REPORT_OUTPUT_BUDGET token, and frees the slot when its build ends, while its client may still
+# be reading the chunks left in its buffer. Created at import, before any event loop runs, so
+# anyio creates the backend limiter on first use. A token is bound to the task that took it.
 REPORT_SLOTS = CapacityLimiter(REPORT_WORKER_LIMIT)
 # The worker threads of the reports in a slot. anyio lends a task one token of a limiter at a
 # time, and the task already holds its REPORT_SLOTS token, so the thread needs a limiter of its
 # own; it is never contended, because only reports in a slot borrow from it.
 REPORT_THREADS = CapacityLimiter(REPORT_WORKER_LIMIT)
+# The chunks one report's buffer holds, built and not yet taken by its response. The build waits
+# for room, so a slow client paces only its own build, and a document of at most this many chunks
+# is built without waiting: its slot, admission and connection are freed before its client has
+# read it.
+REPORT_BUFFER_CHUNKS = 16
+# The shared output budget. A confirmed streamed report takes one token before its slot, waiting
+# holding nothing else, and keeps it until its response has sent its last chunk, closed or
+# stalled, so the unsent output of all reports together stays within REPORT_STREAM_LIMIT
+# buffers, about 8 MiB of 16 KiB chunks, however slowly clients read.
+REPORT_STREAM_LIMIT = 32
+REPORT_OUTPUT_BUDGET = CapacityLimiter(REPORT_STREAM_LIMIT)
 # The report lines a report thread builds between two checks that its client is still connected.
 DISCONNECT_CHECK_LINES = 2000
 # nginx's 499 Client Closed Request, the status of a report stopped because its client
@@ -384,6 +409,11 @@ HTTP_CLIENT_CLOSED_REQUEST = 499
 CLIENT_CLOSED_MESSAGE = ""
 # One INFO record per stopped report; it names the transaction only, never the query or a PAN.
 REPORT_ABANDONED_LOG = "%s report stopped: the client disconnected"
+REPORT_STALLED_LOG = "%s report stopped: the client stopped reading"
+# nginx's send_timeout default: the longest a report's response waits for its client to accept
+# one ASGI message, so a client that stops reading without disconnecting frees its report's
+# slot, admission, connection and output token within that bound.
+REPORT_SEND_TIMEOUT_SECONDS = 60.0
 
 
 def CurrentDate() -> date:
@@ -653,7 +683,6 @@ async def ReportRowBatches(
 
 
 async def NextRowBatch(rowBatches: RowBatches) -> Sequence[Mapping[str, Any]]:
-    """Return the next batch of rowBatches, or NO_REPORT_ROWS once every batch is read."""
     return await anext(rowBatches, NO_REPORT_ROWS)
 
 
@@ -678,7 +707,6 @@ async def RunReportPass[PassResult](
 
 
 def CheckJobRows(job: ReportJob, rows: PassRows) -> None:
-    """Check every row of the validation pass for the CBTRN03C abend, on a report thread."""
     CheckReportInput(rows, job.typeDescriptions, job.categoryDescriptions)
 
 
@@ -738,7 +766,6 @@ async def ClientDisconnected(request: Request) -> bool:
 
 
 async def StopIfClientGone(request: Request) -> None:
-    """Raise ReportAbandonedError when the client of ``request`` has disconnected."""
     if await ClientDisconnected(request):
         raise ReportAbandonedError
 
@@ -759,7 +786,6 @@ def WatchClient(lines: Iterable[ReportLine], request: Request) -> Iterator[Repor
 
 
 def JobLines(job: ReportJob, rows: PassRows) -> Iterator[ReportLine]:
-    """Yield the CBTRN03C lines of the job's rows one at a time, as the rows are read."""
     return IterateReport(job.requestData, rows, job.typeDescriptions, job.categoryDescriptions)
 
 
@@ -775,11 +801,14 @@ def ListReportLines(job: ReportJob, rows: PassRows) -> list[ReportLine]:
 def SendReportChunks(reportStream: ReportStream, job: ReportJob, rows: PassRows) -> None:
     """Build and render the report on a report thread, sending each chunk as it is rendered.
 
+    Each send runs on the event loop and waits while the buffer is full.
+
     Raises:
-        BrokenResourceError: The response has stopped reading, because its client went away.
+        BrokenResourceError: The response has stopped reading, because its client went away or
+            stopped reading; a build waiting for room gets it at once.
     """
     for chunk in reportStream.render(JobLines(job, rows)):
-        from_thread.run_sync(reportStream.chunkSender.send_nowait, chunk)
+        from_thread.run(reportStream.chunkSender.send, chunk)
 
 
 @contextlib.contextmanager
@@ -804,9 +833,9 @@ async def OpenReportJob(
 ) -> ReportJob:
     """Take a report slot and a request admission into holdings, then read and check the report.
 
-    The slot comes first and is waited for holding nothing; the admission is taken only once it
-    is granted. holdings keeps both, and the session's connection and snapshot, until the
-    caller's build ends. A request refused admission within its wait bound
+    The slot comes first and is waited for holding no admission or connection; the admission is
+    taken only once it is granted. holdings keeps both, and the session's connection and
+    snapshot, until the caller's build ends. A request refused admission within its wait bound
     (``core.database.AdmittedReads``) reads nothing and fails as an IOERR of TRANTYPE, its
     first file read, so it answers the WHEN OTHER literal. A gone client is checked for when
     the slot is granted and after the validation pass. ``cbtrn03c.ReportAbendError`` (the
@@ -851,24 +880,41 @@ def OpenReportStream(
 ) -> ReportStream:
     """Return the stream of the confirmed report over reportRange, rendered by render.
 
-    The chunk buffer is unbounded, so the build never waits for the client: the buffer holds
-    at most the document's built bytes, and the build frees its slot, admission and
-    connection as soon as it ends, however slowly the client reads. ``StreamReport`` closes
-    both ends of the buffer.
+    The chunk buffer holds REPORT_BUFFER_CHUNKS chunks, and the build waits for room while it
+    is full. ``StreamReport`` closes both ends of the buffer.
     """
-    chunkSender, chunks = create_memory_object_stream[ReportChunk](math.inf)
+    chunkSender, chunks = create_memory_object_stream[ReportChunk](REPORT_BUFFER_CHUNKS)
     return ReportStream(context, reportRange, render, chunkSender, chunks)
 
 
-async def SendThenClose(
-    sendChunks: Callable[[], Awaitable[None]], chunks: MemoryObjectReceiveStream[ReportChunk]
-) -> None:
-    """Run sendChunks, then close chunks, however sendChunks ends.
+async def SendWithinTimeout(send: Send, message: Message) -> None:
+    """Pass message to send, waiting at most REPORT_SEND_TIMEOUT_SECONDS for the client.
 
-    sendChunks returns early when the client goes away, so the build stops at its next chunk.
+    Raises:
+        ReportClientStalledError: The client accepted no data within the bound.
     """
-    with chunks:
-        await sendChunks()
+    with move_on_after(REPORT_SEND_TIMEOUT_SECONDS) as sendScope:
+        await send(message)
+    if sendScope.cancelled_caught:
+        raise ReportClientStalledError
+
+
+async def SendThenClose(
+    sendChunks: Callable[[], Awaitable[None]], reportStream: ReportStream
+) -> None:
+    """Run sendChunks, then close the stream's chunks, however sendChunks ends.
+
+    sendChunks returns early when the client goes away, and raises ReportClientStalledError
+    when it stops reading; closing chunks then stops the build (``BuildReportStream``). A stall
+    is logged here, once, and sets ``clientStalled`` before chunks closes, so the build does not
+    log it again. The body of a stalled response never ends normally.
+    """
+    with reportStream.chunks:
+        try:
+            await sendChunks()
+        except ReportClientStalledError:
+            reportStream.clientStalled.set()
+            LOGGER.info(REPORT_STALLED_LOG, TRANSACTION_ID)
 
 
 async def BuildReportStream(
@@ -877,10 +923,11 @@ async def BuildReportStream(
     """Build the checked report into its chunk buffer on a report thread, then free holdings.
 
     The sender is closed only once every chunk is sent, so the body ends normally only for a
-    whole document. A build whose response has stopped reading, because the client went away,
-    stops at its next chunk and logs one INFO record. The slot, the admission and the
-    connection are freed as soon as the build ends, however it ends, while the response may
-    still be sending built chunks.
+    whole document. A build whose response has stopped reading, because the client went away
+    or stopped reading, stops at its next chunk, or at once when it is waiting for room; it logs
+    one INFO record for a gone client, as the response has logged a stalled one. The slot, the
+    admission and the connection are freed as soon as the build ends, however it ends, while
+    the response may still be sending the chunks left in the buffer.
 
     Raises:
         RepositoryError: A read of the build pass failed, once its file condition is logged.
@@ -889,7 +936,8 @@ async def BuildReportStream(
     try:
         await RunReportPass(job, functools.partial(SendReportChunks, reportStream))
     except BrokenResourceError:
-        LOGGER.info(REPORT_ABANDONED_LOG, TRANSACTION_ID)
+        if not reportStream.clientStalled.is_set():
+            LOGGER.info(REPORT_ABANDONED_LOG, TRANSACTION_ID)
     except RepositoryError as error:
         LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         raise
@@ -904,11 +952,17 @@ async def StreamReport(
 ) -> None:
     """Run the confirmed report while sendChunks sends ``reportStream.chunks`` as the body.
 
-    First, in the calling task and before a byte is sent, the report takes its slot and
-    admission and is read and checked (``OpenReportJob``), so each outcome that sets the status
-    (the 503 literal, the abend 999, the 499 of a gone client) is raised unwrapped, for the
-    exception handlers. Then sendChunks runs in a child task while the calling task, which
-    holds the slot's token, builds the report (``BuildReportStream``).
+    First, in the calling task and before a byte is sent, the report takes a
+    REPORT_OUTPUT_BUDGET token, then its slot and admission, and is read and checked
+    (``OpenReportJob``), so each outcome that sets the status (the 503 literal, the abend 999,
+    the 499 of a gone client) is raised unwrapped, for the exception handlers. Then sendChunks
+    runs in a child task while the calling task, which holds both tokens, builds the report
+    (``BuildReportStream``). The budget token is released only once both the build and
+    sendChunks have ended, so it covers the chunks left in the buffer until the response has
+    sent them or stopped reading. A sendChunks that raises ReportClientStalledError, its client
+    having accepted nothing for REPORT_SEND_TIMEOUT_SECONDS, stops the report with one INFO
+    record and returns without the body's last message, so the client gets a truncated
+    transfer.
 
     Raises:
         LegacyMessageError: 503 as ``ReportReadFailures`` or 499 as ``ClientGoneOutcome``,
@@ -918,11 +972,11 @@ async def StreamReport(
             started.
     """
     with reportStream.chunkSender, reportStream.chunks:
-        async with contextlib.AsyncExitStack() as holdings:
+        async with REPORT_OUTPUT_BUDGET, contextlib.AsyncExitStack() as holdings:
             with ClientGoneOutcome():
                 job = await OpenReportJob(reportStream.context, reportStream.reportRange, holdings)
             async with create_task_group() as taskGroup:
-                taskGroup.start_soon(SendThenClose, sendChunks, reportStream.chunks)
+                taskGroup.start_soon(SendThenClose, sendChunks, reportStream)
                 await BuildReportStream(reportStream, job, holdings)
 
 
@@ -1009,8 +1063,9 @@ def ExportTransactionReport(
     """Run the CR00 edits and return the confirmed report as a CSV or PDF download.
 
     The document is built in memory as its chunks are sent (``StreamReport``), on a report
-    thread, so rendering never holds the event loop and neither the line list nor the whole
-    document ever exists; no file is written.
+    thread, so rendering never holds the event loop. The line list is never built and the
+    document never joined: only its unsent chunks are held, at most REPORT_BUFFER_CHUNKS in its
+    buffer, and no file is written.
 
     Returns:
         The document's stream, its media type and its ``TRANREPT_<start>_<end>.<ext>`` name.

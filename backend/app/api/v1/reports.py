@@ -79,7 +79,8 @@ class ReportStreamingResponse(StreamingResponse):
     ``corpt00c.StreamReport`` first reads and checks the report, before any byte is sent, so a
     503, 499 or abend it raises still reaches the exception handlers, which FastAPI applies
     around the response; it then builds the report while ``StreamingResponse`` sends each chunk
-    and ends the body once the build has sent the last one.
+    and ends the body once the build has sent the last one. Each message is sent through
+    ``corpt00c.SendWithinTimeout``, so a client that stops reading stops the report.
     """
 
     def __init__(
@@ -93,7 +94,8 @@ class ReportStreamingResponse(StreamingResponse):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Read and check the report, then send its chunks while it is built."""
-        sendChunks = functools.partial(super().__call__, scope, receive, send)
+        sendWithinTimeout = functools.partial(corpt00c.SendWithinTimeout, send)
+        sendChunks = functools.partial(super().__call__, scope, receive, sendWithinTimeout)
         await corpt00c.StreamReport(self.reportStream, sendChunks)
 
 
