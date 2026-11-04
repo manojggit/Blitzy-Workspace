@@ -226,7 +226,8 @@ function IsFieldName(name: string): name is UserDeleteFieldName {
 }
 
 // A 401 returns to sign-on, as the apiClient interceptor does. A 403 shows nothing here, because
-// the interceptor carries its literal to the user's own menu. Anything else is a defect.
+// the interceptor carries its literal to the user's own menu. Any other axios failure is shown as
+// the screen's feedback; anything that is not an axios error is a defect and propagates.
 function ShowCallError(context: DeleteScreenContext, error: unknown): void {
     if (!isAxiosError(error)) {
         throw error;

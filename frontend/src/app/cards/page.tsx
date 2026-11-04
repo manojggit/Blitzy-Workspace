@@ -442,7 +442,6 @@ async function RunScreenCall(
     }
 }
 
-// Aborts whichever list read is in flight at the moment of the call.
 function AbortListRead(listReadRef: ListReadRef): void {
     listReadRef.current?.abort();
 }

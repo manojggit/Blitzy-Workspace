@@ -519,8 +519,8 @@ function MockOutcome(literalCase: LiteralCase): void {
     mockAddTransaction.mockRejectedValue(FailureOf(literalCase));
 }
 
-// delay null keys each character back to back: FillForm types over 100 characters, and a timer
-// between keystrokes pushed the typing tests past jest's 5 s default timeout on a loaded host.
+// delay null keys each character back to back with no timer between keystrokes, because
+// FillForm keys a long form: E2E_LIKE_INPUT alone is over 100 characters.
 function RenderScreen(): UserEvent {
     const user = userEvent.setup({ delay: null });
     render(
