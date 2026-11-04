@@ -8,8 +8,10 @@ import { Providers } from "@/app/providers";
 
 // next/font requires the loader call as a module-scope constant. The variable name is the one
 // the theme's font stack reads, so the self-hosted face reaches every MUI typography role.
+// Roboto is a variable font (wght 100-900), so leaving weight unset loads its variable face:
+// one file per subset serves every weight the M3 type scale uses. A static weight list would
+// return that same file once per weight, which makes Next's font URL rewrite fail the build.
 const roboto = Roboto({
-    weight: ["300", "400", "500", "700"],
     subsets: ["latin"],
     display: "swap",
     variable: "--font-roboto",
