@@ -22,7 +22,9 @@ own:
 - CCUP (COCRDUPC), CU02 (COUSR02C) and CU03 (COUSR03C) use one unit each.
 
 Units never take the batch-window lock: core.locks.EnterOnlineWindow holds it on a separate
-connection for the whole request.
+connection for the whole request. A unit whose statements a repository gated on that window
+re-checks, just before its COMMIT and on its own connection, that the request still holds it
+(core.locks.ConfirmWindowForCommit), and is rolled back with FileIoError when it does not.
 
 A request therefore holds up to four pooled connections at once: the session, the window
 connection and two units. GetSession admits at most ADMITTED_REQUEST_LIMIT requests at a time,
@@ -97,7 +99,7 @@ from sqlalchemy.pool import NullPool
 
 from app.core.config import ParseDatabaseUrl, Settings
 from app.core.errors import FileIoError, MapDatabaseError, RepositoryError
-from app.core.locks import REQUEST_ENGINE_ATTRIBUTE
+from app.core.locks import REQUEST_ENGINE_ATTRIBUTE, ConfirmWindowForCommit
 from app.core.logging import SuppressEngineStatementLogging
 
 # The first statement of every unit: a SELECT ... FOR UPDATE waits at most 5 seconds for a
@@ -576,12 +578,15 @@ async def WriteUnit(engine: AsyncEngine, fileName: str) -> AsyncIterator[AsyncCo
     by the raised file condition. The repository issues the ``SELECT ... FOR UPDATE`` and the
     single INSERT, UPDATE or DELETE on the yielded connection, with bound parameters only, and
     never commits. A clean exit commits at once, so the write is durable before the next write
-    starts. On an exception the transaction is rolled back, and then:
+    starts. Before that COMMIT, a unit a repository gated on the batch window confirms that its
+    request still holds the window (core.locks.ConfirmWindowForCommit). On an exception the
+    transaction is rolled back, and then:
 
-    - a RepositoryError or LegacyMessageError raised by the body, and a task cancellation,
-      propagate unchanged;
-    - a DBAPIError from connecting, BEGIN, the body or COMMIT becomes the MapDatabaseError
-      condition (23505 DuplicateKeyError, 55P03 RecordLockError, other FileIoError);
+    - a RepositoryError or LegacyMessageError raised by the body, the FileIoError of a window
+      found lost before the COMMIT, and a task cancellation propagate unchanged;
+    - a DBAPIError from connecting, BEGIN, the body, the window check or COMMIT becomes the
+      MapDatabaseError condition (23505 DuplicateKeyError, 55P03 RecordLockError, other
+      FileIoError);
     - a connection-level failure (CONNECTION_FAILURES) becomes FileIoError.
 
     The checkout, its pre-ping, BEGIN and the lock timeout run within EngineDeadline of the
@@ -598,6 +603,7 @@ async def WriteUnit(engine: AsyncEngine, fileName: str) -> AsyncIterator[AsyncCo
             committed = False
             try:
                 yield connection
+                await ConfirmWindowForCommit(connection)
                 await connection.commit()
                 committed = True
             finally:

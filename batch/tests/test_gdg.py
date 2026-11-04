@@ -767,7 +767,9 @@ def DeleteOrphanWorkDirectoriesOf(context: JobContext, directoryPath: Path) -> i
 def PublishFirstGenerationIn(context: JobContext, directoryPath: Path) -> str:
     """Publish generation 1 of the directory from its .part file holding PUBLISHED_BYTES."""
     expectedSha256 = hashlib.sha256(PUBLISHED_BYTES).hexdigest()
-    return gdg.PlaceGenerationFile(directoryPath / FileName(OLDEST_GENERATION), expectedSha256)
+    finalPath = directoryPath / FileName(OLDEST_GENERATION)
+    with context.engine.connect() as connection:
+        return gdg.PlaceGenerationFile(finalPath, expectedSha256, connection)
 
 
 SWAP_CASES = (
@@ -947,7 +949,7 @@ def test_catalog_file_path_inside_gdg_root_resolves_there(
     tmp_path: Path, filePathTemplate: str
 ) -> None:
     """The batch's relative "<BASE>/G####V00.dat" and an in-root absolute path name one file."""
-    outputDir, _outsideDir = BuildCatalogRoots(tmp_path)
+    outputDir, _ = BuildCatalogRoots(tmp_path)
     gdgRoot = outputDir / GDG_DIRECTORY_NAME
     filePath = filePathTemplate.format(gdgRoot=gdgRoot)
 

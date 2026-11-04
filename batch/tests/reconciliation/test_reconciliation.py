@@ -313,7 +313,7 @@ def ExpectedSortKeyTexts(
     offsets for layoutName, so the TRAN-IDs come from the oracle's CVTRA05Y layout.
     """
     if layoutName is None:
-        _header, csvRows = compare.ReadExpectedCsv(fixturePath)
+        _, csvRows = compare.ReadExpectedCsv(fixturePath)
         return [row[sortSpec.keyColumn] for row in csvRows], []
     records = compare.ReadFixedWidthRecords(fixturePath)
     tableSpec = compare.TABLE_SPECS[sortSpec.tableName]

@@ -408,7 +408,7 @@ class ReportHarness:
             request=Request(scope, receiveChannel.Receive),
             session=AsyncSession(),
             settings=self.settings,
-            user=CurrentUser(user_id=TEST_USER_ID, user_type=REGULAR_USER_TYPE),
+            user=CurrentUser(userId=TEST_USER_ID, userType=REGULAR_USER_TYPE),
         )
 
     def FreeAdmissions(self) -> int:

@@ -61,6 +61,7 @@ class SettingsStub:
     """The MigrationSettings members revision 0002 reads, without backend/.env or a database."""
 
     imageDir: Path = SHIPPED_EBCDIC_DIR
+    # Named as MigrationSettings names them: an exception to MK_Modernization Rule clause 1.
     APP_ENV: str = "local"
     BCRYPT_ROUNDS: int = TEST_BCRYPT_ROUNDS
 

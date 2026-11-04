@@ -68,16 +68,17 @@ def GetAppSettings(request: Request) -> Settings:
 class CurrentUser:
     """The signed-on user, read from the verified session token.
 
-    ``user_id`` and ``user_type`` replace CDEMO-USER-ID and CDEMO-USER-TYPE. They keep the
-    snake_case of the ``GET /auth/me`` JSON keys they are serialised to.
+    ``userId`` and ``userType`` replace CDEMO-USER-ID and CDEMO-USER-TYPE. This is not a
+    response model: ``GET /auth/me`` copies them into the snake_case ``user_id`` and
+    ``user_type`` keys of its Pydantic body.
     """
 
-    user_id: str
-    user_type: str
+    userId: str
+    userType: str
 
     def IsAdmin(self) -> bool:
         """Return True only for type exactly A, the COSGN00C ``IF CDEMO-USRTYP-ADMIN`` test."""
-        return self.user_type == ADMIN_USER_TYPE
+        return self.userType == ADMIN_USER_TYPE
 
 
 def SessionRefusal() -> LegacyMessageError:
@@ -100,7 +101,7 @@ async def GetCurrentUser(
         claims = ReadSessionToken(token, settings)
     except jwt.InvalidTokenError:
         raise SessionRefusal() from None
-    return CurrentUser(user_id=claims.userId, user_type=claims.userType)
+    return CurrentUser(userId=claims.userId, userType=claims.userType)
 
 
 async def RequireAdmin(user: Annotated[CurrentUser, Depends(GetCurrentUser)]) -> CurrentUser:

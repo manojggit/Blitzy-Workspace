@@ -557,7 +557,7 @@ def test_tranfile_skips_priming_record_and_loads_no_rows(
     extraKeys = DisturbBeforeLoad(engine, TRANFILE_CASE)
     newRunId = AssertLoadAddsHistoryRow(engine, TRANFILE_CASE)
     assert RunRow(engine, newRunId)["counts"] == {ROWS_LOADED_KEY: 0, RECORDS_SKIPPED_KEY: 1}
-    _header, expectedRows = ReadExpectedCsv(LOADER_ROWS_DIR / TRANFILE_CASE.csvName)
+    _, expectedRows = ReadExpectedCsv(LOADER_ROWS_DIR / TRANFILE_CASE.csvName)
     assert expectedRows == []
     AssertTableReplaced(engine, TRANFILE_CASE, extraKeys)
 

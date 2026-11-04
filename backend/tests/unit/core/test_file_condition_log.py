@@ -64,6 +64,7 @@ class CyclicCauseA(Exception):
 class CyclicCauseB(Exception):
     """The other end of the looping chain; it carries the chain's SQLSTATE."""
 
+    # Named as asyncpg.PostgresError names it: an exception to MK_Modernization Rule clause 1.
     sqlstate = "XX000"
 
 

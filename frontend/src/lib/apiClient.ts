@@ -530,18 +530,36 @@ export function LegacyErrorBody<T extends LegacyErrorResponse>(
     return { ...body, ...FeedbackFromBody(body) } as T & CompleteScreenFeedback;
 }
 
+// Told of each navigation to sign-on just before it starts, so the session context can tear down
+// the screen being left.
+const SIGN_ON_REDIRECT_LISTENERS = new Set<() => void>();
+
+// Adds a listener RedirectToSignOn calls before it navigates; the returned function removes it.
+export function SubscribeToSignOnRedirect(listener: () => void): () => void {
+    SIGN_ON_REDIRECT_LISTENERS.add(listener);
+    return () => {
+        SIGN_ON_REDIRECT_LISTENERS.delete(listener);
+    };
+}
+
 // The one navigation to sign-on, shared by the 401 handler and the session context's first read.
 // On the server, and on the sign-on page itself, it does nothing, so sign-on never reloads in a
-// loop.
+// loop. Otherwise every listener runs first, then the browser leaves the page.
 export function RedirectToSignOn(): void {
     if (typeof window === "undefined" || window.location.pathname === SIGN_ON_ROUTE) {
         return;
     }
+    for (const listener of SIGN_ON_REDIRECT_LISTENERS) {
+        listener();
+    }
     window.location.assign(SIGN_ON_ROUTE);
 }
 
-// True for an axios error whose status HandleResponseError already acts on: a 401 goes to sign-on
-// and a 403 returns to the user's own menu. A caller never navigates again for such an error.
+// True for an axios error with status 401 or 403, the statuses HandleResponseError routes (a 401
+// to sign-on, a 403 to the user's own menu), for a caller deciding whether its own fallback
+// routing is needed. It classifies the status only: it does not prove that a navigation happened,
+// it does not reflect the login and logout 401 exemption, and a page may still route itself, as
+// CT01 and CU03 replace their route with sign-on on a 401.
 export function IsInterceptorRoutedRefusal(error: unknown): boolean {
     if (!axios.isAxiosError(error)) {
         return false;

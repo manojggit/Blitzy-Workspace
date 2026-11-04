@@ -340,6 +340,8 @@ Status 12 is returned when:
 - publishing a step's generation after the step has committed finds it `LOST`
     ([Lost generations](#lost-generations));
 - the batch window is not available ([Batch window](#batch-window));
+- the batch window is lost while the command runs (`BATCH WINDOW LOST`), whatever the command
+    was doing ([Batch window](#batch-window));
 - outside a step, the database cannot be reached (`DATABASE NOT AVAILABLE`), or it rejects a
     statement the command does not map itself, as an unmigrated database does
     (`DATABASE ERROR`, naming only the error classes and the SQLSTATE);
@@ -411,7 +413,8 @@ Commit points:
 
 Every CLI command begins in this order, before it executes any step or loader:
 
-1. Take the batch window ([Batch window](#batch-window)).
+1. Take the batch window, then wait until no job session of a former window owner is left
+    ([Batch window](#batch-window)).
 2. Classify interrupted runs ([Interrupted runs](#interrupted-runs)).
 3. Reconcile the GDG catalog with `gdg.ReconcileCatalog()` ([Recovery](#recovery)).
 4. Refuse with exit 12 if the `OPEN` cycle has a `LOST` generation, unless the command is
@@ -420,9 +423,10 @@ Every CLI command begins in this order, before it executes any step or loader:
 
 ### Interrupted runs
 
-The batch window guarantees that no other batch process is alive, so every `job_runs` row still
-`RUNNING` belongs to a process that died. It becomes `INTERRUPTED`, and its step is classified by
-durability class:
+Entering the batch window waits until no job session of a former owner is left, and a command
+whose window was lost commits nothing more, so every `job_runs` row still `RUNNING` belongs to a
+run that died or was stopped. It becomes `INTERRUPTED`, and its step is classified by durability
+class:
 
 - **Atomic steps** (loaders, TRANBKP, COMBTRAN, TRANIDX) and **files-only steps** (CREASTMT)
     committed nothing, because their transaction ended with the connection. Their `.part` file is
@@ -721,6 +725,39 @@ and `CUSTDAT` stay open.
     BATCH WINDOW NOT AVAILABLE
     ```
 
+Holding the window is checked, never assumed. If the dedicated connection alone is lost, for
+example to a network failure or `pg_terminate_backend`, PostgreSQL releases the lock while the
+job connections live on, so the command is fenced against continued ownership:
+
+- Once the lock is granted, `BatchWindow` identifies its connection's session by its process ID
+    and `backend_start`.
+- It then closes the command's job connections. Each job connection opened afterwards takes a
+    second, batch-only advisory key, `BATCH_JOB_SESSION_LOCK`, in shared mode for its whole
+    life, and is admitted only while that session still holds the window.
+- Every job transaction checks that ownership again, on its own connection, just before its
+    `COMMIT`. So does the code before each file effect that no commit covers: a generation's
+    rename, the CREASTMT statement publication and the deletion of managed files by catalog
+    recovery and retention.
+- When a check finds the window lost, its transaction is rolled back, and nothing more is
+    committed, published or cleaned up; as the command stops, it only discards its own
+    uncataloged `.part` and work files ([Abnormal disposition](#abnormal-disposition)). The job
+    connections stay open, still holding `BATCH_JOB_SESSION_LOCK`, until the command has
+    stopped. The loss is final: no later check queries again, and the window is never taken
+    anew. The command exits 12 with this message, and the run it leaves `RUNNING` is
+    classified by the next command ([Interrupted runs](#interrupted-runs)):
+
+    ```text
+    BATCH WINDOW LOST
+    ```
+
+- A command entering the window takes `BATCH_JOB_SESSION_LOCK` exclusively once, with the same
+    60 s lock timeout, so it waits until the job connections of a former owner have closed
+    before it classifies runs or cleans files. Recovery therefore never mistakes live work for a
+    dead process's. If they are still open when the timeout expires, the command changes nothing
+    and exits 12 with `BATCH WINDOW NOT AVAILABLE`.
+- On exit, the job connections are closed before the window is unlocked, so the next command
+    never waits for a finished one.
+
 Batch code never calls `EnterOnlineWindow`, because its job connections would conflict with its
 own window. Alembic migrations do not take the window; they run with the backend stopped.
 
@@ -728,17 +765,32 @@ own window. Alembic migrations do not take the window; they run with the backend
 
 The repositories for `WINDOW_TABLES` (`transactions.transactions`, `xref.card_xref` for the
 `CCXREF` and `CXACAIX` paths, `accounts.accounts` and `security.users`) call
-`locks.EnterOnlineWindow(request, fileName)` before their first statement in a request.
-`request` is the FastAPI request, and `fileName` is the legacy CICS file the statement addresses
-(`TRANSACT`, `CCXREF`, `CXACAIX`, `ACCTDAT` or `USRSEC`), which a refusal names:
+`locks.EnterOnlineWindow(request, fileName, unit)` before their first statement in a request.
+`request` is the FastAPI request, `fileName` is the legacy CICS file the statement addresses
+(`TRANSACT`, `CCXREF`, `CXACAIX`, `ACCTDAT` or `USRSEC`), which a refusal names, and `unit` is
+the write unit the statement runs on, omitted for a read on the request session:
 
 - On the first call, it checks out one connection for the request and runs
-    `SELECT pg_try_advisory_lock_shared(BATCH_WINDOW_LOCK)`; later calls reuse a granted or
-    refused outcome without a query. A granted lock is held for the whole request and released by
-    `locks.LeaveOnlineWindow(request)` in the request dependency's `finally`.
+    `SELECT pg_try_advisory_lock_shared(BATCH_WINDOW_LOCK)`. A granted lock is held for the whole
+    request and released by `locks.LeaveOnlineWindow(request)` in the request dependency's
+    `finally`.
 - When the lock is refused, `EnterOnlineWindow` raises `FileNotOpenError(fileName)` (RESP 19,
     RESP2 60) through the repository, so each service reaches the `WHEN OTHER` branch of the
-    program it ports, with that program's literal.
+    program it ports, with that program's literal. Later calls of the request reuse the refusal
+    without a query.
+- After a grant, each later call first confirms, on the request's window connection, that its
+    session still holds the shared lock. If that session has ended, for example to a lost
+    connection, PostgreSQL has already released the lock and batch may hold the window. The
+    call then discards the connection and raises `FileIoError(fileName)` (IOERR), and so does
+    every later call of the request, which never takes the lock again. The service again
+    answers its `WHEN OTHER` literal, and no statement of the request reaches a window file.
+- A write unit passed to `EnterOnlineWindow` is fenced. Just before its `COMMIT`, `WriteUnit`
+    re-checks the request's hold on the unit's own connection, inside its transaction: the
+    session granted the window, identified by its process ID and `backend_start`, must still
+    hold the shared lock. If it does not, the unit is rolled back and raises
+    `FileIoError(fileName)`, and the request's window is recorded lost. A write admitted before
+    the loss therefore never becomes durable once batch can hold the window. Write units still
+    never take the lock themselves.
 - A shared request that would queue behind a waiting batch request is refused at once. New online
     access fails while the window is closing, and in-flight requests finish, as a CEMT close waits
     for current users.
@@ -1127,6 +1179,10 @@ To retry a failed atomic step, rerun the chain; it resumes at the first step not
 The same command finishes a publication that failed after its step committed: the catalog is
 reconciled first ([Recovery](#recovery)), and the committed step is skipped.
 
+It also resumes after `BATCH WINDOW LOST`, once the database is reachable again. The stopped run
+is classified first ([Interrupted runs](#interrupted-runs)): an atomic or files-only step is
+retried, and a per-write step is refused until you choose one of the two recipes below.
+
 To recover from a failed or interrupted per-write step (POSTTRAN or INTCALC) by restoring from the
 loaders in a new cycle:
 
@@ -1322,7 +1378,11 @@ The orchestration rules above are pinned by these suites in `batch/tests/`:
         the new cycle's generation.
 - `test_batch_window.py`: a second `run-all` while one is running exits 12 (the test sets a 1 s
     timeout); the window is released after success, after a step failure and after the process is
-    killed; batch jobs never call `EnterOnlineWindow`.
+    killed; batch jobs never call `EnterOnlineWindow`. With only the window's connection ended,
+    the next job commit and a generation's publication are refused and the window is never
+    taken again; a POSTTRAN paused between its units then keeps a second command out with
+    `BATCH WINDOW NOT AVAILABLE`, stops with `BATCH WINDOW LOST` once resumed, and is classified
+    `INTERRUPTED` by the next command.
 - `test_posttran.py`: a failure injected at record 150 leaves records 1–149 posted and no DALYREJS
     generation.
 - `test_interest_calc.py`: empty, single-account and multi-account inputs with non-zero

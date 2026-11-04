@@ -152,7 +152,7 @@ def NextRouteFor(userType: str) -> str:
     The stored type is tested as it is, never upper-cased or trimmed, so ``a``, ``u``, ``U``,
     ``X`` and a blank type are all regular users.
     """
-    if CurrentUser(user_id="", user_type=userType).IsAdmin():
+    if CurrentUser(userId="", userType=userType).IsAdmin():
         return ADMIN_ROUTE
     return MENU_ROUTE
 
@@ -343,11 +343,11 @@ async def DescribeCurrentUser(context: OnlineContext) -> CurrentUserResponse:
     sessionUser = context.user
     if sessionUser is None:
         raise SessionRefusal()
-    displayNames = await ReadDisplayNames(context, sessionUser.user_id)
+    displayNames = await ReadDisplayNames(context, sessionUser.userId)
     return CurrentUserResponse(
-        user_id=sessionUser.user_id,
-        user_type=sessionUser.user_type,
+        user_id=sessionUser.userId,
+        user_type=sessionUser.userType,
         first_name=displayNames.firstName,
         last_name=displayNames.lastName,
-        next_route=NextRouteFor(sessionUser.user_type),
+        next_route=NextRouteFor(sessionUser.userType),
     )

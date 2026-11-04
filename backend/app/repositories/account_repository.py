@@ -85,7 +85,7 @@ class AccountRepository:
         lasts until the unit ends. A record another unit holds past the unit's lock timeout
         raises RecordLockError.
         """
-        await EnterOnlineWindow(self.context.request, ACCOUNT_FILE_NAME)
+        await EnterOnlineWindow(self.context.request, ACCOUNT_FILE_NAME, unit)
         statement = (
             select(ACCOUNTS_TABLE)
             .where(ACCOUNTS_TABLE.c.acct_id == acctId.rstrip(" "))
@@ -104,7 +104,7 @@ class AccountRepository:
         exists raises RecordNotFoundError (NOTFND). The rewrite is durable when the unit
         commits.
         """
-        await EnterOnlineWindow(self.context.request, ACCOUNT_FILE_NAME)
+        await EnterOnlineWindow(self.context.request, ACCOUNT_FILE_NAME, unit)
         acctId = str(values[ACCOUNT_KEY_COLUMN]).rstrip(" ")
         changes = {key: value for key, value in values.items() if key != ACCOUNT_KEY_COLUMN}
         # An empty SET compiles to invalid SQL, which would surface as a misleading IOERR.

@@ -496,8 +496,9 @@ def ReclassifyRun(connection: Connection, row: Row) -> None:
 def ClassifyInterruptedRuns(context: JobContext) -> int:
     """Reclassify every RUNNING run as INTERRUPTED; return how many there were.
 
-    Called first in every command, under the batch window: the window guarantees no other batch
-    process is alive, so every RUNNING row belongs to a process that died.
+    Called first in every command, under the batch window: entering it waited until no job
+    session of a former window owner was left, and a process whose window was lost commits
+    nothing more, so every RUNNING row belongs to a run that died or was stopped.
     """
     with context.engine.begin() as connection:
         runningRows = connection.execute(RUNNING_ROWS_STATEMENT).all()

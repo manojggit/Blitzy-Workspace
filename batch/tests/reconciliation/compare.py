@@ -271,7 +271,7 @@ def ReadTableAsOracleState(connection: Connection) -> legacy_oracle.OracleState:
     """
     tables = {
         attribute: ReadIndexedState(connection, tableName)
-        for attribute, tableName, _image, _layout in legacy_oracle.STATE_TABLE_SOURCES
+        for attribute, tableName, _, _ in legacy_oracle.STATE_TABLE_SOURCES
     }
     return legacy_oracle.OracleState(
         **tables,
@@ -446,7 +446,7 @@ def ParseExpectedRecords(
     record_seq is the record's position in the list, from 1. A record that does not decode is
     reported, never raised.
     """
-    fields, _lrecl = legacy_oracle.LAYOUTS[layoutName]
+    fields, _ = legacy_oracle.LAYOUTS[layoutName]
     rows = []
     messages = []
     for recordNumber, record in enumerate(records, start=1):
@@ -485,7 +485,7 @@ def CompareTableWithRecords(
         KeyError: The table or layout name is unknown.
     """
     spec = legacy_oracle.ResolveTableSpec(tableName)
-    fields, _lrecl = legacy_oracle.LAYOUTS[layoutName]
+    fields, _ = legacy_oracle.LAYOUTS[layoutName]
     missingColumns = sorted(set(spec.columns).difference(FieldColumnKinds(fields)))
     if missingColumns:
         return [f"{spec.name}: layout {layoutName} has no field for {missingColumns!r}"]
@@ -673,7 +673,7 @@ def CompareFixedWidthFiles(
     Raises:
         KeyError: The layout name is unknown.
     """
-    fields, _lrecl = legacy_oracle.LAYOUTS[layoutName]
+    fields, _ = legacy_oracle.LAYOUTS[layoutName]
     contents, missing = ReadFileRecords((actualPath, expectedPath))
     if missing:
         return missing

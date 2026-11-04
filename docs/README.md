@@ -777,8 +777,13 @@ legacy sign-on program did.
 - **The session is lost after sign-on.** The browser opened `localhost:3000` instead of
     `127.0.0.1:3000`, so the session cookie is not sent. Open `http://127.0.0.1:3000/signon`.
 - **A batch command exits with `BATCH WINDOW NOT AVAILABLE`.** Another batch command holds the
-    batch window, or an online request did not finish within 60 seconds. Wait for it to end and
-    rerun; see [Batch window](batch.md#batch-window).
+    batch window, or an online request did not finish within 60 seconds, or a command that lost
+    the window still has job connections open. Wait for it to end and rerun; see
+    [Batch window](batch.md#batch-window).
+- **A batch command exits with `BATCH WINDOW LOST`.** The connection holding the batch window
+    was dropped while the command ran, so the command stopped before committing anything more.
+    Check the database connection, then rerun `run-all`; see
+    [Recovery recipes](batch.md#recovery-recipes).
 - **The test suites cannot connect to `carddemo_test`.** The init script runs only when the
     `pgdata` volume is new. To apply it to the running `db` service:
 

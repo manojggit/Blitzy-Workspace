@@ -1,7 +1,7 @@
 // Tests: lib/session.tsx (replaces COCOM01Y CDEMO-USER-ID / CDEMO-USER-TYPE, which COSGN00C
 // filled from USRSEC before its XCTL to COADM01C for type A or to COMEN01C otherwise).
-import { Stack, Typography } from "@mui/material";
-import { act, render, screen, waitFor, type RenderResult } from "@testing-library/react";
+import { Stack, TextField, Typography } from "@mui/material";
+import { act, fireEvent, render, screen, waitFor, type RenderResult } from "@testing-library/react";
 import axios, {
     AxiosError,
     AxiosHeaders,
@@ -9,7 +9,8 @@ import axios, {
     type AxiosResponse,
     type InternalAxiosRequestConfig,
 } from "axios";
-import { StrictMode, useEffect, type ReactElement } from "react";
+import type * as NavigationModule from "next/navigation";
+import { StrictMode, useEffect, useState, type ReactElement } from "react";
 
 import { FetchCurrentUser, type CurrentUserResponse } from "@/lib/api/auth";
 import { FetchAdminMenu, FetchMainMenu, type MenuResponse } from "@/lib/api/menu";
@@ -30,6 +31,12 @@ import { SessionProvider, useSession, type SessionContextValue } from "@/lib/ses
 jest.mock("@/lib/api/auth");
 // The page-tree menu reads the provider sends; each test decides how the server answers them.
 jest.mock("@/lib/api/menu");
+// The App Router's pathname is the page jsdom is on, which each test moves with
+// history.replaceState as a client navigation moves it.
+jest.mock("next/navigation", () => ({
+    ...jest.requireActual<typeof NavigationModule>("next/navigation"),
+    usePathname: () => window.location.pathname,
+}));
 
 // The real home-route bookkeeping and sign-on navigation still run; the wrappers only record the
 // calls session.tsx makes.
@@ -83,6 +90,13 @@ const ADMIN_USER: CurrentUserResponse = {
     next_route: ADMIN_MENU_ROUTE,
 };
 
+// REGULAR_USER's ID under another user type: another identity, as the session token's typ is.
+const RETYPED_USER: CurrentUserResponse = {
+    ...REGULAR_USER,
+    user_type: "A",
+    next_route: ADMIN_MENU_ROUTE,
+};
+
 const SESSION_CONTEXT_KEYS = ["ClearSession", "RefreshSession", "currentUser", "isLoading"];
 const TAMPERED_USER_TYPE_KEY = "user_type";
 
@@ -90,6 +104,14 @@ const LOADING_TEST_ID = "session-loading";
 const USER_ID_TEST_ID = "session-user-id";
 const USER_TYPE_TEST_ID = "session-user-type";
 const NO_USER_SHOWN = "none";
+
+// CAUP, the one screen that shows the SSN unmasked, and the edit fetch it sends.
+const CAUP_ROUTE = "/accounts/update";
+const ACCOUNT_EDIT_URL = "/accounts/00000000001/edit";
+// Fictitious SSN parts, as the CAUP edit fetch fills them in, and a value keyed since.
+const TEST_SSN_PARTS: readonly string[] = ["234", "56", "7890"];
+const KEYED_VALUE_LABEL = "Keyed value";
+const KEYED_VALUE = "KEYED BEFORE THE TEARDOWN";
 
 interface SessionConsumerProps {
     onValue?: (value: SessionContextValue) => void;
@@ -144,9 +166,10 @@ interface RefreshFailureCase {
 const NETWORK_ERROR = BuildNoResponseError(AxiosError.ERR_NETWORK);
 
 // Off the sign-on page, a first read that nothing else answers (no answer, a timeout, a 5xx or
-// another status) goes to sign-on once, and is never retried. A 401 or 403 is the apiClient
-// interceptor's to route, and a cancellation is discarded. The sign-on page reads nothing, so it
-// never redirects to itself, even with the backend unreachable.
+// another status) goes to sign-on once, and is never retried; the redirect conceals the page it
+// leaves. A 401 or 403 is the apiClient interceptor's to route, and a cancellation is discarded.
+// The sign-on page reads nothing, so it never redirects to itself, even with the backend
+// unreachable.
 const MOUNT_FAILURE_CASES: readonly MountFailureCase[] = [
     {
         caseName: "no answer (ERR_NETWORK)",
@@ -245,10 +268,10 @@ function BuildCurrentUserConfig(): InternalAxiosRequestConfig {
     return { url: CURRENT_USER_PATH, headers: new AxiosHeaders() };
 }
 
-// An /auth/me answer with an error status, coded as axios's settle codes it: a bad request below
-// 500, a bad response from 500 on.
-function BuildResponseError(status: number): AxiosError {
-    const config = BuildCurrentUserConfig();
+// An answer with an error status to a call to url, by default /auth/me, coded as axios's settle
+// codes it: a bad request below 500, a bad response from 500 on.
+function BuildResponseError(status: number, url: string = CURRENT_USER_PATH): AxiosError {
+    const config: InternalAxiosRequestConfig = { url, headers: new AxiosHeaders() };
     const response = {
         status,
         data: { message: "", info_message: "", field_errors: [], cursor_field: null },
@@ -297,12 +320,93 @@ function RefreshOnMount(): ReactElement {
     return <SessionConsumer />;
 }
 
-function RenderSessionConsumer(onValue?: (value: SessionContextValue) => void): RenderResult {
-    return render(
+// A protected screen holding what CAUP holds: SSN parts its state was filled with on mount, and a
+// value keyed into it since. Both live exactly as long as its mount.
+function PopulatedScreen(): ReactElement {
+    const [ssnParts] = useState(TEST_SSN_PARTS);
+    const [keyedValue, setKeyedValue] = useState("");
+    return (
+        <Stack>
+            {ssnParts.map((part) => (
+                <Typography key={part}>{part}</Typography>
+            ))}
+            <TextField
+                label={KEYED_VALUE_LABEL}
+                value={keyedValue}
+                onChange={(event) => {
+                    setKeyedValue(event.target.value);
+                }}
+            />
+        </Stack>
+    );
+}
+
+function SessionTree(onValue?: (value: SessionContextValue) => void): ReactElement {
+    return (
         <SessionProvider>
             <SessionConsumer onValue={onValue} />
-        </SessionProvider>,
+        </SessionProvider>
     );
+}
+
+function PopulatedSessionTree(): ReactElement {
+    return (
+        <SessionProvider>
+            <SessionConsumer onValue={CaptureSession} />
+            <PopulatedScreen />
+        </SessionProvider>
+    );
+}
+
+function RenderSessionConsumer(onValue?: (value: SessionContextValue) => void): RenderResult {
+    return render(SessionTree(onValue));
+}
+
+// The client navigation to sign-on that F3 on a menu makes: the App Router renders the same tree
+// on the new pathname. Sign-on is public, so a concealed screen shows again, mounted afresh, and
+// reaching it ends the concealment.
+function ShowSignOnPage(
+    view: RenderResult,
+    tree: ReactElement = SessionTree(CaptureSession),
+): void {
+    window.history.replaceState(null, "", SIGN_ON_ROUTE);
+    view.rerender(tree);
+}
+
+// False once a teardown conceals a protected page: the provider then renders none of its children.
+function IsConsumerShown(): boolean {
+    return screen.queryByTestId(LOADING_TEST_ID) !== null;
+}
+
+// The first read has settled: the consumer shows loading ended, or a redirect concealed it.
+async function WaitForReadSettled(): Promise<void> {
+    await waitFor(() => {
+        expect(screen.queryByTestId(LOADING_TEST_ID)?.textContent).not.toBe("true");
+    });
+}
+
+function ExpectSsnPartsShown(isShown: boolean): void {
+    const shownParts = TEST_SSN_PARTS.filter((part) => screen.queryByText(part) !== null);
+    expect(shownParts).toEqual(isShown ? TEST_SSN_PARTS : []);
+}
+
+// The populated screen of this mount: its SSN parts and the value keyed into it.
+function ExpectScreenAsKeyed(): void {
+    ExpectSsnPartsShown(true);
+    expect(screen.getByLabelText(KEYED_VALUE_LABEL)).toHaveValue(KEYED_VALUE);
+}
+
+// A fresh mount: the SSN parts its state is filled with again, and nothing keyed.
+function ExpectFreshScreen(): void {
+    ExpectSsnPartsShown(true);
+    expect(screen.getByLabelText(KEYED_VALUE_LABEL)).toHaveValue("");
+}
+
+// Neither the SSN parts, the keyed value nor the session consumer is in the DOM.
+function ExpectScreenConcealed(): void {
+    ExpectSsnPartsShown(false);
+    expect(screen.queryByDisplayValue(KEYED_VALUE)).not.toBeInTheDocument();
+    expect(IsConsumerShown()).toBe(false);
 }
 
 function CaptureSession(value: SessionContextValue): void {
@@ -378,6 +482,37 @@ async function RenderSignedOnSession(user: CurrentUserResponse): Promise<Session
     return LatestSession();
 }
 
+// The populated screen on the current page, with /auth/me answering user and KEYED_VALUE keyed.
+async function RenderPopulatedScreen(user: CurrentUserResponse): Promise<RenderResult> {
+    fetchCurrentUserMock.mockResolvedValue(user);
+    const view = render(PopulatedSessionTree());
+    await WaitForSessionLoaded();
+    fireEvent.change(screen.getByLabelText(KEYED_VALUE_LABEL), { target: { value: KEYED_VALUE } });
+    ExpectScreenAsKeyed();
+    return view;
+}
+
+async function RefreshSessionTo(user: CurrentUserResponse): Promise<void> {
+    fetchCurrentUserMock.mockResolvedValue(user);
+    await act(async () => {
+        await LatestSession().RefreshSession();
+    });
+}
+
+// The next /auth/me read stays pending until the returned function releases it to answer.
+function DeferNextRead(answer: () => Promise<CurrentUserResponse>): () => Promise<void> {
+    let release: () => void = () => undefined;
+    const released = new Promise<void>((resolve) => {
+        release = resolve;
+    });
+    fetchCurrentUserMock.mockImplementationOnce(() => released.then(answer));
+    return async () => {
+        await act(async () => {
+            release();
+        });
+    };
+}
+
 // A /auth/me read that stays in flight until its signal is aborted, then rejects as axios does.
 function RejectOnAbort(options?: ReadOptions): Promise<CurrentUserResponse> {
     return new Promise((_resolve, reject) => {
@@ -429,6 +564,13 @@ async function RenderRefreshInFlight(): Promise<RefreshInFlight> {
     return { view, session, abandonedRefresh: StartRefresh(session) };
 }
 
+// F3 on a menu: ClearSession conceals the menu, then the client navigation to the public sign-on
+// page shows the session the sign-off left.
+function SignOffToSignOn(session: SessionContextValue, view: RenderResult): void {
+    session.ClearSession();
+    ShowSignOnPage(view);
+}
+
 // The newer read stays in flight, so it alone owns the loading state and the user shown.
 const ABANDONED_READ_CASES: readonly AbandonedReadCase[] = [
     {
@@ -442,9 +584,7 @@ const ABANDONED_READ_CASES: readonly AbandonedReadCase[] = [
     },
     {
         caseName: "ClearSession (F3 sign-off)",
-        Abandon: (session) => {
-            session.ClearSession();
-        },
+        Abandon: SignOffToSignOn,
         expectedUser: null,
         expectedIsLoading: false,
         expectedHomeRoute: null,
@@ -474,9 +614,7 @@ const ABANDONED_FIRST_READ_CASES: readonly AbandonedReadCase[] = [
     },
     {
         caseName: "ClearSession (F3 sign-off)",
-        Abandon: (session) => {
-            session.ClearSession();
-        },
+        Abandon: SignOffToSignOn,
         expectedUser: null,
         expectedIsLoading: false,
         expectedHomeRoute: null,
@@ -573,27 +711,34 @@ it("RefreshSession rejects a non-axios defect and keeps the user shown", async (
     expect(setHomeRouteMock).toHaveBeenCalledTimes(1);
 });
 
-it("ClearSession drops the user and the home route (F3 sign-off)", async () => {
-    const session = await RenderSignedOnSession(REGULAR_USER);
+it("ClearSession conceals the page, drops the user and the home route (F3 sign-off)", async () => {
+    fetchCurrentUserMock.mockResolvedValue(REGULAR_USER);
+    const view = RenderSessionConsumer(CaptureSession);
+    await WaitForSessionLoaded();
     act(() => {
-        session.ClearSession();
+        LatestSession().ClearSession();
     });
+    expect(IsConsumerShown()).toBe(false);
+    expect(clearHomeRouteMock).toHaveBeenCalledTimes(1);
+    expect(sessionStorage.getItem(HOME_ROUTE_KEY)).toBeNull();
+    ShowSignOnPage(view);
     expect(ShownValue(USER_ID_TEST_ID)).toBe(NO_USER_SHOWN);
     expect(LatestSession().currentUser).toBeNull();
     expect(LatestSession().isLoading).toBe(false);
-    expect(clearHomeRouteMock).toHaveBeenCalledTimes(1);
-    expect(sessionStorage.getItem(HOME_ROUTE_KEY)).toBeNull();
 });
 
 it("an /auth/me answer arriving after ClearSession does not undo the sign-off", async () => {
     const resolveUser = DeferCurrentUser();
-    RenderSessionConsumer(CaptureSession);
+    const view = RenderSessionConsumer(CaptureSession);
     act(() => {
         LatestSession().ClearSession();
     });
     await act(async () => {
         resolveUser(REGULAR_USER);
     });
+    // The abandoned answer neither shows the concealed page again nor restores its user.
+    expect(IsConsumerShown()).toBe(false);
+    ShowSignOnPage(view);
     expect(ShownValue(USER_ID_TEST_ID)).toBe(NO_USER_SHOWN);
     expect(ShownValue(LOADING_TEST_ID)).toBe("false");
     expect(setHomeRouteMock).not.toHaveBeenCalled();
@@ -745,11 +890,13 @@ it.each(MOUNT_FAILURE_CASES)(
     async ({ path, error, reads, redirects }) => {
         window.history.replaceState(null, "", path);
         fetchCurrentUserMock.mockRejectedValue(error);
-        RenderSessionConsumer(CaptureSession);
-        await WaitForSessionLoaded();
+        const view = RenderSessionConsumer(CaptureSession);
+        await WaitForReadSettled();
         expect(fetchCurrentUserMock).toHaveBeenCalledTimes(reads);
         expect(redirectToSignOnMock).toHaveBeenCalledTimes(redirects);
         expect(NavigationAttempts()).toBe(redirects);
+        expect(IsConsumerShown()).toBe(redirects === 0);
+        ShowSignOnPage(view);
         expect(LatestSession().currentUser).toBeNull();
         expect(LatestSession().isLoading).toBe(false);
         expect(setHomeRouteMock).not.toHaveBeenCalled();
@@ -787,13 +934,15 @@ it("StrictMode's effect re-run redirects a first read with no answer to sign-on 
             </SessionProvider>
         </StrictMode>,
     );
-    await WaitForSessionLoaded();
+    await WaitForReadSettled();
     expect(fetchCurrentUserMock).toHaveBeenCalledTimes(2);
     expect(ReadSignal(0).aborted).toBe(true);
-    expect(ReadSignal(1).aborted).toBe(false);
+    // The second read was current when it failed, so it redirected; that redirect's teardown then
+    // abandoned it.
+    expect(ReadSignal(1).aborted).toBe(true);
     expect(redirectToSignOnMock).toHaveBeenCalledTimes(1);
     expect(NavigationAttempts()).toBe(1);
-    expect(ShownValue(USER_ID_TEST_ID)).toBe(NO_USER_SHOWN);
+    expect(IsConsumerShown()).toBe(false);
 });
 
 it.each(REFRESH_FAILURE_CASES)(
@@ -1048,8 +1197,9 @@ const RESTORED_PAGE_FAILURE_CASES: readonly RestoredPageFailureCase[] = [
     },
 ];
 
-// A session still signed on is refreshed in place. As on the first mount, a page outside the
-// answered user's own menu tree reads that tree's menu, for the server's role guard to answer.
+// A session still signed on shows the restored page again, mounted afresh. As on the first mount,
+// a page outside the answered user's own menu tree reads that tree's menu, for the server's role
+// guard to answer.
 const RESTORED_PAGE_USER_CASES: readonly RestoredPageUserCase[] = [
     {
         caseName: "the same user on CM00",
@@ -1107,37 +1257,51 @@ async function DispatchPageShow(persisted: boolean): Promise<void> {
     });
 }
 
+// The pagehide event the browser fires whenever it hides a page: persisted is true when the page
+// enters its back/forward cache and false when it unloads.
+function DispatchPageHide(persisted: boolean): void {
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted }));
+}
+
+// No pagehide runs first, so the restore's own teardown is what conceals the cached screen.
 it.each(RESTORED_PAGE_FAILURE_CASES)(
-    "a page restored from the back/forward cache re-reads /auth/me; $caseName goes to sign-on",
+    "a restored page shows nothing while /auth/me is re-read; $caseName goes to sign-on",
     async ({ Answer, sessionRedirects }) => {
-        window.history.replaceState(null, "", MAIN_MENU_ROUTE);
-        await RenderSignedOnSession(REGULAR_USER);
-        fetchCurrentUserMock.mockImplementationOnce(Answer);
+        window.history.replaceState(null, "", CAUP_ROUTE);
+        const view = await RenderPopulatedScreen(REGULAR_USER);
+        const releaseRead = DeferNextRead(Answer);
         await DispatchPageShow(true);
-        await WaitForSessionLoaded();
-        expect(fetchCurrentUserMock).toHaveBeenCalledTimes(2);
+        ExpectScreenConcealed();
         expect(ReadSignal(1).aborted).toBe(false);
+        await releaseRead();
+        ExpectScreenConcealed();
         expect(NavigationAttempts()).toBe(1);
         expect(redirectToSignOnMock).toHaveBeenCalledTimes(sessionRedirects);
-        expect(ShownValue(USER_ID_TEST_ID)).toBe(NO_USER_SHOWN);
+        ShowSignOnPage(view, PopulatedSessionTree());
         expect(LatestSession().currentUser).toBeNull();
+        expect(LatestSession().isLoading).toBe(false);
     },
 );
 
 it.each(RESTORED_PAGE_USER_CASES)(
-    "a page restored from the back/forward cache re-reads /auth/me and shows $caseName",
+    "a restored page shows nothing until /auth/me answers, then $caseName on a fresh mount",
     async ({ path, user, mainMenuReads }) => {
         window.history.replaceState(null, "", path);
-        await RenderSignedOnSession(REGULAR_USER);
-        fetchCurrentUserMock.mockResolvedValue(user);
+        await RenderPopulatedScreen(REGULAR_USER);
+        act(() => {
+            DispatchPageHide(true);
+        });
+        const releaseRead = DeferNextRead(() => Promise.resolve(user));
         await DispatchPageShow(true);
-        await WaitForSessionLoaded();
-        expect(fetchCurrentUserMock).toHaveBeenCalledTimes(2);
+        ExpectScreenConcealed();
+        expect(ReadSignal(1).aborted).toBe(false);
+        await releaseRead();
+        ExpectFreshScreen();
+        expect(ShownValue(USER_ID_TEST_ID)).toBe(user.user_id);
         expect(LatestSession().currentUser).toEqual(user);
         expect(setHomeRouteMock).toHaveBeenLastCalledWith(user.next_route);
         expect(fetchMainMenuMock).toHaveBeenCalledTimes(mainMenuReads);
         expect(fetchAdminMenuMock).not.toHaveBeenCalled();
-        expect(redirectToSignOnMock).not.toHaveBeenCalled();
         expect(NavigationAttempts()).toBe(0);
     },
 );
@@ -1155,5 +1319,233 @@ it.each(UNREAD_PAGE_SHOW_CASES)(
         expect(fetchMainMenuMock).not.toHaveBeenCalled();
         expect(redirectToSignOnMock).not.toHaveBeenCalled();
         expect(NavigationAttempts()).toBe(0);
+    },
+);
+
+// A 401 from a page's own call, rejected through the real apiClient interceptor.
+async function RejectUnauthorizedCall(url: string): Promise<void> {
+    const refusal = BuildResponseError(HTTP_UNAUTHORIZED, url);
+    await act(async () => {
+        await expect(HandleResponseError(refusal)).rejects.toBe(refusal);
+    });
+}
+
+// A 401 the apiClient interceptor does not redirect, and the page it arrives on.
+interface UnredirectedUnauthorizedCase {
+    caseName: string;
+    path: string;
+    url: string;
+}
+
+// The sign-on page is never redirected to itself, and the sign-on page shows the 401 literals of
+// the login and logout calls itself, so none of them tears the screen down.
+const UNREDIRECTED_UNAUTHORIZED_CASES: readonly UnredirectedUnauthorizedCase[] = [
+    { caseName: "CAUP's edit fetch on sign-on", path: SIGN_ON_ROUTE, url: ACCOUNT_EDIT_URL },
+    { caseName: "the login call on CAUP", path: CAUP_ROUTE, url: "/auth/login" },
+    { caseName: "the logout call on CAUP", path: CAUP_ROUTE, url: "/auth/logout" },
+];
+
+// A teardown that reaches the public sign-on page.
+interface SignOnTeardownCase {
+    caseName: string;
+    TearDown: () => void;
+}
+
+const SIGN_ON_TEARDOWN_CASES: readonly SignOnTeardownCase[] = [
+    {
+        caseName: "a pagehide",
+        TearDown: () => {
+            DispatchPageHide(true);
+        },
+    },
+    {
+        caseName: "ClearSession (F3 sign-off)",
+        TearDown: () => {
+            LatestSession().ClearSession();
+        },
+    },
+];
+
+// The user a RefreshSession answers after REGULAR_USER, on the page it answers on, and the screen
+// that leaves.
+interface RefreshIdentityCase {
+    caseName: string;
+    path: string;
+    user: CurrentUserResponse;
+    ExpectScreen: () => void;
+}
+
+// Another identity is another user ID or another user type. Off sign-on it remounts the screen,
+// so nothing built for the previous user survives; the public sign-on page keeps its own screen
+// through a login.
+const REFRESH_IDENTITY_CASES: readonly RefreshIdentityCase[] = [
+    {
+        caseName: "another user on CAUP remounts the screen afresh",
+        path: CAUP_ROUTE,
+        user: ADMIN_USER,
+        ExpectScreen: ExpectFreshScreen,
+    },
+    {
+        caseName: "another user type on CAUP remounts the screen afresh",
+        path: CAUP_ROUTE,
+        user: RETYPED_USER,
+        ExpectScreen: ExpectFreshScreen,
+    },
+    {
+        caseName: "the same user on CAUP keeps the screen as keyed",
+        path: CAUP_ROUTE,
+        user: REGULAR_USER,
+        ExpectScreen: ExpectScreenAsKeyed,
+    },
+    {
+        caseName: "another user on sign-on keeps the screen as keyed",
+        path: SIGN_ON_ROUTE,
+        user: ADMIN_USER,
+        ExpectScreen: ExpectScreenAsKeyed,
+    },
+];
+
+it.each([true, false])(
+    "a pagehide (persisted %p) conceals a populated CAUP screen before its handler returns",
+    async (persisted) => {
+        window.history.replaceState(null, "", CAUP_ROUTE);
+        await RenderPopulatedScreen(REGULAR_USER);
+        act(() => {
+            DispatchPageHide(persisted);
+            // flushSync has committed the teardown already; act has flushed nothing yet.
+            ExpectScreenConcealed();
+        });
+        // Hiding a page is no sign-off: the home route stays, and nothing is read or navigated.
+        expect(clearHomeRouteMock).not.toHaveBeenCalled();
+        expect(sessionStorage.getItem(HOME_ROUTE_KEY)).toBe(MAIN_MENU_ROUTE);
+        expect(fetchCurrentUserMock).toHaveBeenCalledTimes(1);
+        expect(NavigationAttempts()).toBe(0);
+    },
+);
+
+it("a 401 from CAUP's own call conceals its populated screen, then goes to sign-on", async () => {
+    window.history.replaceState(null, "", CAUP_ROUTE);
+    await RenderPopulatedScreen(REGULAR_USER);
+    await RejectUnauthorizedCall(ACCOUNT_EDIT_URL);
+    ExpectScreenConcealed();
+    expect(NavigationAttempts()).toBe(1);
+    expect(clearHomeRouteMock).toHaveBeenCalledTimes(1);
+    expect(sessionStorage.getItem(HOME_ROUTE_KEY)).toBeNull();
+});
+
+it.each(UNREDIRECTED_UNAUTHORIZED_CASES)(
+    "a 401 from $caseName leaves the populated screen as keyed and never navigates",
+    async ({ path, url }) => {
+        window.history.replaceState(null, "", path);
+        await RenderPopulatedScreen(REGULAR_USER);
+        await RejectUnauthorizedCall(url);
+        ExpectScreenAsKeyed();
+        expect(NavigationAttempts()).toBe(0);
+        expect(clearHomeRouteMock).not.toHaveBeenCalled();
+    },
+);
+
+it.each(SIGN_ON_TEARDOWN_CASES)(
+    "$caseName on the public sign-on page drops the user but keeps the screen as keyed",
+    async ({ TearDown }) => {
+        window.history.replaceState(null, "", SIGN_ON_ROUTE);
+        await RenderPopulatedScreen(REGULAR_USER);
+        // The login's RefreshSession leaves a user for the teardown to drop.
+        await RefreshSessionTo(REGULAR_USER);
+        act(() => {
+            TearDown();
+        });
+        ExpectScreenAsKeyed();
+        expect(LatestSession().currentUser).toBeNull();
+        expect(NavigationAttempts()).toBe(0);
+    },
+);
+
+// What happens on the sign-on page that F3 sign-off reached before a client navigation leaves it
+// for a protected page, and the /auth/me reads made by then.
+interface SignOnRevealCase {
+    caseName: string;
+    OnSignOn: () => Promise<void>;
+    reads: number;
+}
+
+// A login on sign-on whose RefreshSession read gets no answer, so the context holds no user.
+async function FailLoginRead(): Promise<void> {
+    fetchCurrentUserMock.mockRejectedValue(NETWORK_ERROR);
+    await act(async () => {
+        await expect(LatestSession().RefreshSession()).resolves.toBeNull();
+    });
+}
+
+// Reaching sign-on ended the sign-off's concealment, so the protected page reached from it mounts
+// afresh at once and its own calls meet the server's session check; no /auth/me read is added.
+const SIGN_ON_REVEAL_CASES: readonly SignOnRevealCase[] = [
+    { caseName: "Back to CM00", OnSignOn: () => Promise.resolve(), reads: 1 },
+    {
+        caseName: "a login whose /auth/me read gets no answer, then CM00",
+        OnSignOn: FailLoginRead,
+        reads: 2,
+    },
+];
+
+// F3 sign-off on the populated screen of path: ClearSession conceals it, and the client navigation
+// to the public sign-on page shows a fresh mount.
+async function SignOffPopulatedPage(path: string): Promise<RenderResult> {
+    window.history.replaceState(null, "", path);
+    const view = await RenderPopulatedScreen(REGULAR_USER);
+    act(() => {
+        LatestSession().ClearSession();
+    });
+    ExpectScreenConcealed();
+    ShowSignOnPage(view, PopulatedSessionTree());
+    ExpectFreshScreen();
+    return view;
+}
+
+// A client navigation from sign-on to path: the App Router renders the same tree there.
+function ShowProtectedPage(view: RenderResult, path: string): void {
+    window.history.replaceState(null, "", path);
+    view.rerender(PopulatedSessionTree());
+}
+
+it.each(SIGN_ON_REVEAL_CASES)(
+    "after F3 sign-off reaches sign-on, $caseName shows a fresh mount",
+    async ({ OnSignOn, reads }) => {
+        const view = await SignOffPopulatedPage(MAIN_MENU_ROUTE);
+        await OnSignOn();
+        ShowProtectedPage(view, MAIN_MENU_ROUTE);
+        ExpectFreshScreen();
+        expect(ShownValue(USER_ID_TEST_ID)).toBe(NO_USER_SHOWN);
+        expect(fetchCurrentUserMock).toHaveBeenCalledTimes(reads);
+        expect(NavigationAttempts()).toBe(0);
+    },
+);
+
+// Only sign-on ends a concealment: a protected page restored after an earlier visit to sign-on
+// still waits for its /auth/me answer.
+it("a restore after a visit to sign-on shows nothing until /auth/me answers", async () => {
+    const view = await SignOffPopulatedPage(MAIN_MENU_ROUTE);
+    ShowProtectedPage(view, CAUP_ROUTE);
+    fireEvent.change(screen.getByLabelText(KEYED_VALUE_LABEL), { target: { value: KEYED_VALUE } });
+    const releaseRead = DeferNextRead(() => Promise.resolve(REGULAR_USER));
+    await DispatchPageShow(true);
+    ExpectScreenConcealed();
+    expect(fetchCurrentUserMock).toHaveBeenCalledTimes(2);
+    await releaseRead();
+    ExpectFreshScreen();
+    expect(LatestSession().currentUser).toEqual(REGULAR_USER);
+    expect(NavigationAttempts()).toBe(0);
+});
+
+it.each(REFRESH_IDENTITY_CASES)(
+    "a RefreshSession answering $caseName",
+    async ({ path, user, ExpectScreen }) => {
+        window.history.replaceState(null, "", path);
+        await RenderPopulatedScreen(REGULAR_USER);
+        await RefreshSessionTo(REGULAR_USER);
+        await RefreshSessionTo(user);
+        ExpectScreen();
+        expect(LatestSession().currentUser).toEqual(user);
+        expect(ShownValue(USER_ID_TEST_ID)).toBe(user.user_id);
     },
 );

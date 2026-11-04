@@ -58,6 +58,7 @@ from app.utils.record_layouts import DALYREJS_LAYOUT, TRANSACTION_LAYOUT
 from sqlalchemy import Select, Update, func, insert, select, update
 from sqlalchemy.engine import Connection, Row
 
+from batch.orchestration.batch_window import RequireWindow
 from batch.orchestration.job_context import JobContext
 from batch.orchestration.run_ledger import (
     GDG_COMMITTED,
@@ -695,11 +696,13 @@ def FsyncDirectory(directory: ManagedDirectory) -> None:
         LogFsyncRefused(directory.path, error)
 
 
-def PlaceGenerationFile(finalPath: Path, expectedSha256: str) -> str:
+def PlaceGenerationFile(finalPath: Path, expectedSha256: str, connection: Connection) -> str:
     """Put a COMMITTED generation's file in place; return PUBLISHED, or LOST when it is gone.
 
     Both hashes and the rename act on one held descriptor of the base directory, so the .part
     file found matching is the one renamed. A missing base directory holds no file: LOST.
+    RequireWindow on ``connection`` runs once both files have been hashed, just before the
+    rename, so a batch window lost while they were read renames nothing.
     """
     with ExistingArchiveDirectory(finalPath.parent) as directory:
         if directory is None:
@@ -709,6 +712,7 @@ def PlaceGenerationFile(finalPath: Path, expectedSha256: str) -> str:
         partName = PartPath(finalPath).name
         if not HashMatches(directory, partName, expectedSha256):
             return GDG_LOST
+        RequireWindow(connection)
         directory.Replace(partName, finalPath.name)
     return GDG_PUBLISHED
 
@@ -730,11 +734,13 @@ def PublishCommittedRow(context: JobContext, row: Row) -> str:
     """Publish one COMMITTED row, or mark it LOST when no file matches; return the new state.
 
     The file is renamed before the row changes, so a crash in between leaves a COMMITTED row
-    whose final file matches, which the next ReconcileCatalog publishes.
+    whose final file matches, which the next ReconcileCatalog publishes. Both happen in the
+    transaction that moves the row: a lost batch window stops the publication at
+    PlaceGenerationFile's check before the rename, or refuses the row change at its commit.
     """
     finalPath = ResolveFilePath(context, row.file_path)
-    newState = PlaceGenerationFile(finalPath, row.sha256)
     with context.engine.begin() as connection:
+        newState = PlaceGenerationFile(finalPath, row.sha256, connection)
         connection.execute(SetStateStatement(row, GDG_COMMITTED, newState))
     generationName = GenerationName(row.base_name, row.generation)
     if newState == GDG_LOST:
@@ -808,10 +814,17 @@ def PublishedNewestFirstStatement(base: GdgBase) -> Select:
     )
 
 
+def RequireCommandWindow(context: JobContext) -> None:
+    """Raise batch_window.BatchWindowLostError, before a managed file is deleted, once lost."""
+    with context.engine.connect() as connection:
+        RequireWindow(connection)
+
+
 def ScratchFile(context: JobContext, base: GdgBase, row: Row) -> str:
     """Delete a rolled-off generation's file when its base is SCRATCH; return what happened."""
     if not base.scratch:
         return FILE_KEPT
+    RequireCommandWindow(context)
     DeleteArchiveFile(ResolveFilePath(context, row.file_path))
     return FILE_SCRATCHED
 
@@ -864,6 +877,7 @@ def DeleteBaseOrphanParts(directoryPath: Path) -> int:
 
 def DeleteOrphanParts(context: JobContext) -> int:
     """Delete every .part file left under the base directories; return how many there were."""
+    RequireCommandWindow(context)
     return sum(
         DeleteBaseOrphanParts(BaseDirectoryPath(context, base)) for base in GDG_BASES.values()
     )
@@ -896,6 +910,7 @@ def DeleteOrphanWorkDirectories(context: JobContext) -> int:
     the base directory's descriptor. A symbolic link or a file with the suffix is no producer's
     work directory and is left alone, its target untouched.
     """
+    RequireCommandWindow(context)
     return sum(
         DeleteBaseOrphanWorkDirectories(BaseDirectoryPath(context, base))
         for base in GDG_BASES.values()

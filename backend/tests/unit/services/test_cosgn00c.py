@@ -574,7 +574,7 @@ async def test_current_user_is_the_session_user_with_its_own_menu(
 ):
     context = await makeOnlineContext(userType)
     response = await cosgn00c.DescribeCurrentUser(context)
-    assert response.user_id == context.user.user_id
+    assert response.user_id == context.user.userId
     assert response.user_type == userType
     assert response.next_route == nextRoute
     # The session user has no USRSEC record, so the display names are blank.
@@ -585,7 +585,7 @@ async def test_current_user_is_the_session_user_with_its_own_menu(
 async def test_current_user_display_names_come_from_its_usrsec_record(makeOnlineContext, seedUsers):
     seedUser = SeedUserOf(seedUsers, ADMIN_SEED_USER_ID)
     context = await makeOnlineContext(ADMIN_USER_TYPE)
-    context.user = CurrentUser(user_id=seedUser.userId, user_type=seedUser.userType)
+    context.user = CurrentUser(userId=seedUser.userId, userType=seedUser.userType)
     response = await cosgn00c.DescribeCurrentUser(context)
     assert (response.first_name, response.last_name) == (seedUser.firstName, seedUser.lastName)
     assert response.next_route == ADMIN_ROUTE

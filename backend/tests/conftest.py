@@ -770,7 +770,7 @@ class OnlineContextFactory:
             request=Request(OnlineRequestScope(self.application)),
             session=self.application.state.sessionFactory(),
             settings=self.application.state.settings,
-            user=CurrentUser(user_id=NewTestUserId(), user_type=userType),
+            user=CurrentUser(userId=NewTestUserId(), userType=userType),
         )
         self.openContexts.append(context)
         return context

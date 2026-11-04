@@ -72,7 +72,7 @@ def _CheckAdminOnlyOption(context: OnlineContext, option: MenuOption) -> None:
     The test is CDEMO-USRTYP-USER, exactly ``U``, so ``u``, ``X`` and the other regular types
     pass, as does a context with no user. No active COMEN02Y entry is flagged ``A``.
     """
-    isTypeUUser = context.user is not None and context.user.user_type == REGULAR_USER_TYPE
+    isTypeUUser = context.user is not None and context.user.userType == REGULAR_USER_TYPE
     if isTypeUUser and option.userType == OPTION_USER_TYPE_ADMIN_ONLY:
         raise LegacyMessageError(
             ADMIN_ONLY_MESSAGE, field=OPTION_CURSOR_FIELD, httpStatus=HTTP_ACCESS_REFUSED

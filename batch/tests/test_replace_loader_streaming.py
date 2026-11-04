@@ -156,6 +156,7 @@ class LoadRecord:
 class SettingsStub:
     """The BatchSettings member the row builders read, without backend/.env."""
 
+    # Named as BatchSettings names it: an exception to MK_Modernization Rule clause 1.
     BCRYPT_ROUNDS: int = TEST_BCRYPT_ROUNDS
 
 

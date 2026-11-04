@@ -16,6 +16,10 @@ proves the concurrency contract of the Technical Specification, Section 0.6.10:
   literals (cbl/COSGN00C.cbl line 254, cbl/COBIL00C.cbl line 368) with HTTP 503, CCLI still
   lists cards because CARDDAT stays open, and both work again once the window is released;
   more CC00 refusals than LOGIN_MAX_ATTEMPTS count no failure, so none locks the user ID;
+- a lost hold: a CB00 payment whose window session is ended after its READ UPDATE writes
+  nothing and answers the REWRITE's WHEN OTHER literal (cbl/COBIL00C.cbl lines 396-402), and
+  one whose session is ended, with the window then taken as batch takes it, after its WRITE or
+  its REWRITE has that unit's COMMIT refused, keeping only a write committed before the loss;
 - TRANBKP against CT02, with the batch CLI run as a subprocess: a backup holding the window
   refuses the add (cbl/COTRN02C.cbl line 600), and a backup started during an add waits for it
   and archives its row, so every transaction ends in the archive or in the table;
@@ -113,6 +117,7 @@ CARD_LIST_PAGE_ROWS = 7
 
 UNABLE_TO_VERIFY_TEXT = "Unable to verify the User ..."
 ACCOUNT_LOOKUP_FAILED_TEXT = "Unable to lookup Account..."
+UPDATE_ACCOUNT_FAILED_TEXT = "Unable to Update Account..."
 CONFIRM_PAYMENT_TEXT = "Confirm to make a bill payment..."
 PAYMENT_SUCCESS_TEMPLATE = "Payment successful.  Your Transaction ID is {tranId}."
 ACCOUNT_XREF_LOOKUP_FAILED_TEXT = "Unable to lookup Acct in XREF AIX file..."
@@ -353,6 +358,16 @@ ACQUIRE_WINDOW_SQL = text("SELECT pg_advisory_lock(:lockKey)").bindparams(
 RELEASE_WINDOW_SQL = text("SELECT pg_advisory_unlock(:lockKey)").bindparams(
     bindparam("lockKey", type_=BigInteger)
 )
+# The session of this test database holding the window shared: one request's window connection.
+SHARED_WINDOW_HOLDER_SQL = text(
+    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted AND mode = 'ShareLock'"
+    " AND objsubid = 1"
+    " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+    " AND ((classid::bigint << 32) | objid::bigint) = :lockKey"
+).bindparams(bindparam("lockKey", type_=BigInteger))
+# With a timeout, pg_terminate_backend returns once the backend has exited, its locks dropped.
+TERMINATE_BACKEND_SQL = text("SELECT pg_terminate_backend(:backendPid, :timeoutMillis)")
+TERMINATE_TIMEOUT_MILLISECONDS = 5000
 AUTOCOMMIT_ISOLATION = "AUTOCOMMIT"
 
 # --- TRANBKP subprocess and its TRANSACT.BKUP(+1) generation -------------------------------------
@@ -436,7 +451,23 @@ class Gate:
         await asyncio.wait_for(self.release.wait(), GATE_TIMEOUT_SECONDS)
 
 
+@dataclass(frozen=True)
+class LostHoldWrite:
+    """A CB00 write after which its unit loses the window, and the transactions that persist."""
+
+    repositoryClass: type
+    methodName: str
+    keptTransactions: int
+
+
 type RepositoryWrite = Callable[[Any, AsyncConnection, Mapping[str, Any]], Awaitable[None]]
+type LockedRead = Callable[[Any, AsyncConnection, str], Awaitable[Any]]
+
+# The TRANSACT unit's WRITE is lost with its unit; once the REWRITE runs, the WRITE has committed.
+LOST_HOLD_WRITES = [
+    pytest.param(LostHoldWrite(TransactionRepository, "InsertTransaction", 0), id="write"),
+    pytest.param(LostHoldWrite(AccountRepository, "UpdateAccount", 1), id="rewrite"),
+]
 
 ACCOUNT_SCREEN = EditScreen(f"{ACCOUNTS_URL}/{SAMPLE_ACCOUNT_ID}")
 # CCUP is opened with typed keys, which the {cardNum} path and the acctId query carry.
@@ -589,6 +620,16 @@ def HoldRowLock(syncEngine: Engine, rowLock: RowLock) -> Iterator[Callable[[], N
         yield connection.rollback
 
 
+def TerminateSharedWindowSession(syncEngine: Engine) -> None:
+    """End the session holding a request's shared window lock, as a dropped connection would."""
+    with syncEngine.connect() as connection:
+        holderPid = connection.execute(
+            SHARED_WINDOW_HOLDER_SQL, {"lockKey": BATCH_WINDOW_LOCK}
+        ).scalar_one()
+        parameters = {"backendPid": holderPid, "timeoutMillis": TERMINATE_TIMEOUT_MILLISECONDS}
+        assert connection.execute(TERMINATE_BACKEND_SQL, parameters).scalar_one()
+
+
 def CountRows(syncEngine: Engine, probe: Probe) -> int:
     """Return the count the probe's query reads now, on a pooled connection of the test."""
     with syncEngine.connect() as connection:
@@ -685,6 +726,21 @@ def PausedCall(original: RepositoryWrite, gate: Gate) -> RepositoryWrite:
             await gate.Pause()
 
     return GatedCall
+
+
+def PausedLockedRead(original: LockedRead, gate: Gate) -> LockedRead:
+    """Return the READ UPDATE ``original`` wrapped to stop at ``gate`` once it has returned.
+
+    Installed on the repository class, the wrapper receives the repository instance first, and
+    returns the record the original read, holding its row lock in the unit while it waits.
+    """
+
+    async def ReadThenPause(repository: Any, unit: AsyncConnection, key: str) -> Any:
+        record = await original(repository, unit, key)
+        await gate.Pause()
+        return record
+
+    return ReadThenPause
 
 
 def InstallGate(
@@ -1017,6 +1073,62 @@ async def test_window_leaves_card_list_open(
     with HoldBatchWindow(syncEngine):
         listed = ExpectOk(await regularClient.get(CARDS_URL))
     assert len(listed["rows"]) == CARD_LIST_PAGE_ROWS
+
+
+async def test_payment_whose_window_session_ends_writes_nothing(
+    regularClient: httpx.AsyncClient, syncEngine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CB00 loses its shared window after its READ UPDATE: every later file call is IOERR.
+
+    The session holding the request's window lock is ended while the payment waits after the
+    account read, so batch could take the window. The xref read, the TRAN-ID browse, the WRITE
+    and the REWRITE then all fail without reaching their files: no transaction is written, the
+    balance is not rewritten, and the REWRITE's WHEN OTHER literal (COBIL00C lines 396-402), the
+    last one set, answers 503.
+    """
+    amountsBefore = ReadAccountAmounts(syncEngine, SAMPLE_ACCOUNT_ID)
+    tranIdsBefore = ReadTranIds(syncEngine)
+    gate = Gate()
+    pausedRead = PausedLockedRead(AccountRepository.GetAccountForUpdate, gate)
+    monkeypatch.setattr(AccountRepository, "GetAccountForUpdate", pausedRead)
+    paymentRequest = regularClient.post(BILLPAY_URL, json=dict(CONFIRMED_PAYMENT_BODY))
+    async with PausedRequest(paymentRequest, gate) as paymentTask:
+        TerminateSharedWindowSession(syncEngine)
+        gate.release.set()
+        refused = await paymentTask
+    AssertLegacyError(refused, HTTP_FILE_ERROR, UPDATE_ACCOUNT_FAILED_TEXT)
+    assert ReadAccountAmounts(syncEngine, SAMPLE_ACCOUNT_ID) == amountsBefore
+    assert ReadTranIds(syncEngine) == tranIdsBefore
+
+
+@pytest.mark.parametrize("lostHoldWrite", LOST_HOLD_WRITES)
+async def test_payment_write_whose_window_goes_before_its_commit_is_rolled_back(
+    regularClient: httpx.AsyncClient,
+    syncEngine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    lostHoldWrite: LostHoldWrite,
+) -> None:
+    """CB00's write ran inside the window, but batch holds the window before that unit commits.
+
+    The window session is ended and the window taken while the payment waits after the write,
+    so the unit's COMMIT is refused and the write rolled back. Only a write committed before
+    the loss persists, the balance is never rewritten, and the REWRITE's WHEN OTHER literal
+    (COBIL00C lines 396-402), the last one set, answers 503.
+    """
+    amountsBefore = ReadAccountAmounts(syncEngine, SAMPLE_ACCOUNT_ID)
+    tranIdsBefore = set(ReadTranIds(syncEngine))
+    gate = Gate(pauseAfterCall=True)
+    InstallGate(monkeypatch, lostHoldWrite.repositoryClass, lostHoldWrite.methodName, gate)
+    paymentRequest = regularClient.post(BILLPAY_URL, json=dict(CONFIRMED_PAYMENT_BODY))
+    async with PausedRequest(paymentRequest, gate) as paymentTask:
+        TerminateSharedWindowSession(syncEngine)
+        with HoldBatchWindow(syncEngine):
+            gate.release.set()
+            refused = await paymentTask
+    AssertLegacyError(refused, HTTP_FILE_ERROR, UPDATE_ACCOUNT_FAILED_TEXT)
+    assert ReadAccountAmounts(syncEngine, SAMPLE_ACCOUNT_ID) == amountsBefore
+    keptTranIds = set(ReadTranIds(syncEngine)) - tranIdsBefore
+    assert len(keptTranIds) == lostHoldWrite.keptTransactions
 
 
 async def test_backup_holding_window_refuses_transaction_add(

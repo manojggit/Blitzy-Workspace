@@ -80,7 +80,7 @@ class FakeMenuContext:
 
 def BuildContext(userType: str) -> FakeMenuContext:
     """Return a menu context whose session user has the given user type."""
-    return FakeMenuContext(user=CurrentUser(user_id=CONTEXT_USER_ID, user_type=userType))
+    return FakeMenuContext(user=CurrentUser(userId=CONTEXT_USER_ID, userType=userType))
 
 
 def SelectAsAdmin(optionText: str) -> MenuSelectionResponse:

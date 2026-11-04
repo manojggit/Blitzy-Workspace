@@ -280,7 +280,7 @@ class TransactionRepository:
         row = result.mappings().first()
         return dict(row) if row is not None else None
 
-    async def AllocateNextTranId(self, unit: AsyncConnection | AsyncSession) -> str:
+    async def AllocateNextTranId(self, unit: AsyncConnection) -> str:
         """Replace the COTRN02C and COBIL00C STARTBR HIGH-VALUES, READPREV and ADD 1 into 9(16).
 
         Runs on the caller's TRANSACT write unit. pg_advisory_xact_lock serialises concurrent
@@ -288,22 +288,20 @@ class TransactionRepository:
         RecordLockError. An empty table gives TRAN-ID zeros (the ENDFILE branch), so the first
         ID is 0000000000000001, and 9999999999999999 wraps to 0000000000000000.
         """
-        await EnterOnlineWindow(self.context.request, TRANSACTION_FILE_NAME)
+        await EnterOnlineWindow(self.context.request, TRANSACTION_FILE_NAME, unit)
         await self._Execute(unit, TRAN_ID_ALLOCATION_LOCK_STATEMENT)
         result = await self._Execute(unit, HIGHEST_TRAN_ID_STATEMENT)
         highestId = result.scalar_one_or_none()
         nextId = (int(highestId or "0") + 1) % TRAN_ID_MODULUS
         return str(nextId).zfill(TRAN_ID_DIGITS)
 
-    async def InsertTransaction(
-        self, unit: AsyncConnection | AsyncSession, values: Mapping[str, Any]
-    ) -> None:
+    async def InsertTransaction(self, unit: AsyncConnection, values: Mapping[str, Any]) -> None:
         """Replace COTRN02C WRITE-TRANSACT-FILE and COBIL00C WRITE-TRANSACT-FILE (EXEC CICS WRITE).
 
         values maps column names to the new record's fields; generated columns are dropped.
         An existing key raises DuplicateKeyError (DUPREC).
         """
-        await EnterOnlineWindow(self.context.request, TRANSACTION_FILE_NAME)
+        await EnterOnlineWindow(self.context.request, TRANSACTION_FILE_NAME, unit)
         insertValues = {
             name: value for name, value in values.items() if name not in GENERATED_COLUMNS
         }

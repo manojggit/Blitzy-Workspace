@@ -7,6 +7,10 @@ the Technical Specification, Section 0.6.10. The batch CLI holds the window as a
 session-level advisory lock on BATCH_WINDOW_LOCK; these tests take that lock themselves on a
 connection of the test database, so the online side is pinned without the batch package.
 
+A write unit a repository gated is fenced: when its request's hold goes after the write and
+before the unit's COMMIT, and batch takes the window meanwhile, the COMMIT is refused and the
+write rolled back.
+
 pg_locks spans every database of the server, so lock counts are limited to the test database.
 Every request a test builds leaves the window in a finally block, and every exclusive lock is
 unlocked before its connection goes back to the pool, which would otherwise keep it.
@@ -21,14 +25,18 @@ from sqlalchemy.exc import DBAPIError
 from starlette.applications import Starlette
 from starlette.requests import Request
 
-from app.core.errors import LOCK_NOT_AVAILABLE_SQLSTATE, RepositoryError, SqlStateOf
+from app.core.database import WriteUnit
+from app.core.errors import LOCK_NOT_AVAILABLE_SQLSTATE, FileIoError, RepositoryError, SqlStateOf
 from app.core.locks import (
     BATCH_WINDOW_LOCK,
     TRAN_ID_ALLOCATION_LOCK,
+    WINDOW_CONNECTION_ATTRIBUTE,
+    WINDOW_LOST,
     WINDOW_TABLES,
     EnterOnlineWindow,
     FileNotOpenError,
     LeaveOnlineWindow,
+    WindowState,
 )
 
 EXPECTED_WINDOW_TABLES = {
@@ -68,6 +76,22 @@ TRY_BATCH_WINDOW_SQL = text("SELECT pg_try_advisory_lock(:lockKey)")
 WAIT_BATCH_WINDOW_SQL = text("SELECT pg_advisory_lock(:lockKey)")
 RELEASE_BATCH_WINDOW_SQL = text("SELECT pg_advisory_unlock(:lockKey)")
 SET_LOCK_TIMEOUT_SQL = text("SELECT set_config('lock_timeout', :lockTimeout, false)")
+# The session of this database holding BATCH_WINDOW_LOCK shared: one request's window connection.
+SHARED_HOLDER_PID_SQL = text(
+    "SELECT pid FROM pg_locks WHERE locktype = 'advisory'"
+    " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+    " AND objsubid = 1 AND mode = 'ShareLock' AND granted"
+    " AND ((CAST(classid AS bigint) << 32) | CAST(objid AS bigint)) = :lockKey"
+)
+RELEASE_SHARED_WINDOW_SQL = text("SELECT pg_advisory_unlock_shared(:lockKey)")
+# With a timeout, pg_terminate_backend returns once the backend has exited, its locks dropped.
+TERMINATE_BACKEND_SQL = text("SELECT pg_terminate_backend(:backendPid, :timeoutMillis)")
+TERMINATE_TIMEOUT_MILLISECONDS = 5000
+# A USRSEC record a gated write renames; restoreSeedState, under asyncEngine, restores it.
+FIRST_USER_SQL = text("SELECT user_id, first_name FROM security.users ORDER BY user_id LIMIT 1")
+USER_FIRST_NAME_SQL = text("SELECT first_name FROM security.users WHERE user_id = :userId")
+RENAME_USER_SQL = text("UPDATE security.users SET first_name = :firstName WHERE user_id = :userId")
+FENCED_FIRST_NAME = "FENCED"
 
 
 class HeldLock:
@@ -146,6 +170,18 @@ def CountAdvisoryLocks(syncEngine, lockMode, granted=True):
         return connection.execute(ADVISORY_LOCK_COUNT_SQL, lockParameters).scalar_one()
 
 
+def ReadFirstUser(syncEngine):
+    """Return the committed user_id and first_name of the first USRSEC record in key order."""
+    with syncEngine.connect() as connection:
+        return connection.execute(FIRST_USER_SQL).one()
+
+
+def ReadFirstName(syncEngine, userId):
+    """Return the committed first_name of the USRSEC record ``userId``."""
+    with syncEngine.connect() as connection:
+        return connection.execute(USER_FIRST_NAME_SQL, {"userId": userId}).scalar_one()
+
+
 def TryBatchWindow(syncEngine):
     """Return whether batch could take the window now; a granted window is released at once."""
     batchLock = HeldLock(syncEngine.connect())
@@ -191,6 +227,28 @@ async def CancelAndReap(task):
 def PendingTasks():
     """Return the event loop's unfinished tasks other than the running one."""
     return asyncio.all_tasks() - {asyncio.current_task()}
+
+
+async def TerminateWindowSession(request, syncEngine):
+    """End the request's window session from outside, as a dropped connection would."""
+    with syncEngine.connect() as connection:
+        holderPid = connection.execute(SHARED_HOLDER_PID_SQL, WINDOW_LOCK_PARAMETERS).scalar_one()
+        parameters = {"backendPid": holderPid, "timeoutMillis": TERMINATE_TIMEOUT_MILLISECONDS}
+        assert connection.execute(TERMINATE_BACKEND_SQL, parameters).scalar_one()
+
+
+async def ReleaseWindowBehindTheRequest(request, syncEngine):
+    """Drop the shared lock on the request's own window connection, its session left open."""
+    windowConnection = getattr(request.state, WINDOW_CONNECTION_ATTRIBUTE)
+    await windowConnection.execute(RELEASE_SHARED_WINDOW_SQL, WINDOW_LOCK_PARAMETERS)
+    await windowConnection.commit()
+
+
+# The two ways a granted request's hold can go: its session ends, or only its lock does.
+WINDOW_LOSSES = [
+    pytest.param(TerminateWindowSession, id="session-terminated"),
+    pytest.param(ReleaseWindowBehindTheRequest, id="lock-released"),
+]
 
 
 @contextlib.asynccontextmanager
@@ -296,6 +354,59 @@ async def test_enter_window_takes_shared_lock_until_leave(asyncEngine, syncEngin
     assert CountAdvisoryLocks(syncEngine, SHARED_MODE) == 0
     await LeaveOnlineWindow(request)
     assert CountAdvisoryLocks(syncEngine, SHARED_MODE) == 0
+
+
+@pytest.mark.parametrize("loseWindow", WINDOW_LOSSES)
+async def test_lost_hold_fails_every_later_call_without_retaking_the_lock(
+    asyncEngine, syncEngine, loseWindow
+):
+    """A granted request whose hold has gone answers IOERR from then on and never re-locks.
+
+    Batch could take the window at once, so no statement of the request may reach a window file.
+    """
+    request = BuildRequest(asyncEngine)
+    try:
+        await EnterOnlineWindow(request, "ACCTDAT")
+        await loseWindow(request, syncEngine)
+        with pytest.raises(FileIoError) as lostHold:
+            await EnterOnlineWindow(request, "TRANSACT")
+        assert lostHold.value.fileName == "TRANSACT"
+        assert WindowState(request) == WINDOW_LOST
+        with pytest.raises(FileIoError):
+            await EnterOnlineWindow(request, "USRSEC")
+        assert CountAdvisoryLocks(syncEngine, SHARED_MODE) == 0
+        assert TryBatchWindow(syncEngine) is True
+    finally:
+        await LeaveOnlineWindow(request)
+    assert CountAdvisoryLocks(syncEngine, SHARED_MODE) == 0
+
+
+@pytest.mark.parametrize("loseWindow", WINDOW_LOSSES)
+async def test_gated_unit_whose_hold_goes_before_its_commit_is_rolled_back(
+    asyncEngine, syncEngine, loseWindow
+):
+    """A write admitted inside the window never becomes durable once batch holds the window.
+
+    The hold goes after the gated UPDATE and batch takes the window before the unit's COMMIT,
+    which is then refused: the unit raises FileIoError and the request records its window lost.
+    """
+    request = BuildRequest(asyncEngine)
+    user = ReadFirstUser(syncEngine)
+    batchLock = HeldLock(syncEngine.connect())
+    try:
+        with pytest.raises(FileIoError) as refusedCommit:
+            async with WriteUnit(asyncEngine, "USRSEC") as unit:
+                await EnterOnlineWindow(request, "USRSEC", unit)
+                renamed = {"userId": user.user_id, "firstName": FENCED_FIRST_NAME}
+                await unit.execute(RENAME_USER_SQL, renamed)
+                await loseWindow(request, syncEngine)
+                assert batchLock.TryTake() is True
+        assert refusedCommit.value.fileName == "USRSEC"
+        assert ReadFirstName(syncEngine, user.user_id) == user.first_name
+        assert WindowState(request) == WINDOW_LOST
+    finally:
+        batchLock.Release()
+        await LeaveOnlineWindow(request)
 
 
 async def test_concurrent_requests_share_the_window(asyncEngine, syncEngine):

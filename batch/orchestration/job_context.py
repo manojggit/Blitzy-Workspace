@@ -30,7 +30,7 @@ EXIT_OK = 0
 # POSTTRAN rejected at least one daily record: the legacy RETURN-CODE 4.
 EXIT_REJECTS = 4
 # Missing or malformed input, a refused command or rerun, a COMBTRAN duplicate key, or the
-# batch window not available.
+# batch window not available or lost.
 EXIT_FAILURE = 12
 # Abend: POSTTRAN or INTCALC abend 999, no DEFAULT disclosure group, or the CREASTMT statement
 # table capacity exceeded.

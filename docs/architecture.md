@@ -834,13 +834,19 @@ The port keeps that outcome with two advisory locks on one key, `BATCH_WINDOW_LO
 
 - **Online side.** The repositories for `WINDOW_TABLES` (`transactions.transactions`,
     `xref.card_xref` for the `CCXREF` and `CXACAIX` paths, `accounts.accounts` and
-    `security.users`) call `locks.EnterOnlineWindow(request, fileName)` before their first
-    statement in a request.
+    `security.users`) call `locks.EnterOnlineWindow(request, fileName, unit)` before their
+    first statement in a request; `unit` is omitted for a read on the request session.
     - The first call checks out one connection for the request and runs
         `SELECT pg_try_advisory_lock_shared(BATCH_WINDOW_LOCK)`, a session-level lock.
     - A granted lock is held on that connection for the whole request, across the request session
         and all its write units, and released by `locks.LeaveOnlineWindow` in the request
         dependency's `finally`. Write units never take the lock themselves.
+    - Each later call first confirms that the connection's session still holds the lock. Once it
+        does not, as after a lost connection, the call and every later one in the request raise
+        `FileIoError` (IOERR) without taking the lock again.
+    - A write unit passed as `unit` re-checks the request's hold just before its `COMMIT`, on
+        its own connection. A unit whose request has lost the window is rolled back with
+        `FileIoError`, so no write becomes durable after the loss.
     - A refused lock raises `FileNotOpenError(file, resp=19, resp2=60)`, so each service reaches
         the `WHEN OTHER` branch of the program it ports, with that program's literal.
     - A shared request that would queue behind a waiting batch command is refused at once. New
@@ -852,6 +858,13 @@ The port keeps that outcome with two advisory locks on one key, `BATCH_WINDOW_LO
     `seed-all`, and each standalone `job` and `load`. When the lock is not granted within 60 s,
     the command changes nothing and exits 12 with `BATCH WINDOW NOT AVAILABLE`. A crashed run
     never leaves the window closed, because PostgreSQL releases the lock with the connection.
+    - Ownership is fenced. Every job connection holds the batch-only `BATCH_JOB_SESSION_LOCK`
+        shared and is admitted only while the window's own session still holds the window, and
+        every job commit, generation rename, statement publication and managed-file deletion
+        checks that again first. If that session alone is lost, the command stops at its next
+        check, commits nothing more and exits 12 with `BATCH WINDOW LOST`.
+    - A command entering the window waits, within the same timeout, until the job connections
+        of a former owner have closed, so it never classifies or cleans up a run still alive.
 - **Not gated.** Alembic migrations run with the backend stopped and take no window. CR00 is not
     gated, because the legacy program never opened `TRANSACT`; CM00, CA00, CCLI, CCDL and CCUP
     touch no window file.

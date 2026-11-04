@@ -92,7 +92,7 @@ class FakeMenuContext:
 def BuildContext(userType: str) -> FakeMenuContext:
     """Return a context whose user has ``userType`` and a random eight-character user ID."""
     randomUserId = secrets.token_hex(4).upper()
-    return FakeMenuContext(user=CurrentUser(user_id=randomUserId, user_type=userType))
+    return FakeMenuContext(user=CurrentUser(userId=randomUserId, userType=userType))
 
 
 def SelectAsUser(optionText: str, userType: str = REGULAR_USER_TYPE) -> MenuSelectionResponse:

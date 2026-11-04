@@ -56,6 +56,7 @@ LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 class LockNotAvailableDriverError(Exception):
     """A driver error carrying SQLSTATE 55P03 where asyncpg's error carries it."""
 
+    # Named as asyncpg.PostgresError names it: an exception to MK_Modernization Rule clause 1.
     sqlstate = LOCK_NOT_AVAILABLE_SQLSTATE
 
 

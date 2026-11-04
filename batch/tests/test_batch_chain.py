@@ -856,11 +856,11 @@ def InjectPublicationFailure(monkeypatch: pytest.MonkeyPatch, stepNo: int) -> No
     originalPlace = gdg.PlaceGenerationFile
     failedPaths: list[Path] = []
 
-    def FailingPlace(finalPath: Path, expectedSha256: str) -> str:
+    def FailingPlace(finalPath: Path, expectedSha256: str, connection: Connection) -> str:
         if IsProducedGeneration(finalPath, stepNo) and not failedPaths:
             failedPaths.append(finalPath)
             raise OSError(INJECTED_PUBLICATION_ERRNO, INJECTED_PUBLICATION_REASON)
-        return originalPlace(finalPath, expectedSha256)
+        return originalPlace(finalPath, expectedSha256, connection)
 
     monkeypatch.setattr(gdg, PLACE_GENERATION_FILE_NAME, FailingPlace)
 
@@ -872,11 +872,11 @@ def InjectLostPublication(monkeypatch: pytest.MonkeyPatch, stepNo: int) -> None:
     """
     originalPlace = gdg.PlaceGenerationFile
 
-    def LosingPlace(finalPath: Path, expectedSha256: str) -> str:
+    def LosingPlace(finalPath: Path, expectedSha256: str, connection: Connection) -> str:
         if IsProducedGeneration(finalPath, stepNo):
             gdg.PartPath(finalPath).unlink(missing_ok=True)
             finalPath.unlink(missing_ok=True)
-        return originalPlace(finalPath, expectedSha256)
+        return originalPlace(finalPath, expectedSha256, connection)
 
     monkeypatch.setattr(gdg, PLACE_GENERATION_FILE_NAME, LosingPlace)
 

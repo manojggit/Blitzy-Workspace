@@ -33,6 +33,7 @@ import {
     SetHomeRoute,
     SIGN_ON_ROUTE,
     StorePendingMessage,
+    SubscribeToSignOnRedirect,
     TakePendingMessage,
     ToAllowedRoute,
     ToScreenFeedback,
@@ -633,15 +634,31 @@ it.each(ORIGIN_CASES)("backend origin %p roots every call at one /api/v1", async
     await expect(LoadClientRoots(origin)).resolves.toStrictEqual([expectedRoot, expectedRoot]);
 });
 
+// Each redirect to sign-on runs every sign-on redirect listener once, before the browser leaves.
 it.each(UNAUTHORIZED_CASES)(
-    "401 from $url on $currentPath redirects to /signon: $navigates (CICS sign-on)",
+    "401 from $url on $currentPath redirects to /signon after its listeners: $navigates",
     async ({ url, currentPath, navigates }) => {
         window.history.pushState({}, "", currentPath);
+        const navigatedBeforeListener: boolean[] = [];
+        const unsubscribe = SubscribeToSignOnRedirect(() => {
+            navigatedBeforeListener.push(NavigationWasAttempted(consoleErrorSpy));
+        });
         await ExpectRejectedUnchanged(BuildAxiosError(401, {}, url));
+        unsubscribe();
         expect(NavigationWasAttempted(consoleErrorSpy)).toBe(navigates);
+        expect(navigatedBeforeListener).toEqual(navigates ? [false] : []);
         expect(TakePendingMessage()).toBe("");
     },
 );
+
+it("a sign-on redirect listener is not called once its unsubscribe has run", async () => {
+    const listener = jest.fn();
+    const unsubscribe = SubscribeToSignOnRedirect(listener);
+    unsubscribe();
+    await ExpectRejectedUnchanged(BuildAxiosError(401, {}, ACCOUNT_URL));
+    expect(listener).not.toHaveBeenCalled();
+    expect(NavigationWasAttempted(consoleErrorSpy)).toBe(true);
+});
 
 it("API_CLIENT runs the 401 redirect on a rejected call (registered interceptor)", async () => {
     const accountCall = API_CLIENT.get(ACCOUNT_URL, {

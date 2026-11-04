@@ -539,10 +539,10 @@ def FailPublication(monkeypatch: pytest.MonkeyPatch, baseName: str) -> None:
     """Make every rename of a baseName generation into place raise EIO, as os.replace can."""
     originalPlace = gdg.PlaceGenerationFile
 
-    def PlaceOrFail(finalPath: Path, expectedSha256: str) -> str:
+    def PlaceOrFail(finalPath: Path, expectedSha256: str, connection: Connection) -> str:
         if finalPath.parent.name == baseName:
             raise OSError(errno.EIO, INJECTED_PUBLICATION_MESSAGE, str(finalPath))
-        return originalPlace(finalPath, expectedSha256)
+        return originalPlace(finalPath, expectedSha256, connection)
 
     monkeypatch.setattr(gdg, "PlaceGenerationFile", PlaceOrFail)
 

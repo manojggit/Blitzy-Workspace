@@ -457,7 +457,7 @@ def TableAccountTexts(connection: Connection, acctId: str) -> dict[str, str]:
 
 def FixtureAccountTexts(csvPath: Path, acctId: str) -> dict[str, str]:
     """Return the balance and cycle fields of one account row of an expected accounts CSV."""
-    _header, rows = compare.ReadExpectedCsv(csvPath)
+    _, rows = compare.ReadExpectedCsv(csvPath)
     row = next(row for row in rows if row[ACCT_ID_COLUMN] == acctId)
     return {column: str(row[column]) for column in UNFLUSHED_COLUMNS}
 

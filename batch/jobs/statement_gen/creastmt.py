@@ -14,7 +14,8 @@ the marker stays for the next run. A run killed during its publication is rolled
 next run before that run reads, and the backups and .part files a run killed at any other
 point left are deleted then too. A failure after the commit point, such as the ledger finish,
 exits 16 with the new statements in place, and the retry writes them again from the same
-tables. The CLI holds the batch window around the command, so this module takes no lock.
+tables. The CLI holds the batch window around the command, so this module takes no lock; it
+checks that the window still holds (RequireWindow) before its recovery and its publication.
 """
 
 import errno
@@ -29,10 +30,12 @@ from typing import IO
 
 from app.core.logging import PrintableText
 from jinja2 import TemplateError
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
 
 from batch.jobs.statement_gen import cbstm03a, cbstm03b
 from batch.orchestration import run_ledger
+from batch.orchestration.batch_window import RequireWindow
 from batch.orchestration.job_context import EXIT_ABEND, EXIT_OK, JobContext, JobFailure, JobResult
 
 JOB_NAME = "statement-gen"
@@ -203,15 +206,18 @@ def DescribeOutputs(statementsDir: Path) -> str:
 def WriteStatements(context: JobContext, statementsDir: Path) -> StatementCounts:
     """STEP010, STEP020 and STEP040: read TRXFL and the master files, and write the statements.
 
-    RecoverInterruptedPublication first finishes what a killed run left, before anything is
+    RecoverInterruptedPublication first finishes what a killed run left, before any table is
     read, so a run that then fails before the commit point leaves the previous statements. The
     whole TRNXFILE table loads next, as 8100-TRNXFILE-OPEN does before the first
     cross-reference, so a capacity or empty-file abend happens before any file is opened. The
     statements then stream from the cross-reference read into the files. That read is closed
     before the connection, on success and on failure alike, and the connection writes nothing.
+    The recovery and the publication each run only once RequireWindow on that connection has
+    found the command's batch window still held.
     """
-    RecoverInterruptedPublication(statementsDir)
     with context.engine.connect() as connection:
+        RequireWindow(connection)
+        RecoverInterruptedPublication(statementsDir)
         table = cbstm03a.LoadTransactionTable(cbstm03b.ReadStatementTransactions(connection))
         with closing(cbstm03b.ReadXrefsInCardOrder(connection)) as sources:
             statements = (
@@ -219,17 +225,20 @@ def WriteStatements(context: JobContext, statementsDir: Path) -> StatementCounts
                 for source in sources
             )
             statementRecords = cbstm03a.BuildStatementFiles(table, statements)
-            return WriteStatementFiles(statementsDir, statementRecords)
+            return WriteStatementFiles(statementsDir, statementRecords, connection)
 
 
 def WriteStatementFiles(
-    statementsDir: Path, statementRecords: Iterable[cbstm03a.StatementRecords]
+    statementsDir: Path,
+    statementRecords: Iterable[cbstm03a.StatementRecords],
+    connection: Connection | None = None,
 ) -> StatementCounts:
     """STEP030 and the STMTFILE and HTMLFILE DDs: write both .part files, then publish both.
 
     Each statement's records are written as they are built, one LF after every record. Only
     when every statement is written are both files made durable and published over STATEMNT.PS
-    and STATEMNT.HTML as a pair (PublishFiles). A failure before the publication's commit point
+    and STATEMNT.HTML as a pair (PublishFiles), which checks the batch window on ``connection``,
+    the job connection, when one is given. A failure before the publication's commit point
     removes both .part files and every other work file, and leaves the previous statements as
     they were. The caller has already run RecoverInterruptedPublication.
     """
@@ -250,7 +259,7 @@ def WriteStatementFiles(
             WriteRecords(htmlFile, records.htmlLines)
             counts.Add(records)
         completedFiles = ((statementFile, STATEMENT_FILE_NAME), (htmlFile, HTML_FILE_NAME))
-        PublishFiles(statementsDir, completedFiles)
+        PublishFiles(statementsDir, completedFiles, connection)
     return counts
 
 
@@ -341,22 +350,29 @@ def WriteRecords(outputFile: IO[str], records: Iterable[str]) -> None:
         outputFile.write(record + LINE_TERMINATOR)
 
 
-def PublishFiles(statementsDir: Path, completedFiles: tuple[tuple[IO[str], str], ...]) -> None:
+def PublishFiles(
+    statementsDir: Path,
+    completedFiles: tuple[tuple[IO[str], str], ...],
+    connection: Connection | None,
+) -> None:
     """Make both complete .part files durable, then publish them over both targets as a pair.
 
-    completedFiles pairs each open .part file with its target file name. BackUpTargets keeps
-    the previous files and creates the marker; both .part files are then renamed over their
-    targets and the directory is synced. Removing the marker is the commit point. An OSError
-    before it, from the marker's sync, either rename, the renames' sync or the removal itself,
-    rolls the publication back (RollBackPublication) and is raised again, so the previous
-    statements stand as they were. After it the directory is synced and the backups are
-    deleted; a failure there leaves the new statements in place, and the next run deletes any
-    backup left.
+    completedFiles pairs each open .part file with its target file name. Once both are synced,
+    RequireWindow on ``connection``, when one is given, refuses a lost batch window before the
+    publication changes any file. BackUpTargets then keeps the previous files and creates the
+    marker; both .part files are renamed over their targets and the directory is synced.
+    Removing the marker is the commit point. An OSError before it, from the marker's sync,
+    either rename, the renames' sync or the removal itself, rolls the publication back
+    (RollBackPublication) and is raised again, so the previous statements stand as they were.
+    After it the directory is synced and the backups are deleted; a failure there leaves the new
+    statements in place, and the next run deletes any backup left.
     """
     for temporaryFile, _ in completedFiles:
         temporaryFile.flush()
         os.fsync(temporaryFile.fileno())
         temporaryFile.close()
+    if connection is not None:
+        RequireWindow(connection)
     BackUpTargets(statementsDir)
     try:
         SyncDirectory(statementsDir)

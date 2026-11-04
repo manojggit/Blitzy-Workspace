@@ -63,8 +63,10 @@ from batch.orchestration.batch_chain import (
     RunStandaloneLoad,
 )
 from batch.orchestration.batch_window import (
+    BATCH_WINDOW_LOST_MESSAGE,
     BATCH_WINDOW_UNAVAILABLE_MESSAGE,
     BatchWindow,
+    BatchWindowLostError,
     BatchWindowUnavailableError,
 )
 from batch.orchestration.clock import Clock, ParseAsOf
@@ -502,26 +504,40 @@ def BuildCommandContext(
     )
 
 
+def RunWindowedCommand(
+    settings: BatchSettings, engine: Engine, invocation: CommandInvocation
+) -> int:
+    """Hold the batch window, the job engine fenced, around the prelude and the action.
+
+    The order is fixed: interrupted runs are classified first, then the generation catalog is
+    reconciled, then the action resolves, skips or executes steps.
+    """
+    context = BuildCommandContext(settings, engine, invocation)
+    with BatchWindow(settings, jobEngine=engine):
+        run_ledger.ClassifyInterruptedRuns(context)
+        gdg.ReconcileCatalog(context)
+        return invocation.action(context)
+
+
 def RunInBatchWindow(settings: BatchSettings, engine: Engine, invocation: CommandInvocation) -> int:
     """Run the invocation's prelude and action inside the batch window; return its status.
 
-    The order is fixed: interrupted runs are classified first, then the generation catalog is
-    reconciled, then the action resolves, skips or executes steps. A window not granted within
-    its lock timeout, or a database that cannot be reached, gives EXIT_FAILURE. So does any
-    other database error that neither the prelude nor the action mapped to a status, such as
-    the missing relations of an unmigrated database: it is logged by class and SQLSTATE only.
-    A file error neither mapped, such as a directory where catalog recovery expects a generation
-    file or an orphan .part, gives EXIT_FAILURE too, logged by class, errno symbol and path.
-    In each case BatchWindow has then already released whatever it held.
+    A window not granted within its lock timeout, a window lost while the command runs, or a
+    database that cannot be reached gives EXIT_FAILURE. So does any other database error that
+    neither the prelude nor the action mapped to a status, such as the missing relations of an
+    unmigrated database: it is logged by class and SQLSTATE only. A file error neither mapped,
+    such as a directory where catalog recovery expects a generation file or an orphan .part,
+    gives EXIT_FAILURE too, logged by class, errno symbol and path. A lost window has stopped
+    the command before any later commit or publication, leaving its run RUNNING for the next
+    command to classify. In each case BatchWindow has then already released whatever it held.
     """
-    context = BuildCommandContext(settings, engine, invocation)
     try:
-        with BatchWindow(settings):
-            run_ledger.ClassifyInterruptedRuns(context)
-            gdg.ReconcileCatalog(context)
-            return invocation.action(context)
+        return RunWindowedCommand(settings, engine, invocation)
     except BatchWindowUnavailableError:
         LOGGER.error(BATCH_WINDOW_UNAVAILABLE_MESSAGE)
+        return EXIT_FAILURE
+    except BatchWindowLostError:
+        LOGGER.error(BATCH_WINDOW_LOST_MESSAGE)
         return EXIT_FAILURE
     except OperationalError as error:
         LOGGER.error(DATABASE_UNAVAILABLE_LOG, type(error).__name__)

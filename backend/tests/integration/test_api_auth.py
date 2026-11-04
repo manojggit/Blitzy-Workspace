@@ -175,10 +175,10 @@ def ParseSetCookie(response: httpx.Response, cookieName: str) -> SetCookie:
     ]
     assert len(cookieHeaders) == 1, f"{len(cookieHeaders)} Set-Cookie headers of {cookieName}"
     namePart, *attributeParts = cookieHeaders[0].split(";")
-    name, _separator, value = namePart.partition("=")
+    name, _, value = namePart.partition("=")
     attributes = {}
     for attributePart in attributeParts:
-        attributeName, _separator, attributeValue = attributePart.strip().partition("=")
+        attributeName, _, attributeValue = attributePart.strip().partition("=")
         attributes[attributeName.lower()] = attributeValue
     return SetCookie(name=name, value=value, attributes=attributes)
 
@@ -239,7 +239,7 @@ async def FailSignOns(
     client: httpx.AsyncClient, userId: str, correctCredential: str, attempts: int
 ) -> None:
     """Sign ``userId`` on ``attempts`` times with wrong passwords; each answers the 401 literal."""
-    for _attempt in range(attempts):
+    for _ in range(attempts):
         response = await SignOn(client, userId, NewWrongCredential(correctCredential))
         AssertLegacyError(response, HTTP_UNAUTHORIZED, WRONG_CREDENTIAL_LITERAL, CREDENTIAL_CURSOR)
 
@@ -568,7 +568,7 @@ async def test_unknown_user_id_is_locked_after_max_failures(
 ) -> None:
     """The throttle counts the upper-cased ID, known or not, so its lower-case form is locked."""
     unknownUserId = NewUnknownUserId(syncEngine)
-    for _attempt in range(testSettings.LOGIN_MAX_ATTEMPTS):
+    for _ in range(testSettings.LOGIN_MAX_ATTEMPTS):
         response = await SignOn(apiClient, unknownUserId, NewCredential())
         AssertLegacyError(response, HTTP_UNAUTHORIZED, USER_NOT_FOUND_LITERAL, USER_ID_CURSOR)
     assert ReadFailureCount(syncEngine, unknownUserId) == testSettings.LOGIN_MAX_ATTEMPTS

@@ -198,12 +198,12 @@ class UserRepository:
 
         A record another task holds past the unit's lock timeout raises RecordLockError.
         """
-        await EnterOnlineWindow(self.context.request, USER_FILE_NAME)
+        await EnterOnlineWindow(self.context.request, USER_FILE_NAME, unit)
         return await self._FetchFirst(unit, KeyedSelect(userId).with_for_update())
 
     async def InsertUser(self, unit: AsyncConnection, values: Mapping[str, Any]) -> None:
         """WRITE DATASET(USRSEC): add the record; an existing key raises DuplicateKeyError."""
-        await EnterOnlineWindow(self.context.request, USER_FILE_NAME)
+        await EnterOnlineWindow(self.context.request, USER_FILE_NAME, unit)
         await self._Execute(unit, RecordInsert(values))
 
     async def UpdateUser(self, unit: AsyncConnection, values: Mapping[str, Any]) -> None:
@@ -212,14 +212,14 @@ class UserRepository:
         The other keys of ``values`` are the columns written (``first_name``, ``last_name``,
         ``password_hash``, ``user_type``). No such record raises RecordNotFoundError (NOTFND).
         """
-        await EnterOnlineWindow(self.context.request, USER_FILE_NAME)
+        await EnterOnlineWindow(self.context.request, USER_FILE_NAME, unit)
         result = await self._Execute(unit, KeyedUpdate(values))
         if result.rowcount == 0:
             raise RecordNotFoundError(USER_FILE_NAME)
 
     async def DeleteUser(self, unit: AsyncConnection, userId: str) -> int:
         """DELETE DATASET(USRSEC): remove the record; return 0 for NOTFND, else 1."""
-        await EnterOnlineWindow(self.context.request, USER_FILE_NAME)
+        await EnterOnlineWindow(self.context.request, USER_FILE_NAME, unit)
         result = await self._Execute(unit, KeyedDelete(userId))
         return result.rowcount
 
