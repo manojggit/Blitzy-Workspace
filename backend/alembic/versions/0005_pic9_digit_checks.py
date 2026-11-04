@@ -140,7 +140,6 @@ def AddDigitCheck(checkSpec: DigitCheckSpec) -> None:
 
 
 def DropDigitCheck(checkSpec: DigitCheckSpec) -> None:
-    """Drop one digit check created by AddDigitCheck."""
     op.drop_constraint(
         op.f(checkSpec.name),
         checkSpec.table,

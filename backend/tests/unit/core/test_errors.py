@@ -185,7 +185,6 @@ def test_body_has_exactly_the_legacy_keys():
 
 
 def test_exact_empty_field_errors_keep_only_the_cursor():
-    """An outcome declared to fail no field lists none, and the cursor field is still sent."""
     details = LegacyErrorDetails(exactFieldErrors=True)
     errorBody = LegacyMessageError(NO_CHANGES_MESSAGE, STATUS_FIELD, details=details).Body()
     assert (errorBody["field_errors"], errorBody["cursor_field"]) == ([], STATUS_FIELD)

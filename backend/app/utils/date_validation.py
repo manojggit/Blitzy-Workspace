@@ -510,7 +510,6 @@ def _Fail(state: _DateEditState, suffix: str, status: DatePartStatus, *parts: _D
 
 
 def _SetStatus(state: _DateEditState, status: DatePartStatus, *parts: _DatePart) -> None:
-    """SET the given part flags to status."""
     for part in parts:
         state.statuses[part] = status
 

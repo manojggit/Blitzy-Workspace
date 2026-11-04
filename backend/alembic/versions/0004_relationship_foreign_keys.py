@@ -163,7 +163,6 @@ def AddForeignKey(foreignKeySpec: ForeignKeySpec) -> None:
 
 
 def DropForeignKey(foreignKeySpec: ForeignKeySpec) -> None:
-    """Drop one foreign key created by AddForeignKey."""
     op.drop_constraint(
         op.f(foreignKeySpec.name),
         foreignKeySpec.sourceTable,

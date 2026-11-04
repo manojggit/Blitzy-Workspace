@@ -2149,8 +2149,9 @@ The detail row of the sample report holds these values:
 | `amount` | `50.00` |
 
 Header rows leave every column but `line_kind` empty, and total rows fill only `amount`. Amounts
-are plain decimals. A text cell starting with `=`, `+`, `-` or `@` is prefixed with `'`, so a
-spreadsheet never runs it as a formula.
+are plain decimals. A text cell that starts with a tab, CR or LF, or with `=`, `+`, `-` or `@`
+after any leading whitespace, C0 controls or DEL, is prefixed with `'`, so a spreadsheet never
+runs it as a formula.
 
 With `format=pdf`, the response is `application/pdf`: the 133-column print lines drawn in Courier,
 reproducing the TRANREPT print file.

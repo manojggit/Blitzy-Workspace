@@ -39,7 +39,6 @@ from app.repositories.transaction_repository import TRANSACTION_FILE_NAME, Trans
 from app.schemas.billpay import BillPayRequest, BillPayResponse
 from app.services.billpay import cobil00c
 
-# --- Seed and request values -----------------------------------------------------------------
 SEED_ACCT_ID = "00000000004"
 SEED_CARD_NUM = "2988091353094312"
 SEED_BALANCE = Decimal("40.00")
@@ -103,7 +102,6 @@ PAYMENT_RECORD = {
     "proc_ts_format": "S",
 }
 
-# --- Plain SQL with bound values ---------------------------------------------------------------
 ACCOUNT_QUERY = text("SELECT * FROM accounts.accounts WHERE acct_id = :acctId")
 SET_BALANCE_STATEMENT = text(
     "UPDATE accounts.accounts SET curr_balance = :amount WHERE acct_id = :acctId"

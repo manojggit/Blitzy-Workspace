@@ -28,6 +28,7 @@ tests/conftest.py, and restoreSeedState undoes every committed row. The cases co
 import contextlib
 import csv
 import io
+import itertools
 import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -235,9 +236,13 @@ PDF_SIGNATURE = b"%PDF"
 MONTHLY_DISPOSITION_TEMPLATE = 'attachment; filename="TRANREPT_2022-07-01_2022-07-31.{extension}"'
 PLAIN_AMOUNT_PATTERN = re.compile(r"-?\d+\.\d{2}")
 CAT_CD_DIGITS = 4
-# A spreadsheet runs a cell starting with one of these as a formula, so every CSV text cell
-# starting with one gets the apostrophe in front; the amount cell never does.
+# A spreadsheet may run a cell as a formula when it starts with a tab, CR or LF, or when its first
+# character after the whitespace, C0 controls and DEL an import may skip is one of
+# FORMULA_PREFIXES, so every such CSV text cell gets the apostrophe in front; the amount never does.
+CONTROL_PREFIXES = ("\t", "\r", "\n")
 FORMULA_PREFIXES = ("=", "+", "-", "@")
+DELETE_CHARACTER = "\x7f"
+C0_CONTROL_LIMIT = 0x20
 FORMULA_GUARD = "'"
 # The CSV cells of the monthly report with FORMULA_TRANSACTION: the detail sources, then the
 # detail, page-total and grand-total amounts, whose totals hold 10.00 - 1.00 + 20.50 plus the
@@ -448,9 +453,20 @@ def CsvColumnCells(
     return [row[columnIndex] for row in csvRows if row[lineKindIndex] in lineKinds]
 
 
+def IsImportSkippedCharacter(character: str) -> bool:
+    """Return whether a spreadsheet import may skip ``character`` before a cell's formula."""
+    isControl = ord(character) < C0_CONTROL_LIMIT or character == DELETE_CHARACTER
+    return character.isspace() or isControl
+
+
 def GuardFormulaText(cellText: str) -> str:
-    """Return ``cellText`` behind FORMULA_GUARD when it starts with one of FORMULA_PREFIXES."""
-    if cellText.startswith(FORMULA_PREFIXES):
+    """Return ``cellText`` behind FORMULA_GUARD when a spreadsheet may run it as a formula.
+
+    That is when it starts with one of CONTROL_PREFIXES, or with one of FORMULA_PREFIXES once
+    its leading import-skipped characters are dropped.
+    """
+    visibleText = "".join(itertools.dropwhile(IsImportSkippedCharacter, cellText))
+    if cellText.startswith(CONTROL_PREFIXES) or visibleText.startswith(FORMULA_PREFIXES):
         return FORMULA_GUARD + cellText
     return cellText
 

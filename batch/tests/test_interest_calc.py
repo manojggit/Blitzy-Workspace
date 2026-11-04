@@ -242,7 +242,6 @@ ABEND_SCENARIO = SyntheticScenario(
 MISSING_DEFAULT_KEY = DisclosureKey(DEFAULT_GROUP, "01", 1)
 
 
-# --- Arranging the synthetic input --------------------------------------------------------------
 def SetAccounts(engine: Engine, setups: Iterable[AccountSetup]) -> None:
     """Set each sample account's group, balance and cycle fields, in one transaction."""
     with engine.begin() as connection:
@@ -368,7 +367,6 @@ def WrongOrderFirstCards(
     }
 
 
-# --- Running INTCALC and reading its outputs ----------------------------------------------------
 def ReadOracleState(engine: Engine) -> legacy_oracle.OracleState:
     """Read every dataset of the database into the oracle's state, through plain SQL."""
     with engine.connect() as connection:
@@ -474,7 +472,6 @@ def AccountRecordCards(records: Iterable[str], acctId: str) -> set[str]:
     }
 
 
-# --- Sample chain parity ------------------------------------------------------------------------
 def test_intcalc_systran_generation_equals_expected_fixture(
     batchEnvironment: BatchEnvironment,
 ) -> None:
@@ -529,7 +526,6 @@ def test_run_date_override_changes_tran_id_prefix(batchEnvironment: BatchEnviron
     ]
 
 
-# --- Synthetic edge cases, predicted by the oracle ----------------------------------------------
 def test_empty_category_balance_input_exits_0_and_rewrites_nothing(
     batchEnvironment: BatchEnvironment,
 ) -> None:
@@ -669,7 +665,6 @@ def test_tran_id_suffix_wraps_from_999999_to_000000(
     ]
 
 
-# --- The TRAN-CAT-BAL-RECORD display through log masking ----------------------------------------
 def MaskedIntcalcMessages(caplog: pytest.LogCaptureFixture) -> list[str]:
     """Return each captured interest_calc record's message after the batch log masking filter."""
     maskingFilter = PanMaskingFilter()

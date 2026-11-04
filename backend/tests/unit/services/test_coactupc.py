@@ -53,7 +53,6 @@ from app.services.accounts import coactupc
 from app.services.accounts.coactupc import FetchAccountForEdit, ProcessAccountUpdate
 from app.utils.lookup_codes import VALID_NANP_AREA_CODES
 
-# --- Accounts, users and files -------------------------------------------------------------------
 EDIT_ACCOUNT_ID = "00000000016"
 EDIT_CUSTOMER_ID = "000000016"
 LOW_FICO_ACCOUNT_ID = "00000000001"
@@ -76,14 +75,12 @@ BIRTH_DATE_FIELDS = ("dob_year", "dob_month", "dob_day")
 DATE_PARTS = ("year", "month", "day")
 PHONE_PARTS = ("area", "prefix", "line")
 
-# --- HTTP statuses of the legacy error contract (AAP 0.6.5) --------------------------------------
 HTTP_EDIT_FAILURE = 400
 HTTP_NOT_FOUND = 404
 HTTP_RECORD_CHANGED = 409
 HTTP_RECORD_LOCKED = 423
 HTTP_FILE_ERROR = 503
 
-# --- Screen states (ACUP-CHANGE-ACTION) ----------------------------------------------------------
 DETAILS_NOT_FETCHED = UpdateScreenState.DETAILS_NOT_FETCHED
 SHOW_DETAILS = UpdateScreenState.SHOW_DETAILS
 CHANGES_NOT_OK = UpdateScreenState.CHANGES_NOT_OK
@@ -99,7 +96,6 @@ INFO_PROMPT_FOR_CONFIRMATION = "Changes validated.Press F5 to save"
 INFO_CONFIRM_UPDATE_SUCCESS = "Changes committed to database"
 INFO_INFORM_FAILURE = "Changes unsuccessful. Please try again"
 
-# --- WS-RETURN-MSG texts set on a reachable path -------------------------------------------------
 # 1210-EDIT-ACCOUNT sets WS-PROMPT-FOR-ACCT for a blank key, then 1200 line 1442 overwrites it
 # with NO-SEARCH-CRITERIA-RECEIVED; lines 1806-1810 STRING the key literal.
 MSG_ACCOUNT_NOT_PROVIDED = "Account number not provided"
@@ -134,7 +130,6 @@ MSG_LOCK_CUSTOMER = "Could not lock customer record for update"
 MSG_RECORD_CHANGED = "Record changed by some one else. Please review"
 MSG_UPDATE_FAILED = "Update of record failed"
 
-# --- The eight field literals pinned verbatim (AAP 0.6.9) ----------------------------------------
 MSG_ACCOUNT_STATUS_YES_NO = "Account Status must be Y or N."
 MSG_CREDIT_LIMIT_REQUIRED = "Credit Limit must be supplied."
 MSG_CREDIT_LIMIT_NOT_VALID = "Credit Limit is not valid"
@@ -362,14 +357,12 @@ CUSTOMER_REWRITE_REFUSED_LOG = (
     " (cause CheckViolationError, SQLSTATE 23514)"
 )
 
-# --- Screen token forgery ------------------------------------------------------------------------
 RANDOM_TOKEN_BYTES = 64
 FOREIGN_SECRET_BYTES = 48
 SECONDS_PER_MINUTE = 60
 EXPIRY_MARGIN_SECONDS = 60
 
 
-# --- Value objects -------------------------------------------------------------------------------
 class FieldCase(NamedTuple):
     """Fields keyed over the fetched screen, the first message and the failing fields."""
 
@@ -431,7 +424,6 @@ class UpdateScenario:
     storedRows: StoredRows
 
 
-# --- Case builders -------------------------------------------------------------------------------
 def Case(changes: Mapping[str, str], expectedMessage: str, *expectedFieldErrors: str) -> FieldCase:
     """Return a FieldCase whose failing fields are listed in 3300 cursor order."""
     return FieldCase(MappingProxyType(dict(changes)), expectedMessage, expectedFieldErrors)
@@ -548,7 +540,6 @@ def SaveFailure(httpStatus: int, message: str) -> ExpectedScreen:
     )
 
 
-# --- Case tables ---------------------------------------------------------------------------------
 # 1200-EDIT-MAP-INPUTS over every editable COACTUP field, in edit order (lines 1470-1669). Each
 # row is keyed over VALID_BASELINE, so its own field is the only one failing.
 FIELD_LITERAL_CASES = [
@@ -715,7 +706,6 @@ RAW_AMOUNT_CASES = [
 ]
 
 
-# --- Database reads and writes -------------------------------------------------------------------
 def ReadAccountRow(syncEngine: Engine, acctId: str) -> dict[str, Any]:
     """Return the accounts.accounts row of ``acctId`` as committed."""
     with syncEngine.connect() as connection:
@@ -784,7 +774,6 @@ def AssertRowsUnchanged(syncEngine: Engine, storedRows: StoredRows) -> None:
     assert SnapshotRows(syncEngine, storedRows.acctId, storedRows.custId) == storedRows
 
 
-# --- Requests ------------------------------------------------------------------------------------
 async def FetchScreen(context: Any, acctId: str) -> AccountScreen:
     """Return the SHOW_DETAILS screen of ``GET /accounts/{acctId}/edit``."""
     screen = await FetchAccountForEdit(context, acctId)
@@ -849,7 +838,6 @@ def PatchToday(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(coactupc, "date", SimpleNamespace(today=FixedToday))
 
 
-# --- Assertions ----------------------------------------------------------------------------------
 def AssertNoNeverShownText(message: str, infoMessage: str) -> None:
     """Assert that neither message line holds a text no reachable statement leaves on screen."""
     assert message.rstrip(" ") not in NEVER_SHOWN_TEXTS
@@ -1028,7 +1016,6 @@ async def RefuseCustomerLock(self: CustomerRepository, unit: object, custId: str
     raise RecordLockError(CUSTOMER_FILE)
 
 
-# --- Screen token forgers ------------------------------------------------------------------------
 def RandomToken(screen: AccountScreen, settings: Any) -> str:
     """Return random text in place of the screen token."""
     return secrets.token_urlsafe(RANDOM_TOKEN_BYTES)
@@ -1067,7 +1054,6 @@ TOKEN_FORGERS: list[Callable[[AccountScreen, Any], str]] = [
 TOKEN_FORGER_IDS = ["random", "foreign-secret", "tampered", "expired"]
 
 
-# --- Fixtures ------------------------------------------------------------------------------------
 @pytest_asyncio.fixture(name="onlineContext")
 async def OnlineContextFixture(makeOnlineContext: Callable[..., Any]) -> Any:
     """Return the OnlineContext of a regular (type U) user, who reaches CAUP from CM00."""
@@ -1156,9 +1142,7 @@ async def SaveExpectingError(scenario: UpdateScenario) -> LegacyMessageError:
     return await ExpectScreenError(scenario.context, EDIT_ACCOUNT_ID, saveRequest)
 
 
-# --- Phase 2: the edit fetch, the key edit and the field literals --------------------------------
 def test_pinned_literals_are_expected_messages_of_the_edit_tables():
-    """Each literal pinned verbatim is what a composed table row expects."""
     editCases = [*FIELD_LITERAL_CASES, *DATE_LITERAL_CASES, *BOUNDARY_REJECTED_CASES]
     assert PINNED_FIELD_LITERALS <= {fieldCase.expectedMessage for fieldCase in editCases}
 
@@ -1288,7 +1272,6 @@ async def test_numval_c_amount_validates_and_is_saved_truncated(scenario, amount
     assert savedAccount == RewrittenAccount(scenario.storedRows.accountRow, amountCase.storedAmount)
 
 
-# --- Phase 3: the ACUP-CHANGE-ACTION state machine -----------------------------------------------
 @pytest.mark.parametrize(
     "action", list(UpdateAction), ids=[action.value for action in UpdateAction]
 )
@@ -1397,7 +1380,6 @@ async def test_key_after_changes_done_returns_the_empty_key_screen(scenario):
 
 @pytest.mark.usefixtures("restoreSeedState")
 async def test_key_after_failed_save_returns_the_empty_key_screen(scenario, monkeypatch):
-    """After a CHANGES_FAILED save any key starts afresh as well."""
     monkeypatch.setattr(AccountRepository, "GetAccountForUpdate", RefuseAccountLock)
     error = await SaveExpectingError(scenario)
     nextRequest = WithChanges(ScreenOfError(error), OTHER_FIELD_VALUES)
@@ -1419,7 +1401,6 @@ async def test_forged_token_restarts_at_details_not_fetched(scenario, forgeToken
     AssertRowsUnchanged(scenario.syncEngine, scenario.storedRows)
 
 
-# --- Phase 4: the F5 save outcomes of 9600-WRITE-PROCESSING --------------------------------------
 @pytest.mark.usefixtures("restoreSeedState")
 @pytest.mark.parametrize("lockCase", LOCK_CASES, ids=LOCK_CASE_IDS)
 async def test_lock_failure_answers_its_file_literal_and_writes_nothing(
@@ -1484,7 +1465,6 @@ async def test_low_fico_account_fails_the_edits_its_seed_values_fail(scenario, f
 
 
 async def test_low_fico_account_validates_once_its_seed_defects_are_corrected(scenario):
-    """With the FICO score, state and Phone Number 2 area code corrected, account 1 validates."""
     lowFicoRows = SnapshotRows(scenario.syncEngine, LOW_FICO_ACCOUNT_ID, LOW_FICO_CUSTOMER_ID)
     lowFicoScreen = await FetchScreen(scenario.context, LOW_FICO_ACCOUNT_ID)
     request = WithChanges(lowFicoScreen, LOW_FICO_CORRECTIONS)

@@ -399,7 +399,6 @@ async def test_customer_read_io_error_answers_the_custdat_file_error(
     ids=["cross-reference", "account-master", "customer-master"],
 )
 def test_service_not_found_builders_match_the_source_strings(builder, key, expectedMessage):
-    """Extra check: the service's NOTFND builders give the strings typed from the source."""
     assert builder(key) == expectedMessage
 
 

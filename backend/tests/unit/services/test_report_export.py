@@ -8,8 +8,9 @@ database. Expected values are typed by hand from that download contract, never t
 module:
 - CSV: UTF-8, a header row line_kind, tran_id, acct_id, type_cd, type_desc, cat_cd, cat_desc,
     source, amount, then one row per report line in report order; amounts are plain decimals;
-    a text cell starting with =, +, - or @ gets a ' prefix so a spreadsheet keeps it as text,
-    while a negative amount is numeric data and stays unguarded;
+    a text cell starting with a tab, CR or LF, or with =, +, - or @ after any leading whitespace
+    or control characters, gets a ' prefix so a spreadsheet keeps it as text, while a negative
+    amount is numeric data and stays unguarded;
 - PDF: every 133-column print line drawn unchanged in Courier, as TRANREPT printed it, with a
     new physical page only when a page is full; the document is deterministic and uncompressed,
     so a small decoder here follows the page tree from the trailer's /Root and reads back the
@@ -186,16 +187,50 @@ FULL_ROW_CASES = (
 )
 FULL_ROW_IDS = ("header-line", "detail-line", "grand-total-line")
 
+# DALYTRAN text decodes from code page 037 with its controls and spaces kept: X'05' is a tab,
+# X'0D' CR, X'25' LF, X'0B' a vertical tab and X'41' a no-break space.
 GUARD_CASES = (
     ("=x", "'=x"),
     ("+x", "'+x"),
     ("-x", "'-x"),
     ("@x", "'@x"),
+    ("\t=1+1", "'\t=1+1"),
+    ("\r=1", "'\r=1"),
+    ("\n@x", "'\n@x"),
+    ("\t-x", "'\t-x"),
+    ("\tabc", "'\tabc"),
+    (" =x", "' =x"),
+    ("\x0b+x", "'\x0b+x"),
+    ("\xa0-x", "'\xa0-x"),
+    ("\x00 \x7f@x", "'\x00 \x7f@x"),
     ("x", "x"),
+    (" x", " x"),
     ("a-b", "a-b"),
     ("", ""),
 )
-GUARD_IDS = ("equals", "plus", "minus", "at", "plain", "inner-prefix", "empty")
+GUARD_IDS = (
+    "equals",
+    "plus",
+    "minus",
+    "at",
+    "tab-equals",
+    "cr-equals",
+    "lf-at",
+    "tab-minus",
+    "tab-plain",
+    "space-equals",
+    "vertical-tab-plus",
+    "no-break-space-minus",
+    "nul-space-del-at",
+    "plain",
+    "space-plain",
+    "inner-prefix",
+    "empty",
+)
+# A detail line whose source kept the leading tab of its DALYTRAN record, with a credit amount.
+IMPORTED_TAB_SOURCE_LINE = BuildDetailLine(
+    {"source": "\t=1+1"}, Decimal("-12.34"), "-         12.34"
+)
 
 LINES_PER_PAGE = report_export.LinesPerPage()
 # (detail line count, the [start, stop) span of those lines each PDF page must draw)
@@ -645,8 +680,15 @@ def test_csv_row_carries_kind_padded_category_and_empty_absent_fields(lineIndex,
     assert SampleCsvRows()[lineIndex] == expectedRow
 
 
+def test_csv_guards_an_imported_tab_prefixed_source_and_keeps_its_amount_numeric():
+    csvRow = ParseCsv(report_export.RenderCsv([IMPORTED_TAB_SOURCE_LINE]))[1]
+
+    assert csvRow[EXPECTED_COLUMNS.index("source")] == "'\t=1+1"
+    assert csvRow[EXPECTED_COLUMNS.index("amount")] == "-12.34"
+
+
 @pytest.mark.parametrize("cellText, guardedText", GUARD_CASES, ids=GUARD_IDS)
-def test_guard_csv_cell_prefixes_only_a_leading_formula_character(cellText, guardedText):
+def test_guard_csv_cell_prefixes_text_a_spreadsheet_could_run_as_a_formula(cellText, guardedText):
     assert report_export.GuardCsvCell(cellText) == guardedText
 
 

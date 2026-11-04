@@ -65,7 +65,8 @@ def FormatEdited(value: Decimal | int, picture: str) -> str:
     fraction digits truncate and high-order integer digits are dropped. A + position shows + or
     -, a - position shows a space or -, and a zero result is positive. When every digit position
     is Z and the stored value is zero, the whole item is spaces, sign, commas and point included.
-    Raises PictureError for any other picture, and TypeError for a float or other non-numeric value.
+    Raises PictureError for any other picture or an edited result of another width, and TypeError
+    for a float or other non-numeric value.
     """
     pictureSpec = _ParsePicture(picture)
     stored = StoreInto(value, pictureSpec.intDigits, pictureSpec.decDigits, signed=True)
@@ -76,7 +77,11 @@ def FormatEdited(value: Decimal | int, picture: str) -> str:
     leadingSign = signCharacter if pictureSpec.signPosition == LEADING_SIGN else ""
     trailingSign = signCharacter if pictureSpec.signPosition == TRAILING_SIGN else ""
     result = leadingSign + body + trailingSign
-    assert len(result) == len(pictureSpec.symbols), (picture, result)
+    if len(result) != len(pictureSpec.symbols):
+        raise PictureError(
+            f"picture {picture!r} is {len(pictureSpec.symbols)} characters wide; the edited"
+            f" result is {len(result)}"
+        )
     return result
 
 

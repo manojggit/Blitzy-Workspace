@@ -285,7 +285,6 @@ ROW_EXCLUSIVE_LOCK_STATEMENT = text(
 )
 
 
-# --- Helpers -------------------------------------------------------------------------------------
 def CaseId(loaderCase: LoaderCase) -> str:
     """Return the pytest id of a loader case: its `load` command name."""
     return loaderCase.cliName
@@ -481,7 +480,6 @@ def KillDailyLoadInsideTransaction(engine: Engine, imagePath: Path) -> int:
     return LatestRunId(engine, DAILY_CASE.stepNo)
 
 
-# --- Loader declarations -------------------------------------------------------------------------
 @pytest.mark.parametrize("loaderCase", ALL_LOADER_CASES, ids=CaseId)
 def test_loader_module_declares_its_jcl_job_table_and_chain_step(loaderCase: LoaderCase) -> None:
     """Each loader module names its command, its JCL member and its table, at its chain step."""
@@ -494,7 +492,6 @@ def test_loader_module_declares_its_jcl_job_table_and_chain_step(loaderCase: Loa
     assert [step.stepNo for step in StepsForJob(definition)] == [loaderCase.stepNo]
 
 
-# --- Parity with the expected loader rows (AAP 0.9.1 item 2, 0.9.3) -----------------------------
 @pytest.mark.parametrize("loaderCase", LOADER_CASES, ids=CaseId)
 def test_ebcdic_loader_rows_equal_expected_fixture(
     batchEnvironment: BatchEnvironment, loaderCase: LoaderCase
@@ -584,7 +581,6 @@ def test_tranfile_has_no_ascii_image_and_exits_12(batchEnvironment: BatchEnviron
     assert CountRows(engine, Transaction.__table__) == 0
 
 
-# --- Failure atomicity ---------------------------------------------------------------------------
 def test_malformed_image_exits_12_and_leaves_table_unchanged(
     batchEnvironment: BatchEnvironment, tmp_path: Path
 ) -> None:
@@ -645,7 +641,6 @@ def test_sigkilled_atomic_loader_is_retried_to_clean_result(
     assert TableDifferences(engine, DAILY_CASE) == []
 
 
-# --- History rows and the financial-reload rule (AAP 0.6.8) --------------------------------------
 def test_load_accounts_after_alembic_seed_adds_history_row_and_moves_last_run_id(
     batchEnvironment: BatchEnvironment,
 ) -> None:

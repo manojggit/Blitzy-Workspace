@@ -58,7 +58,6 @@ HTTP_NOT_FOUND = 404
 HTTP_DUPLICATE_KEY = 409
 HTTP_FILE_ERROR = 503
 
-# --- Seed data ---------------------------------------------------------------------------------
 ADDING_ACCT_ID = "00000000004"
 ADDING_CARD_NUM = "2988091353094312"
 MASKED_ADDING_CARD_NUM = "************4312"
@@ -216,7 +215,6 @@ COPIED_ADDED_ROW = MappingProxyType(
     }
 )
 
-# --- Plain SQL; every value is bound -----------------------------------------------------------
 INSERT_TRANSACTION_SQL = text(
     "INSERT INTO transactions.transactions (tran_id, tran_type_cd, tran_cat_cd, tran_source,"
     " tran_desc, tran_amt, merchant_id, merchant_name, merchant_city, merchant_zip, card_num,"
@@ -600,7 +598,6 @@ async def test_first_failing_edit_is_the_only_message(
 # confirm prompt is therefore unreachable on an empty file, as in COPY-LAST-TRAN-DATA.
 @pytest.mark.usefixtures("restoreSeedState")
 async def test_copy_last_empty_file_stops_at_type_cd(makeOnlineContext, syncEngine):
-    """F5 with no TRANSACT record answers the Type CD presence literal and changes no row."""
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     request = BuildAddRequest({"action": COPY_LAST_ACTION, "confirm": ""})
     refusal = EditFailure(TYPE_CD_EMPTY_MESSAGE, "type_cd")
@@ -675,7 +672,6 @@ def test_pre_gregorian_date_is_ceedays_message_2513():
 async def test_accepted_entry_reaches_the_confirm_prompt(
     makeOnlineContext, syncEngine, overrides, shownField
 ):
-    """Every edit passes, so a blank CONFIRM returns the prompt with the edited map."""
     InsertTransactionRow(syncEngine, LAST_TRAN_ID)
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     request = BuildAddRequest({**overrides, "confirm": ""})

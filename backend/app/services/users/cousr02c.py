@@ -100,7 +100,6 @@ def IsBlank(value: str) -> bool:
 
 
 def WithoutPadding(value: Any) -> str:
-    """Return a field value as text without its trailing space padding."""
     return str(value).rstrip(FIELD_PADDING)
 
 

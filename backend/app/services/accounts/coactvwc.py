@@ -409,9 +409,9 @@ def ScreenError(message: str, httpStatus: int) -> LegacyMessageError:
     The information line is always the input prompt (1200, lines 528-530) and the cursor is
     always ACCTSID (1300-SETUP-SCREEN-ATTRS, lines 546-552).
     """
-    # ACCTSID is the map's only input, and the error contract cannot place the cursor on a
-    # field without listing it as failing. So it is listed for every failure, including the
-    # CUSTDAT-only failures (FLG-CUSTFILTER-NOT-OK), where COACTVWC leaves ACCTSID uncoloured.
+    # ACCTSID, the map's only input, takes the cursor and is listed as failing for every failure,
+    # even a CUSTDAT-only one (FLG-CUSTFILTER-NOT-OK), which lines 555-564 leave uncoloured and
+    # which only a file error gives, as card_xref.cust_id has a foreign key to customers.
     return LegacyMessageError(
         message,
         field=ACCOUNT_ID_FIELD,

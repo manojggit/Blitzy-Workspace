@@ -136,7 +136,6 @@ INDEX_STATE_SQL = text(
 )
 
 
-# --- Catalog and ledger reads --------------------------------------------------------------------
 def IndexState(engine: Engine) -> dict[str, object] | None:
     """Return the catalog state of ix_transactions_proc_ts, or None when the index is absent.
 
@@ -228,7 +227,6 @@ def WrittenFiles(outputDir: Path) -> list[Path]:
     return sorted(path for path in outputDir.rglob("*") if path.is_file())
 
 
-# --- Fixtures ------------------------------------------------------------------------------------
 @pytest.fixture(name="procTsIndexRestored")
 def ProcTsIndexRestored(batchEnvironment: BatchEnvironment) -> Iterator[None]:
     """After the test, replace whatever ix_transactions_proc_ts it left by revision 0003's index.
@@ -242,7 +240,6 @@ def ProcTsIndexRestored(batchEnvironment: BatchEnvironment) -> Iterator[None]:
         connection.execute(SEED_PROC_TS_INDEX_SQL)
 
 
-# --- Tests ---------------------------------------------------------------------------------------
 def test_tran_index_exits_0_and_index_is_valid_on_proc_ts(
     batchEnvironment: BatchEnvironment,
 ) -> None:

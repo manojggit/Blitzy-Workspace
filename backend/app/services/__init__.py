@@ -1,7 +1,8 @@
 """CardDemo service layer replacing the CICS online programs and the CBTRN02C/CBTRN03C rules.
 
-Each module ports one legacy COBOL program, named after it in lower case. The eight cluster
-packages and the programs they replace:
+Each program-port module below ports one legacy COBOL program and is named after it in lower
+case. login_throttle, menu_options and report_export are supplementary modules, not program
+ports. The eight cluster packages and their modules:
     auth: cosgn00c (COSGN00C, CC00 sign-on) and login_throttle (the sign-on lockout).
     menu: comen01c (COMEN01C, CM00 main menu), coadm01c (COADM01C, CA00 admin menu) and
         menu_options (the COMEN02Y and COADM02Y option tables).
@@ -14,8 +15,9 @@ packages and the programs they replace:
     billpay: cobil00c (COBIL00C, CB00).
     users: cousr00c, cousr01c, cousr02c and cousr03c (COUSR00C-COUSR03C, CU00-CU03).
 
-Every service module opens with its own "Replaces: ..." header naming its program,
-transaction ID, BMS map and copybooks.
+Every module listed above opens with a "Replaces:" header naming the legacy artefacts it
+replaces, such as its program, transaction ID or batch job, BMS map, copybooks and print file,
+or stating that it replaces none.
 
 This package re-exports nothing, and importing it reads no settings and opens no database
 connection, so batch can import the shared rules directly, for example:

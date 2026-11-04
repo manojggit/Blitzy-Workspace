@@ -165,7 +165,6 @@ ATOMIC_PRODUCER_CASES = (
 )
 
 
-# --- Streamed STEP05R merge ------------------------------------------------------------------
 # Synthetic SORTIN records: the TRAN-ID, then a tag naming the input and the record's position
 # in it, padded with spaces to LRECL 350, so equal keys stay distinguishable.
 BKUP_TAG = "BKUP"

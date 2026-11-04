@@ -451,7 +451,6 @@ def LowerAscii(text: str) -> str:
 
 
 def AmountValue(text: str) -> Decimal:
-    """Return a before-image amount string as the exact S9(10)V99 value it holds."""
     return Decimal(text)
 
 
@@ -565,7 +564,6 @@ def EncodeUpdateState(updateState: AccountUpdateState, context: OnlineContext) -
 
 
 def NonBlankTexts(texts: Mapping[str, str]) -> dict[str, str]:
-    """Return the texts that are not blank, without their trailing spaces."""
     return {name: text.rstrip(" ") for name, text in texts.items() if text.strip(" ")}
 
 
@@ -713,7 +711,6 @@ def ReceiveMap(
 
 
 def StoredText(value: object) -> str:
-    """Return a stored X(n) column as text without its trailing spaces (CHAR columns pad)."""
     return str(value).rstrip(" ")
 
 
@@ -742,7 +739,6 @@ def BeforeImageOf(account: Mapping[str, Any], customer: Mapping[str, Any]) -> di
 
 
 def ImageFieldTexts(beforeImage: Mapping[str, str]) -> dict[str, str]:
-    """Return each non-amount screen field's slice of the before-image (IMAGE_FIELD_SOURCES)."""
     return {
         name: beforeImage.get(column, "")[offset : offset + length]
         for name, (column, offset, length) in IMAGE_FIELD_SOURCES.items()
@@ -897,7 +893,6 @@ def EditMessage(label: str, suffix: str) -> str:
 
 
 def FailStep(editContext: AccountEditContext, step: EditStep, suffix: str) -> None:
-    """Fail every field of the step with its label followed by suffix."""
     editContext.collector.Fail(step.fieldKeys, EditMessage(step.label, suffix))
 
 
@@ -1158,7 +1153,6 @@ ACCOUNT_EDIT_TABLE = (
 
 
 def RunEditTable(newValues: NewAccountData, today: date) -> EditCollector:
-    """Walk ACCOUNT_EDIT_TABLE over the new values and return what the edits left set."""
     editContext = AccountEditContext(values=newValues.texts, collector=EditCollector(), today=today)
     for step in ACCOUNT_EDIT_TABLE:
         step.editFunction(editContext, step)
@@ -1209,7 +1203,6 @@ def RaiseScreenError(outcome: ScreenOutcome, context: OnlineContext) -> NoReturn
 
 
 def Respond(outcome: ScreenOutcome, context: OnlineContext) -> AccountScreen:
-    """Return the screen of an outcome, or raise it as an error when its message is set."""
     if outcome.message:
         RaiseScreenError(outcome, context)
     return BuildScreen(outcome, context)

@@ -193,7 +193,6 @@ def _IsBlank(text: str) -> bool:
 
 
 def _FindFirstSelection(selections: Sequence[UserSelection]) -> UserSelection | None:
-    """Return the first row whose SELnnnn code is not blank; later codes are ignored."""
     for selection in selections:
         if not _IsBlank(selection.selection):
             return selection
@@ -213,7 +212,6 @@ def _RouteFor(selection: UserSelection) -> str | None:
 
 
 def _RouteWithUserId(route: str, userId: str) -> str:
-    """Return ``route`` with the selected user ID as its ``userId`` query parameter."""
     return f"{route}?{urlencode({ROUTE_USER_ID_PARAMETER: userId})}"
 
 

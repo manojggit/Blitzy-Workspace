@@ -316,12 +316,10 @@ def CreateDatasetTable(tableSpec: TableSpec) -> None:
 
 
 def DropDatasetTable(tableSpec: TableSpec) -> None:
-    """Drop one dataset table, with its primary key and comment."""
     op.drop_table(tableSpec.name, schema=tableSpec.schema)
 
 
 def CreateSchemas() -> None:
-    """Create the nine dataset-group schemas in DATASET_SCHEMAS order."""
     for schemaName in DATASET_SCHEMAS:
         op.execute(sa.schema.CreateSchema(schemaName))
 

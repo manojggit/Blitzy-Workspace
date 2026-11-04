@@ -261,7 +261,6 @@ CYCLE_STEPS_LEDGER = sa.table(
 
 
 def BuildColumns(columnSpecs: tuple[ColumnSpec, ...]) -> list[sa.Column]:
-    """Return one Column per spec, in spec order."""
     return [
         sa.Column(
             spec.name,
@@ -354,7 +353,6 @@ def CreateCycleStepsTable() -> None:
 
 
 def CountRows(connection: sa.Connection, schemaName: str, tableName: str) -> int:
-    """Return the number of rows in schemaName.tableName, counted with a Core statement."""
     countStatement = sa.select(sa.func.count()).select_from(sa.table(tableName, schema=schemaName))
     return connection.execute(countStatement).scalar_one()
 
@@ -428,7 +426,6 @@ def CycleStepRow(cycleId: int, stepNo: int, runIdsByStep: Mapping[int, int]) -> 
 def InsertCycleSteps(
     connection: sa.Connection, cycleId: int, runIdsByStep: Mapping[int, int]
 ) -> None:
-    """Insert one cycle_steps row for every step in CHAIN_STEP_NUMBERS."""
     stepRows = [CycleStepRow(cycleId, stepNo, runIdsByStep) for stepNo in CHAIN_STEP_NUMBERS]
     connection.execute(sa.insert(CYCLE_STEPS_LEDGER), stepRows)
 

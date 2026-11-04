@@ -74,7 +74,6 @@ from app.services.cards.cocrdslc import (
 )
 
 if TYPE_CHECKING:
-    # Type-only: the Settings that OnlineContext.settings carries and core.security expects.
     from app.core.config import Settings
 
 LOGGER = logging.getLogger(__name__)
@@ -183,7 +182,8 @@ class BeforeImage:
 
     ``name`` is CARD-EMBOSSED-NAME upper-cased (A-Z only), and ``year``, ``month`` and ``day``
     are CARD-EXPIRAION-DATE (1:4), (6:2) and (9:2). ``cvv`` takes part only in the 9300
-    compare; it travels inside the encrypted token and never in a response.
+    compare; a response carries it only inside the encrypted ``screen_token``, never as a
+    plaintext response field.
     """
 
     cvv: str
@@ -805,7 +805,6 @@ def EditExpiryYear(screenValue: str) -> FieldEditResult:
 
 
 def IsDigitsInRange(screenValue: str, length: int, validRange: range) -> bool:
-    """Return True for exactly ``length`` ASCII digits whose value lies in ``validRange``."""
     if len(screenValue) != length or not IsAsciiDigits(screenValue):
         return False
     return int(screenValue) in validRange

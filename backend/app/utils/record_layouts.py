@@ -478,14 +478,19 @@ def EncodeRecord(values: dict[str, object], layout: RecordLayout) -> str:
 
     Every field's column must be present (a TS26 field also needs "<name>_format"). Numbers are
     stored as a COBOL MOVE does, truncating digits the picture cannot hold. The record carries
-    no terminator. Raises RecordFormatError naming the layout, field and offset.
+    no terminator. Raises RecordFormatError naming the layout, field and offset, or the layout and
+    LRECL when the encoded record has another length.
     """
     characters = [" "] * layout.lrecl
     for field in layout.fields:
         fieldEnd = field.offset + field.length
         characters[field.offset : fieldEnd] = _EncodeField(values, field, layout)
     record = "".join(characters)
-    assert len(record) == layout.lrecl, (layout.name, len(record))
+    if len(record) != layout.lrecl:
+        raise RecordFormatError(
+            f"{layout.name}: the encoded record is {len(record)} characters long; its LRECL is"
+            f" {layout.lrecl}"
+        )
     return record
 
 

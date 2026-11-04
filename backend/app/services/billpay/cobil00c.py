@@ -107,7 +107,6 @@ CONFIRM_NO_VALUES = ("N", "n")
 # The BillPayRequest fields that replace MOVE -1 TO ACTIDINL and MOVE -1 TO CONFIRML.
 CURSOR_ACCT_ID = "acct_id"
 CURSOR_CONFIRM = "confirm"
-# The padding a BMS input field carries.
 FIELD_PADDING = " "
 
 # TRAN-AMT S9(09)V99 and ACCT-CURR-BAL S9(10)V99.
@@ -463,9 +462,4 @@ def ScreenError(message: str, field: str, httpStatus: int) -> LegacyMessageError
 
 
 def RaiseScreenError(message: str, field: str, httpStatus: int) -> NoReturn:
-    """Raise the legacy error of a screen sent with ERR-FLG set: the four standard keys only.
-
-    Raises:
-        LegacyMessageError: always, with ``message``, the cursor ``field`` and ``httpStatus``.
-    """
     raise ScreenError(message, field, httpStatus)

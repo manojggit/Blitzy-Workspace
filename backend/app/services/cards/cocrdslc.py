@@ -36,7 +36,6 @@ from app.repositories.card_repository import CARD_FILE_NAME, CardRepository
 from app.schemas.cards import CardDetailResponse
 
 if TYPE_CHECKING:
-    # Type-only: the Settings that OnlineContext.settings carries and DecodeCardRef expects.
     from app.core.config import Settings
 
 LOGGER = logging.getLogger(__name__)

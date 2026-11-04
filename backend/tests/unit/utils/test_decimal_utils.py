@@ -439,7 +439,6 @@ def test_store_into_stores_product_of_two_15_digit_operands():
 @pytest.mark.parametrize("hostileContext", HOSTILE_CONTEXTS, ids=HOSTILE_CONTEXT_IDS)
 @pytest.mark.parametrize("storeCase", ISOLATION_STORE_CASES, ids=ISOLATION_STORE_IDS)
 def test_store_into_ignores_and_preserves_caller_context(storeCase, hostileContext):
-    """StoreInto computes in its own copy of COBOL_CONTEXT, whatever context the caller holds."""
     valueText, intDigits, decDigits, expectedText = storeCase
     value = Decimal(valueText)
     with localcontext(hostileContext) as callerContext:
@@ -499,7 +498,6 @@ def test_store_into_monthly_interest_formula_cbact04c():
 @pytest.mark.parametrize("wrongTypeValue", WRONG_TYPE_VALUES, ids=WRONG_TYPE_IDS)
 @pytest.mark.parametrize("storeFunction", STORE_FUNCTIONS)
 def test_store_functions_reject_non_numeric_types(storeFunction, wrongTypeValue):
-    """Only Decimal and int are COBOL numeric values; float, bool, str and None are refused."""
     with pytest.raises(TypeError, match="must be Decimal or int"):
         storeFunction(wrongTypeValue, 9, 2)
 
@@ -507,7 +505,6 @@ def test_store_functions_reject_non_numeric_types(storeFunction, wrongTypeValue)
 @pytest.mark.parametrize("nonFiniteValue", NON_FINITE_VALUES, ids=str)
 @pytest.mark.parametrize("storeFunction", STORE_FUNCTIONS)
 def test_store_functions_reject_non_finite_values(storeFunction, nonFiniteValue):
-    """No numeric picture holds NaN or Infinity."""
     with pytest.raises(ZonedDecimalError, match="non-finite"):
         storeFunction(nonFiniteValue, 9, 2)
 
@@ -526,7 +523,6 @@ def test_store_functions_reject_impossible_pictures(storeFunction, picture):
 def test_store_functions_reject_values_beyond_31_digit_intermediates(
     storeFunction, overContextValue
 ):
-    """An integer part longer than any COBOL intermediate cannot be stored."""
     with pytest.raises(InvalidOperation):
         storeFunction(overContextValue, 9, 2)
 
@@ -548,7 +544,6 @@ def test_decode_zoned_plain_final_digit_is_positive():
 
 @pytest.mark.parametrize("text, scale, expectedText", DECODE_SCALE_CASES, ids=DECODE_SCALE_IDS)
 def test_decode_zoned_keeps_every_implied_decimal(text, scale, expectedText):
-    """The result exponent is -scale, so trailing fraction zeros survive the decode."""
     AssertExactDecimal(DecodeZoned(text, scale), expectedText)
 
 
@@ -591,7 +586,6 @@ def test_zoned_decimal_error_is_a_value_error():
 
 @pytest.mark.parametrize(VALUE_CASE_ARGNAMES, ENCODE_SIGNED_CASES, ids=str)
 def test_encode_zoned_overpunches_last_digit(value, intDigits, decDigits, expectedText):
-    """The stored digits are zero-padded and the last one carries the sign overpunch."""
     assert EncodeZoned(value, intDigits, decDigits) == expectedText
 
 

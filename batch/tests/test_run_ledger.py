@@ -123,7 +123,6 @@ UNFINISHED_COUNTS: dict[str, int] = {}
 LONG_TRANSACTION_SECONDS = 1.0
 
 
-# --- Ledger reads and writes ---------------------------------------------------------------------
 def OpenCycleId(engine: Engine) -> int:
     """Return the OPEN cycle's id; fail the test when no cycle is OPEN."""
     with engine.connect() as connection:
@@ -304,7 +303,6 @@ def ExpectedRunLines(run: Row) -> tuple[str, str]:
     )
 
 
-# --- Financial tables ----------------------------------------------------------------------------
 def ReloadTable(loaderName: str) -> Table:
     """Return the table a financial loader replaces."""
     return Base.metadata.tables[run_ledger.FINANCIAL_RELOAD_TABLES[loaderName]]
@@ -348,7 +346,6 @@ def ExpectedReloadRefusal(loaderName: str, blockingSteps: list[int], cycleId: in
     )
 
 
-# --- Opening and closing cycles ------------------------------------------------------------------
 def test_alembic_seed_records_open_seed_cycle_with_loader_steps_completed(
     batchEnvironment: BatchEnvironment,
 ) -> None:
@@ -471,7 +468,6 @@ def test_new_cycle_refuses_later_start_step_before_any_cycle_change(
     assert CountJobRuns(engine) == runCount
 
 
-# --- Step identity, skip, force and failure ------------------------------------------------------
 def test_tranbkp_steps_6_and_15_are_distinct_identities(batchEnvironment: BatchEnvironment) -> None:
     """job tran-backup runs step 6, then step 15: each occurrence is its own identity."""
     engine = batchEnvironment.engine
@@ -673,7 +669,6 @@ def test_run_finished_late_in_a_long_transaction_records_when_it_finished(
     assert recordedSeconds >= LONG_TRANSACTION_SECONDS
 
 
-# --- Interrupted runs ----------------------------------------------------------------------------
 @pytest.mark.parametrize(
     ("stepNo", "durability"),
     [
@@ -762,7 +757,6 @@ def test_every_command_classifies_interrupted_runs_first(
     assert interruptedRun.finished_at is not None
 
 
-# --- Financial reloads ---------------------------------------------------------------------------
 @pytest.mark.parametrize("loaderName", FINANCIAL_LOADERS)
 @pytest.mark.parametrize("writerState", RELOAD_BLOCKING_STATES)
 def test_financial_reload_refused_while_later_writer_step_completed_failed_or_interrupted(

@@ -25,6 +25,7 @@ from decimal import Decimal
 
 import pytest
 
+from app.utils import cobol_format
 from app.utils.cobol_format import (
     REPORT_DETAIL_AMOUNT_PICTURE,
     REPORT_TOTAL_AMOUNT_PICTURE,
@@ -185,3 +186,17 @@ def test_picture_constants_equal_their_texts():
 def test_format_edited_rejects_unsupported_picture(picture):
     with pytest.raises(PictureError):
         FormatEdited(Decimal("1234.56"), picture)
+
+
+def test_format_edited_refuses_a_result_of_another_width(monkeypatch):
+    realRenderBody = cobol_format._RenderBody
+
+    def WidenedRenderBody(pictureSpec, digits):
+        return realRenderBody(pictureSpec, digits) + " "
+
+    monkeypatch.setattr(cobol_format, "_RenderBody", WidenedRenderBody)
+    with pytest.raises(PictureError) as refusal:
+        FormatEdited(Decimal("1234.56"), REPORT_DETAIL_AMOUNT_PICTURE)
+    assert str(refusal.value) == (
+        "picture '-ZZZ,ZZZ,ZZZ.ZZ' is 15 characters wide; the edited result is 16"
+    )

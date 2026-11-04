@@ -311,7 +311,6 @@ def NestedHeaderToken():
     return f"{headerSegment}.{EncodeSegment(b'{}')}."
 
 
-# --- Passwords -----------------------------------------------------------------------------------
 def test_hash_password_produces_salted_bcrypt_hash():
     password = NewMixedCasePassword()
     firstHash = HashPassword(password, TEST_BCRYPT_ROUNDS)
@@ -341,7 +340,6 @@ def test_verify_password_refuses_unusable_stored_hash(storedHash):
     assert VerifyPassword(NewMixedCasePassword(), storedHash) is False
 
 
-# --- Session token -------------------------------------------------------------------------------
 @pytest.mark.parametrize("userType", [ADMIN_USER_TYPE, REGULAR_USER_TYPE, LOWER_CASE_ADMIN_TYPE])
 def test_session_token_round_trip(userType, sessionSettings):
     sessionToken = IssueSessionToken(SAMPLE_USER_ID, userType, sessionSettings)
@@ -434,7 +432,6 @@ async def test_get_current_user_refuses_nested_header_with_empty_401(
     assert refusalBody["message"] == ""
 
 
-# --- Session cookie options ----------------------------------------------------------------------
 @pytest.mark.parametrize(("appEnv", "secureExpected"), COOKIE_ENVIRONMENTS)
 def test_cookie_options_follow_app_env(appEnv, secureExpected):
     cookieSettings = BuildSettings(appEnv)
@@ -470,7 +467,6 @@ def test_cookie_max_age_matches_setting(lifetimeMinutes, lifetimeSettings):
     assert f"Max-Age={lifetimeSeconds}" in response.headers["set-cookie"].split("; ")
 
 
-# --- Fernet navigation tokens: card_ref and screen_token -----------------------------------------
 @pytest.mark.parametrize("tokenKind", FERNET_TOKEN_KINDS)
 def test_fernet_token_round_trip(tokenKind, sessionSettings):
     encodedPayload = tokenKind.NewPayload()
@@ -532,7 +528,6 @@ def test_screen_token_without_state_object_is_refused(stateText, sessionSettings
         DecodeScreenToken(screenToken, sessionSettings)
 
 
-# --- Masking -------------------------------------------------------------------------------------
 @pytest.mark.parametrize(("maskFunction", "rawValue", "maskedValue"), MASKING_CASES)
 def test_masking_keeps_only_last_four_characters(maskFunction, rawValue, maskedValue):
     assert maskFunction(rawValue) == maskedValue

@@ -112,7 +112,6 @@ from batch.tests.reconciliation import legacy_oracle
 
 LOGGER = logging.getLogger(__name__)
 
-# --- Environment ---------------------------------------------------------------------------------
 TEST_DATABASE_NAME = "carddemo_test"
 TEST_DATABASE_SUFFIX = "_test"
 TEST_SYNC_URL_VARIABLE = "TEST_SYNC_DATABASE_URL"
@@ -124,7 +123,6 @@ TEST_APP_ENV = "test"
 TEST_BCRYPT_ROUNDS = "4"
 SLOW_MARKER_LINE = "slow: long-running interruption and kill tests"
 
-# --- Clock, paths and timeouts -------------------------------------------------------------------
 FIXED_AS_OF_TEXT = "2022-07-18T00:00:00"
 TESTS_DIR = Path(__file__).resolve().parent
 EXPECTED_DIR = TESTS_DIR / "fixtures" / "expected"
@@ -142,7 +140,6 @@ KILL_WAIT_SECONDS = 30
 SCHEMA_LOCK_TIMEOUT = "30s"
 LOCK_TIMEOUT_SETTING = "lock_timeout"
 
-# --- SQL -----------------------------------------------------------------------------------------
 DROP_SCHEMA_TEMPLATE = "DROP SCHEMA IF EXISTS {quotedSchema} CASCADE"
 DROP_VERSION_TABLE_SQL = "DROP TABLE IF EXISTS public.alembic_version"
 DROP_SORT_KEY_FUNCTION_SQL = "DROP FUNCTION IF EXISTS public.ebcdic_sort_key(text) CASCADE"
@@ -168,13 +165,11 @@ WINDOW_LOCK_COUNT_STATEMENT = text(
     " AND ((classid::bigint << 32) | objid::bigint) = :lockKey"
 ).bindparams(bindparam("lockKey", type_=BigInteger))
 
-# --- Failure injection ---------------------------------------------------------------------------
 INJECTED_FAILURE_TEMPLATE = "INJECTED FAILURE AT STEP {stepNo}"
 INJECTED_ROLLBACK_TEMPLATE = "INJECTED ROLLBACK AT STEP {stepNo}"
 FINISH_ATOMIC_RUN_NAME = "FinishAtomicRun"
 REPLACE_LOADER_MODULE = "batch.loaders.replace_loader"
 
-# --- Messages ------------------------------------------------------------------------------------
 MISSING_URL_MESSAGE = (
     "No test database URL: set TEST_SYNC_DATABASE_URL or SYNC_DATABASE_URL in backend/.env or"
     " the environment; without TEST_SYNC_DATABASE_URL the tests use SYNC_DATABASE_URL's server"
@@ -208,7 +203,6 @@ NO_CYCLE_STEP_MESSAGE = "No batch cycle holds chain step {stepNo}"
 UNKNOWN_STEP_MESSAGE = "Chain step {stepNo} does not exist; the chain has steps 1 to {stepCount}"
 PROCESS_ALREADY_EXITED_LOG = "carddemo-batch process %d had already exited before SIGKILL"
 
-# --- Synthetic data ------------------------------------------------------------------------------
 # Every synthetic key starts with a prefix no sample key of its width uses: the sample accounts
 # and customers are 1-50 with leading zeros, the sample cards starting with 9 continue with 5 to
 # 8, and the sample daily and interest TRAN-IDs start with 0 and 2.
@@ -261,7 +255,6 @@ SPEC_AMOUNT_MESSAGE = "amount must be a Decimal: money is never floating point"
 SPEC_PER_CARD_MESSAGE = "perCard must not be negative, got {perCard}"
 
 
-# --- Environment resolution (runs at import) -----------------------------------------------------
 class DatabaseUrlSettings(BaseSettings):
     """The two batch database URLs as configured: the process environment, then backend/.env.
 
@@ -337,7 +330,6 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", SLOW_MARKER_LINE)
 
 
-# --- Value types ---------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class SeedSnapshot:
     """Every table's rows and every serial sequence's state, read right after a migration.
@@ -388,7 +380,6 @@ class SyntheticTransactionSpec:
             raise ValueError(SPEC_PER_CARD_MESSAGE.format(perCard=self.perCard))
 
 
-# --- Test database reset, snapshot and restore ---------------------------------------------------
 def SetLocalLockTimeout(connection: Connection, timeout: str) -> None:
     """Bound every lock wait of the current transaction, as SET LOCAL lock_timeout does."""
     connection.execute(select(func.set_config(LOCK_TIMEOUT_SETTING, timeout, True)))
@@ -580,7 +571,6 @@ def RequireEngineOnTestDatabase(engine: Engine, testDatabaseUrl: str) -> None:
         pytest.fail(failureText, pytrace=False)
 
 
-# --- Fixtures ------------------------------------------------------------------------------------
 @pytest.fixture(name="testDatabaseUrl", scope="session")
 def TestDatabaseUrl() -> str:
     """Return the psycopg2 URL of the test database, whose name ends in _test."""
@@ -667,7 +657,6 @@ def BatchEnvironmentFixture(
     )
 
 
-# --- CLI runners ---------------------------------------------------------------------------------
 def InvokeCli(arguments: Sequence[str]) -> CliOutcome:
     """Run a carddemo-batch command in this process, so a test's monkeypatches apply.
 
@@ -765,7 +754,6 @@ def WaitUntil(
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
-# --- Ledger and lock probes ----------------------------------------------------------------------
 def IsBatchWindowHeld(engine: Engine) -> bool:
     """Return whether a session holds the exclusive batch window on the engine's database."""
     with engine.connect() as connection:
@@ -813,7 +801,6 @@ def StepRow(engine: Engine, stepNo: int) -> dict[str, object]:
     return dict(row)
 
 
-# --- Failure injection ---------------------------------------------------------------------------
 def FindChainStep(stepNo: int) -> batch_chain.ChainStep:
     """Return the chain step numbered stepNo; ValueError for a number outside 1-18."""
     for step in batch_chain.CHAIN:
@@ -879,7 +866,6 @@ def InjectAtomicRollbackFailure(monkeypatch: pytest.MonkeyPatch, stepNo: int) ->
             monkeypatch.setattr(boundModule, FINISH_ATOMIC_RUN_NAME, FailingFinish)
 
 
-# --- Synthetic data builders ---------------------------------------------------------------------
 def SyntheticKey(index: int, width: int, prefix: str = SYNTHETIC_KEY_PREFIX) -> str:
     """Return prefix followed by index zero-padded to a width-character digit key."""
     keyText = prefix + f"{index:0{width - len(prefix)}d}"

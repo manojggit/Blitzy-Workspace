@@ -63,7 +63,6 @@ LOGIN_ATTEMPTS_COLUMNS: tuple[ColumnSpec, ...] = (
 
 
 def BuildLoginAttemptsColumns() -> list[sa.Column]:
-    """Return one Column per LOGIN_ATTEMPTS_COLUMNS spec, in spec order."""
     return [
         sa.Column(
             spec.name,

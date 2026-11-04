@@ -66,7 +66,6 @@ from app.services.cards.cocrdslc import (
 )
 
 if TYPE_CHECKING:
-    # Type-only: the Settings that OnlineContext.settings carries and the token codecs expect.
     from app.core.config import Settings
 
 LOGGER = logging.getLogger(__name__)

@@ -110,7 +110,6 @@ CCUP_ERROR_BODY_KEYS = frozenset(
     {"message", "info_message", "field_errors", "cursor_field", "fields", "state", "screen_token"}
 )
 
-# --- Detail values keyed on the screen ---------------------------------------------------------
 NEW_NAME = "Renamed Card Holder"
 NEW_STATUS = "N"
 NEW_MONTH = "02"
@@ -127,7 +126,6 @@ INVALID_DETAIL_VALUES = {
 OTHER_DETAIL_VALUES = {NAME_FIELD: "Ignored Name", STATUS_FIELD: "Y", MONTH_FIELD: "07"}
 VALID_BOUNDARY_YEARS = ["1950", "2099"]
 
-# --- Screen tokens -----------------------------------------------------------------------------
 OTHER_SECRET_KEY_BYTES = 48
 # How far past the token lifetime the expired token was issued.
 EXPIRY_MARGIN_SECONDS = 60
@@ -615,7 +613,6 @@ async def test_unchanged_details_are_no_change_whatever_the_case(cardScenario):
 
 
 async def test_valid_change_waits_for_confirmation(cardScenario):
-    """A valid change gives CHANGES_OK_NOT_CONFIRMED with the F5 prompt and writes nothing."""
     validated = await ValidatedScreen(cardScenario, {STATUS_FIELD: NEW_STATUS})
     AssertScreen(validated, CONFIRM_SCREEN)
     assert validated.fields.active_status == NEW_STATUS
@@ -623,7 +620,6 @@ async def test_valid_change_waits_for_confirmation(cardScenario):
 
 
 async def test_enter_while_confirming_runs_no_edit(cardScenario):
-    """ENTER on the validated screen runs no edit: refused values are ignored, state kept."""
     validated = await ValidatedScreen(cardScenario, {STATUS_FIELD: NEW_STATUS})
     screen = await SendKey(cardScenario, WithCardChanges(validated, INVALID_DETAIL_VALUES))
     AssertScreen(screen, CONFIRM_SCREEN)
@@ -654,7 +650,6 @@ async def test_save_writes_the_validated_values(cardScenario):
 
 
 async def test_cancel_rereads_the_card(cardScenario):
-    """F12 on the validated screen discards the change and shows the card as stored."""
     validated = await ValidatedScreen(cardScenario, {STATUS_FIELD: NEW_STATUS})
     screen = await SendKey(cardScenario, WithCardChanges(validated, {}, UpdateAction.CANCEL))
     AssertScreen(screen, SHOWN_SCREEN)
@@ -664,7 +659,6 @@ async def test_cancel_rereads_the_card(cardScenario):
 
 @pytest.mark.parametrize("action", list(UpdateAction))
 async def test_key_after_changes_done_shows_empty_key_screen(cardScenario, action):
-    """Every key after CHANGES_DONE discards the input and sends the empty key screen."""
     saved = await SavedScreen(cardScenario, {STATUS_FIELD: NEW_STATUS})
     screen = await SendKey(cardScenario, WithCardChanges(saved, INVALID_DETAIL_VALUES, action))
     AssertScreen(screen, EMPTY_KEY_SCREEN)

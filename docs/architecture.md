@@ -1060,7 +1060,8 @@ enforced:
         functions on the raw text;
     - bound SQL parameters only (ruff `S608`);
     - React escaping with no `dangerouslySetInnerHTML` (ESLint `react/no-danger`);
-    - the CSV formula guard: text cells starting with `=`, `+`, `-` or `@` are prefixed with `'`;
+    - the CSV formula guard: text cells starting with a tab, CR or LF, or with `=`, `+`, `-` or
+        `@` after any leading whitespace, C0 controls or DEL, are prefixed with `'`;
     - escaping of `&`, `<` and `>` in statement HTML field values;
     - the `Origin` CSRF guard and HttpOnly cookies ([CSRF and CORS](#csrf-and-cors)).
 - Cleaning never changes an accept or reject outcome for input a 3270 could send. Where the legacy

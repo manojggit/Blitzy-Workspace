@@ -84,7 +84,6 @@ from batch.tests.conftest import (
 )
 from batch.tests.reconciliation import compare, legacy_oracle
 
-# --- The chain as Section 0.6.8 defines it -------------------------------------------------------
 EXPECTED_LEGACY_ORDER = (
     "ACCTFILE",
     "CARDFILE",
@@ -174,7 +173,6 @@ START_AT_USAGE_ERROR = f"Invalid value for '--start-at': {batch_chain.START_AT_R
 UNKNOWN_START_AT_NAME = "NOPE"
 TRACEBACK_HEADER = "Traceback (most recent call last)"
 
-# --- Clean-run fixtures and outputs --------------------------------------------------------------
 CLEAN_ACCOUNTS_CSV = EXPECTED_DIR / "intcalc_accounts.csv"
 CLEAN_CATEGORY_BALANCES_CSV = EXPECTED_DIR / "posttran_tcatbal.csv"
 CLEAN_COMBINED_DAT = EXPECTED_DIR / "combtran_combined.dat"
@@ -196,7 +194,6 @@ STATEMENT_FIXTURES = {
 }
 GDG_BASE_NAMES = tuple(gdg.GDG_BASES)
 
-# --- Synthetic interruption case -----------------------------------------------------------------
 SYNTHETIC_RECORD_COUNT = 20_000
 SYNTHETIC_DAILY_FILE_NAME = "AWS.M2.CARDDEMO.DALYTRAN.SYNTHETIC.PS"
 RELOAD_MARKER_AMOUNT = Decimal("1.00")
@@ -218,7 +215,6 @@ FIRST_BACKUP_NEVER_RUN = (run_ledger.STEP_PENDING, 0)
 # Step 6's state and run count after job tran-backup ran it and a later run-all skipped it.
 FIRST_BACKUP_RUN_THEN_SKIPPED = (run_ledger.STEP_COMPLETED, 2)
 
-# --- Failed POSTTRAN over the sample daily file --------------------------------------------------
 SAMPLE_DAILY_PATH = legacy_oracle.ImagePath(
     REPO_ROOT / "data" / "EBCDIC", legacy_oracle.DALYTRAN_IMAGE
 )
@@ -228,7 +224,6 @@ VALIDATION_FUNCTION_NAME = "ValidateDailyTransaction"
 INJECTED_IO_STATEMENT = "INJECTED"
 INJECTED_IO_REASON = "injected I/O error"
 
-# --- Publication after a producer step's commit --------------------------------------------------
 INTCALC_STEP = 14
 COMBTRAN_STEP = 16
 # The generation each producer step writes in a run-all from the seed, whose catalog is empty:
@@ -256,7 +251,6 @@ INJECTED_PUBLICATION_REASON = "injected rename failure"
 LOST_BLOCKED_COMMANDS = (("run-all",), RERUN_COMMANDS[COMBTRAN_STEP])
 
 
-# --- Value types ---------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ChainSnapshot:
     """The chain's financial state and outputs at one moment, compared before and after a command.
@@ -316,7 +310,6 @@ INTERRUPTION_STARTS = [
 ]
 
 
-# --- Snapshots -----------------------------------------------------------------------------------
 def ReadAccountBalances(connection: Connection) -> dict[str, tuple[Decimal, Decimal, Decimal]]:
     """Return every account's balance, cycle credit and cycle debit, keyed by acct_id."""
     accounts = Account.__table__.c
@@ -404,7 +397,6 @@ def ChainOutcomeSnapshot(engine: Engine, outputDir: Path) -> ChainSnapshot:
     return snapshot
 
 
-# --- The clean-run reference ---------------------------------------------------------------------
 def CleanGenerationDifferences(connection: Connection, outputDir: Path) -> list[str]:
     """Return how each CLEAN_GENERATION_FIXTURES (0) generation differs from its fixture.
 
@@ -467,7 +459,6 @@ def StatementDifferences(outputDir: Path) -> list[str]:
     ]
 
 
-# --- Ledger reads --------------------------------------------------------------------------------
 def SeedRunCeiling(environment: BatchEnvironment) -> int:
     """Return the highest run_id the Alembic seed recorded; every later run is this test's."""
     seedRuns = environment.snapshot.tableRows[JOB_RUNS.fullname]
@@ -521,7 +512,6 @@ def AssertCyclesAtSeed(environment: BatchEnvironment) -> None:
     assert RowsByPrimaryKey(currentRows, CYCLES) == RowsByPrimaryKey(seedRows, CYCLES)
 
 
-# --- Table contents ------------------------------------------------------------------------------
 def ReadModelRows(connection: Connection, sourceTable: Table) -> list[dict[str, object]]:
     """Return every row of sourceTable without its generated *_sort columns."""
     storedColumns = [
@@ -562,7 +552,6 @@ def SampleCardNumbers(environment: BatchEnvironment) -> list[str]:
     return sorted(xrefRow["card_num"] for xrefRow in xrefRows)
 
 
-# --- Commands ------------------------------------------------------------------------------------
 def RunAll(environment: BatchEnvironment, *options: str) -> CliOutcome:
     """Run run-all with the given options and the frozen reconciliation clock."""
     return InvokeCli(["run-all", *options, "--as-of", environment.asOfText])
@@ -602,7 +591,6 @@ def StepId(stepNo: int) -> str:
     return f"step-{stepNo:02d}"
 
 
-# --- Failure and recovery scenarios --------------------------------------------------------------
 def ReloadMarkerSpec(environment: BatchEnvironment) -> SyntheticTransactionSpec:
     """Return one transaction on the first sample card; a committed TRANFILE reload deletes it."""
     return SyntheticTransactionSpec(
@@ -751,7 +739,6 @@ def StartAtTranBackupFromSeed(environment: BatchEnvironment) -> list[dict[str, o
     return runs
 
 
-# --- Interruption scenario -----------------------------------------------------------------------
 def StageSyntheticDailyFile(environment: BatchEnvironment) -> Path:
     """Write 20,000 synthetic daily records over the sample cards and stage them as DALYTRAN."""
     dailyPath = environment.outputDir.parent / SYNTHETIC_DAILY_FILE_NAME
@@ -853,7 +840,6 @@ def AssertPostingStateMatchesOracle(engine: Engine, expected: legacy_oracle.Orac
     assert actual.transactions == expected.transactions
 
 
-# --- Publication scenarios -----------------------------------------------------------------------
 def IsProducedGeneration(finalPath: Path, stepNo: int) -> bool:
     """Return whether finalPath is the final file of the generation step stepNo writes."""
     base, generation = PRODUCED_GENERATIONS[stepNo]
@@ -1001,7 +987,6 @@ def AssertRefusedByLostGeneration(
     assert len(NewRuns(environment)) == runCount
 
 
-# --- Order and shared definitions ----------------------------------------------------------------
 def test_chain_has_18_steps_in_legacy_order_with_durability_classes() -> None:
     durabilityByStep = {step.stepNo: step.durability for step in batch_chain.CHAIN}
     assert tuple(step.stepNo for step in batch_chain.CHAIN) == CHAIN_STEP_NUMBERS
@@ -1024,7 +1009,6 @@ def test_tranbkp_definition_is_shared_by_steps_6_and_15() -> None:
     assert batch_chain.StepsForJob(tranBackup) == (firstOccurrence, secondOccurrence)
 
 
-# --- Resume from the seed, exit policy and --start-at --------------------------------------------
 def test_run_all_from_alembic_seed_runs_only_steps_6_and_13_to_18_and_exits_4(
     batchEnvironment: BatchEnvironment,
 ) -> None:
@@ -1142,7 +1126,6 @@ def test_run_chain_refuses_unknown_start_at_built_in_code(
     AssertCyclesAtSeed(batchEnvironment)
 
 
-# --- Failure at every step, reruns and force -----------------------------------------------------
 @pytest.mark.parametrize("stepNo", CHAIN_STEP_NUMBERS, ids=StepId)
 def test_injected_failure_at_each_step_then_rerun_reaches_clean_result(
     stepNo: int, batchEnvironment: BatchEnvironment
@@ -1225,7 +1208,6 @@ def test_failed_posttran_with_step_6_pending_is_refused_then_forced_from_partial
     assert BackupGenerationCount(engine) == backupCountBefore
 
 
-# --- Publication after the step's commit ---------------------------------------------------------
 @pytest.mark.parametrize("stepNo", PRODUCER_STEPS, ids=StepId)
 def test_publication_error_after_commit_keeps_step_completed_and_next_run_all_skips_it(
     stepNo: int, batchEnvironment: BatchEnvironment
@@ -1257,7 +1239,6 @@ def test_generation_lost_in_publication_stops_chain_and_blocks_cycle_until_new_c
     AssertCleanChainResult(engine, outputDir)
 
 
-# --- SIGKILL of a per-write step -----------------------------------------------------------------
 @pytest.mark.slow
 @pytest.mark.parametrize("interruptionStart", INTERRUPTION_STARTS)
 def test_sigkilled_posttran_is_interrupted_refused_then_forced_from_partial_state(

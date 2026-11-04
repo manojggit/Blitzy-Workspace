@@ -60,7 +60,6 @@ from batch.tests.reconciliation.compare import (
     ReadTableAsOracleState,
 )
 
-# --- The step and its command --------------------------------------------------------------------
 POSTTRAN_JOB = "post-tran"
 POSTTRAN_LEGACY_NAME = "POSTTRAN"
 POSTTRAN_STEP_NO = 13
@@ -73,7 +72,6 @@ EXIT_REFUSED = legacy_oracle.EXIT_UTILITY_FAILURE
 # The recovery paths a refusal of a FAILED or INTERRUPTED per-write step names (AAP 0.6.8).
 RECOVERY_PATH_FRAGMENTS = ("seed-all", "run-all --new-cycle", FORCE_OPTION)
 
-# --- Legacy displays and records -----------------------------------------------------------------
 # DISPLAY 'TRANSACTIONS PROCESSED :' WS-TRANSACTION-COUNT and 'TRANSACTIONS REJECTED  :'
 # WS-REJECT-COUNT (lines 227-228); both counters are PIC 9(09).
 PROCESSED_LABEL = "TRANSACTIONS PROCESSED :"
@@ -89,7 +87,6 @@ PART_FILE_PATTERN = "*.part"
 TCATBAL_CREATE_PREFIX = "TCATBAL record not found for key : "
 TCATBAL_CREATE_SUFFIX = ".. Creating."
 
-# --- Inputs and frozen values --------------------------------------------------------------------
 EBCDIC_DIR = TESTS_DIR.parents[1] / "data" / "EBCDIC"
 DAILY_CSV = LOADER_ROWS_DIR / "daily_transactions.csv"
 SAMPLE_DAILY_RECORD_COUNT = 300
@@ -104,7 +101,6 @@ CREATE_TCATBAL_FUNCTION_NAME = "CreateCategoryBalance"
 INJECTED_STATEMENT = "INJECTED"
 INJECTED_IO_MESSAGE = "injected I/O error"
 
-# --- Synthetic rejects ---------------------------------------------------------------------------
 # InsertSyntheticCards numbers its cards from 1, so card index 0 has no cross-reference (100).
 UNKNOWN_CARD_NUM = SyntheticCardNum(0)
 # One cent over the synthetic credit limit with a zero cycle: WS-TEMP-BAL exceeds it (102).
@@ -135,7 +131,6 @@ class OracleInputs:
     dailyRecords: list[str]
 
 
-# --- Fixtures ------------------------------------------------------------------------------------
 @pytest.fixture(name="sampleInputs", scope="module")
 def SampleInputs() -> OracleInputs:
     """Read the sample state and the 300 DALYTRAN records from the EBCDIC images, once."""
@@ -172,7 +167,6 @@ def FailedPosttran(batchEnvironment: BatchEnvironment) -> CliOutcome:
         return RunPosttranCli(batchEnvironment)
 
 
-# --- Helpers -------------------------------------------------------------------------------------
 def RunPosttranCli(environment: BatchEnvironment, force: bool = False) -> CliOutcome:
     """Run carddemo-batch job post-tran in this process at the frozen clock, forced on request."""
     arguments = ["job", POSTTRAN_JOB, AS_OF_OPTION, environment.asOfText]
@@ -320,7 +314,6 @@ def DailyRecords(rows: list[dict[str, object]]) -> list[str]:
     ]
 
 
-# --- Parity on the sample data -------------------------------------------------------------------
 def test_posttran_on_sample_data_exits_4_with_rejects(
     postedSample: CliOutcome, samplePosting: legacy_oracle.PosttranOutcome
 ) -> None:
@@ -385,7 +378,6 @@ def test_posted_orig_ts_is_copied_from_staged_record_and_proc_ts_is_frozen_clock
     assert CountRows(engine, DailyTransaction.__table__) == SAMPLE_DAILY_RECORD_COUNT
 
 
-# --- Per-write durability and failure ------------------------------------------------------------
 def test_failure_at_record_150_leaves_records_1_to_149_posted_and_exits_16(
     failedPosttran: CliOutcome,
     batchEnvironment: BatchEnvironment,
@@ -473,7 +465,6 @@ def test_posttran_rejects_reach_dalyrejs_with_reason_trailer(
     assert CountRows(engine, Transaction.__table__) == 0
 
 
-# --- The TCATBAL create display through log masking ----------------------------------------------
 def MaskedPosttranMessages(caplog: pytest.LogCaptureFixture) -> list[str]:
     """Return each captured posttran record's message after the batch log masking filter."""
     maskingFilter = PanMaskingFilter()

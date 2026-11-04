@@ -217,7 +217,6 @@ def CheckReportInput(
 
 
 def DrainLines(state: ReportState) -> list[ReportLine]:
-    """Return the lines written since the last drain, in print order, and forget them."""
     writtenLines = state.lines
     state.lines = []
     return writtenLines
@@ -401,7 +400,6 @@ def WriteCountedLine(state: ReportState, line: ReportLine) -> None:
 
 
 def HeaderLine(text: str) -> ReportLine:
-    """A header-kind line: REPORT-NAME-HEADER, the blank line or a TRANSACTION-HEADER line."""
     return ReportLine(line_kind=ReportLineKind.HEADER, text=text)
 
 

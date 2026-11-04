@@ -51,7 +51,6 @@ from app.schemas.users import (
 )
 from app.services.users import cousr00c
 
-# --- Users MixedUsers adds to the ten seed users -------------------------------------------------
 MIXED_CASE_USER_IDS = ("a1", "AA", "A1", "1A")
 EXTRA_USER_IDS = ("ZZ000001", "ZZ000002", "ZZ000003", "ZZ000004", "ZZ000005")
 ADDED_USER_IDS = MIXED_CASE_USER_IDS + EXTRA_USER_IDS
@@ -78,7 +77,6 @@ EXPECTED_FIRST_PAGE_IDS = [
 # The only digit-led user ID sorts after every letter-led one.
 LAST_USER_ID = "1A"
 
-# --- Screen and paging ---------------------------------------------------------------------------
 # WS-USER-DATA, USER-REC OCCURS 10 TIMES (line 57).
 PAGE_ROWS = 10
 ENTRY_PAGE = 0
@@ -106,7 +104,6 @@ END_OF_FILE_SEARCH_KEY = EXTRA_USER_IDS[0]
 BLANK_SEARCH_KEYS = ["", "        "]
 USER_FILE_NAME = "USRSEC"
 
-# --- COUSR00C literals and routes ----------------------------------------------------------------
 AT_TOP_OF_PAGE_MESSAGE = "You are at the top of the page..."
 REACHED_BOTTOM_MESSAGE = "You have reached the bottom of the page..."
 REACHED_TOP_MESSAGE = "You have reached the top of the page..."
@@ -119,7 +116,6 @@ UPDATE_ROUTE = "/admin/users/update?userId=USER0001"
 DELETE_ROUTE = "/admin/users/delete?userId=USER0001"
 INVALID_SELECTION_CODE = "X"
 
-# --- SQL: identifiers only, values always bound --------------------------------------------------
 INSERT_USER_SQL = text(
     "INSERT INTO security.users (user_id, first_name, last_name, password_hash, user_type)"
     " VALUES (:userId, :firstName, :lastName, :passwordHash, :userType)"
@@ -278,7 +274,6 @@ def ShownSelections(shownPage: UserListResponse, code: str) -> list[UserSelectio
     ("coreMessage", "sourceLiteral"), CORE_PAGING_MESSAGES, ids=CORE_PAGING_MESSAGE_IDS
 )
 def test_core_paging_messages_are_the_cousr00c_literals(coreMessage, sourceLiteral):
-    """The shared paging constants the service returns are the COUSR00C literals verbatim."""
     assert coreMessage == sourceLiteral
 
 

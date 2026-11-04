@@ -545,8 +545,9 @@ async def test_file_condition_is_unable_to_update(harness, failure):
 async def test_f3_saves_every_pending_change_through_the_f5_entry_point(harness):
     """F3 performs UPDATE-USER-INFO before it returns (lines 111-119), exactly as F5 does.
 
-    The router therefore calls cousr02c.UpdateUser for both keys; this F3 save of every field
-    at once commits the whole record before the client navigates back.
+    Both keys therefore share one save, cousr02c.UpdateUser, which this case calls directly to
+    verify that every pending field is persisted at once. It does not cover the router's key
+    dispatch or the client's return to the previous screen.
     """
     newPassword = NewPassword()
     request = UserUpdateRequest(
@@ -565,7 +566,6 @@ async def test_f3_saves_every_pending_change_through_the_f5_entry_point(harness)
 
 @pytest.mark.parametrize("produceBody", OUTCOME_BODIES, ids=OUTCOME_BODY_IDS)
 async def test_no_outcome_body_carries_a_password_or_a_hash(harness, produceBody):
-    """Neither the stored or typed password nor the old or new hash reaches any body."""
     hashBefore = StoredUserOf(harness).passwordHash
     outcome = await produceBody(harness)
     hashAfter = StoredUserOf(harness).passwordHash

@@ -307,7 +307,6 @@ async def test_card_is_read_by_card_number_only(ccdl, seedCard):
 
 @pytest.mark.parametrize("buildCardKey", CARD_KEY_BUILDERS)
 async def test_card_is_shown_masked_without_cvv(ccdl, seedCard, buildCardKey):
-    """The seed card, typed or sealed in a card_ref, is shown masked and without its CVV."""
     assert (seedCard.acctId, seedCard.cardNum) == (SEED_ACCT_ID, SEED_CARD_NUM)
     cardKey = buildCardKey(seedCard.cardNum, ccdl.settings)
     detail = await cocrdslc.ViewCard(ccdl.context, cardKey, seedCard.acctId)

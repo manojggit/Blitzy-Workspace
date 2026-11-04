@@ -512,7 +512,10 @@ async def test_s_selection_routes_to_the_transaction_view_before_any_search(
 async def test_invalid_selection_code_answers_the_literal_with_the_browsed_list(
     makeOnlineContext, postedTransactions, syncEngine
 ):
-    """A code other than S keeps its literal over the re-browsed first page: a 400 with rows."""
+    """A nonblank code other than S or s keeps its literal over the re-browsed first page.
+
+    The refusal is a 400 with the page's rows.
+    """
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     firstPage = await ShowFirstPage(context)
     request = SelectionRequest(firstPage, INVALID_SELECTION)

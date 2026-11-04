@@ -1,12 +1,12 @@
 """Replaces: COUSR01C (CU01), BMS COUSR01, copybooks CSUSR01Y.
 
-The admin add-user screen. ENTER (PROCESS-ENTER-KEY) checks the five fields for presence in
-source order, and the first blank one ends validation. It then writes the USRSEC record
-(WRITE-USER-SEC-FILE) with the values as keyed: nothing is upper-cased and the user type is
-not restricted, so any non-blank character is stored. Only exactly ``A`` later signs on as an
-admin. The password is stored as a bcrypt hash of the text as entered, case kept. Sign-on
-upper-cases its input (COSGN00C), so a password created in lower case never signs on; that is
-the legacy outcome and is kept.
+The admin add-user screen. ENTER (PROCESS-ENTER-KEY) checks the five fields for presence only,
+in source order (lines 117-151), and the first blank one ends validation. It then moves the
+values into the USRSEC record as keyed (lines 154-158) and writes it (WRITE-USER-SEC-FILE):
+nothing is upper-cased and the user type is not restricted, so any non-blank character is
+stored. Only exactly ``A`` later signs on as an admin. The password is stored as a bcrypt hash
+of the text as entered, case kept. Sign-on upper-cases its input (COSGN00C lines 132-136), so a
+password created in lower case never signs on; that is the legacy outcome and is kept.
 
 Legacy paths with no code here: ``EIBCALEN = 0`` (back to sign-on) is the admin guard and its
 401; PF3 (``XCTL COADM01C``) and PF4 (CLEAR-CURRENT-SCREEN) are frontend navigation and form
@@ -89,7 +89,6 @@ def IsBlank(value: str) -> bool:
 
 
 def TrimFieldPadding(value: str) -> str:
-    """Return the keyed text without its trailing BMS padding; leading spaces are kept."""
     return value.rstrip(FIELD_PADDING)
 
 

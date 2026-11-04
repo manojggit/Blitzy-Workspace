@@ -111,7 +111,6 @@ if TYPE_CHECKING:
     from app.core.config import Settings
     from app.core.dependencies import OnlineContext
 
-# --- Database and HTTP ---------------------------------------------------------------------------
 TEST_DATABASE_NAME = "carddemo_test"
 TEST_DATABASE_SUFFIX = "_test"
 # Connection keywords of libpq (psycopg2) and asyncpg that name a server or a database. SQLAlchemy
@@ -125,14 +124,12 @@ API_BASE_URL = "http://127.0.0.1:8000"
 LOGIN_PATH = "/api/v1/auth/login"
 HTTP_OK = 200
 
-# --- Environment ---------------------------------------------------------------------------------
 TEST_APP_ENV = "test"
 SECRET_KEY_BYTES = 48
 TEST_BCRYPT_ROUNDS = "4"
 RESTORE_LOCK_TIMEOUT = "10s"
 RESET_LOCK_TIMEOUT = "30s"
 
-# --- Paths and Alembic ---------------------------------------------------------------------------
 ALEMBIC_INI_PATH = REPO_ROOT / "backend" / "alembic.ini"
 ALEMBIC_HEAD = "head"
 ALEMBIC_URL_OPTION = "sqlalchemy.url"
@@ -140,7 +137,6 @@ ALEMBIC_URL_OPTION = "sqlalchemy.url"
 ALEMBIC_LOGGING_ATTRIBUTE = "configure_logger"
 USRSEC_IMAGE_PATH = REPO_ROOT / "data" / "EBCDIC" / "AWS.M2.CARDDEMO.USRSEC.PS"
 
-# --- USRSEC record layout: copybook CSUSR01Y, SEC-USER-DATA, 80 bytes ----------------------------
 USRSEC_RECORD_LENGTH = 80
 USRSEC_ID_SLICE = slice(0, 8)
 USRSEC_FIRST_NAME_SLICE = slice(8, 28)
@@ -150,7 +146,6 @@ USRSEC_TYPE_SLICE = slice(56, 57)
 EBCDIC_CODEC = "cp037"
 FIELD_PADDING = " "
 
-# --- Generated sign-on users ---------------------------------------------------------------------
 # COSGN00C upper-cases USERID and PASSWD (cbl/COSGN00C.cbl lines 132-136), and map COSGN00 keys
 # at most 8 characters of each, so generated IDs (7 characters) and passwords (8) are
 # upper-case and cp037-printable: they sign on exactly as created.
@@ -162,13 +157,11 @@ TEST_USER_LAST_NAME_PREFIX = "Type "
 ADMIN_USER_TYPE = "A"
 REGULAR_USER_TYPE = "U"
 
-# --- SQL with identifiers only; values are always bound ------------------------------------------
 LOCK_TIMEOUT_SETTING = "lock_timeout"
 DROP_VERSION_TABLE_SQL = "DROP TABLE IF EXISTS public.alembic_version"
 DROP_SORT_KEY_FUNCTION_SQL = "DROP FUNCTION IF EXISTS public.ebcdic_sort_key(text)"
 DEFER_CONSTRAINTS_SQL = "SET CONSTRAINTS ALL DEFERRED"
 
-# --- Failure messages ----------------------------------------------------------------------------
 MISSING_URLS_MESSAGE = (
     "The test database URLs are not set or not valid. Copy backend/.env.example to backend/.env"
     " and set DATABASE_URL and SYNC_DATABASE_URL, or TEST_DATABASE_URL and"
@@ -208,7 +201,6 @@ UNREACHABLE_DATABASE_MESSAGE = (
 )
 USRSEC_SIZE_MESSAGE = "{path} holds {size} bytes, not a multiple of the 80-byte USRSEC record."
 
-# --- Server identity: what one connection reached, read the same way by both drivers -------------
 DATABASE_IDENTITY_QUERY = select(
     func.current_database(),
     func.host(func.inet_server_addr()),
@@ -217,7 +209,6 @@ DATABASE_IDENTITY_QUERY = select(
 )
 
 
-# --- Value objects -------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class DatabaseUrls:
     """The asyncpg and psycopg2 URLs of the test database; repr hides their passwords."""
@@ -323,7 +314,6 @@ class DatabaseUrlSettings(BaseSettings):
     TEST_SYNC_DATABASE_URL: str = Field(default="", repr=False)
 
 
-# --- Environment bootstrap -----------------------------------------------------------------------
 def RenameDatabase(url: str, databaseName: str) -> str:
     """Return ``url`` naming ``databaseName``; "" for a blank URL or one that does not parse."""
     if not url.strip():
@@ -371,7 +361,6 @@ def BootstrapTestEnvironment() -> DatabaseUrls:
 TEST_DATABASE_URLS = BootstrapTestEnvironment()
 
 
-# --- Database preparation (sync, psycopg2) -------------------------------------------------------
 def ParseDatabaseUrl(url: str) -> URL:
     """Return ``url`` parsed; fail the test run when it does not parse or names no database.
 
@@ -613,7 +602,6 @@ def RestoreSeedSnapshot(syncEngine: Engine, snapshot: SeedSnapshot) -> None:
         ResetSerialSequences(connection)
 
 
-# --- Server identity: asyncpg and psycopg2 must reach one database of one server -----------------
 def ReadServerIdentity(syncEngine: Engine) -> ServerIdentity:
     """Return the ServerIdentity of ``syncEngine``, after checking its connected database.
 
@@ -661,7 +649,6 @@ def RequireOneServer(asyncIdentity: ServerIdentity, syncIdentity: ServerIdentity
         pytest.fail(failureText, pytrace=False)
 
 
-# --- Seed users: the USRSEC image, decoded independently of app.seed.image_reader ----------------
 def DecodeUsrsecRecord(record: bytes) -> SeedUser:
     """Return one 80-byte cp037 SEC-USER-DATA record, sliced by the CSUSR01Y offsets."""
     recordText = record.decode(EBCDIC_CODEC)
@@ -686,7 +673,6 @@ def ReadSeedUsers() -> tuple[SeedUser, ...]:
     )
 
 
-# --- Application, client and user helpers --------------------------------------------------------
 def BuildClient(application: "FastAPI") -> httpx.AsyncClient:
     """Return a client of ``application`` that sends the allow-listed Origin OriginGuard checks."""
     return httpx.AsyncClient(
@@ -801,7 +787,6 @@ class OnlineContextFactory:
                 await context.session.close()
 
 
-# --- Fixtures ------------------------------------------------------------------------------------
 @pytest.fixture(name="databaseUrls", scope="session")
 def DatabaseUrlsFixture() -> DatabaseUrls:
     """Return the test database URLs resolved when this module was imported."""

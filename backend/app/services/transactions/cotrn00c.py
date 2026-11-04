@@ -259,7 +259,6 @@ def _NormalisedPage(page: int) -> int:
 def _FindFirstSelection(
     selections: Sequence[TransactionSelection],
 ) -> TransactionSelection | None:
-    """Return the first row whose SELnnnn code is not blank; later codes are ignored."""
     for selection in selections:
         if not _IsBlank(selection.selection):
             return selection
@@ -267,7 +266,6 @@ def _FindFirstSelection(
 
 
 def _ViewRoute(tranId: str) -> str:
-    """Return the Transaction View route with the selected TRAN-ID exactly as displayed."""
     return f"{VIEW_ROUTE}?{urlencode({ROUTE_TRAN_ID_PARAMETER: tranId})}"
 
 
@@ -537,7 +535,6 @@ def _InvalidSelectionRefusal(state: ListState) -> LegacyMessageError:
 def _BuildListResponse[ResponseModel: TransactionListResponse](
     state: ListState, responseModel: type[ResponseModel]
 ) -> ResponseModel:
-    """Return the COTRN00 screen: rows, page number, keys, ERRMSG, cursor and TRNIDIN blanking."""
     return responseModel(
         rows=[_BuildRow(record) for record in state.rows],
         page=state.page,

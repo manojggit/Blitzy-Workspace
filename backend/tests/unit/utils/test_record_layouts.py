@@ -683,3 +683,24 @@ def test_encode_record_withholds_an_overlong_password():
     AssertNamesField(message, SEC_USR_PWD_FIELD)
     assert "9 characters exceed the length 8" in message
     AssertWithheld(message, secretText)
+
+
+@pytest.mark.parametrize("lengthChange", (1, -1), ids=("one-over-long", "one-short"))
+def test_encode_record_refuses_a_record_of_another_length(lengthChange, monkeypatch):
+    layout, columns = SAMPLE_COLUMNS[ACCT_ID_FIELD.layoutName]
+    acctIdKind = layout.fields[0].kind
+    realEncoder = record_layouts._ENCODERS[acctIdKind]
+
+    def MisfittingEncoder(values, field):
+        fieldText = realEncoder(values, field)
+        if field.name == ACCT_ID_FIELD.columnName:
+            return (fieldText + " ")[: field.length + lengthChange]
+        return fieldText
+
+    monkeypatch.setitem(record_layouts._ENCODERS, acctIdKind, MisfittingEncoder)
+    with pytest.raises(RecordFormatError) as refusal:
+        EncodeRecord(columns, layout)
+    assert str(refusal.value) == (
+        f"CVACT01Y: the encoded record is {300 + lengthChange} characters long; its LRECL is 300"
+    )
+    assert (refusal.value.fieldName, refusal.value.fieldOffset) == (None, None)

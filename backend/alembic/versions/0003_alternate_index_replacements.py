@@ -12,8 +12,9 @@ PATH plus BLDINDEX needs no counterpart because PostgreSQL maintains an index on
 ``ix_transactions_proc_ts`` is the name batch/jobs/tranidx.py re-creates and re-indexes.
 
 VSAM orders keys by their cp037 bytes, so lower case sorts before upper case and both before
-digits. ``public.ebcdic_sort_key`` maps every cp037 printable character (bytes X'40'-X'FE') to
-the code point equal to its byte; under ``COLLATE "C"`` UTF-8 byte order is code-point order,
+digits. ``public.ebcdic_sort_key`` maps the character of each cp037 byte X'40'-X'FE' to the code
+point equal to its byte; the range holds the whole cp037 printable repertoire plus the non-printing
+U+00A0 (X'41') and U+00AD (X'CA'). Under ``COLLATE "C"`` UTF-8 byte order is code-point order,
 so ordering by the stored, indexed ``*_sort`` columns is EBCDIC key order for any key a 3270
 field can carry. The digit-checked keys acct_id and cust_id sort alike in both code pages and
 get no sort column. The generated expressions call the function unqualified, as the models do,
@@ -39,7 +40,8 @@ down_revision: str | Sequence[str] | None = "0002"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
-# The cp037 printable bytes X'40'-X'FE': 191 characters, X'40' being the space.
+# The 191 cp037 bytes X'40'-X'FE', X'40' being the space: every printable character plus the
+# non-printing X'41' (U+00A0) and X'CA' (U+00AD).
 EBCDIC_PRINTABLE_BYTES = range(0x40, 0xFF)
 EBCDIC_CODE_PAGE = "cp037"
 
@@ -148,8 +150,8 @@ class UnicodeEscapedText(sa.types.TypeDecorator):
 
 
 def BuildSortKeyTranslation() -> tuple[str, str]:
-    """Return translate()'s from and to strings: each cp037 printable character, in byte order,
-    and the code point equal to that character's cp037 byte (space to U+0040, a to U+0081).
+    """Return translate()'s from and to strings: the characters of cp037 bytes X'40'-X'FE', in byte
+    order, and the code point equal to each character's cp037 byte (space to U+0040, a to U+0081).
     """
     fromChars = bytes(EBCDIC_PRINTABLE_BYTES).decode(EBCDIC_CODE_PAGE)
     toChars = "".join(chr(byteValue) for byteValue in EBCDIC_PRINTABLE_BYTES)
@@ -182,7 +184,6 @@ def AddSortColumn(sortSpec: SortColumnSpec) -> None:
 
 
 def DropSortColumn(sortSpec: SortColumnSpec) -> None:
-    """Drop one generated sort column."""
     op.drop_column(sortSpec.table, sortSpec.sortColumn, schema=sortSpec.schema)
 
 
@@ -198,7 +199,6 @@ def CreateAixIndex(indexSpec: AixIndexSpec) -> None:
 
 
 def DropAixIndex(indexSpec: AixIndexSpec) -> None:
-    """Drop one index created by CreateAixIndex."""
     op.drop_index(op.f(indexSpec.indexName), table_name=indexSpec.table, schema=indexSpec.schema)
 
 

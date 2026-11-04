@@ -1,4 +1,5 @@
-"""Replaces: COTRN02C (CT02), BMS COTRN02, copybooks CVTRA05Y, CVACT01Y, CVACT03Y, CSUTLDTC
+"""Replaces: COTRN02C (CT02), BMS COTRN02, copybooks CVTRA05Y, CVACT01Y, CVACT03Y
+and the called date-validation program CSUTLDTC (app.utils.date_validation).
 
 The Transaction Add screen, served as ``POST /api/v1/transactions``. ENTER (``enter``) runs
 PROCESS-ENTER-KEY: the key edits (VALIDATE-INPUT-KEY-FIELDS), the data edits
@@ -136,7 +137,8 @@ DATE_MASK = ISO_DATE_MASK
 TRAN_AMT_INT_DIGITS = 9
 TRAN_AMT_DEC_DIGITS = 2
 # EVALUATE CONFIRMI: WHEN 'Y' 'y' adds; WHEN 'N' 'n' SPACES prompts (a one-character field
-# keyed blank is a space; LOW-VALUES cannot arrive, as a 3270 field never sends it).
+# keyed blank is a space). WHEN LOW-VALUES needs no entry: an untouched field arrives as ""
+# and pads to a space, and ScreenText's code-page-037 printable check refuses NUL with 422.
 CONFIRM_ADD_VALUES = frozenset({"Y", "y"})
 CONFIRM_PROMPT_VALUES = frozenset({"N", "n", " "})
 
@@ -347,7 +349,6 @@ def IsNumericField(text: str, length: int) -> bool:
 
 
 def TrimPadding(text: str) -> str:
-    """Return the text without its trailing field padding; leading spaces are kept."""
     return text.rstrip(FIELD_PADDING)
 
 

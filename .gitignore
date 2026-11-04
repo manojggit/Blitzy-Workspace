@@ -18,7 +18,6 @@ var/
 frontend/test-results/
 frontend/playwright-report/
 
-# Coverage data
 .coverage
 
 # Tool-generated artefacts

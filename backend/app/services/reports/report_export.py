@@ -21,6 +21,7 @@ import array
 import csv
 import io
 import itertools
+import re
 from collections.abc import Iterable, Iterator, Sequence
 from decimal import Decimal
 
@@ -49,8 +50,10 @@ CSV_TEXT_COLUMNS = tuple(column for column in CSV_COLUMNS if column != CSV_AMOUN
 CSV_CAT_CD_COLUMN = "cat_cd"
 CAT_CD_DIGITS = 4
 CSV_ENCODING = "utf-8"
-# A spreadsheet runs a cell starting with one of these as a formula; the apostrophe makes it text.
-FORMULA_PREFIXES = ("=", "+", "-", "@")
+# A text cell a spreadsheet may run as a formula: one starting with a tab, CR or LF, or one whose
+# first character after any whitespace, C0 controls or DEL an import may skip is =, +, - or @.
+# The apostrophe in front makes it text.
+FORMULA_CELL_PATTERN = re.compile(r"[\t\r\n]|[\s\x00-\x1f\x7f]*[=+\-@]")
 FORMULA_GUARD = "'"
 
 CSV_MEDIA_TYPE = "text/csv; charset=utf-8"
@@ -62,7 +65,6 @@ PDF_MEDIA_TYPE = "application/pdf"
 # line, while a chunk in hand stays small beside the report.
 REPORT_CHUNK_BYTES = 16 * 1024
 
-# One chunk of a document, as every renderer yields it: encoded bytes.
 type ReportChunk = bytes
 
 # 133 Courier columns at 8 pt take 133 x 4.8 = 638.4 pt, inside the 720 pt between the 36 pt
@@ -120,17 +122,18 @@ JSON_LINE_SEPARATOR = b","
 def GuardCsvCell(text: str) -> str:
     """Return text prefixed with an apostrophe when a spreadsheet would run it as a formula.
 
-    Descriptions and sources keyed online in CT02 reach the report as entered, so a text cell
-    starting with ``=``, ``+``, ``-`` or ``@`` gets ``'`` in front. Amounts are never guarded:
-    a negative amount such as ``-12.34`` is numeric data.
+    Descriptions and sources keyed online in CT02, and sources posted from the DALYTRAN image
+    with any control characters it decodes to, reach the report as entered, so a text cell
+    ``FORMULA_CELL_PATTERN`` matches gets ``'`` in front. Amounts are never guarded: a negative
+    amount such as ``-12.34`` is numeric data.
 
     Args:
         text: The text of one CSV cell.
 
     Returns:
-        ``'`` plus text when text starts with a formula prefix, otherwise text unchanged.
+        ``'`` plus text when ``FORMULA_CELL_PATTERN`` matches its start, otherwise text unchanged.
     """
-    if text.startswith(FORMULA_PREFIXES):
+    if FORMULA_CELL_PATTERN.match(text):
         return FORMULA_GUARD + text
     return text
 
@@ -221,7 +224,6 @@ def IterateCsv(lines: Iterable[ReportLine]) -> Iterator[bytes]:
 
 
 def RenderCsv(lines: Iterable[ReportLine]) -> bytes:
-    """Return the whole CSV document ``IterateCsv`` yields for the report lines."""
     return b"".join(IterateCsv(lines))
 
 
@@ -401,7 +403,6 @@ def IteratePdf(lines: Iterable[ReportLine]) -> Iterator[bytes]:
 
 
 def RenderPdf(lines: Iterable[ReportLine]) -> bytes:
-    """Return the whole PDF document ``IteratePdf`` yields for the report print lines."""
     return b"".join(IteratePdf(lines))
 
 
@@ -467,9 +468,4 @@ def IterateJson(
 
 
 def RenderJson(envelope: TransactionReportResponse, lines: Iterable[ReportLine]) -> bytes:
-    """Return the whole screen JSON ``IterateJson`` yields for ``envelope`` and ``lines``.
-
-    Raises:
-        ReportJsonEnvelopeError: As ``SplitJsonEnvelope``.
-    """
     return b"".join(IterateJson(envelope, lines))
