@@ -115,6 +115,8 @@ const FIELD_LABELS: Readonly<Record<BillPayInputName, string>> = {
     acct_id: "Enter Acct ID:",
     confirm: "Do you want to pay your balance now. Please confirm:",
 };
+// ACTIDIN and CONFIRM, the map's two unprotected fields.
+const KEYED_INPUT_NAMES: readonly BillPayInputName[] = ["acct_id", "confirm"];
 const BALANCE_LABEL = "Your current balance is:";
 const CONFIRM_HINT = "Y/N";
 
@@ -416,10 +418,13 @@ async function Settle(settleCall: () => void): Promise<void> {
     });
 }
 
-// The 3270 keyboard lock: ACTIDIN, CONFIRM, ENTER and F4 are frozen, F3 still leaves.
+// The 3270 keyboard lock: ACTIDIN and CONFIRM are read-only, never disabled, so the field holding
+// the cursor keeps it; ENTER and F4 are frozen, F3 still leaves.
 function ExpectKeyboardLocked(): void {
-    expect(InputOf("acct_id")).toBeDisabled();
-    expect(InputOf("confirm")).toBeDisabled();
+    for (const name of KEYED_INPUT_NAMES) {
+        expect(InputOf(name)).toHaveAttribute("readonly");
+        expect(InputOf(name)).toBeEnabled();
+    }
     expect(screen.getByRole("button", { name: MAP_KEYS.ENTER.button })).toBeDisabled();
     expect(screen.getByRole("button", { name: MAP_KEYS.F4.button })).toBeDisabled();
     expect(screen.getByRole("button", { name: MAP_KEYS.F3.button })).toBeEnabled();
@@ -448,8 +453,9 @@ async function TryToEditWhileLocked(user: UserEvent, confirmSent: string): Promi
 
 // Physical keys reach the useFunctionKeys window listener. They all run inside one act, so no
 // render, and no effect handing the keys their disabled state, runs between two presses. The
-// pointer first leaves the inputs: an input focused when the busy render disables it would have
-// MUI's FormControl update its focus state during act's final flush, outside act.
+// pointer first leaves the inputs: an input still focused when the answer moves the cursor to
+// another field would have MUI's FormControl update its focus state during act's final flush,
+// outside act.
 async function PressInOneTurn(user: UserEvent, keyNames: readonly string[]): Promise<void> {
     await user.click(document.body);
     await act(async () => {
@@ -457,14 +463,6 @@ async function PressInOneTurn(user: UserEvent, keyNames: readonly string[]): Pro
             window.dispatchEvent(new KeyboardEvent("keydown", { key: keyName, bubbles: true }));
         }
     });
-}
-
-// A click on the ENTER key leaves the cursor in its field, as a PF key never moved it, and the
-// busy render then disables that focused field. As in PressInOneTurn, the pointer first leaves
-// the inputs, so MUI's FormControl does not update its focus state outside act.
-async function ClickEnterWithNoFieldFocused(user: UserEvent): Promise<void> {
-    await user.click(document.body);
-    await UseMapKey(user, "ENTER", "button");
 }
 
 // The confirmed payment screen as sent: the account, the Y answer and the CURBAL shown.
@@ -590,8 +588,8 @@ it.each(LITERAL_CASES)(
     },
 );
 
-// The lock disables the field ENTER is pressed in, which keeps the browser focus through the
-// call; the answer naming that field gives it back its focused outline and floated label.
+// The lock leaves the field ENTER is pressed in read-only, so it keeps the cursor, its focused
+// outline and its floated label through the call and once the answer names it.
 it.each(KEYED_FIELD_FAILURES)(
     "COBIL00C $message after ENTER in $cursorField leaves that field focused",
     async (literalCase) => {
@@ -628,13 +626,15 @@ it("COBIL00C keyboard lock: nothing is keyed while PayBill runs", async () => {
     const pendingPayBill = DeferPayBill();
     const user = RenderScreen();
     await KeyRequest(user, PROMPT_REQUEST);
-    await ClickEnterWithNoFieldFocused(user);
+    await PressKey(user, MAP_KEYS.ENTER.key);
     ExpectKeyboardLocked();
+    // ENTER was pressed in ACTIDIN, which keeps the cursor while the call runs.
+    expect(InputOf("acct_id")).toHaveFocus();
     await TryToEditWhileLocked(user, "");
     await Settle(() => pendingPayBill.Answer(BuildBillPayResponse()));
     await ExpectAlert(CONFIRM_PAYMENT_MESSAGE, "error");
-    expect(InputOf("acct_id")).toBeEnabled();
-    expect(InputOf("confirm")).toBeEnabled();
+    expect(InputOf("acct_id")).not.toHaveAttribute("readonly");
+    expect(InputOf("confirm")).not.toHaveAttribute("readonly");
     expect(InputOf("confirm")).toHaveFocus();
     expect(BalanceField()).toHaveValue(TEST_BALANCE);
     expect(InputOf("acct_id")).toHaveValue(TEST_ACCOUNT_ID);
@@ -648,8 +648,10 @@ it("COBIL00C PF4 is locked during PayBill, so its answer applies to the screen s
     await ShowConfirmPrompt(user);
     const pendingPayBill = DeferPayBill();
     await KeyInto(user, "confirm", "Y");
-    await ClickEnterWithNoFieldFocused(user);
+    await PressKey(user, MAP_KEYS.ENTER.key);
     ExpectKeyboardLocked();
+    // ENTER was pressed in CONFIRM, which keeps the cursor while the call runs.
+    expect(InputOf("confirm")).toHaveFocus();
     await TryToEditWhileLocked(user, "Y");
     await Settle(() => pendingPayBill.Fail(FailureOf(DUPLICATE_TRAN_ID_CASE)));
     await ExpectAlert(TRAN_ID_EXISTS_MESSAGE, "error");

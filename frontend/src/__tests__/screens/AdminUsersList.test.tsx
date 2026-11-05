@@ -807,6 +807,76 @@ it.each(TRIGGERS)(
     },
 );
 
+// COUSR00C WHEN OTHER (lines 132-135): an AID outside ENTER, PF3, PF7 and PF8 sets ERR-FLG, moves
+// -1 to USRIDINL and sends CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy) over the map as it stood; no
+// file is browsed.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
+const UNBOUND_KEYS: readonly string[] = ["F4", "F5", "F12"];
+
+// A PF key the legend lacks, pressed where the cursor is; the event tells whether its browser
+// default was blocked.
+async function PressUnboundKey(keyName: string): Promise<KeyboardEvent> {
+    const keyInit = { key: keyName, bubbles: true, cancelable: true };
+    const keyEvent = new KeyboardEvent("keydown", keyInit);
+    await act(async () => {
+        (document.activeElement ?? document.body).dispatchEvent(keyEvent);
+    });
+    return keyEvent;
+}
+
+// Types the search key, then picks U on row 2, which leaves the cursor in SEL0002.
+async function KeyListInput(user: UserEvent): Promise<void> {
+    await user.type(SearchField(), SEARCH_TEXT);
+    await ChooseSelection(user, SELECTED_ROW_NUMBER, "U");
+}
+
+// The next ENTER sends the U code beside its row's user and the search key, so the invalid key
+// left both as they were.
+async function ExpectKeyedInputSentByEnter(user: UserEvent): Promise<void> {
+    mockSelectUsers.mockResolvedValueOnce({ route: `/admin/users/update?userId=${TEST_USER_ID}` });
+    await PressKey(user, "ENTER");
+    const chosen = { rowNumber: SELECTED_ROW_NUMBER, code: "U" };
+    const selections = ExpectedSelections(FIRST_PAGE_ROWS, chosen);
+    expect(mockSelectUsers).toHaveBeenCalledWith({ selections, search_user_id: SEARCH_TEXT });
+}
+
+it.each(UNBOUND_KEYS)(
+    "COUSR00C %s shows the invalid-key literal in red, browses nothing and keeps the map",
+    async (keyName) => {
+        const user = await RenderLoadedScreen();
+        await KeyListInput(user);
+        const keyEvent = await PressUnboundKey(keyName);
+        await ExpectAlert(INVALID_KEY_MESSAGE, ERRMSG_SEVERITY);
+        expect(keyEvent.defaultPrevented).toBe(true);
+        await waitFor(() => expect(SearchField()).toHaveFocus());
+        expect(SearchField()).toHaveAttribute("aria-invalid", "false");
+        expect(mockListUsers).toHaveBeenCalledTimes(1);
+        expect(mockSelectUsers).not.toHaveBeenCalled();
+        expect(mockRouterPush).not.toHaveBeenCalled();
+        expect(BodyRowTexts()).toEqual(RowTextsOf(FIRST_PAGE_ROWS));
+        expect(SearchField()).toHaveValue(SEARCH_TEXT);
+        expect(screen.getByText("Page: 1")).toBeVisible();
+        await ExpectKeyedInputSentByEnter(user);
+    },
+);
+
+// The keys wait while a browse runs, the invalid-key action with them, so the browse's answer is
+// what the screen shows.
+it.each(UNBOUND_KEYS)("COUSR00C %s while an F8 browse runs answers nothing", async (keyName) => {
+    const user = await RenderLoadedScreen();
+    const answerBrowse = HoldNextBrowse();
+    await PressKey(user, "F8");
+    expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+    const keyEvent = await PressUnboundKey(keyName);
+    expect(keyEvent.defaultPrevented).toBe(true);
+    expect(screen.queryByRole("alert")).toBeNull();
+    await answerBrowse(BuildListResponse({ rows: OTHER_PAGE_ROWS, page: 2 }));
+    await ExpectKeysReady();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(BodyRowTexts()).toEqual(RowTextsOf(OTHER_PAGE_ROWS));
+    expect(mockListUsers).toHaveBeenCalledTimes(2);
+});
+
 // The session refusal has a blank message; the apiClient interceptor, not the page, sends the
 // browser to sign-on, as EIBCALEN = 0 returned to COSGN00C.
 it("COUSR00C 401 on the first browse shows no message; apiClient owns /signon", async () => {

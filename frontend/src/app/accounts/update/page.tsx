@@ -53,7 +53,12 @@ import {
     type MessageSeverity,
     type ScreenFeedback,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition, type PfKey } from "@/lib/useFunctionKeys";
+import {
+    EnterKeyOf,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+    type PfKey,
+} from "@/lib/useFunctionKeys";
 
 type AccountFieldName = keyof AccountScreenFields;
 
@@ -1021,7 +1026,9 @@ function AccountMessageLine({ feedback }: AccountMessageLineProps) {
 
 function AccountUpdateScreen() {
     const { view, feedback, isBusy, keys, legendKeys } = useAccountUpdateScreen();
-    useFunctionKeys(keys);
+    // PFK-INVALID: an AID outside ENTER, PF3, PF5 and PF12 does SET CCARD-AID-ENTER, so an unbound
+    // PF key sends action "enter"; the server turns an F5 or F12 its state refuses into ENTER.
+    useFunctionKeys(keys, EnterKeyOf(keys));
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}
@@ -1046,7 +1053,9 @@ function AccountUpdateEntry() {
     return <AccountUpdateScreen key={JSON.stringify([acctId])} />;
 }
 
-// useSearchParams needs a Suspense boundary for the static prerender of npm run build.
+// useSearchParams needs a Suspense boundary wherever Next.js prerenders a page. The route layout
+// renders this one on demand, so the query is known on the first render and the empty fallback
+// never shows.
 export default function AccountUpdatePage() {
     return (
         <Suspense fallback={null}>

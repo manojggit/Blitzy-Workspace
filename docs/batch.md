@@ -558,6 +558,13 @@ in them is created, read, renamed and deleted relative to the open directory, ne
 link at its name. A `gdg` or base directory that is a symbolic link, or not a directory, is
 refused with `gdg.ManagedDirectoryError` and exit 12 ([Recovery](#recovery)).
 
+Every archive path is derived from the fixed base name and the generation number, never taken
+from the catalog: a row's `file_path` must be exactly `<BASE>/G####V00.dat` for its base and
+generation. A row whose `base_name` is not one of the four bases above, or whose `file_path` is
+anything else, such as an absolute path or one climbing out with `..`, is refused with
+`gdg.CatalogPathError` and exit 12 before anything is read, renamed or deleted for it, and its
+state is left unchanged ([Recovery](#recovery)).
+
 ### Publication
 
 Publishing a generation takes these steps:
@@ -646,6 +653,13 @@ name stays on that line. The batch window is released. Every command stops the s
 the path is repaired; the next command then reconciles the catalog as above. A `gdg` or base
 directory that is a symbolic link stops the command the same way, with one
 `FILE ERROR ManagedDirectoryError` line naming it, before anything is deleted through it.
+
+A catalog row whose path is refused ([GDG archives](#gdg-archives)) stops the command with exit
+12 wherever the command meets it: in recovery, publication, `SCRATCH` retention, the `LOST` check
+or a `(0)` or `(-n)` reference. One ERROR line names the generation and the stored `file_path`, with
+non-printable characters escaped, and one `FILE ERROR CatalogPathError ERRNO EINVAL` line
+follows, before anything is read, renamed or deleted for the row. Each later command that meets
+the row stops the same way until the row is repaired.
 
 ### Lost generations
 
@@ -1026,6 +1040,19 @@ To abandon any `OPEN` cycle and run the loaders of steps 1–5 and 7–12 in a n
 .venv/bin/carddemo-batch seed-all
 ```
 
+The `seed-all` syntax, with optional arguments in square brackets:
+
+```text
+.venv/bin/carddemo-batch seed-all [--source-dir DIRECTORY] [--daily-file PATH]
+```
+
+`--source-dir` replaces `CARDDEMO_EBCDIC_DIR` as the directory of the images steps 1–5 and 7–11
+read. Without `--daily-file`, step 12 also stages `AWS.M2.CARDDEMO.DALYTRAN.PS` from that
+directory; `--daily-file` names the daily image step 12 stages instead. A relative `DIRECTORY` or
+`PATH` resolves against the repository root ([Options](#options)). `seed-all` takes no
+`--encoding` and always reads EBCDIC images, because the TRANFILE and DUSRSECJ images exist in
+EBCDIC only.
+
 `seed-all` is destructive to the configured database: it replaces every loaded table.
 
 ### Run one job
@@ -1117,9 +1144,9 @@ Each option configures the commands or steps named:
 | `--occurrence` | `job tran-backup` | `1` for step 6, `2` for step 15 |
 | `--run-date DATE` | INTCALC, step 14 | The 10-character `PARM-DATE`; default `2022071800` |
 | `--as-of TIMESTAMP` | POSTTRAN, INTCALC | The value `Clock.Now()` returns |
-| `--daily-file PATH` | DALYTRAN, step 12 | The daily image to stage |
+| `--daily-file PATH` | DALYTRAN, step 12; `seed-all` | The daily image to stage |
 | `--encoding` | Loaders, DALYTRAN | `ebcdic` (the default) or `ascii` |
-| `--source-dir DIRECTORY` | Loaders | The directory holding the images |
+| `--source-dir DIRECTORY` | Loaders, `seed-all` | The directory holding the images |
 
 `DATE` is a 10-character text such as `2022071800`. `TIMESTAMP` is an ISO timestamp such as
 `2022-07-18T00:00:00`. `PATH` and `DIRECTORY` are file-system paths; a relative one is resolved

@@ -67,8 +67,8 @@ function FindDefinition(
 }
 
 // The screen's ENTER, as the invalid-key action of the screens whose PFK-INVALID check does SET
-// CCARD-AID-ENTER (COCRDLIC, COCRDSLC, COCRDUPC): an unbound PF key runs ENTER, ENTER's own
-// disabled state included.
+// CCARD-AID-ENTER (COACTVWC, COACTUPC, COCRDLIC, COCRDSLC, COCRDUPC): an unbound PF key runs
+// ENTER, ENTER's own disabled state included.
 export function EnterKeyOf(
     definitions: readonly FunctionKeyDefinition[],
 ): FunctionKeyDefinition | undefined {

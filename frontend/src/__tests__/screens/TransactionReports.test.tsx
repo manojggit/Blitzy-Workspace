@@ -1083,26 +1083,42 @@ async function WaitForRequestEnd(): Promise<void> {
     await waitFor(() => expect(screen.queryByRole("progressbar")).not.toBeInTheDocument());
 }
 
-// The three report types, the six date parts and CONFIRM, in map order.
-function CriteriaControls(): HTMLElement[] {
-    return [
-        ...REPORT_TYPE_LABELS.map((label) => ReportTypeButton(label)),
-        ...DATE_PARTS.map((part) => DatePartInput(part)),
-        ConfirmInput(),
-    ];
+// The six date parts and CONFIRM, in map order.
+function CriteriaInputs(): HTMLElement[] {
+    return [...DATE_PARTS.map((part) => DatePartInput(part)), ConfirmInput()];
 }
 
-// The 3270 keyboard lock: every criteria control and ENTER are frozen, F3 still leaves.
+// The three report types, then the date parts and CONFIRM, in map order.
+function CriteriaControls(): HTMLElement[] {
+    return [...REPORT_TYPE_LABELS.map((label) => ReportTypeButton(label)), ...CriteriaInputs()];
+}
+
+// The 3270 keyboard lock: every criteria input is read-only and every report-type segment reads
+// as unavailable, yet none is natively disabled, so the control holding the cursor keeps it. ENTER
+// is frozen; F3 still leaves.
 function ExpectKeyboardLocked(): void {
+    for (const label of REPORT_TYPE_LABELS) {
+        expect(ReportTypeButton(label)).toHaveAttribute("aria-disabled", "true");
+    }
+    for (const input of CriteriaInputs()) {
+        expect(input).toHaveAttribute("readonly");
+    }
     for (const control of CriteriaControls()) {
-        expect(control).toBeDisabled();
+        expect(control).toBeEnabled();
     }
     expect(screen.getByRole("button", { name: ENTER_KEY.buttonName })).toBeDisabled();
     expect(screen.getByRole("button", { name: F3_KEY.buttonName })).toBeEnabled();
 }
 
-// The keyboard unlocked again: every criteria control and ENTER accept input.
+// The keyboard unlocked again: no segment reads as unavailable, every criteria input takes keys,
+// and ENTER is enabled.
 function ExpectKeyboardUnlocked(): void {
+    for (const label of REPORT_TYPE_LABELS) {
+        expect(ReportTypeButton(label)).not.toHaveAttribute("aria-disabled");
+    }
+    for (const input of CriteriaInputs()) {
+        expect(input).not.toHaveAttribute("readonly");
+    }
     for (const control of CriteriaControls()) {
         expect(control).toBeEnabled();
     }
@@ -1123,9 +1139,10 @@ function ExpectFocusedField(input: HTMLElement): void {
 const LOCKED_EDIT_KEYS = "{Backspace}9";
 
 // Clicks, typing and the physical ENTER while the call runs change nothing on the criteria that
-// were sent. A disabled MUI button sets pointer-events: none, which user-event refuses by default.
+// were sent. No criteria control is disabled, so user-event's default pointer-events check also
+// confirms that each one still takes the pointer.
 async function TryToEditWhileLocked(confirmSent: string): Promise<void> {
-    const lockedUser = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
+    const lockedUser = userEvent.setup();
     await lockedUser.click(ReportTypeButton(YEARLY_LABEL));
     for (const control of [...DATE_PARTS.map((part) => DatePartInput(part)), ConfirmInput()]) {
         await lockedUser.type(control, LOCKED_EDIT_KEYS);
@@ -1430,6 +1447,8 @@ it.each(LOCKED_CALL_CASES)(
         await user.type(ConfirmInput(), `{Backspace}${confirm}`);
         await PressScreenKey(user, ENTER_KEY, "key");
         ExpectKeyboardLocked();
+        // ENTER was pressed in Start MM, which keeps the cursor while the call runs.
+        expect(DatePartInput(START_MONTH_PART)).toHaveFocus();
         await TryToEditWhileLocked(confirm);
         await SettleOutcome(pendingReport, outcome);
         expect(screen.queryByRole("alert")?.textContent ?? "").toBe(outcome.literal);
@@ -1443,8 +1462,8 @@ it.each(LOCKED_CALL_CASES)(
     },
 );
 
-// The lock disables the blank Start MM part ENTER is pressed in, which keeps the browser focus
-// through the call; the answer naming that part gives it back its focused outline and label.
+// The lock leaves the blank Start MM part ENTER is pressed in read-only, so it keeps the cursor,
+// its focused outline and its label through the call and once the answer names it.
 it("CORPT00C an edit failure naming the part ENTER was pressed in keeps it focused", async () => {
     MockReportOutcome(EditFailure(START_MONTH_EMPTY_MESSAGE, "startMm"));
     const user = await RenderScreen();

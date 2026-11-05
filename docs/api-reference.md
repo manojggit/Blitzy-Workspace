@@ -274,6 +274,7 @@ An outcome that fails no field, where the legacy program only moves the cursor, 
     outcomes, and a read failure that leaves the account key valid (a CUSTDAT not-found or file
     error).
 - CCUP: the no-change answer and the lock, record-changed and update-failed save outcomes.
+- CT00: the invalid-selection refusal.
 - CU00: the paging refusals and the invalid-selection refusal.
 - CU02: `Please modify to update ...`.
 
@@ -1579,10 +1580,18 @@ travels only in the encrypted before-image inside `screen_token`, and a save kee
 | `expiry_month`, `expiry_day` | 2 |
 | `expiry_year` | 4 |
 
-Other outcomes are those of [`GET /api/v1/cards/{cardNum}`](#get-apiv1cardscardnum), each with
-the key screen in state `DETAILS_NOT_FETCHED` (`CardScreenErrorResponse`). The 404 for an
-invalid `card_ref` shows the account as sent and a blank `fields.card_num`, so the `card_ref` is
-never echoed.
+Other outcomes are those of [`GET /api/v1/cards/{cardNum}`](#get-apiv1cardscardnum), each a
+`CardScreenErrorResponse`:
+
+- With typed keys, each outcome carries the key screen in state `DETAILS_NOT_FETCHED`.
+- The 404 for an invalid `card_ref` carries that key screen too. It shows the account as sent
+    and a blank `fields.card_num`, so the `card_ref` is never echoed.
+- A `card_ref` from the card list whose card is not found (404
+    `Did not find cards for this search condition`, `acct_id` and `card_num`) or cannot be read
+    (503 with the file-error text, `acct_id`) answers in state `SHOW_DETAILS`, with `info_message`
+    `Details of selected card shown above` and `cursor_field` `embossed_name`. Both keys are kept,
+    the card number masked, and the detail fields are blank. The `screen_token` holds both keys,
+    so the next ENTER or F12 is a `PUT` on the `card_ref`.
 
 ### PUT /api/v1/cards/{cardNum}
 
@@ -1690,6 +1699,11 @@ Other outcomes:
 - 400 with the key literals of [`GET /api/v1/cards/{cardNum}`](#get-apiv1cardscardnum), before a
     fetch.
 - 404 `Did not find cards for this search condition`: an invalid or expired `card_ref` path.
+- 404 `Did not find cards for this search condition` (`acct_id`, `card_num`), or 503 with the
+    file-error text (`acct_id`): the card is not found or cannot be read. Before a fetch the
+    state stays `DETAILS_NOT_FETCHED`. On `cancel` the state is `SHOW_DETAILS`, with
+    `info_message` `Details of selected card shown above`, `cursor_field` `embossed_name`, both
+    keys kept and the detail fields blank.
 - 409 `Record changed by some one else. Please review`, state `SHOW_DETAILS` with fresh data.
 - 423 `Could not lock record for update`, state `CHANGES_FAILED`.
 - 503 `Update of record failed`, state `CHANGES_FAILED`.
@@ -1830,8 +1844,9 @@ Other outcomes:
 - A non-blank code other than `S` or `s`, on a row whose `tran_id` is not blank, sets
     `Invalid selection. Valid value is S`, and the list is browsed again from `search_tran_id`. When
     that literal stays, the answer is 400 (`TransactionSelectionErrorResponse`) with the browsed
-    `rows`, `page`, `first_key`, `last_key` and `search_cleared`. When the browse replaces it with
-    a paging literal, the answer is a 200 list with `route` null.
+    `rows`, `page`, `first_key`, `last_key` and `search_cleared`, an empty `field_errors` and
+    `cursor_field` `search_tran_id`. When the browse replaces it with a paging literal, the
+    answer is a 200 list with `route` null.
 - 400 `Tran ID must be Numeric ...` (`search_tran_id`): no row was routed by `S` or `s`, and the
     search key is not numeric. On an empty file the answer is `You are at the top of the page...`
     instead.

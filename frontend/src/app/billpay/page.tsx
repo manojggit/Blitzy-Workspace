@@ -19,7 +19,7 @@ import {
 import { ConfirmField } from "@/components/ConfirmField";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, MessageLine } from "@/components/MessageLine";
-import { ScreenShell } from "@/components/ScreenShell";
+import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
 import { PayBill, type BillPayResponse } from "@/lib/api/billpay";
 import {
     SeverityForOutcome,
@@ -117,7 +117,6 @@ interface BillPayFieldsProps {
 interface KeyedInputProps {
     value: string;
     isInvalid: boolean;
-    isKeyboardLocked: boolean;
     onValueChange: (value: string) => void;
     inputRef: RefObject<HTMLInputElement | null>;
 }
@@ -151,17 +150,13 @@ function IsInputName(name: string | null): name is BillPayInputName {
 }
 
 // Replaces MOVE -1 TO <field>L: the input the server names takes the cursor. Any other name, or
-// none (the abend text), puts it on ACTIDIN, the map's IC field, because the keyboard lock took
-// the focus from whatever held it while the call ran. That lock clears MUI's focused state while
-// the browser keeps a disabled input focused, and focusing that input again fires no focus event,
-// so it is blurred first and MUI restores its focused outline and floated label.
+// none (the abend text), puts it on ACTIDIN, the map's IC field. The keyboard lock leaves the
+// inputs read-only rather than disabled, so an input that kept the cursor through the call keeps
+// its focused outline and floated label, and focusing it again changes nothing.
 function FocusCursorField(inputs: BillPayInputElements, cursorField: string | null): void {
     const cursorInput = inputs[IsInputName(cursorField) ? cursorField : FIRST_INPUT_NAME];
     if (cursorInput === null) {
         return;
-    }
-    if (cursorInput === document.activeElement) {
-        cursorInput.blur();
     }
     cursorInput.focus();
 }
@@ -283,14 +278,12 @@ function BuildKeyDefinitions(actions: BillPayKeyActions): FunctionKeyDefinition[
     ];
 }
 
-// The keyed character goes into the form unchanged: no trimming, case folding or filtering. The
-// field is locked while the call runs, as the 3270 keyboard is.
+// The keyed character goes into the form unchanged: no trimming, case folding or filtering.
 function BindKeyedInput(screen: BillPayScreenModel, name: BillPayInputName): KeyedInputProps {
     const formField = FORM_FIELD_OF_INPUT[name];
     return {
         value: screen.form[formField],
         isInvalid: screen.feedback.fieldErrors.includes(name),
-        isKeyboardLocked: screen.isBusy,
         onValueChange: (value) => screen.setForm((current) => ({ ...current, [formField]: value })),
         inputRef: screen.inputRefs[name],
     };
@@ -362,20 +355,24 @@ function useBillPayScreen(): BillPayScreenModel {
 }
 
 // While the server names ACTIDIN in error, the field is described by the ERRMSG line that holds
-// its literal.
+// its literal. While the call runs it keeps the cursor but refuses keystrokes, as the 3270
+// keyboard locked, so the balance shown always belongs to the account that was sent.
 function AccountIdField(props: KeyedInputProps) {
-    const { value, isInvalid, isKeyboardLocked, onValueChange, inputRef } = props;
+    const { value, isInvalid, onValueChange, inputRef } = props;
     const { label, maxLength } = FIELD_DEFINITIONS.acct_id;
+    const isBusy = useScreenBusy();
     return (
         <TextField
             label={label}
             value={value}
             onChange={(event) => onValueChange(event.target.value)}
             error={isInvalid}
-            disabled={isKeyboardLocked}
             variant="outlined"
             inputRef={inputRef}
-            slotProps={{ htmlInput: { maxLength, ...ErrorMessageReference(isInvalid) } }}
+            slotProps={{
+                htmlInput: { maxLength, ...ErrorMessageReference(isInvalid) },
+                input: { readOnly: isBusy },
+            }}
         />
     );
 }
@@ -394,14 +391,13 @@ function CurrentBalanceDisplay({ currentBalance }: CurrentBalanceDisplayProps) {
 }
 
 function PaymentConfirmField(props: KeyedInputProps) {
-    const { value, isInvalid, isKeyboardLocked, onValueChange, inputRef } = props;
+    const { value, isInvalid, onValueChange, inputRef } = props;
     return (
         <ConfirmField
             label={FIELD_DEFINITIONS.confirm.label}
             value={value}
             onChange={onValueChange}
             error={isInvalid}
-            disabled={isKeyboardLocked}
             inputRef={inputRef}
         />
     );

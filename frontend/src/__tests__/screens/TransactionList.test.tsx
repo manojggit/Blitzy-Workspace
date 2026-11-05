@@ -266,11 +266,19 @@ interface SearchDescriptionCase extends LiteralCase {
     describedBy: string | null;
 }
 
-// Both rejections name TRNIDIN in field_errors; the 200 paging literal names it only as the
-// cursor, so TRNIDIN, which has no helper text, is described by nothing.
+// The non-numeric search key and the lookup failure name TRNIDIN in field_errors; the
+// invalid-selection 400 and the 200 paging literal name it only as the cursor, so TRNIDIN,
+// which has no helper text, is described by nothing.
 const SEARCH_DESCRIPTION_CASES: readonly SearchDescriptionCase[] = [
     { literal: NUMERIC_SEARCH, key: "ENTER", status: HTTP_EDIT_FAILURE, describedBy: ERRMSG_ID },
     { literal: LOOKUP_FAILED, key: "F8", status: 503, describedBy: ERRMSG_ID },
+    {
+        literal: INVALID_SELECTION,
+        key: "ENTER",
+        status: HTTP_EDIT_FAILURE,
+        refusedPage: FIRST_LIST_PAGE,
+        describedBy: null,
+    },
     { literal: BOTTOM_ALREADY, key: "F8", status: HTTP_OK, describedBy: null },
 ];
 
@@ -360,9 +368,11 @@ function BuildAxiosError(status: number, body: LegacyErrorResponse): AxiosError 
 }
 
 // The body of LegacyMessageError(field=search_tran_id), which the TRANSACT lookup failure and
-// both edit failures raise.
+// both edit failures raise. Each puts the cursor on TRNIDIN, but the invalid selection names no
+// field in field_errors: COTRN00C's WHEN OTHER sets no ERR-FLG and only moves the cursor.
 function BuildSearchErrorBody(message: string): LegacyErrorResponse {
-    return BuildErrorBody({ message, field_errors: [SEARCH_FIELD], cursor_field: SEARCH_FIELD });
+    const fieldErrors = message === INVALID_SELECTION ? [] : [SEARCH_FIELD];
+    return BuildErrorBody({ message, field_errors: fieldErrors, cursor_field: SEARCH_FIELD });
 }
 
 // A rejection whose body adds the list page, if any, to the four legacy keys.
@@ -820,7 +830,7 @@ describe("COTRN00C ENTER with a non-numeric search key", () => {
 
 // The map offers only S, so the 400 stands for the server's verdict on a code it was sent; the
 // browse restarted from the search key, so the page number returns from 2 to 1, and its
-// search_cleared blanks TRNIDIN.
+// search_cleared blanks TRNIDIN. The code sets no ERR-FLG, so TRNIDIN takes the cursor unmarked.
 describe("COTRN00C ENTER answered 400 with an invalid selection code", () => {
     it("COTRN00C invalid selection shows the re-browsed page under the red literal", async () => {
         const user = await RenderFirstPage();
@@ -834,7 +844,7 @@ describe("COTRN00C ENTER answered 400 with an invalid selection code", () => {
         await ExpectAlert(INVALID_SELECTION, "error");
         ExpectShownRows(FOUND_FIRST_ROW_NUMBER);
         expect(PageIndicator(1)).toBeVisible();
-        expect(SearchField()).toHaveAttribute("aria-invalid", "true");
+        expect(SearchField()).toHaveAttribute("aria-invalid", "false");
         expect(SearchField()).toHaveFocus();
         expect(SearchField()).toHaveValue("");
     });

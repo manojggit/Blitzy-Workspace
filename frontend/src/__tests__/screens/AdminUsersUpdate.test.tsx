@@ -909,6 +909,202 @@ describe("COUSR02C PF4 (CLEAR-CURRENT-SCREEN)", () => {
     );
 });
 
+// COUSR02C WHEN OTHER (lines 127-129): an AID outside ENTER, PF3, PF4, PF5 and PF12 sets ERR-FLG
+// and sends CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy) over the map as received. Nothing is read or
+// written, and the SEND's CURSOR puts the cursor on USRIDIN, the map's IC field.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
+const UNBOUND_KEYS: readonly string[] = ["F7", "F8"];
+
+// The next save stays in flight until the test settles it through the returned function.
+function DeferNextSave(): (response: UserMessageResponse) => void {
+    let resolveSave: (response: UserMessageResponse) => void = () => undefined;
+    mockUpdateUser.mockImplementationOnce(
+        () =>
+            new Promise((resolve) => {
+                resolveSave = resolve;
+            }),
+    );
+    return (response) => resolveSave(response);
+}
+
+// The edits and the typed password stay, and nothing was read, written or routed.
+function ExpectEditsKeptUnsent(): void {
+    expect(FieldInput(LAST_NAME_LABEL)).toHaveValue(EDITED_LAST_NAME);
+    expect(FieldInput(PASSWORD_LABEL)).toHaveValue(NEW_PASSWORD);
+    expect(mockFetchUser).toHaveBeenCalledTimes(1);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    expect(mockRouterPush).not.toHaveBeenCalled();
+}
+
+// The edits and the typed password are still what PF5 sends.
+async function ExpectEditsSavedByPf5(view: ScreenView): Promise<void> {
+    mockUpdateUser.mockResolvedValue(BuildSaveResponse(UPDATED_MESSAGE));
+    await Trigger(view, SAVE_ACTION, "key");
+    await ExpectAlert(UPDATED_MESSAGE, "success");
+    expect(mockUpdateUser).toHaveBeenCalledWith(TEST_USER_ID, EDITED_REQUEST);
+}
+
+describe("COUSR02C WHEN OTHER (a PF key the legend lacks)", () => {
+    it.each(UNBOUND_KEYS)(
+        "COUSR02C %s shows the invalid-key literal in red and keeps every keyed value",
+        async (keyName) => {
+            const view = await RenderFromList();
+            await EditDetails(view.user);
+            const isDefaultAllowed = fireEvent.keyDown(FieldInput(PASSWORD_LABEL), {
+                key: keyName,
+            });
+            await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+            expect(isDefaultAllowed).toBe(false);
+            await waitFor(() => expect(FieldInput(USER_ID_LABEL)).toHaveFocus());
+            expect(FieldInput(USER_ID_LABEL)).toHaveAttribute("aria-invalid", "false");
+            ExpectEditsKeptUnsent();
+            await ExpectEditsSavedByPf5(view);
+        },
+    );
+});
+
+// The keys disable while the save runs, the invalid-key action with them, so the save's answer is
+// the message shown.
+describe("COUSR02C a PF key the legend lacks while a save is in flight", () => {
+    it.each(UNBOUND_KEYS)(
+        "COUSR02C %s while a PF5 save is in flight answers nothing; the save's answer shows",
+        async (keyName) => {
+            const view = await RenderFromList();
+            const settleSave = DeferNextSave();
+            await Trigger(view, SAVE_ACTION, "key");
+            expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+            expect(fireEvent.keyDown(window, { key: keyName })).toBe(false);
+            expect(screen.queryByText(INVALID_KEY_MESSAGE)).toBeNull();
+            await act(async () => {
+                settleSave(BuildSaveResponse(UPDATED_MESSAGE));
+            });
+            await ExpectAlert(UPDATED_MESSAGE, "success");
+            expect(screen.queryByText(INVALID_KEY_MESSAGE)).toBeNull();
+            expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+        },
+    );
+});
+
+// A second key pressed with PF5 or PF3 before the busy render disables the keys: a second save, a
+// fetch, a clear, a navigation and the invalid-key literal.
+const SECOND_KEYS_AFTER_SAVE: readonly string[] = ["F5", "Enter", "F3", "F4", "F12", "F7"];
+const SECOND_KEYS_AFTER_SAVE_AND_EXIT: readonly string[] = ["F3", "F5"];
+
+// Two keys pressed before React re-renders: the second finds every key still enabled.
+function PressTwoKeysBeforeRender(firstKeyName: string, secondKeyName: string): void {
+    act(() => {
+        fireEvent.keyDown(window, { key: firstKeyName });
+        fireEvent.keyDown(window, { key: secondKeyName });
+    });
+}
+
+// One save is out with the edits as typed, and nothing else has happened: no fetch, no clear, no
+// invalid-key literal and no navigation.
+function ExpectOneSaveInFlight(): void {
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    expect(mockUpdateUser).toHaveBeenCalledWith(TEST_USER_ID, EDITED_REQUEST);
+    expect(mockFetchUser).toHaveBeenCalledTimes(1);
+    expect(FieldInput(LAST_NAME_LABEL)).toHaveValue(EDITED_LAST_NAME);
+    expect(screen.queryByText(INVALID_KEY_MESSAGE)).toBeNull();
+    expect(mockRouterPush).not.toHaveBeenCalled();
+}
+
+// The one save's green answer is the message shown, and a later PF5 sends the next PUT.
+async function ExpectSaveAnsweredThenUnlocked(view: ScreenView): Promise<void> {
+    await ExpectAlert(UPDATED_MESSAGE, "success");
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    expect(mockRouterPush).not.toHaveBeenCalled();
+    mockUpdateUser.mockResolvedValue(BuildSaveResponse(UPDATED_MESSAGE));
+    await Trigger(view, SAVE_ACTION, "key");
+    await WaitForIdle();
+    expect(mockUpdateUser).toHaveBeenCalledTimes(2);
+}
+
+// The in-flight lock refuses the second key, so one press sends one PUT and its answer lands on the
+// screen that sent it; the lock then clears, so the next PF5 saves again.
+describe("COUSR02C keys pressed in the same turn as PF5", () => {
+    it.each(SECOND_KEYS_AFTER_SAVE)(
+        "COUSR02C PF5 and %s in one turn send one PUT, answered on the screen sent",
+        async (secondKeyName) => {
+            const view = await RenderFromList();
+            await EditDetails(view.user);
+            const settleSave = DeferNextSave();
+            PressTwoKeysBeforeRender(SAVE_ACTION.keyName, secondKeyName);
+            ExpectOneSaveInFlight();
+            await act(async () => {
+                settleSave(BuildSaveResponse(UPDATED_MESSAGE));
+            });
+            await ExpectSaveAnsweredThenUnlocked(view);
+        },
+    );
+});
+
+// F3's save is a write like F5's: a second F3 or an F5 in its turn sends no second PUT, and the
+// screen returns once, after the one save settles.
+describe("COUSR02C keys pressed in the same turn as PF3", () => {
+    it.each(SECOND_KEYS_AFTER_SAVE_AND_EXIT)(
+        "COUSR02C PF3 and %s in one turn send one PUT, then return once",
+        async (secondKeyName) => {
+            const view = await RenderFromList();
+            await EditDetails(view.user);
+            const settleSave = DeferNextSave();
+            PressTwoKeysBeforeRender(SAVE_AND_EXIT_ACTION.keyName, secondKeyName);
+            ExpectOneSaveInFlight();
+            await act(async () => {
+                settleSave(BuildSaveResponse(UPDATED_MESSAGE));
+            });
+            await ExpectNavigationTo(USER_LIST_ROUTE);
+            expect(mockRouterPush).toHaveBeenCalledTimes(1);
+            expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+        },
+    );
+});
+
+// The two saves, PF5 and PF3's save-then-return, each pressed in ENTER's turn.
+const SAVES_AFTER_FETCH: readonly ScreenAction[] = [SAVE_ACTION, SAVE_AND_EXIT_ACTION];
+
+// Only ENTER's read went out: no PUT of the edits keyed before it, and no return to the list.
+function ExpectReadAloneInFlight(): void {
+    expect(mockFetchUser).toHaveBeenCalledTimes(2);
+    ExpectLastFetchOf(TEST_USER_ID);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    expect(mockRouterPush).not.toHaveBeenCalled();
+}
+
+// The read's answer is the message shown and nothing was saved meanwhile; a later PF5 then sends
+// one PUT of the record the read returned.
+async function ExpectReadAnsweredThenSaveUnlocked(view: ScreenView): Promise<void> {
+    await ExpectAlert(PRESS_PF5_MESSAGE, "info");
+    await WaitForIdle();
+    expect(FieldInput(LAST_NAME_LABEL)).toHaveValue(FETCHED_LAST_NAME);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    expect(mockRouterPush).not.toHaveBeenCalled();
+    mockUpdateUser.mockResolvedValue(BuildSaveResponse(UPDATED_MESSAGE));
+    await Trigger(view, SAVE_ACTION, "key");
+    await ExpectAlert(UPDATED_MESSAGE, "success");
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    expect(mockUpdateUser).toHaveBeenCalledWith(TEST_USER_ID, UNEDITED_REQUEST);
+}
+
+// The 3270 keyboard locks from ENTER until the read answers, so a save keyed in ENTER's turn,
+// before the busy render disables the keys, is never sent.
+describe("COUSR02C a save pressed in the same turn as ENTER", () => {
+    it.each(SAVES_AFTER_FETCH)(
+        "COUSR02C ENTER and $keyName in one turn send the read alone; a later PF5 saves once",
+        async ({ keyName }) => {
+            const view = await RenderFromList();
+            await EditDetails(view.user);
+            const resolveFetch = DeferNextFetch();
+            PressTwoKeysBeforeRender(FETCH_ACTION.keyName, keyName);
+            ExpectReadAloneInFlight();
+            await act(async () => {
+                resolveFetch(BuildUserDetail());
+            });
+            await ExpectReadAnsweredThenSaveUnlocked(view);
+        },
+    );
+});
+
 describe("COUSR02C READ-USER-SEC-FILE literals", () => {
     it.each(FETCH_LITERAL_CASES)(
         "COUSR02C fetch shows %p (HTTP %p) as %p",

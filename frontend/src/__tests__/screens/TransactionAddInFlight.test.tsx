@@ -198,8 +198,9 @@ function DeferEveryAdd(): PendingAdd[] {
 }
 
 // The presses go to the window listener from anywhere on the page, so the pointer then leaves
-// the inputs: an input focused when the busy render disables it would have MUI's FormControl
-// update its focus state during act's final flush, which React reports as outside act.
+// the inputs: an input still focused when the answer moves the cursor to another field would
+// have MUI's FormControl update its focus state during act's final flush, which React reports as
+// outside act.
 async function KeyAccountAndConfirm(user: UserEvent): Promise<void> {
     await user.type(screen.getByLabelText(ACCOUNT_LABEL), TEST_ACCOUNT_ID);
     await user.type(screen.getByLabelText(CONFIRM_LABEL), CONFIRMED);

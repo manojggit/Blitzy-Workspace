@@ -81,9 +81,9 @@ How each legacy mechanism is replaced:
         and fill the header.
     - `useFunctionKeys.ts`: binds F3, F4, F5, F7, F8 and F12 to the bar's buttons, so legacy
         literals that mention PF keys stay accurate. Any other PF1–PF24 key is kept from the
-        browser and answered by the screen's optional invalid-key action: ENTER on CCLI, CCDL and
-        CCUP; the `Invalid key pressed. Please see below...` literal on CT00, CT01, CT02, CR00 and
-        CB00; nothing on the other screens.
+        browser and answered by the invalid-key action each screen passes: ENTER on CAVW, CAUP,
+        CCLI, CCDL and CCUP; the `Invalid key pressed. Please see below...` literal on CC00, CM00,
+        CA00, CU00, CU01, CU02, CU03, CT00, CT01, CT02, CR00 and CB00.
     - `api/*.ts`: typed endpoint functions whose types mirror `backend/app/schemas/*.py` field for
         field, with snake_case JSON keys.
 - **Theme.** `frontend/src/app/theme.ts` is the only source of colour, type, shape and spacing
@@ -338,8 +338,8 @@ defines:
 - **First-failure mode**: every other online program. Their edits are `EVALUATE` and `IF` chains
     in which the first failure ends validation. The response carries `message` and
     `cursor_field`. `field_errors` names the failing field, or nothing when the program only
-    moves the cursor, as for the CU00 paging and invalid-selection literals and CU02's
-    `Please modify to update ...`.
+    moves the cursor, as for the CU00 paging literals, the CT00 and CU00 invalid-selection
+    literals and CU02's `Please modify to update ...`.
 
 Edits are table-driven: an ordered list of `(field, editFunction)` pairs walked by a short loop.
 This keeps COACTUPC's roughly 30 edits inside the 20-line function limit.

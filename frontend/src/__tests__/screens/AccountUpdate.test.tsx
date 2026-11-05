@@ -2518,6 +2518,31 @@ describe("COACTUPC /accounts/update actions", () => {
     it.each(INPUT_METHODS)("COACTUPC F3 by %s returns to /menu without a PUT", ExitsToMainMenu);
 });
 
+// COACTUPC PFK-INVALID: an AID outside ENTER, PF3, PF5 and PF12 does SET CCARD-AID-ENTER, so the
+// key never reaches the browser and sends ENTER's request under the held screen_token.
+const PFK_INVALID_KEYS: readonly string[] = ["F4", "F7", "F8"];
+
+async function SendsEnterForInvalidKey(keyName: string): Promise<void> {
+    await RenderInState(UpdateScreenState.SHOW_DETAILS);
+    QueueUpdateOutcome(HTTP_OK, BuildAccountScreen(UpdateScreenState.SHOW_DETAILS));
+    const isDefaultAllowed = await PressKey(keyName);
+    await WaitForIdle();
+    expect(isDefaultAllowed).toBe(false);
+    expect(mockUpdateAccount).toHaveBeenCalledTimes(1);
+    ExpectUpdateRequest(TEST_ACCOUNT_ID, {
+        action: UpdateAction.ENTER,
+        screen_token: FIRST_SCREEN_TOKEN,
+        fields: PickFields(TEST_FIELDS, EditableNamesIn(UpdateScreenState.SHOW_DETAILS)),
+    });
+}
+
+describe("COACTUPC PFK-INVALID keys on /accounts/update", () => {
+    it.each(PFK_INVALID_KEYS)(
+        "COACTUPC %s is processed as ENTER and sends action enter with the held screen_token",
+        SendsEnterForInvalidKey,
+    );
+});
+
 // One input keyed over its shown value.
 type FieldEdit = readonly [name: AccountFieldName, value: string];
 

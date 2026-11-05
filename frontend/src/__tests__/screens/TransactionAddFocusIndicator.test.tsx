@@ -1,9 +1,10 @@
 // Screen tests: BMS COTRN02, program COTRN02C (CT02), page /transactions/add. Covers only the
 // focus indicator when the answer's cursor_field names the input that held the cursor as ENTER
-// was pressed: the keyboard lock disables that input while the call runs, and once the answer is
-// applied the input is again the focused element in MUI's focused state, with the focused outline
-// and, where the field has a floating label, that label shrunk. Literals are copied verbatim from
-// backend/app/services/transactions/cotrn02c.py; labels from bms/COTRN02.bms.
+// was pressed: the keyboard lock turns that input read-only, never disabled, so it keeps the
+// cursor while the call runs, and once the answer is applied it is still the focused element in
+// MUI's focused state, with the focused outline and, where the field has a floating label, that
+// label shrunk. Literals are copied verbatim from backend/app/services/transactions/cotrn02c.py;
+// labels from bms/COTRN02.bms.
 import { ThemeProvider } from "@mui/material/styles";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
@@ -212,11 +213,14 @@ async function PressEnterInField(user: UserEvent, sameFieldCase: SameFieldCase):
     await user.keyboard("{Enter}");
 }
 
-// The keyboard lock: the input is disabled and MUI has dropped its focused state.
-function ExpectLockedWithoutIndicator(label: string): void {
+// The keyboard lock: the input is read-only but enabled, and keeps the cursor and MUI's focused
+// state through the call.
+function ExpectLockedKeepingFocus(label: string): void {
     const input = FieldInput(label);
-    expect(input).toBeDisabled();
-    expect(input.closest(MUI_INPUT_ROOT_SELECTOR)).not.toHaveClass(MUI_FOCUSED_CLASS);
+    expect(input).toHaveAttribute("readonly");
+    expect(input).toBeEnabled();
+    expect(input).toHaveFocus();
+    expect(input.closest(MUI_INPUT_ROOT_SELECTOR)).toHaveClass(MUI_FOCUSED_CLASS);
 }
 
 // Settles the one request inside act, so the page applies the answer before the assertions.
@@ -259,12 +263,12 @@ afterEach(() => {
 });
 
 it.each(SAME_FIELD_CASES)(
-    "COTRN02C answer naming the focused $field as cursor_field restores its focus indicator",
+    "COTRN02C answer naming the focused $field as cursor_field keeps its focus indicator",
     async (sameFieldCase) => {
         const pendingAdds = DeferEveryAdd();
         const user = RenderScreen();
         await PressEnterInField(user, sameFieldCase);
-        ExpectLockedWithoutIndicator(sameFieldCase.label);
+        ExpectLockedKeepingFocus(sameFieldCase.label);
         await SettleOnlyAdd(pendingAdds, sameFieldCase.SettlePending);
         await waitFor(() => {
             expect(screen.getByRole("alert").textContent).toBe(sameFieldCase.message);

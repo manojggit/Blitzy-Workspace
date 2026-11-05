@@ -29,7 +29,7 @@ import { CENTRE_ALIGNED_ROW_STYLE, CENTRED_TEXT_STYLE } from "@/app/theme";
 import { ConfirmField } from "@/components/ConfirmField";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
-import { ScreenShell } from "@/components/ScreenShell";
+import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
 import {
     AddTransaction,
     TransactionAddAction,
@@ -269,9 +269,6 @@ interface AddKeyActions {
 interface AddFieldBinding {
     values: AddFieldValues;
     fieldErrors: readonly string[];
-    // True while a call runs: every input is locked, as the 3270 keyboard is, so the answer
-    // always applies to the form that was sent.
-    isBusy: boolean;
     inputsRef: RefObject<AddInputElements>;
     onFieldChange: (name: AddFieldName, value: string) => void;
 }
@@ -313,18 +310,13 @@ function IsInputName(name: string | null): name is AddFieldName {
 }
 
 // Replaces MOVE -1 TO <field>L: the input the server names takes the cursor. Any other name, or
-// none (the abend text), puts it on ACTIDIN, the map's IC field, because the keyboard lock took
-// the focus from whatever held it while the call ran. The lock disables the inputs, and MUI drops
-// the focused state of a disabled input while the browser may keep it as the active element;
-// focusing the active element fires no focus event, so it is blurred first and the focus event
-// restores the outline and the shrunk label.
+// none (the abend text), puts it on ACTIDIN, the map's IC field. The keyboard lock leaves the
+// inputs read-only rather than disabled, so an input that kept the cursor through the call keeps
+// its focused outline and shrunk label, and focusing it again changes nothing.
 function FocusCursorField(inputs: AddInputElements, cursorField: string | null): void {
     const cursorInput = inputs[IsInputName(cursorField) ? cursorField : FIRST_FIELD];
     if (cursorInput === null || cursorInput === undefined) {
         return;
-    }
-    if (cursorInput.ownerDocument.activeElement === cursorInput) {
-        cursorInput.blur();
     }
     cursorInput.focus();
 }
@@ -599,8 +591,8 @@ function useTransactionAdd(): AddScreenModel {
     const shownValues = useMemo(() => DisplayedValues(values, servedCard), [values, servedCard]);
     const { fieldErrors } = feedback;
     const form = useMemo<AddFieldBinding>(
-        () => ({ values: shownValues, fieldErrors, isBusy, inputsRef, onFieldChange }),
-        [shownValues, fieldErrors, isBusy, onFieldChange],
+        () => ({ values: shownValues, fieldErrors, inputsRef, onFieldChange }),
+        [shownValues, fieldErrors, onFieldChange],
     );
     return { form, feedback, isBusy, keys };
 }
@@ -631,23 +623,30 @@ function HtmlInputProps(definition: AddFieldDefinition, hasError: boolean) {
     return { maxLength: definition.maxLength, ...ErrorMessageReference(hasError, helperTextId) };
 }
 
+// The input element's BMS attributes, and the ScreenShell keyboard lock: read-only, never
+// disabled, so the field holding the cursor keeps it through the call.
+function AddFieldSlotProps(definition: AddFieldDefinition, hasError: boolean, isBusy: boolean) {
+    return { htmlInput: HtmlInputProps(definition, hasError), input: { readOnly: isBusy } };
+}
+
 // No form element: useFunctionKeys handles ENTER from any input, and a native submit would add a
-// second action. The field is locked while the call runs.
+// second action. While the call runs the field keeps the cursor but refuses keystrokes, as the
+// 3270 keyboard locked, so the answer always applies to the form that was sent.
 function AddTextField({ definition, form }: AddTextFieldProps) {
     const { name } = definition;
     const { inputsRef } = form;
     const hasError = form.fieldErrors.includes(name);
+    const isBusy = useScreenBusy();
     return (
         <TextField
             {...StaticFieldProps(definition)}
             value={form.values[name]}
             onChange={(event) => form.onFieldChange(name, event.target.value)}
             error={hasError}
-            disabled={form.isBusy}
             inputRef={(element: HTMLInputElement | null) => {
                 inputsRef.current[name] = element;
             }}
-            slotProps={{ htmlInput: HtmlInputProps(definition, hasError) }}
+            slotProps={AddFieldSlotProps(definition, hasError, isBusy)}
         />
     );
 }
@@ -704,7 +703,6 @@ function TransactionConfirmField({ form }: FieldGroupProps) {
             value={form.values.confirm}
             onChange={(value) => form.onFieldChange(CONFIRM_FIELD, value)}
             error={form.fieldErrors.includes(CONFIRM_FIELD)}
-            disabled={form.isBusy}
             inputRef={(element: HTMLInputElement | null) => {
                 inputsRef.current[CONFIRM_FIELD] = element;
             }}

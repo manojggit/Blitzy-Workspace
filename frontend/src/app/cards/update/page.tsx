@@ -179,6 +179,22 @@ const EDITABLE_FIELDS_BY_STATE: Readonly<Record<UpdateScreenState, readonly Card
         [UpdateScreenState.CHANGES_FAILED]: KEY_FIELD_NAMES,
     });
 
+// The COCRDUP PF legend: FKEYS (ENTER=Process F3=Exit) is always shown, while FKEYSC (F5=Save
+// F12=Cancel) is ATTRB=(ASKIP,DRK) until 3300-SETUP-SCREEN-ATTRS brightens it IF
+// PROMPT-FOR-CONFIRMATION, which 3250-SETUP-INFOMSG sets only WHEN CCUP-CHANGES-OK-NOT-CONFIRMED.
+const FKEYS_LEGEND: readonly PfKey[] = Object.freeze(["ENTER", "F3"]);
+const CONFIRMATION_LEGEND: readonly PfKey[] = Object.freeze(["ENTER", "F3", "F5", "F12"]);
+
+// The legend each returned state shows, by the CCUP-CHANGE-ACTION 88-levels.
+const LEGEND_KEYS_BY_STATE: Readonly<Record<UpdateScreenState, readonly PfKey[]>> = Object.freeze({
+    [UpdateScreenState.DETAILS_NOT_FETCHED]: FKEYS_LEGEND,
+    [UpdateScreenState.SHOW_DETAILS]: FKEYS_LEGEND,
+    [UpdateScreenState.CHANGES_NOT_OK]: FKEYS_LEGEND,
+    [UpdateScreenState.CHANGES_OK_NOT_CONFIRMED]: CONFIRMATION_LEGEND,
+    [UpdateScreenState.CHANGES_DONE]: FKEYS_LEGEND,
+    [UpdateScreenState.CHANGES_FAILED]: FKEYS_LEGEND,
+});
+
 // What the COMMAREA kept between two CCUP tasks: the CCUP-CHANGE-ACTION state, the latest
 // encrypted screen_token and card_ref the server issued (no card_ref while no card is held), and
 // the map fields as last shown or keyed. It lives in React state only; neither token is ever
@@ -286,11 +302,13 @@ interface FieldView {
     changeField: FieldChangeHandler;
 }
 
+// legendKeys are the buttons the state's legend shows; useCardUpdateScreen binds every COCRDUP
+// PF key, shown or not.
 interface CardUpdateScreenModel {
     view: FieldView;
     feedback: ScreenFeedbackView;
     isBusy: boolean;
-    keys: readonly FunctionKeyDefinition[];
+    legendKeys: readonly FunctionKeyDefinition[];
 }
 
 interface CardTextFieldProps {
@@ -498,10 +516,12 @@ function ShowPendingMessage(setters: ScreenSetters): void {
 
 // Lines 482-497: a session the card list opened reads its card by CDEMO-ACCT-ID and
 // CDEMO-CARD-NUM; the held card_ref stands for that card, or for the card a fetch last showed.
-// Until it is fetched, as after a refused entry fetch or F12 re-read, the screen shows at most its
-// number masked, which is no card number to send; so ENTER, F5 and F12, all processed as ENTER
-// before the fetch, read it again by the card_ref. Typing a card number drops the card_ref
-// (WithFieldValue), so typed keys go by PUT.
+// Until it is fetched, as after an invalid or expired card_ref refusal or a failure that brings no
+// screen (a 500 or a network error), the screen shows at most its number masked, which is no card
+// number to send; so ENTER, F5 and F12, all processed as ENTER before the fetch, read it again by
+// the card_ref. A refused CARDDAT read on the entry fetch or F12 re-read answers in SHOW_DETAILS
+// with both keys in its screen_token, so the next key is a PUT by the card_ref. Typing a card
+// number drops the card_ref (WithFieldValue), so typed keys go by PUT.
 function UnfetchedCardRefOf(model: CardUpdateModel): string | null {
     if (model.state !== UpdateScreenState.DETAILS_NOT_FETCHED) {
         return null;
@@ -538,9 +558,11 @@ function HandleAction(action: UpdateAction, context: ActionContext): void {
     runRequest(() => UpdateCard(ResolveCardKey(model), request));
 }
 
-// The FKEYS and FKEYSC legend. F5 and F12 are offered in every state rather than dimmed by the
-// FKEYSC attribute, because the server owns which key is valid in each state. ENTER, F5 and F12
-// each send a request, so they are disabled while one is in flight; F3 only navigates.
+// Every COCRDUP key, in legend order: ENTER=Process, F3=Exit, F5=Save and F12=Cancel. All four
+// stay bound in every state, as a dark 3270 PF key still sends its AID: the server processes a
+// save or cancel its state does not allow as ENTER (lines 413-424). LegendKeysShownIn picks the
+// buttons the state's legend shows. ENTER, F5 and F12 each send a request, so they are disabled
+// while one is in flight; F3 only navigates.
 function BuildFunctionKeys(handlers: KeyHandlers, isBusy: boolean): FunctionKeyDefinition[] {
     const requestKey = (key: PfKey, label: string, action: UpdateAction) => ({
         key,
@@ -554,6 +576,21 @@ function BuildFunctionKeys(handlers: KeyHandlers, isBusy: boolean): FunctionKeyD
         requestKey("F5", SAVE_LABEL, UpdateAction.SAVE),
         requestKey("F12", CANCEL_LABEL, UpdateAction.CANCEL),
     ];
+}
+
+// A state the table does not name shows the DETAILS_NOT_FETCHED legend, as the server processes
+// an unreadable screen_token as DETAILS_NOT_FETCHED.
+function LegendKeysFor(state: UpdateScreenState): readonly PfKey[] {
+    return Object.hasOwn(LEGEND_KEYS_BY_STATE, state) ? LEGEND_KEYS_BY_STATE[state] : FKEYS_LEGEND;
+}
+
+// The keys whose legend entry the state shows, in BuildFunctionKeys order.
+function LegendKeysShownIn(
+    keys: readonly FunctionKeyDefinition[],
+    state: UpdateScreenState,
+): FunctionKeyDefinition[] {
+    const legendPfKeys = LegendKeysFor(state);
+    return keys.filter((definition) => legendPfKeys.includes(definition.key));
 }
 
 // Replaces MOVE -1 TO <field>L: the cursor goes to the field the server names, read-only or not.
@@ -709,8 +746,9 @@ function useCardUpdateScreen(): CardUpdateScreenModel {
     // PFK-INVALID: an AID outside ENTER, PF3, PF5 and PF12 does SET CCARD-AID-ENTER, so an unbound
     // PF key sends action "enter"; the server turns an F5 or F12 its state refuses into ENTER.
     useFunctionKeys(keys, EnterKeyOf(keys));
+    const legendKeys = LegendKeysShownIn(keys, store.model.state);
     const view = useFieldView(store, registry.registerInput);
-    return { view, keys, isBusy: store.isBusy, feedback: store.feedback };
+    return { view, legendKeys, isBusy: store.isBusy, feedback: store.feedback };
 }
 
 // A stable id per map field, so a field in error can name its own helper text after ERRMSG.
@@ -858,7 +896,7 @@ function CardDetailFields({ view }: FieldSectionProps) {
 }
 
 function CardUpdateScreen() {
-    const { view, feedback, isBusy, keys } = useCardUpdateScreen();
+    const { view, feedback, isBusy, legendKeys } = useCardUpdateScreen();
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}
@@ -873,7 +911,7 @@ function CardUpdateScreen() {
                 severity={feedback.severity}
                 infoMessage={feedback.infoMessage}
             />
-            <FunctionKeyBar keys={keys} />
+            <FunctionKeyBar keys={legendKeys} />
         </ScreenShell>
     );
 }

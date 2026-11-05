@@ -971,6 +971,148 @@ describe("COUSR03C PF4 clear (CLEAR-CURRENT-SCREEN)", () => {
     });
 });
 
+// COUSR03C WHEN OTHER (lines 126-128): an AID outside ENTER, PF3, PF4, PF5 and PF12 sets ERR-FLG
+// and sends CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy) over the map as received. Nothing is read or
+// deleted, and the SEND's CURSOR puts the cursor on USRIDIN, the map's IC field.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
+const UNBOUND_KEYS: readonly string[] = ["F7", "F8"];
+
+// The first-entry fetch is the only call, and the user it showed is still shown.
+function ExpectFetchedUserKept(): void {
+    expect(ShownValues()).toEqual(FetchedValues(TEST_USER_ID));
+    expect(mockFetchUser).toHaveBeenCalledTimes(1);
+    expect(mockDeleteUser).not.toHaveBeenCalled();
+    expect(mockRouterPush).not.toHaveBeenCalled();
+}
+
+describe("COUSR03C WHEN OTHER (a PF key the legend lacks)", () => {
+    it.each(UNBOUND_KEYS)(
+        "COUSR03C %s shows the invalid-key literal in red and keeps the user shown",
+        async (keyName) => {
+            const user = await RenderFromList();
+            await user.click(screen.getByLabelText(FIRST_NAME_LABEL));
+            const firstNameInput = screen.getByLabelText(FIRST_NAME_LABEL);
+            expect(fireEvent.keyDown(firstNameInput, { key: keyName })).toBe(false);
+            await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+            await waitFor(() => expect(screen.getByLabelText(USER_ID_LABEL)).toHaveFocus());
+            expect(screen.getByLabelText(USER_ID_LABEL)).toHaveAttribute("aria-invalid", "false");
+            ExpectFetchedUserKept();
+            await PressFunction(user, "F5", "key");
+            await ExpectAlert(DELETED_MESSAGE, "success");
+            expect(mockDeleteUser).toHaveBeenCalledWith(TEST_USER_ID);
+        },
+    );
+});
+
+// The keys disable while the delete runs, the invalid-key action with them, so the delete's answer
+// is the message shown.
+describe("COUSR03C a PF key the legend lacks while a delete is in flight", () => {
+    it.each(UNBOUND_KEYS)(
+        "COUSR03C %s while a PF5 delete is in flight answers nothing; the delete's answer shows",
+        async (keyName) => {
+            const settleDelete = DeferCall("delete");
+            const user = await RenderFromList();
+            await PressFunction(user, "F5", "key");
+            expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+            expect(fireEvent.keyDown(window, { key: keyName })).toBe(false);
+            expect(screen.queryByRole("alert")).toBeNull();
+            await act(async () => {
+                settleDelete();
+            });
+            await ExpectAlert(DELETED_MESSAGE, "success");
+            expect(mockDeleteUser).toHaveBeenCalledTimes(1);
+        },
+    );
+});
+
+// A second key pressed with PF5 before the busy render disables the keys: a second delete, a
+// fetch, a return to either menu, a clear and the invalid-key literal.
+const SECOND_KEYS_AFTER_DELETE: readonly string[] = ["F5", "Enter", "F3", "F4", "F12", "F7"];
+
+// Two keys pressed before React re-renders: the second finds every key still enabled.
+function PressTwoKeysBeforeRender(firstKeyName: string, secondKeyName: string): void {
+    act(() => {
+        fireEvent.keyDown(window, { key: firstKeyName });
+        fireEvent.keyDown(window, { key: secondKeyName });
+    });
+}
+
+// One delete is out for the fetched user, and nothing else has happened: no fetch, no clear, no
+// message and no navigation.
+function ExpectOneDeleteInFlight(): void {
+    expect(mockDeleteUser).toHaveBeenCalledTimes(1);
+    expect(mockDeleteUser).toHaveBeenCalledWith(TEST_USER_ID);
+    expect(mockFetchUser).toHaveBeenCalledTimes(1);
+    expect(ShownValues()).toEqual(FetchedValues(TEST_USER_ID));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(mockRouterPush).not.toHaveBeenCalled();
+}
+
+// The one delete's green answer clears the screen, and a later PF5 sends the next DELETE.
+async function ExpectDeleteAnsweredThenUnlocked(user: UserEvent): Promise<void> {
+    await ExpectAlert(DELETED_MESSAGE, "success");
+    expect(ShownValues()).toEqual(EMPTY_SCREEN_VALUES);
+    expect(mockDeleteUser).toHaveBeenCalledTimes(1);
+    expect(mockRouterPush).not.toHaveBeenCalled();
+    await PressFunction(user, "F5", "key");
+    await ExpectIdle();
+    expect(mockDeleteUser).toHaveBeenCalledTimes(2);
+}
+
+// The in-flight lock refuses the second key, so one press sends one DELETE and its green answer is
+// the one shown, never a second DELETE's "User ID NOT found..."; the lock then clears.
+describe("COUSR03C keys pressed in the same turn as PF5", () => {
+    it.each(SECOND_KEYS_AFTER_DELETE)(
+        "COUSR03C PF5 and %s in one turn send one DELETE, answered on the screen sent",
+        async (secondKeyName) => {
+            const settleDelete = DeferCall("delete");
+            const user = await RenderFromList();
+            PressTwoKeysBeforeRender(PF_KEY_ACTIONS.F5, secondKeyName);
+            ExpectOneDeleteInFlight();
+            await act(async () => {
+                settleDelete();
+            });
+            await ExpectDeleteAnsweredThenUnlocked(user);
+        },
+    );
+});
+
+// Only ENTER's read went out, over blanked details: no DELETE and no navigation.
+function ExpectReadAloneInFlight(): void {
+    expect(mockFetchUser).toHaveBeenCalledTimes(2);
+    ExpectLastFetchOf(TEST_USER_ID);
+    expect(mockDeleteUser).not.toHaveBeenCalled();
+    expect(ShownValues()).toEqual({ ...EMPTY_SCREEN_VALUES, user_id: TEST_USER_ID });
+    expect(mockRouterPush).not.toHaveBeenCalled();
+}
+
+// The read's prompt shows the user, still undeleted; a later PF5 then sends one DELETE.
+async function ExpectReadAnsweredThenDeleteUnlocked(user: UserEvent): Promise<void> {
+    await ExpectAlert(PRESS_PF5_MESSAGE, "info");
+    expect(ShownValues()).toEqual(FetchedValues(TEST_USER_ID));
+    expect(mockDeleteUser).not.toHaveBeenCalled();
+    expect(mockRouterPush).not.toHaveBeenCalled();
+    await PressFunction(user, "F5", "key");
+    await ExpectAlert(DELETED_MESSAGE, "success");
+    expect(mockDeleteUser).toHaveBeenCalledTimes(1);
+    expect(mockDeleteUser).toHaveBeenCalledWith(TEST_USER_ID);
+}
+
+// The 3270 keyboard locks from ENTER until the read answers, so a PF5 keyed in ENTER's turn,
+// before the busy render disables the keys, never deletes the user the read then shows.
+describe("COUSR03C PF5 pressed in the same turn as ENTER", () => {
+    it("COUSR03C ENTER and PF5 in one turn send the read alone; a later PF5 deletes", async () => {
+        const user = await RenderFromList();
+        const settleFetch = DeferCall("fetch");
+        PressTwoKeysBeforeRender(PF_KEY_ACTIONS.ENTER, PF_KEY_ACTIONS.F5);
+        ExpectReadAloneInFlight();
+        await act(async () => {
+            settleFetch();
+        });
+        await ExpectReadAnsweredThenDeleteUnlocked(user);
+    });
+});
+
 describe("COUSR03C message literals (ERRMSG)", () => {
     it.each(LITERAL_CASES)(
         "COUSR03C $call answered $status shows '$literal' as $severity",

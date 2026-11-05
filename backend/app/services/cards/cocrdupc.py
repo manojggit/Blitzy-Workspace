@@ -215,7 +215,8 @@ class CardUpdateState:
 
     ``acctId`` and ``cardNum`` are the keys that passed 1210 and 1220, or the card-list keys
     read without those edits (lines 482-497); both are empty before fetch. ``beforeImage`` is
-    CCUP-OLD-DETAILS once the card is read. ``newData`` is set on entering STATE_CONFIRM with
+    CCUP-OLD-DETAILS once 9000-READ-DATA has run: the card read, or BLANK_BEFORE_IMAGE after
+    a failed read that still shows details. ``newData`` is set on entering STATE_CONFIRM with
     the validated values F5 rewrites, and is kept into STATE_DONE, STATE_LOCK_ERROR and
     STATE_UPDATE_FAILED, whose screen shows the values written or attempted (3200
     CCUP-CHANGES-MADE, lines 1113-1123); STATE_SHOW_DETAILS and STATE_CHANGES_NOT_OK carry
@@ -235,6 +236,9 @@ class CardUpdateState:
 
 
 NOT_FETCHED_STATE = CardUpdateState(STATE_NOT_FETCHED, "", "")
+# 9000-READ-DATA opens with INITIALIZE CCUP-OLD-DETAILS (line 1345): every field is PIC X, the
+# CVV included, so a read that finds no card leaves each one spaces, held here right-trimmed.
+BLANK_BEFORE_IMAGE = BeforeImage(cvv="", name="", year="", month="", day="", status="")
 
 
 def EncodeUpdateToken(state: CardUpdateState, settings: "Settings") -> str:
@@ -334,6 +338,10 @@ class ScreenReply:
 type ScreenHandler = Callable[
     [OnlineContext, CardUpdateState, CardScreenFields], Awaitable[CardScreen]
 ]
+# The screen a failed 9100 read answers with, from the keys read, the message and the flagged
+# keys: ReadFailureReply where the state stays not fetched, ReadFailureDetailsReply where the
+# caller sets CCUP-SHOW-DETAILS whatever the read found.
+type ReadFailureBuilder = Callable[[tuple[str, str], str, tuple[str, ...]], ScreenReply]
 
 
 async def FetchCardForEdit(
@@ -353,9 +361,11 @@ async def FetchCardForEdit(
         LegacyMessageError: 404 ``Did not find cards for this search condition`` for an
             invalid or expired ``card_ref``, one carrying no card key, or a card that does not
             exist; 400 with the key edit literal, never for the card-list entry; 503 with the
-            CARDDAT READ file-error text. Each body carries the not-fetched key screen; for a
-            ``card_ref`` carrying no card key it shows the account as sent and a blank card
-            number, so the token is never echoed.
+            CARDDAT READ file-error text. The card-list entry sets CCUP-SHOW-DETAILS whatever
+            its read found, so its 404 and 503 carry the SHOW_DETAILS screen with both keys
+            kept and blank details (ReadFailureDetailsReply). Every other body carries the
+            not-fetched key screen; for a ``card_ref`` carrying no card key it shows the
+            account as sent and a blank card number, so the token is never echoed.
     """
     cardText = DecodeCardKey(cardKey, context.settings, isCardRef=isCardRef)
     if cardText is None:
@@ -364,7 +374,7 @@ async def FetchCardForEdit(
         )
         raise ScreenError(reply, STATUS_NOT_FOUND, context.settings)
     if IsListEntry(cardKey, acctId, isCardRef=isCardRef):
-        return await ShowFetchedCard(context, acctId, cardText)
+        return await ShowFetchedCard(context, acctId, cardText, ReadFailureDetailsReply)
     return await FetchWithKeys(context, acctId, cardText)
 
 
@@ -383,7 +393,8 @@ async def ProcessCardUpdate(
             or, once details are fetched, an invalid or expired ``card_ref`` path, 409 for a
             record changed since fetch, 423 for a record lock, and 503 for a failed rewrite or
             a CARDDAT read error. Each body carries the screen ``fields``, ``state`` and
-            ``screen_token``.
+            ``screen_token``; a not-fetched ENTER whose read fails stays DETAILS_NOT_FETCHED,
+            and an F12 whose re-read fails gives SHOW_DETAILS with the keys kept.
     """
     tokenState = DecodeUpdateToken(request.screen_token, context.settings) or NOT_FETCHED_STATE
     state = BindStateToPath(tokenState, cardKey, context.settings)
@@ -572,16 +583,19 @@ async def FetchWithKeys(context: OnlineContext, acctText: str, cardText: str) ->
             shownKeys=(acctText, cardText),
         )
         raise ScreenError(reply, STATUS_EDIT_FAILED, context.settings)
-    return await ShowFetchedCard(context, keys.acctId, keys.cardNum)
+    return await ShowFetchedCard(context, keys.acctId, keys.cardNum, ReadFailureReply)
 
 
-async def ShowFetchedCard(context: OnlineContext, acctId: str, cardNum: str) -> CardScreen:
+async def ShowFetchedCard(
+    context: OnlineContext, acctId: str, cardNum: str, failureReply: ReadFailureBuilder
+) -> CardScreen:
     """Port of SET CCUP-SHOW-DETAILS after a successful 9000-READ-DATA.
 
     The before-image is shown with the upper-cased name, the information line is
-    FOUND-CARDS-FOR-ACCOUNT and the cursor is the name (3300, lines 1212-1214).
+    FOUND-CARDS-FOR-ACCOUNT and the cursor is the name (3300, lines 1212-1214). A failed
+    read raises the screen ``failureReply`` builds for the caller.
     """
-    beforeImage = await ReadBeforeImage(context, acctId, cardNum)
+    beforeImage = await ReadBeforeImage(context, acctId, cardNum, failureReply)
     state = CardUpdateState(STATE_SHOW_DETAILS, acctId, cardNum, beforeImage)
     reply = ScreenReply(state, DETAILS_SHOWN_INFO, ImageValues(beforeImage), cursorField=NAME_FIELD)
     return BuildScreen(reply, context.settings)
@@ -592,29 +606,36 @@ async def RereadCard(
 ) -> CardScreen:
     """Port of WHEN CCARD-AID-PFK12 (lines 958-966): re-read the card, discarding the edits.
 
-    The keys come from the token and no edit runs.
+    The keys come from the token and no edit runs. The screen shows details whatever the
+    read found: a list session's F12 sets CCUP-SHOW-DETAILS unconditionally (lines 484-494),
+    and a menu session's does so IF FOUND-CARDS-FOR-ACCOUNT, which 1200-EDIT-MAP-INPUTS set
+    with the details fetched (line 668) and a failed 9100 leaves set. So a failed re-read
+    keeps both keys with a blank before-image (ReadFailureDetailsReply).
     """
-    return await ShowFetchedCard(context, state.acctId, state.cardNum)
+    return await ShowFetchedCard(context, state.acctId, state.cardNum, ReadFailureDetailsReply)
 
 
-async def ReadBeforeImage(context: OnlineContext, acctId: str, cardNum: str) -> BeforeImage:
+async def ReadBeforeImage(
+    context: OnlineContext, acctId: str, cardNum: str, failureReply: ReadFailureBuilder
+) -> BeforeImage:
     """Port of 9000-READ-DATA and 9100-GETCARD-BYACCTCARD (lines 1343-1417).
 
     CARDDAT is read by card number only; the account key is never compared with the card's.
 
     Raises:
         LegacyMessageError: 404 ``Did not find cards for this search condition`` (NOTFND),
-            or 503 with the READ file-error text (WHEN OTHER), each on the key screen.
+            or 503 with the READ file-error text (WHEN OTHER), each on the screen
+            ``failureReply`` builds from the keys read.
     """
     try:
         card = await CardRepository(context).GetCard(cardNum)
     except RepositoryError as error:
         LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
         message = BuildFileErrorMessage(READ_OPERATION, CARD_FILE_NAME, error.resp, error.resp2)
-        reply = ReadFailureReply((acctId, cardNum), message, (ACCT_ID_FIELD,))
+        reply = failureReply((acctId, cardNum), message, (ACCT_ID_FIELD,))
         raise ScreenError(reply, STATUS_FILE_ERROR, context.settings) from error
     if card is None:
-        reply = ReadFailureReply(
+        reply = failureReply(
             (acctId, cardNum), CARD_NOT_FOUND_MESSAGE, (ACCT_ID_FIELD, CARD_NUM_FIELD)
         )
         raise ScreenError(reply, STATUS_NOT_FOUND, context.settings)
@@ -626,8 +647,10 @@ def ReadFailureReply(
 ) -> ScreenReply:
     """The key screen of a failed 9100 read: the keys shown, the cursor on the account.
 
-    NOTFND sets both filter flags NOT-OK and WHEN OTHER the account flag (lines 1395-1406);
-    the state stays DETAILS_NOT_FETCHED, so the information line is the key prompt.
+    NOTFND sets both filter flags NOT-OK and WHEN OTHER the account flag (lines 1395-1406).
+    For the not-fetched ENTER, 2000-DECIDE-ACTION sets CCUP-SHOW-DETAILS only IF
+    FOUND-CARDS-FOR-ACCOUNT (lines 954-965), which a failed read never sets there, so the
+    state stays DETAILS_NOT_FETCHED and the information line is the key prompt.
     """
     return ScreenReply(
         NOT_FETCHED_STATE,
@@ -636,6 +659,28 @@ def ReadFailureReply(
         fieldErrors=fieldErrors,
         cursorField=ACCT_ID_FIELD,
         shownKeys=shownKeys,
+    )
+
+
+def ReadFailureDetailsReply(
+    heldKeys: tuple[str, str], message: str, fieldErrors: tuple[str, ...]
+) -> ScreenReply:
+    """The details screen of a failed 9100 read on the card-list entry or the F12 re-read.
+
+    Both SET CCUP-SHOW-DETAILS after 9000-READ-DATA whatever 9100 found (lines 482-497,
+    958-966), so the keys stay held with the blank before-image INITIALIZE left, and 3200
+    shows it. 3250 sets FOUND-CARDS-FOR-ACCOUNT and 3300 puts the cursor on the name (lines
+    1145-1146, 1212-1214); NOTFND flags both keys and WHEN OTHER the account (lines 1395-1406).
+    """
+    acctId, cardNum = heldKeys
+    state = CardUpdateState(STATE_SHOW_DETAILS, acctId, cardNum, BLANK_BEFORE_IMAGE)
+    return ScreenReply(
+        state,
+        DETAILS_SHOWN_INFO,
+        ImageValues(BLANK_BEFORE_IMAGE),
+        message=message,
+        fieldErrors=fieldErrors,
+        cursorField=NAME_FIELD,
     )
 
 

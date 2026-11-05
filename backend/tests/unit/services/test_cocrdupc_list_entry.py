@@ -16,6 +16,10 @@ set:
     (``isCardRef``) that is no token, give ``Did not find cards for this search condition``
     (line 204) on the not-fetched key screen with the key prompt (line 163); the same short
     text typed is ``CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER`` (line 789);
+- a list card_ref whose 9100 READ answers NOTFND (both keys flagged, line 204) or IOERR (the
+    account flagged, the READ file-error text) still sets CCUP-SHOW-DETAILS (line 494): the keys
+    are kept over the blank before-image of INITIALIZE CCUP-OLD-DETAILS (line 1345), and the
+    next ENTER runs the detail edits, giving ``Card name not provided`` (line 182);
 - a done or failed (C, L, F) token keeps CCUP-NEW-CARDDATA, which 3200-SETUP-SCREEN-VARS shows
     for CCUP-CHANGES-MADE (lines 1113-1123).
 
@@ -24,6 +28,7 @@ AsyncMock, so no database is needed.
 """
 
 import secrets
+from collections.abc import Callable
 from datetime import date
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple
@@ -32,9 +37,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.core.dependencies import OnlineContext
-from app.core.errors import LegacyMessageError
+from app.core.errors import FileIoError, LegacyMessageError
 from app.core.security import EncodeCardRef
-from app.schemas.cards import CardScreenFields
+from app.repositories.card_repository import CARD_FILE_NAME
+from app.schemas.cards import CardScreenFields, CardUpdateRequest
 from app.schemas.common import UpdateScreenState
 from app.services.cards import cocrdupc
 
@@ -78,12 +84,25 @@ CARD_NOT_PROVIDED_MESSAGE = "Card number not provided"
 ACCOUNT_FILTER_MESSAGE = "ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER"
 CARD_FILTER_MESSAGE = "CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER"
 CARD_NOT_FOUND_MESSAGE = "Did not find cards for this search condition"
+CARD_NAME_NOT_PROVIDED_MESSAGE = "Card name not provided"
+PROMPT_FOR_CHANGES_INFO = "Update card details presented above."
+# 9100 WHEN OTHER (lines 1402-1411) on IOERR, RESP 17 and RESP2 0: WS-FILE-ERROR-MESSAGE with
+# 'READ' in X(8), LIT-CARDFILENAME in X(9) and each code as nine digits and a space, cut to X(75).
+READ_FILE_ERROR_MESSAGE = (
+    "File Error: READ     on CARDDAT   returned RESP 000000017 ,RESP2 000000000"
+)
 NO_MESSAGE = ""
 ACCT_ID_FIELD = "acct_id"
 CARD_NUM_FIELD = "card_num"
 NAME_FIELD = "embossed_name"
+# CRDNAME, CRDSTCD, EXPMON and EXPYEAR in the 1230-1260 edit order (lines 698-708).
+DETAIL_FIELDS = ["embossed_name", "active_status", "expiry_month", "expiry_year"]
+MASKED_LISTED_CARD_NUM = "************4321"
 EDIT_FAILED_STATUS = 400
 NOT_FOUND_STATUS = 404
+FILE_ERROR_STATUS = 503
+# INITIALIZE CCUP-OLD-DETAILS (line 1345): every PIC X field spaces, held right-trimmed.
+BLANK_BEFORE_IMAGE = cocrdupc.BeforeImage(cvv="", name="", year="", month="", day="", status="")
 # Every CCUP error body: the four legacy keys and the screen beside them (ScreenError).
 CARD_SCREEN_ERROR_KEYS = frozenset(
     {"message", "info_message", "field_errors", "cursor_field", "fields", "state", "screen_token"}
@@ -280,6 +299,103 @@ async def test_card_ref_not_carrying_card_key_is_not_found(
     tokenState = cocrdupc.DecodeUpdateToken(body["screen_token"], testSettings)
     assert tokenState == cocrdupc.NOT_FETCHED_STATE
     cardRepository.GetCard.assert_not_awaited()
+
+
+def NoCardRecord(cardNum: str) -> dict[str, object] | None:
+    """Answer the CARDDAT READ with no record, as NOTFND does."""
+    return None
+
+
+def RaiseCardFileIo(cardNum: str) -> dict[str, object] | None:
+    """Answer the CARDDAT READ with IOERR, which 9100 takes WHEN OTHER."""
+    raise FileIoError(CARD_FILE_NAME)
+
+
+class FailedListRead(NamedTuple):
+    """A 9100 READ of the listed card that fails: the stub's answer and the refusal it gives."""
+
+    readAnswer: Callable[[str], dict[str, object] | None]
+    httpStatus: int
+    message: str
+    fieldErrors: list[str]
+
+
+FAILED_LIST_READS = [
+    pytest.param(
+        FailedListRead(
+            NoCardRecord, NOT_FOUND_STATUS, CARD_NOT_FOUND_MESSAGE, [ACCT_ID_FIELD, CARD_NUM_FIELD]
+        ),
+        id="notfnd",
+    ),
+    pytest.param(
+        FailedListRead(
+            RaiseCardFileIo, FILE_ERROR_STATUS, READ_FILE_ERROR_MESSAGE, [ACCT_ID_FIELD]
+        ),
+        id="ioerr",
+    ),
+]
+
+
+async def RefusedListEntry(
+    cardRepository: StubCardRepository,
+    context: OnlineContext,
+    cardRef: str,
+    failedRead: FailedListRead,
+) -> LegacyMessageError:
+    """Open the listed card by its card_ref while its READ fails; return the refusal."""
+    cardRepository.GetCard.side_effect = failedRead.readAnswer
+    with pytest.raises(LegacyMessageError) as raised:
+        await cocrdupc.FetchCardForEdit(context, cardRef, LIST_ACCT_ID, isCardRef=True)
+    return raised.value
+
+
+@pytest.mark.parametrize("failedRead", FAILED_LIST_READS)
+async def test_failed_list_entry_read_keeps_keys_in_show_details(
+    cardRepository, testSettings, failedRead
+):
+    """The keys stay with blank details, the 9100 flags, and the cursor on the name."""
+    context = BuildContext(testSettings)
+    cardRef = EncodeCardRef(LISTED_CARD_NUM, testSettings)
+    refusal = await RefusedListEntry(cardRepository, context, cardRef, failedRead)
+    body = refusal.Body()
+    assert refusal.httpStatus == failedRead.httpStatus
+    assert set(body) == CARD_SCREEN_ERROR_KEYS
+    assert (body["message"], body["info_message"]) == (failedRead.message, DETAILS_SHOWN_INFO)
+    assert (body["field_errors"], body["cursor_field"]) == (failedRead.fieldErrors, NAME_FIELD)
+    assert body["state"] == UpdateScreenState.SHOW_DETAILS
+    shownFields = CardScreenFields(acct_id=LIST_ACCT_ID, card_num=MASKED_LISTED_CARD_NUM)
+    assert body["fields"] == shownFields.model_dump()
+    heldState = cocrdupc.CardUpdateState(
+        cocrdupc.STATE_SHOW_DETAILS, LIST_ACCT_ID, LISTED_CARD_NUM, BLANK_BEFORE_IMAGE
+    )
+    assert cocrdupc.DecodeUpdateToken(body["screen_token"], testSettings) == heldState
+
+
+@pytest.mark.parametrize("failedRead", FAILED_LIST_READS)
+async def test_enter_after_failed_list_entry_read_runs_detail_edits(
+    cardRepository, testSettings, failedRead
+):
+    """ENTER by the held card_ref is a SHOW_DETAILS ENTER, never a key edit or another read.
+
+    1100 receives each blank detail as LOW-VALUES, which never equals the blank before-image,
+    so every 1230-1260 edit runs and fails, the name's literal first (CCUP-CHANGES-NOT-OK).
+    """
+    context = BuildContext(testSettings)
+    cardRef = EncodeCardRef(LISTED_CARD_NUM, testSettings)
+    shown = (await RefusedListEntry(cardRepository, context, cardRef, failedRead)).Body()
+    keyedFields = CardScreenFields(**shown["fields"])
+    request = CardUpdateRequest(screen_token=shown["screen_token"], fields=keyedFields)
+    with pytest.raises(LegacyMessageError) as raised:
+        await cocrdupc.ProcessCardUpdate(context, cardRef, request)
+    body = raised.value.Body()
+    assert raised.value.httpStatus == EDIT_FAILED_STATUS
+    assert (body["message"], body["info_message"]) == (
+        CARD_NAME_NOT_PROVIDED_MESSAGE,
+        PROMPT_FOR_CHANGES_INFO,
+    )
+    assert body["field_errors"] == DETAIL_FIELDS
+    assert body["state"] == UpdateScreenState.CHANGES_NOT_OK
+    cardRepository.GetCard.assert_awaited_once_with(LISTED_CARD_NUM)
 
 
 @pytest.mark.parametrize("stateCode", FINISHED_STATE_CODES)

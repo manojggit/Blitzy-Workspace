@@ -227,11 +227,12 @@ async def ProcessTransactionSelection(
 
     Raises:
         LegacyMessageError: 400 ``Invalid selection. Valid value is S`` when the browse leaves
-            that literal on ERRMSG, its body adding the browsed page's ``rows``, ``page``,
-            ``first_key`` and ``last_key``; 400 ``Tran ID must be Numeric ...`` with the four
-            standard keys only for a non-numeric search key, which wins over an invalid code
-            as ERR-FLG does; 503 ``Unable to lookup transaction...`` while the batch window
-            holds TRANSACT or on a database failure.
+            that literal on ERRMSG, its ``field_errors`` empty and its body adding the browsed
+            page's ``rows``, ``page``, ``first_key`` and ``last_key``; 400
+            ``Tran ID must be Numeric ...`` with the four standard keys only for a non-numeric
+            search key, which wins over an invalid code as ERR-FLG does; 503
+            ``Unable to lookup transaction...`` while the batch window holds TRANSACT or on a
+            database failure.
     """
     selection = _FindFirstSelection(request.selections)
     state = ListState(firstKey=request.first_key, lastKey="", page=_NormalisedPage(request.page))
@@ -519,8 +520,10 @@ def _InvalidSelectionRefusal(state: ListState) -> LegacyMessageError:
 
     The edit failure rides on the page the browse built: the body adds its ``rows``, ``page``,
     ``first_key``, ``last_key`` and ``search_cleared`` beside the four standard keys, dumped as
-    JSON so each ``tran_amt`` stays a decimal string, never a float. The invalid code sets no
-    ERR-FLG, so the browse blanked TRNIDIN as every forward browse does.
+    JSON so each ``tran_amt`` stays a decimal string, never a float. WHEN OTHER (lines 196-201)
+    sets no ERR-FLG and only moves the cursor to TRNIDIN, so ``field_errors`` is empty,
+    ``cursor_field`` is ``search_tran_id``, and the browse blanked TRNIDIN as every forward
+    browse does.
     """
     listPage = _BuildListResponse(state, TransactionListResponse)
     pageBody = listPage.model_dump(mode="json", include=LIST_PAGE_BODY_FIELDS)
@@ -528,7 +531,7 @@ def _InvalidSelectionRefusal(state: ListState) -> LegacyMessageError:
         INVALID_SELECTION_MESSAGE,
         field=SEARCH_CURSOR_FIELD,
         httpStatus=EDIT_FAILURE_STATUS,
-        details=LegacyErrorDetails(extraBody=pageBody),
+        details=LegacyErrorDetails(extraBody=pageBody, exactFieldErrors=True),
     )
 
 

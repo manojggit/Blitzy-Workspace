@@ -10,9 +10,11 @@ The service is called directly, never over HTTP, against the migrated and seeded
 - the CCUP-CHANGE-ACTION state machine of 0000-MAIN and 2000-DECIDE-ACTION (lines 517-1022),
   where F5 is valid only once changes are validated, F12 only once details are fetched, and
   the no-change compare (lines 680-692) runs before every detail edit;
-- 9100-GETCARD-BYACCTCARD WHEN OTHER (lines 1402-1411), which flags the account and shows the
-  READ/CARDDAT WS-FILE-ERROR-MESSAGE (lines 133-152): a 503 on the key screen, whether the
-  read is the fetch or the F12 re-read;
+- 9100-GETCARD-BYACCTCARD NOTFND (lines 1395-1401), which flags both keys, and WHEN OTHER
+  (lines 1402-1411), which flags the account and shows the READ/CARDDAT WS-FILE-ERROR-MESSAGE
+  (lines 133-152): a 404 or 503 on the key screen for the fetch with typed keys, and on the
+  SHOW_DETAILS screen for the F12 re-read, which sets CCUP-SHOW-DETAILS whatever the read found
+  (lines 958-966), with both keys kept and the before-image INITIALIZE blanks (line 1345);
 - 9200-WRITE-PROCESSING and 9300-CHECK-CHANGE-IN-REC (lines 1420-1511), which rewrite the
   name as entered, the status and the new year and month with the before-image day, and keep
   the CVV.
@@ -24,7 +26,7 @@ write happened is read back from cards.cards with plain SQL, and every test rest
 
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import date
 from typing import Any, NamedTuple
 
@@ -130,6 +132,13 @@ OTHER_SECRET_KEY_BYTES = 48
 # How far past the token lifetime the expired token was issued.
 EXPIRY_MARGIN_SECONDS = 60
 
+# 9000-READ-DATA INITIALIZEs CCUP-OLD-DETAILS (line 1345), all PIC X, so a failed read leaves
+# every before-image field spaces, which the token holds right-trimmed; the keys are kept.
+BLANK_BEFORE_IMAGE = cocrdupc.BeforeImage(cvv="", name="", year="", month="", day="", status="")
+HELD_KEYS_STATE = cocrdupc.CardUpdateState(
+    cocrdupc.STATE_SHOW_DETAILS, SEED_ACCT_ID, SEED_CARD_NUM, BLANK_BEFORE_IMAGE
+)
+
 CARD_ROW_QUERY = text(
     "SELECT acct_id, cvv_cd, embossed_name, expiration_date, active_status"
     " FROM cards.cards WHERE card_num = :cardNum"
@@ -216,6 +225,24 @@ READ_FILE_ERROR_REFUSAL = ExpectedRefusal(
     (ACCT_ID_FIELD,),
     ACCT_ID_FIELD,
     UpdateScreenState.DETAILS_NOT_FETCHED,
+)
+# A failed F12 re-read is CCUP-SHOW-DETAILS (lines 958-966): 3250 sets FOUND-CARDS-FOR-ACCOUNT,
+# so 3300 puts the cursor on the name (lines 1145-1146, 1212-1214), with the 9100 flags.
+REREAD_FILE_ERROR_REFUSAL = ExpectedRefusal(
+    HTTP_FILE_ERROR,
+    READ_FILE_ERROR_MESSAGE,
+    DETAILS_SHOWN_INFO,
+    (ACCT_ID_FIELD,),
+    NAME_FIELD,
+    UpdateScreenState.SHOW_DETAILS,
+)
+REREAD_NOT_FOUND_REFUSAL = ExpectedRefusal(
+    HTTP_NOT_FOUND,
+    CARD_NOT_FOUND_MESSAGE,
+    DETAILS_SHOWN_INFO,
+    BOTH_KEY_FIELDS,
+    NAME_FIELD,
+    UpdateScreenState.SHOW_DETAILS,
 )
 RESTART_REFUSAL = ExpectedRefusal(
     HTTP_EDIT_FAILURE,
@@ -388,6 +415,11 @@ async def RaiseReadFileIo(repository: CardRepository, cardNum: str) -> None:
     raise FileIoError(CARD_FILE_NAME)
 
 
+async def ReadNoCard(repository: CardRepository, cardNum: str) -> Mapping[str, Any] | None:
+    """Stand in for the 9100 READ of CARDDAT answering NOTFND: the card is gone since fetch."""
+    return None
+
+
 async def FetchForEditReadRefusal(
     scenario: CardScenario, monkeypatch: pytest.MonkeyPatch
 ) -> LegacyMessageError:
@@ -396,13 +428,27 @@ async def FetchForEditReadRefusal(
     return await FetchRefusal(scenario.context, SEED_CARD_NUM, SEED_ACCT_ID)
 
 
+async def RereadRefusal(
+    scenario: CardScenario, monkeypatch: pytest.MonkeyPatch, failingRead: Callable[..., Any]
+) -> LegacyMessageError:
+    """Fetch the seed card, then press F12 while ``failingRead`` answers its re-read."""
+    fetched = await FetchCardScreen(scenario.context, SEED_CARD_NUM, SEED_ACCT_ID)
+    monkeypatch.setattr(CardRepository, "GetCard", failingRead)
+    return await SendRefusedKey(scenario, WithCardChanges(fetched, {}, UpdateAction.CANCEL))
+
+
 async def RereadReadRefusal(
     scenario: CardScenario, monkeypatch: pytest.MonkeyPatch
 ) -> LegacyMessageError:
     """Fetch the seed card, then press F12 while its re-read answers IOERR; return the refusal."""
-    fetched = await FetchCardScreen(scenario.context, SEED_CARD_NUM, SEED_ACCT_ID)
-    monkeypatch.setattr(CardRepository, "GetCard", RaiseReadFileIo)
-    return await SendRefusedKey(scenario, WithCardChanges(fetched, {}, UpdateAction.CANCEL))
+    return await RereadRefusal(scenario, monkeypatch, RaiseReadFileIo)
+
+
+async def RereadMissingRefusal(
+    scenario: CardScenario, monkeypatch: pytest.MonkeyPatch
+) -> LegacyMessageError:
+    """Fetch the seed card, then press F12 while its re-read answers NOTFND; return the refusal."""
+    return await RereadRefusal(scenario, monkeypatch, ReadNoCard)
 
 
 # --- 1230-1260 detail edits (lines 806-944) ----------------------------------------------------
@@ -575,17 +621,45 @@ async def test_fetch_of_missing_card_is_not_found(cardScenario):
     assert body["fields"][ACCT_ID_FIELD] == SEED_ACCT_ID
 
 
-@pytest.mark.parametrize(
-    "readEntry",
-    [FetchForEditReadRefusal, RereadReadRefusal],
-    ids=["fetch-for-edit", "f12-reread"],
-)
-async def test_card_read_error_shows_file_error_on_key_screen(cardScenario, monkeypatch, readEntry):
-    """A CARDDAT READ ending WHEN OTHER: 503 WS-FILE-ERROR-MESSAGE, account flagged, no write."""
-    refusal = await readEntry(cardScenario, monkeypatch)
-    body = AssertRefusal(refusal, READ_FILE_ERROR_REFUSAL)
-    shownKeys = (body["fields"][ACCT_ID_FIELD], body["fields"][CARD_NUM_FIELD])
-    assert shownKeys == (SEED_ACCT_ID, MASKED_SEED_CARD_NUM)
+class ReadFailureCase(NamedTuple):
+    """A CARDDAT READ that fails, the refusal it answers with and the state its token holds."""
+
+    readEntry: Callable[[CardScenario, pytest.MonkeyPatch], Awaitable[LegacyMessageError]]
+    expected: ExpectedRefusal
+    tokenState: cocrdupc.CardUpdateState
+
+
+READ_FAILURE_CASES = [
+    pytest.param(
+        ReadFailureCase(
+            FetchForEditReadRefusal, READ_FILE_ERROR_REFUSAL, cocrdupc.NOT_FETCHED_STATE
+        ),
+        id="fetch-for-edit-ioerr",
+    ),
+    pytest.param(
+        ReadFailureCase(RereadReadRefusal, REREAD_FILE_ERROR_REFUSAL, HELD_KEYS_STATE),
+        id="f12-reread-ioerr",
+    ),
+    pytest.param(
+        ReadFailureCase(RereadMissingRefusal, REREAD_NOT_FOUND_REFUSAL, HELD_KEYS_STATE),
+        id="f12-reread-notfnd",
+    ),
+]
+
+
+@pytest.mark.parametrize("readCase", READ_FAILURE_CASES)
+async def test_card_read_failure_answers_on_its_entry_screen(cardScenario, monkeypatch, readCase):
+    """A failed CARDDAT READ shows both keys, the card masked, and blank details; no write.
+
+    The fetch with typed keys stays on the not-fetched key screen; the F12 re-read answers in
+    SHOW_DETAILS with a token holding both keys and the blank before-image.
+    """
+    refusal = await readCase.readEntry(cardScenario, monkeypatch)
+    body = AssertRefusal(refusal, readCase.expected)
+    shownFields = CardScreenFields(acct_id=SEED_ACCT_ID, card_num=MASKED_SEED_CARD_NUM)
+    assert body["fields"] == shownFields.model_dump(mode="json")
+    settings = cardScenario.context.settings
+    assert cocrdupc.DecodeUpdateToken(body["screen_token"], settings) == readCase.tokenState
     AssertSeedRowUnchanged(cardScenario)
 
 

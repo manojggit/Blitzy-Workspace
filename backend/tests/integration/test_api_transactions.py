@@ -566,10 +566,12 @@ async def test_invalid_selection_continues_with_the_search(
     searchIndex = PAGE_SIZE - 1
     selectionBody = SelectionBody("X", SELECTED_TRAN_ID, pagedTransactions[searchIndex])
     response = await regularClient.post(SELECTION_URL, json=selectionBody)
-    refusal = AssertLegacyError(
-        response, HTTP_EDIT_FAILURE, INVALID_SELECTION_TEXT, SEARCH_CURSOR_FIELD
-    )
-    assert LIST_PAGE_KEYS <= set(refusal)
+    assert response.status_code == HTTP_EDIT_FAILURE, response.text
+    refusal = response.json()
+    assert LEGACY_ERROR_KEYS | LIST_PAGE_KEYS <= set(refusal)
+    assert refusal["message"] == INVALID_SELECTION_TEXT
+    # COTRN00C's WHEN OTHER sets no ERR-FLG: no field fails, only the cursor goes to TRNIDIN.
+    assert (refusal["field_errors"], refusal["cursor_field"]) == ([], SEARCH_CURSOR_FIELD)
     assert PageIds(refusal) == list(pagedTransactions[searchIndex : searchIndex + PAGE_SIZE])
     assert refusal["page"] == 1
 

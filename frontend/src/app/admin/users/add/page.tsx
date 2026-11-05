@@ -233,9 +233,10 @@ function HandleClear(context: UserAddContext): void {
     context.RequestFocus(INITIAL_FOCUS_FIELD);
 }
 
-// COUSR01C WHEN OTHER (lines 98-102): the legend shows F12=Exit, but PF12 has no handler, so the
-// keyed values are sent back unchanged with the invalid-key literal. It is refused while an add is
-// in flight, so the answer's message is the one shown.
+// COUSR01C WHEN OTHER (lines 98-102): the legend shows F12=Exit, but PF12 has no handler, so PF12
+// and every other PF key the legend lacks send the keyed values back unchanged with the
+// invalid-key literal. It is refused while an add is in flight, so the answer's message is the one
+// shown.
 function HandleInvalidKey(context: UserAddContext): void {
     if (context.isInFlightRef.current) {
         return;
@@ -297,13 +298,21 @@ function usePendingMessage(setFeedback: Dispatch<SetStateAction<UserAddFeedback>
     }, [setFeedback]);
 }
 
-// PF3 is XCTL COADM01C: back to the admin menu, saving nothing.
+// PF3 is XCTL COADM01C: back to the admin menu, saving nothing. Every PF key the legend lacks takes
+// the WHEN OTHER branch as PF12 does, and like every key it waits while an add is in flight. The
+// same definitions drive the physical keys and the on-screen buttons.
 function useUserAddKeys(context: UserAddContext, isBusy: boolean): FunctionKeyDefinition[] {
     const router = useRouter();
-    return useMemo(
+    const keys = useMemo(
         () => BuildFunctionKeys(context, isBusy, () => router.push(ADMIN_HOME_ROUTE)),
         [context, isBusy, router],
     );
+    const invalidKeyAction = useMemo(
+        () => ({ onPress: () => HandleInvalidKey(context), disabled: isBusy }),
+        [context, isBusy],
+    );
+    useFunctionKeys(keys, invalidKeyAction);
+    return keys;
 }
 
 // The keyed values with the setters, cursor request and in-flight lock the key handlers act
@@ -417,7 +426,6 @@ function UserAddFields(props: UserAddFieldsProps) {
 // own.
 function UserAddScreen() {
     const screen = useUserAdd();
-    useFunctionKeys(screen.keys);
     return (
         <ScreenShell {...SHELL_HEADER} isBusy={screen.isBusy}>
             <UserAddFields

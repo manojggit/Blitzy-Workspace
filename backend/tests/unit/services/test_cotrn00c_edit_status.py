@@ -16,7 +16,8 @@ are typed from those lines:
 - on an empty TRANSACT it answers 200 with the top-of-page literal on an empty page 0;
 - an invalid code the browse leaves on ERRMSG answers 400 with the page's rows, page, first_key,
     last_key and search_cleared, each amount a JSON decimal string; the code sets no ERR-FLG, so
-    the browse blanks TRNIDIN (line 325) and search_cleared is true;
+    field_errors is empty, only the cursor goes to TRNIDIN, the browse blanks TRNIDIN (line 325)
+    and search_cleared is true;
 - an invalid code a paging literal replaces answers 200 with that page, page 1;
 - a STARTBR NOTFND from the list or the selection route answers 200 with the top-of-page
     literal over the shown page read back from its first key, last_key HIGH-VALUES and TRNIDIN
@@ -132,6 +133,11 @@ def StandardBody(message: str) -> dict[str, object]:
         "field_errors": [SEARCH_CURSOR_FIELD],
         "cursor_field": SEARCH_CURSOR_FIELD,
     }
+
+
+def CursorOnlyBody(message: str) -> dict[str, object]:
+    """Return the four standard keys of a 400 that fails no field: only the cursor moves."""
+    return StandardBody(message) | {"field_errors": []}
 
 
 def BrowseRecords(firstNumber: int, count: int) -> list[dict[str, object]]:
@@ -253,7 +259,7 @@ async def test_invalid_selection_on_a_page_with_a_next_page_is_an_edit_failure(
     pageKeys |= {"first_key": SHOWN_FIRST_KEY, "last_key": SHOWN_LAST_KEY}
     pageKeys |= {"search_cleared": True}
     assert raised.value.httpStatus == EDIT_FAILURE_STATUS
-    assert raised.value.Body() == StandardBody(INVALID_SELECTION_MESSAGE) | pageKeys
+    assert raised.value.Body() == CursorOnlyBody(INVALID_SELECTION_MESSAGE) | pageKeys
     transactionRepository.BrowseForward.assert_awaited_once_with(
         browseKey, inclusive=True, limit=PAGE_ROWS
     )

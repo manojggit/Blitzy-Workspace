@@ -22,14 +22,18 @@ and transcribed in docs/batch.md ("GDG archives").
 - Retention: LIMIT 5, applied after every publication and again by every ReconcileCatalog. The
   oldest PUBLISHED generation beyond it becomes ROLLED_OFF, committed before SCRATCH bases delete
   its file; NOSCRATCH TRANSACT.BKUP keeps it.
-- Containment: every archive operation stays beneath the configured CARDDEMO_OUTPUT_DIR. That
-  root is opened as given, following links, so it may be absolute or linked; the gdg directory,
-  each base directory and each work directory are opened relative to their parent's descriptor
-  without following a link (OpenArchiveDirectory). One that is a symbolic link or not a
-  directory raises ManagedDirectoryError, an OSError the file-error mappings turn into exit 12,
-  and nothing is read, written or deleted through it. The held descriptor then serves every
-  creation, read, rename, listing and deletion in that directory, files opened with O_NOFOLLOW,
-  so a directory swapped for a link once opened changes nothing this module reaches.
+- Containment: every archive operation stays beneath the configured CARDDEMO_OUTPUT_DIR. A
+  generation's path is derived from its fixed base name and number (CatalogFilePath), never
+  taken from the catalog's file_path; a row whose base_name is not a GDG_BASES name, or whose
+  file_path differs from that derivation, raises CatalogPathError, an OSError the file-error
+  mappings turn into exit 12, before anything is read, renamed or deleted for it or its state
+  changes. The output root is opened as given, following links, so it may be absolute or
+  linked; the gdg directory, each base directory and each work directory are opened relative to
+  their parent's descriptor without following a link (OpenArchiveDirectory). One that is a
+  symbolic link or not a directory raises ManagedDirectoryError, likewise exit 12, and nothing
+  is read, written or deleted through it. The held descriptor then serves every creation, read,
+  rename, listing and deletion in that directory, files opened with O_NOFOLLOW, so a directory
+  swapped for a link once opened changes nothing this module reaches.
 
 Records arrive already encoded by record_layouts.EncodeRecord; this module only checks their
 length and writes them, one per line ended by "\\n". Base names come from GDG_BASES only, never
@@ -106,6 +110,9 @@ NON_DESCENDING_NAMES = frozenset({"", os.curdir, os.pardir})
 REFUSED_DIRECTORY_TEXT = (
     "managed archive directory is a symbolic link or not a directory; it is never followed"
 )
+CATALOG_PATH_REFUSED_TEXT = (
+    "catalog file_path is not the <BASE>/G####V00.dat of its base and generation; never used"
+)
 # A work directory or run file name: its prefix, UNIQUE_NAME_BYTES random bytes as hex, and its
 # suffix, created exclusively and retried with a new name up to UNIQUE_NAME_ATTEMPTS times.
 UNIQUE_NAME_BYTES = 8
@@ -128,6 +135,7 @@ ROLLED_OFF_LOG = "GENERATION %s ROLLED OFF (LIMIT %d); FILE %s"
 ORPHAN_DELETED_LOG = "ORPHAN GENERATION FILE %s DELETED"
 ORPHAN_WORK_DIRECTORY_DELETED_LOG = "ORPHAN WORK DIRECTORY %s DELETED"
 LEFTOVER_DELETED_LOG = "ROLLED-OFF GENERATION %s: LEFTOVER FILE %s DELETED"
+CATALOG_PATH_REFUSED_LOG = "GENERATION %s REFUSED: CATALOG FILE_PATH %s IS NOT <BASE>/G####V00.dat"
 # A directory fsync refusal names its class and errno symbol, never the OS error text.
 DIRECTORY_FSYNC_LOG = "DIRECTORY FSYNC REFUSED FOR %s: %s ERRNO %s"
 UNKNOWN_CODE = "UNKNOWN"
@@ -208,6 +216,17 @@ class ManagedDirectoryError(OSError):
     the chain) and its filename the full path of the refused directory. Being an OSError, it
     reaches exit status 12 through every file-error mapping: the CLI's FILE ERROR line, the
     chain's and each job's. Nothing is created, read or deleted through the refused directory.
+    """
+
+
+class CatalogPathError(OSError):
+    """A catalog row refused because its file_path is not the path derived for it.
+
+    Its base_name is not a GDG_BASES name, or its file_path is not the "<BASE>/G####V00.dat"
+    RelativeFilePath gives for its base and generation. Its errno is EINVAL and its filename
+    the stored file_path. Being an OSError, it reaches exit status 12 through every file-error
+    mapping, as ManagedDirectoryError does. Nothing is read, hashed, renamed or deleted for the
+    row, and its state is left as it was.
     """
 
 
@@ -470,9 +489,21 @@ def RelativeFilePath(base: GdgBase, generation: int) -> str:
     return PurePosixPath(base.name, fileName).as_posix()
 
 
-def ResolveFilePath(context: JobContext, filePath: str) -> Path:
-    """Return the absolute path of a catalog file_path."""
-    return context.settings.GdgDir() / filePath
+def CatalogFilePath(context: JobContext, row: Row) -> Path:
+    """Return the absolute path of a catalog row's file, GdgDir()/<BASE>/G####V00.dat.
+
+    The path is derived from the row's base and generation, never taken from its file_path,
+    which must equal RelativeFilePath's text for them. A row of any other base, or with any other
+    file_path, such as an absolute one or one climbing out with "..", is logged at ERROR by its
+    escaped generation name and file_path and refused with CatalogPathError.
+    """
+    base = GDG_BASES.get(row.base_name)
+    derivedPath = None if base is None else RelativeFilePath(base, row.generation)
+    if derivedPath is None or row.file_path != derivedPath:
+        generationName = PrintableText(GenerationName(row.base_name, row.generation))
+        LOGGER.error(CATALOG_PATH_REFUSED_LOG, generationName, PrintableText(row.file_path))
+        raise CatalogPathError(errno.EINVAL, CATALOG_PATH_REFUSED_TEXT, row.file_path)
+    return context.settings.GdgDir() / derivedPath
 
 
 def PartPath(path: Path) -> Path:
@@ -486,11 +517,11 @@ def PartName(generation: int) -> str:
 
 
 def GenerationFromRow(context: JobContext, row: Row) -> Generation:
-    """Build a Generation from a batch.gdg_generations row."""
+    """Build a Generation from a batch.gdg_generations row, its path from CatalogFilePath."""
     return Generation(
         baseName=row.base_name,
         generation=row.generation,
-        path=ResolveFilePath(context, row.file_path),
+        path=CatalogFilePath(context, row),
         recordCount=row.record_count,
         sha256=row.sha256,
         state=row.state,
@@ -738,7 +769,7 @@ def PublishCommittedRow(context: JobContext, row: Row) -> str:
     transaction that moves the row: a lost batch window stops the publication at
     PlaceGenerationFile's check before the rename, or refuses the row change at its commit.
     """
-    finalPath = ResolveFilePath(context, row.file_path)
+    finalPath = CatalogFilePath(context, row)
     with context.engine.begin() as connection:
         newState = PlaceGenerationFile(finalPath, row.sha256, connection)
         connection.execute(SetStateStatement(row, GDG_COMMITTED, newState))
@@ -825,7 +856,7 @@ def ScratchFile(context: JobContext, base: GdgBase, row: Row) -> str:
     if not base.scratch:
         return FILE_KEPT
     RequireCommandWindow(context)
-    DeleteArchiveFile(ResolveFilePath(context, row.file_path))
+    DeleteArchiveFile(CatalogFilePath(context, row))
     return FILE_SCRATCHED
 
 
@@ -845,12 +876,15 @@ def RollOff(context: JobContext, base: GdgBase, limit: int = GDG_LIMIT) -> int:
     The rows become ROLLED_OFF, so no reference resolves them, and commit before any SCRATCH
     file is deleted: a crash or unlink error in between leaves an unreferenced leftover file,
     which the next ReconcileCatalog deletes, never a resolvable generation without its file.
-    TRANSACT.BKUP (NOSCRATCH) keeps its files.
+    TRANSACT.BKUP (NOSCRATCH) keeps its files. A SCRATCH row whose file path CatalogFilePath
+    refuses rolls back the transaction before any row changes.
     """
     statement = PublishedNewestFirstStatement(base).offset(limit)
     with context.engine.begin() as connection:
         expiredRows = connection.execute(statement).all()
         for row in expiredRows:
+            if base.scratch:
+                CatalogFilePath(context, row)
             connection.execute(SetStateStatement(row, GDG_PUBLISHED, GDG_ROLLED_OFF))
     for row in expiredRows:
         disposition = ScratchFile(context, base, row)
@@ -974,7 +1008,7 @@ def DeleteLeftoverFiles(context: JobContext, base: GdgBase) -> int:
     for row in rolledOffRows:
         ScratchFile(context, base, row)
         generationName = GenerationName(row.base_name, row.generation)
-        leftoverPath = ResolveFilePath(context, row.file_path)
+        leftoverPath = CatalogFilePath(context, row)
         LOGGER.warning(LEFTOVER_DELETED_LOG, generationName, PrintableText(leftoverPath))
     return len(rolledOffRows)
 

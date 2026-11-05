@@ -453,6 +453,63 @@ describe("COADM01C keyboard lock", () => {
     });
 });
 
+// COADM01C WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy), then
+// SEND-MENU-SCREEN. No option is sent, OPTION keeps its keyed text and is not flagged, and the
+// cursor goes back to OPTION, the IC field. The literal is core/messages.py INVALID_KEY_MESSAGE.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
+// The PF keys outside the COADM01 legend "ENTER=Continue  F3=Exit".
+const UNBOUND_KEYS: readonly string[] = ["F4", "F5", "F7", "F8", "F12"];
+
+describe("COADM01C keys outside the COADM01 legend", () => {
+    it.each(UNBOUND_KEYS)(
+        "COADM01C %s shows the invalid-key literal in red with the cursor on OPTION",
+        async (key) => {
+            const user = await RenderLoadedScreen();
+            await user.type(OptionField(), "2");
+            await PressKey(user, key);
+            await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+            expect(OptionField()).toHaveValue("2");
+            expect(OptionField()).toHaveFocus();
+            expect(OptionField()).toHaveAttribute("aria-invalid", "false");
+            expect(mockSelectAdminMenuOption).not.toHaveBeenCalled();
+            expect(mockLogout).not.toHaveBeenCalled();
+            expect(mockRouterPush).not.toHaveBeenCalled();
+            expect(mockRouterReplace).not.toHaveBeenCalled();
+        },
+    );
+});
+
+describe("COADM01C invalid key pressed again", () => {
+    it("COADM01C F5 again after the cursor left OPTION puts it back on OPTION", async () => {
+        const user = await RenderLoadedScreen();
+        await PressKey(user, "F5");
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+        await user.tab();
+        expect(OptionField()).not.toHaveFocus();
+        await PressKey(user, "F5");
+        expect(OptionField()).toHaveFocus();
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+    });
+});
+
+// The keyboard lock covers every PF key: one pressed during a selection is answered by nothing.
+describe("COADM01C keys outside the legend while a selection is in flight", () => {
+    it("COADM01C answers no other PF key until the selection settles", async () => {
+        const answerSelection = DeferSelection();
+        const user = await RenderLoadedScreen();
+        await user.click(OptionButton(5, TRAN_TYPE_LIST_LABEL));
+        expect(screen.getByRole("button", { name: CONTINUE_BUTTON })).toBeDisabled();
+        for (const key of UNBOUND_KEYS) {
+            await PressKey(user, key);
+        }
+        expect(screen.queryByRole("alert")).toBeNull();
+        answerSelection(NOT_INSTALLED_RESPONSE);
+        await ExpectAlert(NOT_INSTALLED_MESSAGE, "success");
+        await WaitForIdle();
+        expect(mockSelectAdminMenuOption).toHaveBeenCalledTimes(1);
+    });
+});
+
 describe("COADM01C not-installed literal (PGMIDERR-ERR-PARA)", () => {
     it.each(NOT_INSTALLED_CASES)(
         "COADM01C option %d shows the not-installed literal in green",

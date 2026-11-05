@@ -4,11 +4,24 @@ import { inputBaseClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRef, type ReactElement, type Ref } from "react";
+import { createRef, type ReactElement, type ReactNode, type Ref } from "react";
 
 import { CARD_DEMO_THEME } from "@/app/theme";
 import { ConfirmField } from "@/components/ConfirmField";
 import { MessageLine } from "@/components/MessageLine";
+import { ScreenShell } from "@/components/ScreenShell";
+
+// ScreenShell's header reads the session; nobody is signed on here. The mocked keys mirror the
+// exports of @/lib/session and its SessionContextValue.
+jest.mock("@/lib/session", () => ({
+    SessionProvider: ({ children }: { children: ReactNode }) => children,
+    useSession: () => ({
+        currentUser: null,
+        isLoading: false,
+        RefreshSession: jest.fn(),
+        ClearSession: jest.fn(),
+    }),
+}));
 
 // Each map's ASKIP INITIAL prompt before CONFIRM, verbatim: trailing blanks and " :" are kept.
 const COBIL00_PROMPT = "Do you want to pay your balance now. Please confirm: ";
@@ -16,6 +29,12 @@ const COBIL00_PROMPT = "Do you want to pay your balance now. Please confirm: ";
 const INVALID_CONFIRM_MESSAGE = "Invalid value. Valid values are (Y/N)...";
 const ERRMSG_ID = "message-line-errmsg";
 const CONFIRM_HINT = "Y/N";
+// The COBIL00 header: TRNNAME, PGMNAME and the row-4 title of bms/COBIL00.bms.
+const CB00_SHELL_PROPS = {
+    transactionId: "CB00",
+    programName: "COBIL00C",
+    screenTitle: "Bill Payment",
+};
 
 const CONFIRM_PROMPTS: readonly { mapName: string; prompt: string }[] = [
     { mapName: "COBIL00", prompt: COBIL00_PROMPT },
@@ -60,14 +79,27 @@ interface DisabledStateCase {
     isEnabled: boolean;
 }
 
-// The keyboard lock while a page's call runs: set freezes the field, false or omitted keys it.
+interface BusyStateCase {
+    busyState: string;
+    isBusy: boolean;
+    keystrokeCount: number;
+}
+
+// The page-set disabled state: set freezes the field, false or omitted keys it.
 const DISABLED_STATE_CASES: readonly DisabledStateCase[] = [
     { disabledState: "disabled set", disabled: true, isEnabled: false },
     { disabledState: "disabled false", disabled: false, isEnabled: true },
     { disabledState: "disabled omitted", isEnabled: true },
 ];
 
-// Every error state with every keyboard-lock state, as the prompt label shows them.
+// The ScreenShell keyboard lock while a page's call runs: the field keeps the cursor but turns
+// read-only, never disabled, so it refuses the keystroke; a free keyboard takes it.
+const BUSY_STATE_CASES: readonly BusyStateCase[] = [
+    { busyState: "busy", isBusy: true, keystrokeCount: 0 },
+    { busyState: "not busy", isBusy: false, keystrokeCount: 1 },
+];
+
+// Every error state with every disabled state, as the prompt label shows them.
 const PROMPT_STATE_CASES = ERROR_STATE_CASES.flatMap((errorCase) =>
     DISABLED_STATE_CASES.map((disabledCase) => ({ ...errorCase, ...disabledCase })),
 );
@@ -78,6 +110,11 @@ interface ConfirmRenderOptions {
     error?: boolean;
     disabled?: boolean;
     inputRef?: Ref<HTMLInputElement>;
+}
+
+interface ConfirmInShellProps {
+    isBusy: boolean;
+    onChange: (value: string) => void;
 }
 
 function RenderWithTheme(ui: ReactElement) {
@@ -100,6 +137,22 @@ function RenderConfirm(options: ConfirmRenderOptions = {}): HTMLInputElement {
     // The prompt is a separate label above the field that names the input through for=, so the
     // input is found by role and name; the accessible name is the label text trimmed.
     return screen.getByRole<HTMLInputElement>("textbox", { name: label.trim() });
+}
+
+// COBIL00 CONFIRM on its screen: the shell shares the page's busy flag with the fields under it.
+function ConfirmInShell({ isBusy, onChange }: ConfirmInShellProps) {
+    return (
+        <ThemeProvider theme={CARD_DEMO_THEME}>
+            <ScreenShell {...CB00_SHELL_PROPS} isBusy={isBusy}>
+                <ConfirmField label={COBIL00_PROMPT} value="" onChange={onChange} />
+            </ScreenShell>
+        </ThemeProvider>
+    );
+}
+
+// Found by its prompt, as RenderConfirm finds the field.
+function ShellConfirmInput(): HTMLInputElement {
+    return screen.getByRole<HTMLInputElement>("textbox", { name: COBIL00_PROMPT.trim() });
 }
 
 describe("ConfirmField field shape", () => {
@@ -153,7 +206,7 @@ describe("ConfirmField keystrokes", () => {
     });
 });
 
-describe("ConfirmField keyboard lock", () => {
+describe("ConfirmField disabled state", () => {
     it.each(DISABLED_STATE_CASES)(
         "COBIL00 CONFIRM with $disabledState takes keystrokes: $isEnabled",
         async ({ disabled, isEnabled }) => {
@@ -163,6 +216,28 @@ describe("ConfirmField keyboard lock", () => {
             expect(input.disabled).toBe(!isEnabled);
             await user.type(input, "Y");
             expect(onChange).toHaveBeenCalledTimes(isEnabled ? 1 : 0);
+        },
+    );
+});
+
+// The cursor is in CONFIRM when the call starts, as ENTER is pressed from the field; the lock
+// leaves it there and leaves the prompt undimmed.
+describe("ConfirmField keyboard lock", () => {
+    it.each(BUSY_STATE_CASES)(
+        "COBIL00 CONFIRM in a $busyState shell keeps the cursor and takes $keystrokeCount keys",
+        async ({ isBusy, keystrokeCount }) => {
+            const user = userEvent.setup();
+            const onChange = jest.fn();
+            const { rerender } = render(<ConfirmInShell isBusy={false} onChange={onChange} />);
+            const input = ShellConfirmInput();
+            await user.click(input);
+            rerender(<ConfirmInShell isBusy={isBusy} onChange={onChange} />);
+            expect(input).toHaveFocus();
+            expect(input).toBeEnabled();
+            expect(input.hasAttribute("readonly")).toBe(isBusy);
+            expect(input.labels?.[0]).not.toHaveClass("Mui-disabled");
+            await user.keyboard("Y");
+            expect(onChange).toHaveBeenCalledTimes(keystrokeCount);
         },
     );
 });

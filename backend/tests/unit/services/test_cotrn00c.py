@@ -24,7 +24,7 @@ code-page-037 byte order. Expected values are typed from these lines:
     service's declared contract a 400 with the four standard keys only, so the page shown stays;
 - S or s on a row routes to the Transaction View before the search key is read (lines 185-195);
     another code sets ``Invalid selection. Valid value is S`` (line 199) and the list is browsed
-    on, a 400 whose body carries the browsed page;
+    on, a 400 whose body carries the browsed page and, as no ERR-FLG is set, no failing field;
 - a TRANSACT file condition on the forward or the backward browse, the batch window's NOTOPEN
     and an IOERR included, is the 503 ``Unable to lookup transaction...`` with a lower-case
     ``t`` (lines 615, 649 and 683).
@@ -326,6 +326,11 @@ def StandardBody(message: str) -> dict[str, object]:
     }
 
 
+def CursorOnlyBody(message: str) -> dict[str, object]:
+    """Return the four standard keys of a refusal that fails no field: only the cursor moves."""
+    return StandardBody(message) | {"field_errors": []}
+
+
 def F8Query(shownPage: TransactionListResponse) -> TransactionListQuery:
     """Return F8 on the page shown: forward after its last key, with its first key and page."""
     return TransactionListQuery(
@@ -514,7 +519,8 @@ async def test_invalid_selection_code_answers_the_literal_with_the_browsed_list(
 ):
     """A nonblank code other than S or s keeps its literal over the re-browsed first page.
 
-    The refusal is a 400 with the page's rows.
+    The refusal is a 400 with the page's rows. WHEN OTHER sets no ERR-FLG, so no field fails and
+    only the cursor goes to TRNIDIN.
     """
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     firstPage = await ShowFirstPage(context)
@@ -524,7 +530,7 @@ async def test_invalid_selection_code_answers_the_literal_with_the_browsed_list(
     refusalBody = raised.value.Body()
     assert raised.value.httpStatus == EDIT_FAILURE_STATUS
     standardKeys = {key: refusalBody[key] for key in STANDARD_BODY_KEYS}
-    assert standardKeys == StandardBody(INVALID_SELECTION_MESSAGE)
+    assert standardKeys == CursorOnlyBody(INVALID_SELECTION_MESSAGE)
     expectedRows = [JsonListRow(listRow) for listRow in FIRST_PAGE_LIST_ROWS]
     assert (refusalBody["rows"], refusalBody["page"]) == (expectedRows, FIRST_PAGE)
     assert StoredTransactions(syncEngine) == PostedRecords(postedTransactions)

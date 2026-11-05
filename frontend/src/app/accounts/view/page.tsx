@@ -28,7 +28,7 @@ import {
     type MessageSeverity,
     type ScreenFeedback,
 } from "@/lib/apiClient";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import { EnterKeyOf, useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CAVW";
 const PROGRAM_NAME = "COACTVWC";
@@ -499,15 +499,15 @@ function ExitToMenu(screen: AccountViewScreenState, router: AppRouter): void {
     router.push(MENU_ROUTE);
 }
 
-// COACTVWC accepts ENTER and PF3 only (any other key is processed as ENTER), so no other key is
-// bound. F3 replaces the XCTL back to the main menu. Every response sets a new feedback object, so
-// its identity is the outcome: ENTER answered again with the same literal still brings the
-// message line into view.
+// COACTVWC accepts ENTER and PF3 only, so only they are bound and shown. PFK-INVALID: any other
+// AID does SET CCARD-AID-ENTER, so an unbound PF key runs the ENTER search. F3 replaces the XCTL
+// back to the main menu. Every response sets a new feedback object, so its identity is the
+// outcome: ENTER answered again with the same literal still brings the message line into view.
 function AccountViewScreen() {
     const router = useRouter();
     const screen = useAccountViewScreen();
     const keys = BuildFunctionKeys(screen, () => ExitToMenu(screen, router));
-    useFunctionKeys(keys);
+    useFunctionKeys(keys, EnterKeyOf(keys));
     return (
         <ScreenShell {...SCREEN_IDENTITY} isBusy={screen.isBusy}>
             <AccountDetails screen={screen} />
@@ -531,7 +531,9 @@ function AccountViewEntry() {
     return <AccountViewScreen key={JSON.stringify([acctId])} />;
 }
 
-// useSearchParams needs a Suspense boundary, or the static prerender of the route fails.
+// useSearchParams needs a Suspense boundary wherever Next.js prerenders a page. The route layout
+// renders this one on demand, so the query is known on the first render and the empty fallback
+// never shows.
 export default function AccountViewPage() {
     return (
         <Suspense fallback={null}>

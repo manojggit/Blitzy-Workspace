@@ -41,7 +41,12 @@ import {
     type MessageSeverity,
 } from "@/lib/apiClient";
 import { useSession } from "@/lib/session";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+    type InvalidKeyAction,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CC00";
 const PROGRAM_NAME = "COSGN00C";
@@ -129,6 +134,14 @@ const UNEXPECTED_ROUTE_FEEDBACK: SignOnFeedback = {
     severity: ERROR_SEVERITY,
 };
 
+// WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY in red, with the cursor back on
+// USERID, the map's IC field. No field is in error.
+const INVALID_KEY_FEEDBACK: SignOnFeedback = {
+    ...FRESH_SCREEN_FEEDBACK,
+    message: INVALID_KEY_MESSAGE,
+    severity: ERROR_SEVERITY,
+};
+
 interface CredentialState {
     credentials: Credentials;
     SetCredential: (name: CredentialName, value: string) => void;
@@ -161,9 +174,11 @@ interface SignOnFormProps {
     form: SignOnForm;
 }
 
-// The PF keys, and whether the screen is busy: a call in flight, or the route change it started.
+// The PF keys, the answer to any other PF key, and whether the screen is busy: a call in flight,
+// or the route change it started.
 interface SignOnKeys {
     keys: FunctionKeyDefinition[];
+    invalidKeyAction: InvalidKeyAction;
     isBusy: boolean;
 }
 
@@ -289,6 +304,14 @@ async function SubmitExit(context: SignOnContext): Promise<void> {
     }
 }
 
+// WHEN OTHER reads no file, so nothing reaches the server: the typed User ID and Password stay,
+// and the invalid-key literal takes the sign-off notice's place, as ENTER and F3 clear that
+// notice. Each press is a new feedback, so the cursor returns to USERID every time.
+function ShowInvalidKey(form: SignOnForm): void {
+    form.SetThankYouText("");
+    form.SetFeedback({ ...INVALID_KEY_FEEDBACK });
+}
+
 // The COSGN00 legend ENTER=Sign-on  F3=Exit; no other key is bound.
 function BuildSignOnKeys(context: SignOnContext, isBusy: boolean): FunctionKeyDefinition[] {
     return [
@@ -383,7 +406,8 @@ function useSignOnForm(): SignOnForm {
 }
 
 // The XCTL to the user's menu ends with that menu: the route change runs as a transition, so the
-// screen stays busy until the menu has rendered and a second ENTER cannot sign on again.
+// screen stays busy until the menu has rendered and a second ENTER cannot sign on again. Any other
+// PF key is refused while busy, like ENTER and F3.
 function useSignOnKeys(form: SignOnForm): SignOnKeys {
     const router = useRouter();
     const { RefreshSession, ClearSession } = useSession();
@@ -397,7 +421,11 @@ function useSignOnKeys(form: SignOnForm): SignOnKeys {
         () => BuildSignOnKeys({ form, RefreshSession, ClearSession, Navigate: navigate }, isBusy),
         [form, RefreshSession, ClearSession, navigate, isBusy],
     );
-    return { keys, isBusy };
+    const invalidKeyAction = useMemo(
+        () => ({ onPress: () => ShowInvalidKey(form), disabled: isBusy }),
+        [form, isBusy],
+    );
+    return { keys, invalidKeyAction, isBusy };
 }
 
 function CredentialFieldId(name: CredentialName): string {
@@ -459,7 +487,7 @@ function ThankYouNotice({ text }: ThankYouNoticeProps) {
 }
 
 // The ERRMSG line below the form. A sign-off, from this screen's F3 or a menu's, leaves that line
-// blank, and its thank-you notice takes the line's place until the next ENTER or F3 clears it.
+// blank, and its thank-you notice takes the line's place until the next PF key or ENTER clears it.
 function SignOnMessages({ form }: SignOnFormProps) {
     if (!IsBlankText(form.thankYouText)) {
         return <ThankYouNotice text={form.thankYouText} />;
@@ -475,8 +503,8 @@ function SignOnMessages({ form }: SignOnFormProps) {
 
 function SignOnScreen() {
     const form = useSignOnForm();
-    const { keys, isBusy } = useSignOnKeys(form);
-    useFunctionKeys(keys);
+    const { keys, invalidKeyAction, isBusy } = useSignOnKeys(form);
+    useFunctionKeys(keys, invalidKeyAction);
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}

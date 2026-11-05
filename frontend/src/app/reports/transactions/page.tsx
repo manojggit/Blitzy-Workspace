@@ -60,7 +60,7 @@ import {
     MessageLine,
     type ErrorMessageReferenceAttributes,
 } from "@/components/MessageLine";
-import { ScreenShell } from "@/components/ScreenShell";
+import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
 import {
     IsCancelledRequest,
     SeverityForOutcome,
@@ -547,15 +547,12 @@ function useReportInputs(): ReportInputsState {
     return { inputs, setInputs, setReportType, setTextInput };
 }
 
-// The keyboard lock disables the criteria during a call, which clears MUI's focused state though
-// the browser keeps the disabled control focused. Focusing that control again fires no focus
-// event, so it is blurred first and MUI restores its focused outline, label or focus ring.
+// The keyboard lock leaves the criteria read-only rather than disabled during a call, so a
+// control that kept the cursor through it keeps MUI's focused outline, label or focus ring, and
+// focusing it again changes nothing.
 function PlaceCursor(control: HTMLElement | null | undefined): void {
     if (control === null || control === undefined) {
         return;
-    }
-    if (control === document.activeElement) {
-        control.blur();
     }
     control.focus();
 }
@@ -870,7 +867,6 @@ function useReportForm(): ReportForm {
 interface ReportTypeSelectorProps {
     value: ReportType | null;
     onChange: ReportTypeSetter;
-    disabled: boolean;
     firstButtonRef: Ref<HTMLButtonElement>;
     // The server names reportType in field_errors.
     isFlagged: boolean;
@@ -888,20 +884,31 @@ function useSelectorOrientation(): SelectorOrientation {
 
 // ToggleButtonGroup places its segments by position among its direct children, so each button is
 // an element of the group rather than a component of its own. Enter on a segment is the map's
-// ENTER, as it was from the one-byte selector field holding the cursor; Space chooses it.
+// ENTER, as it was from the one-byte selector field holding the cursor; Space chooses it. While
+// the keyboard is locked each segment reads as unavailable through aria-disabled but is never
+// natively disabled, so the segment holding the cursor keeps it.
 function RenderReportTypeButton(
     option: ReportTypeOption,
     buttonRef: Ref<HTMLButtonElement> | undefined,
+    isLocked: boolean,
 ): ReactNode {
     return (
         <ToggleButton
             key={option.value}
             value={option.value}
             ref={buttonRef}
+            aria-disabled={isLocked ? true : undefined}
             {...SCREEN_ENTER_PROPS}
         >
             {option.label}
         </ToggleButton>
+    );
+}
+
+// The three segments in BMS order; MONTHLY, the map's IC field, takes the first-focus ref.
+function ReportTypeButtons(firstButtonRef: Ref<HTMLButtonElement>, isLocked: boolean): ReactNode {
+    return REPORT_TYPE_OPTIONS.map((option, position) =>
+        RenderReportTypeButton(option, position === 0 ? firstButtonRef : undefined, isLocked),
     );
 }
 
@@ -922,18 +929,27 @@ type ReportTypeChangeHandler = (event: MouseEvent<HTMLElement>, next: ReportType
 
 interface ReportTypeChoice {
     isFlagged: boolean;
+    // The ScreenShell keyboard lock, held while the call runs.
+    isLocked: boolean;
     handleChange: ReportTypeChangeHandler;
 }
 
 // A choice made after the server flagged the group answers that flag, so the group no longer
-// reads as invalid; the next ENTER outcome that names the report type flags it again.
+// reads as invalid; the next ENTER outcome that names the report type flags it again. While the
+// keyboard is locked a press chooses nothing, as the selector fields refused keystrokes until
+// CORPT00C answered, so the answer always applies to the type that was sent.
 function useReportTypeChoice(props: ReportTypeSelectorProps): ReportTypeChoice {
+    const isLocked = useScreenBusy();
     const [answeredFeedback, setAnsweredFeedback] = useState<FeedbackState | null>(null);
     const handleChange: ReportTypeChangeHandler = (_event, next) => {
+        if (isLocked) {
+            return;
+        }
         setAnsweredFeedback(props.feedback);
         props.onChange(next);
     };
-    return { isFlagged: props.isFlagged && answeredFeedback !== props.feedback, handleChange };
+    const isFlagged = props.isFlagged && answeredFeedback !== props.feedback;
+    return { isFlagged, isLocked, handleChange };
 }
 
 // One exclusive choice replaces the three one-byte selectors. Pressing the chosen type again
@@ -946,14 +962,11 @@ function ReportTypeSelector(props: ReportTypeSelectorProps) {
             exclusive
             value={props.value}
             orientation={orientation}
-            disabled={props.disabled}
             onChange={choice.handleChange}
             aria-label={REPORT_TYPE_GROUP_LABEL}
             {...FlaggedSelectorProps(choice.isFlagged)}
         >
-            {REPORT_TYPE_OPTIONS.map((option, position) =>
-                RenderReportTypeButton(option, position === 0 ? props.firstButtonRef : undefined),
-            )}
+            {ReportTypeButtons(props.firstButtonRef, choice.isLocked)}
         </ToggleButtonGroup>
     );
 }
@@ -968,11 +981,13 @@ function DatePartDescription(isFlagged: boolean, hintId: string): ErrorMessageRe
 }
 
 // Only the BMS LENGTH limits the part: the keyed text is never trimmed, padded or checked here,
-// so every CORPT00C date literal stays reachable.
+// so every CORPT00C date literal stays reachable. While the call runs the part is read-only, so
+// it keeps the cursor but refuses keystrokes.
 function DatePartSlotProps(
     part: DatePartDefinition,
     isFlagged: boolean,
     hintId: string,
+    isBusy: boolean,
 ): TextFieldProps["slotProps"] {
     return {
         htmlInput: {
@@ -981,6 +996,7 @@ function DatePartSlotProps(
             "aria-label": part.ariaLabel,
             ...DatePartDescription(isFlagged, hintId),
         },
+        input: { readOnly: isBusy },
     };
 }
 
@@ -989,14 +1005,14 @@ interface DatePartInputProps {
     value: string;
     onChange: TextInputSetter;
     isFlagged: boolean;
-    disabled: boolean;
     inputRef: RefCallback<HTMLElement>;
     // The element id of the row's (MM/DD/YYYY) hint.
     hintId: string;
 }
 
 function DatePartInput(props: DatePartInputProps) {
-    const { part, value, onChange, isFlagged, disabled, inputRef } = props;
+    const { part, value, onChange, isFlagged, inputRef } = props;
+    const isBusy = useScreenBusy();
     return (
         <TextField
             label={part.label}
@@ -1005,11 +1021,10 @@ function DatePartInput(props: DatePartInputProps) {
                 onChange(part.name, event.target.value)
             }
             error={isFlagged}
-            disabled={disabled}
             variant="outlined"
             fullWidth
             inputRef={inputRef}
-            slotProps={DatePartSlotProps(part, isFlagged, props.hintId)}
+            slotProps={DatePartSlotProps(part, isFlagged, props.hintId, isBusy)}
         />
     );
 }
@@ -1020,7 +1035,6 @@ interface DatePartsFieldProps {
     inputs: ReportInputs;
     onChange: TextInputSetter;
     errorFields: readonly string[];
-    disabled: boolean;
     bindRef: FieldRefBinder;
 }
 
@@ -1039,7 +1053,6 @@ function DatePartsRow(props: DatePartsRowProps) {
                         value={props.inputs[part.name]}
                         onChange={props.onChange}
                         isFlagged={props.errorFields.includes(part.name)}
-                        disabled={props.disabled}
                         inputRef={props.bindRef(part.name)}
                         hintId={props.hintId}
                     />
@@ -1060,7 +1073,7 @@ function DatePartsField(props: DatePartsFieldProps) {
             </Typography>
             <Stack>
                 <DatePartsRow {...props} hintId={hintId} />
-                <FormHelperText id={hintId} variant="outlined" disabled={props.disabled}>
+                <FormHelperText id={hintId} variant="outlined">
                     {DATE_HINT}
                 </FormHelperText>
             </Stack>
@@ -1093,7 +1106,6 @@ function DateRangeFields({ form, errorFields }: ReportFieldsProps) {
             inputs={form.inputs}
             onChange={form.setTextInput}
             errorFields={errorFields}
-            disabled={form.isBusy}
             bindRef={form.bindRef}
         />
     ));
@@ -1106,7 +1118,6 @@ function ReportConfirmField({ form, errorFields }: ReportFieldsProps) {
             value={form.inputs.confirm}
             onChange={(value) => form.setTextInput("confirm", value)}
             error={errorFields.includes("confirm")}
-            disabled={form.isBusy}
             inputRef={form.bindRef("confirm")}
         />
     );
@@ -1116,9 +1127,11 @@ interface ReportFormSectionProps {
     form: ReportForm;
 }
 
-// The report type, both date ranges and the confirm flag, in map order. All of them are locked
-// while the request runs, as the 3270 keyboard is until CORPT00C answers, so the answer always
-// applies to the criteria that were sent; it unlocks them in the render that places the cursor.
+// The report type, both date ranges and the confirm flag, in map order. Each reads the ScreenShell
+// keyboard lock while the request runs, as the 3270 keyboard locked until CORPT00C answered: the
+// control holding the cursor keeps it, but no keystroke or press changes a criterion, so the
+// answer always applies to the criteria that were sent; it unlocks them in the render that places
+// the cursor.
 function ReportCriteriaSection({ form }: ReportFormSectionProps) {
     const errorFields = FlaggedFields(form.feedback);
     return (
@@ -1126,7 +1139,6 @@ function ReportCriteriaSection({ form }: ReportFormSectionProps) {
             <ReportTypeSelector
                 value={form.inputs.reportType}
                 onChange={form.setReportType}
-                disabled={form.isBusy}
                 firstButtonRef={form.bindRef("reportType")}
                 isFlagged={errorFields.includes("reportType")}
                 feedback={form.feedback}

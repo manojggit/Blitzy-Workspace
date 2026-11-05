@@ -13,7 +13,9 @@ CARDDEMO_OUTPUT_DIR/gdg/<BASE>/G####V00.dat with the batch.gdg_generations catal
 - Containment: a gdg or base directory that is a symbolic link is refused with
   ManagedDirectoryError, and exit 12 from a command, before anything is listed, created or
   deleted through it; a directory swapped for a link once opened is still the one acted on; a
-  link named like a .part or a work directory inside a real base directory is never followed.
+  link named like a .part or a work directory inside a real base directory is never followed; a
+  catalog row whose file_path is not the <BASE>/G####V00.dat derived for it, or whose base is
+  not a GDG base, is refused with CatalogPathError and exit 12 before any file effect.
 - LOST blocks the OPEN cycle: every command exits 12 naming the generation until run-all
   --new-cycle abandons the cycle and its LOST rows.
 - Abnormal disposition: DISP=(NEW,CATLG,DELETE) of DALYREJS(+1) and SYSTRAN(+1)
@@ -111,7 +113,6 @@ ROLLED_OFF_RELATIVE = -LEGACY_GDG_LIMIT
 SCRATCH_BASES = [gdg.DALYREJS, gdg.SYSTRAN, gdg.TRANSACT_COMBINED]
 SCRATCH_BASE_IDS = [base.name for base in SCRATCH_BASES]
 CATALOG_OUTPUT_DIRECTORY_NAME = "catalog-output"
-OUTSIDE_DIRECTORY_NAME = "outside-gdg-root"
 LINKED_DIRECTORY_NAME = "LINKED.BASE"
 SAMPLE_FILE_NAME = GENERATION_FILE_TEMPLATE.format(generation=OLDEST_GENERATION)
 SAMPLE_FILE_PATH = f"{gdg.SYSTRAN.name}/{SAMPLE_FILE_NAME}"
@@ -166,6 +167,14 @@ REFUSAL_LINE_PATTERN = re.compile(r"FILE ERROR ManagedDirectoryError ERRNO (?P<e
 # bytes of the .part file its publication renames.
 SWAPPED_OUT_SUFFIX = ".opened"
 PUBLISHED_BYTES = b"GENERATION PLACED BY PUBLICATION\n"
+# A forged catalog row, numbered above every generation a test publishes; the bytes of the file
+# its file_path names, whose SHA-256 the row carries; a base name GDG_BASES does not hold; and
+# the FILE ERROR line the command's refusal of the row ends with.
+FORGED_GENERATION = 900
+FORGED_FILE_BYTES = b"FILE A FORGED CATALOG ROW NAMES\n"
+FORGED_FILE_SHA256 = hashlib.sha256(FORGED_FILE_BYTES).hexdigest()
+UNKNOWN_BASE_NAME = "FORGED.BASE"
+CATALOG_PATH_REFUSAL_PREFIX = "FILE ERROR CatalogPathError ERRNO EINVAL ON "
 
 
 class InjectedProducerError(Exception):
@@ -921,6 +930,137 @@ def test_command_refuses_a_linked_base_directory_with_one_file_error_line(
     assert refusals[0].string.endswith(f" ON {linkPath}"), outcome.output
     assert CountJobRuns(jobContext.engine) == runsBefore
     assert TreeSnapshot(outside) == outsideBefore
+
+
+def AbsoluteOutsideFilePath(context: JobContext, baseName: str) -> tuple[Path, str]:
+    """Return a file outside the archive and its absolute path as a forged file_path."""
+    namedFile = OutsideDirectory(context) / baseName / FileName(FORGED_GENERATION)
+    return namedFile, str(namedFile)
+
+
+def ClimbingOutsideFilePath(context: JobContext, baseName: str) -> tuple[Path, str]:
+    """Return a file outside the archive and its path from GdgDir(), climbing out with "..".
+
+    The file's directory and that directory's parent are real names, so joined to GdgDir() the
+    path reaches the file without a ".." where a managed directory name is opened.
+    """
+    namedFile = OutsideDirectory(context) / baseName / FileName(FORGED_GENERATION)
+    climbingPath = namedFile.relative_to(context.settings.GdgDir(), walk_up=True)
+    return namedFile, climbingPath.as_posix()
+
+
+def UnknownBaseFilePath(context: JobContext, baseName: str) -> tuple[Path, str]:
+    """Return the file of a base GDG_BASES does not hold, and "<BASE>/G####V00.dat" for it."""
+    fileName = FileName(FORGED_GENERATION)
+    return context.settings.GdgDir() / baseName / fileName, f"{baseName}/{fileName}"
+
+
+@dataclass(frozen=True)
+class ForgedRowCase:
+    """A forged catalog row of generation FORGED_GENERATION, by base name and state.
+
+    namedFile returns, given the context and the base name, the file the row's file_path names
+    and that file_path. Without the refusal, a COMMITTED row would have the matching .part beside
+    that file renamed, a PUBLISHED row with LEGACY_GDG_LIMIT newer generations and a ROLLED_OFF
+    row whose final file is left in its base directory would each have that file deleted, and a
+    LOST row would be read by the LOST check.
+    """
+
+    baseName: str
+    state: str
+    namedFile: Callable[[JobContext, str], tuple[Path, str]]
+
+
+OUTSIDE_FILE_PATH_FORMS = {"absolute": AbsoluteOutsideFilePath, "dot-dot": ClimbingOutsideFilePath}
+FORGED_ROW_STATES = (
+    run_ledger.GDG_COMMITTED,
+    run_ledger.GDG_PUBLISHED,
+    run_ledger.GDG_ROLLED_OFF,
+    run_ledger.GDG_LOST,
+)
+FORGED_ROW_CASES = [
+    pytest.param(ForgedRowCase(gdg.SYSTRAN.name, state, namedFile), id=f"{formName}-{state}")
+    for formName, namedFile in OUTSIDE_FILE_PATH_FORMS.items()
+    for state in FORGED_ROW_STATES
+] + [
+    pytest.param(
+        ForgedRowCase(UNKNOWN_BASE_NAME, run_ledger.GDG_COMMITTED, UnknownBaseFilePath),
+        id=f"unknown-base-{run_ledger.GDG_COMMITTED}",
+    )
+]
+
+
+def CatalogRowValues(
+    context: JobContext, baseName: str, generation: int, state: str
+) -> dict[str, object]:
+    """Return a catalog row of the context's run, with the derived file_path and forged hash."""
+    return {
+        "base_name": baseName,
+        "generation": generation,
+        "file_path": f"{baseName}/{FileName(generation)}",
+        "record_count": 1,
+        "sha256": FORGED_FILE_SHA256,
+        "state": state,
+        "run_id": context.runId,
+    }
+
+
+def PlantForgedRow(context: JobContext, case: ForgedRowCase) -> str:
+    """Catalog the case's forged row with the files that make a stage act on it; return its path.
+
+    The file it names holds FORGED_FILE_BYTES, as its .part when the row is COMMITTED. Its base
+    directory exists, as an earlier generation leaves it, holding the row's own final file when
+    the row is ROLLED_OFF. A PUBLISHED row gets LEGACY_GDG_LIMIT newer PUBLISHED generations.
+    """
+    namedFile, filePath = case.namedFile(context, case.baseName)
+    plantedFile = PartPath(namedFile) if case.state == run_ledger.GDG_COMMITTED else namedFile
+    PlantFiles(plantedFile.parent, {plantedFile.name: FORGED_FILE_BYTES})
+    leftovers = {FileName(FORGED_GENERATION): FORGED_FILE_BYTES}
+    isRolledOff = case.state == run_ledger.GDG_ROLLED_OFF
+    PlantFiles(context.settings.GdgDir() / case.baseName, leftovers if isRolledOff else {})
+    forgedRow = CatalogRowValues(context, case.baseName, FORGED_GENERATION, case.state)
+    rows = [{**forgedRow, "file_path": filePath}]
+    if case.state == run_ledger.GDG_PUBLISHED:
+        rows += [
+            CatalogRowValues(context, case.baseName, generation, run_ledger.GDG_PUBLISHED)
+            for generation in range(FORGED_GENERATION + 1, FORGED_GENERATION + 1 + LEGACY_GDG_LIMIT)
+        ]
+    with context.engine.begin() as connection:
+        connection.execute(insert(GDG_GENERATIONS), rows)
+    return filePath
+
+
+@pytest.mark.parametrize("case", FORGED_ROW_CASES)
+def test_catalog_row_whose_file_path_is_not_derived_is_refused_before_any_file_effect(
+    jobContext: JobContext, case: ForgedRowCase
+) -> None:
+    """load tran-types exits 12 on a catalog row whose file_path is not its derived path.
+
+    The stage meeting the row (publication, retention, leftover deletion or the LOST check)
+    refuses it with one ERROR line and one FILE ERROR CatalogPathError line naming the stored
+    file_path, before anything is read, renamed or deleted: the files outside and inside the
+    archive keep their bytes, every row of the base keeps its state, and no run is recorded.
+    """
+    context = LedgeredContext(jobContext)
+    filePath = PlantForgedRow(context, case)
+    outside, archive = OutsideDirectory(context), context.settings.GdgDir()
+    outsideBefore, archiveBefore = TreeSnapshot(outside), TreeSnapshot(archive)
+    statesBefore = CatalogStates(context.engine, case.baseName)
+    runsBefore = CountJobRuns(context.engine)
+
+    outcome = InvokeCli(LOAD_TRAN_TYPES_ARGUMENTS)
+
+    refusals = [line for line in outcome.output.splitlines() if CATALOG_PATH_REFUSAL_PREFIX in line]
+    generationName = gdg.GenerationName(case.baseName, FORGED_GENERATION)
+    refusedLog = gdg.CATALOG_PATH_REFUSED_LOG % (generationName, filePath)
+    assert outcome.exitCode == EXIT_FAILURE, outcome.output
+    assert len(refusals) == 1, outcome.output
+    assert refusals[0].endswith(CATALOG_PATH_REFUSAL_PREFIX + filePath), outcome.output
+    assert outcome.output.count(refusedLog) == 1, outcome.output
+    assert TreeSnapshot(outside) == outsideBefore
+    assert TreeSnapshot(archive) == archiveBefore
+    assert CatalogStates(context.engine, case.baseName) == statesBefore
+    assert CountJobRuns(context.engine) == runsBefore
 
 
 @pytest.mark.parametrize(

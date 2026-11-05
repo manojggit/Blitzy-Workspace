@@ -74,6 +74,13 @@ interface UpdateKey extends FunctionKey {
 
 interface ActionKeyCase extends UpdateKey {
     method: InputMethod;
+    state: UpdateScreenState;
+}
+
+// The legend buttons a state shows, in screen order.
+interface LegendCase {
+    state: UpdateScreenState;
+    buttonNames: readonly string[];
 }
 
 interface EditableByStateCase {
@@ -108,11 +115,13 @@ interface FlaggedFields {
     cursorField: CardFieldName;
 }
 
-// A key edit or CARDDAT read refused with the DETAILS_NOT_FETCHED key screen: the literal and its
-// status, the keys the body echoes (CARDSID masked), and the keys the page shows afterwards.
+// A key edit or CARDDAT read refused: the literal and its status, the state the body answers in
+// (the DETAILS_NOT_FETCHED key screen, or SHOW_DETAILS after a failed read of a held card), the
+// keys the body echoes (CARDSID masked), and the keys the page shows afterwards.
 interface KeyRefusalCase extends FlaggedFields {
     text: string;
     status: number;
+    state: UpdateScreenState;
     echoedKeys: CardKeyFields;
     shownKeys: CardKeyFields;
 }
@@ -366,17 +375,41 @@ const CANCEL_KEY: UpdateKey = {
     action: UpdateAction.CANCEL,
 };
 const EXIT_KEY: FunctionKey = { buttonName: "Exit (F3)", key: "F3" };
-const LEGEND_BUTTON_NAMES: readonly string[] = [
-    ENTER_KEY.buttonName,
-    EXIT_KEY.buttonName,
+// FKEYS is always shown; FKEYSC is ATTRB=(ASKIP,DRK) until 3300-SETUP-SCREEN-ATTRS brightens it IF
+// PROMPT-FOR-CONFIRMATION (lines 1315-1316), which 3250 sets only WHEN
+// CCUP-CHANGES-OK-NOT-CONFIRMED (lines 1149-1150).
+const FKEYS_BUTTON_NAMES: readonly string[] = [ENTER_KEY.buttonName, EXIT_KEY.buttonName];
+const CONFIRMATION_BUTTON_NAMES: readonly string[] = [
+    ...FKEYS_BUTTON_NAMES,
     SAVE_KEY.buttonName,
     CANCEL_KEY.buttonName,
 ];
+const LEGEND_BUTTON_NAMES_BY_STATE: Readonly<Record<UpdateScreenState, readonly string[]>> = {
+    [UpdateScreenState.DETAILS_NOT_FETCHED]: FKEYS_BUTTON_NAMES,
+    [UpdateScreenState.SHOW_DETAILS]: FKEYS_BUTTON_NAMES,
+    [UpdateScreenState.CHANGES_NOT_OK]: FKEYS_BUTTON_NAMES,
+    [UpdateScreenState.CHANGES_OK_NOT_CONFIRMED]: CONFIRMATION_BUTTON_NAMES,
+    [UpdateScreenState.CHANGES_DONE]: FKEYS_BUTTON_NAMES,
+    [UpdateScreenState.CHANGES_FAILED]: FKEYS_BUTTON_NAMES,
+};
+const LEGEND_CASES: readonly LegendCase[] = Object.values(UpdateScreenState).map((state) => ({
+    state,
+    buttonNames: LEGEND_BUTTON_NAMES_BY_STATE[state],
+}));
 
 const REQUEST_KEYS: readonly UpdateKey[] = [ENTER_KEY, SAVE_KEY, CANCEL_KEY];
 const INPUT_METHODS: readonly InputMethod[] = ["click", "key"];
-const ACTION_KEY_CASES: readonly ActionKeyCase[] = REQUEST_KEYS.flatMap((updateKey) =>
-    INPUT_METHODS.map((method) => ({ ...updateKey, method })),
+// A dark key has no button to click, yet still sends its AID from the keyboard.
+const KEYBOARD_ONLY: readonly InputMethod[] = ["key"];
+// Each key with the held screen_token in a state with FKEYSC dark and in the one it brightens.
+const HELD_TOKEN_STATES: readonly UpdateScreenState[] = [
+    UpdateScreenState.SHOW_DETAILS,
+    UpdateScreenState.CHANGES_OK_NOT_CONFIRMED,
+];
+const ACTION_KEY_CASES: readonly ActionKeyCase[] = HELD_TOKEN_STATES.flatMap((state) =>
+    REQUEST_KEYS.flatMap((updateKey) =>
+        InputMethodsIn(updateKey, state).map((method) => ({ ...updateKey, method, state })),
+    ),
 );
 const EXIT_CASES: readonly ExitCase[] = (["card list", "main menu"] as const).flatMap((entry) =>
     INPUT_METHODS.map((method) => ({ entry, method })),
@@ -620,6 +653,42 @@ async function PressFunctionKey(
     await WaitForIdle();
 }
 
+function IsShownInLegend(functionKey: FunctionKey, state: UpdateScreenState): boolean {
+    return LEGEND_BUTTON_NAMES_BY_STATE[state].includes(functionKey.buttonName);
+}
+
+// A key is clicked only where the state's legend shows its button; a dark key is pressed on the
+// keyboard alone.
+function InputMethodsIn(
+    functionKey: FunctionKey,
+    state: UpdateScreenState,
+): readonly InputMethod[] {
+    return IsShownInLegend(functionKey, state) ? INPUT_METHODS : KEYBOARD_ONLY;
+}
+
+// The button where the state's legend shows one, else the keyboard.
+function MethodShownIn(functionKey: FunctionKey, state: UpdateScreenState): InputMethod {
+    return IsShownInLegend(functionKey, state) ? "click" : "key";
+}
+
+// A key the state's legend shows has its button; a dark FKEYSC key has none.
+function ExpectLegendButton(functionKey: FunctionKey, state: UpdateScreenState): void {
+    const button = screen.queryByRole("button", { name: functionKey.buttonName });
+    if (IsShownInLegend(functionKey, state)) {
+        expect(button).toBeInTheDocument();
+        return;
+    }
+    expect(button).not.toBeInTheDocument();
+}
+
+// The legend group's button labels in screen order.
+function LegendButtonNames(): (string | null)[] {
+    const legend = screen.getByRole("group", { name: "Function keys" });
+    return within(legend)
+        .getAllByRole("button")
+        .map((button) => button.textContent);
+}
+
 async function TypeKeys(user: UserEvent, acctText: string, cardText: string): Promise<void> {
     await user.type(InputOf("acct_id"), acctText);
     await user.type(InputOf("card_num"), cardText);
@@ -847,19 +916,41 @@ function TypedKeyRefusal(
     typedKeys: CardKeyFields,
 ): KeyRefusalCase {
     const echoedKeys = { ...typedKeys, card_num: MaskedCardText(typedKeys.card_num) };
-    return { text, status, ...flagged, echoedKeys, shownKeys: typedKeys };
+    const state = UpdateScreenState.DETAILS_NOT_FETCHED;
+    return { text, status, state, ...flagged, echoedKeys, shownKeys: typedKeys };
 }
 
-// A read of the held card_ref refused, the entry fetch or F12 from SHOW_DETAILS: no card number
-// was typed, so MergeScreenFields shows the keys the body echoes (the held card masked, or no
-// card for an invalid card_ref) as the card the next key reads again by its card_ref.
+// An invalid or expired card_ref refused on the entry fetch or as F12's path: no card number was
+// typed, so MergeScreenFields shows the keys the body echoes (the list's account, or none) as the
+// key screen whose next key reads the held card_ref again.
 function HeldCardRefusal(
     text: string,
     status: number,
     flagged: FlaggedFields,
     echoedKeys: CardKeyFields,
 ): KeyRefusalCase {
-    return { text, status, ...flagged, echoedKeys, shownKeys: echoedKeys };
+    const state = UpdateScreenState.DETAILS_NOT_FETCHED;
+    return { text, status, state, ...flagged, echoedKeys, shownKeys: echoedKeys };
+}
+
+// The held card's CARDDAT read refused on the entry fetch or F12's re-read: COCRDUPC sets
+// CCUP-SHOW-DETAILS whatever 9000-READ-DATA found (lines 482-497, 958-966), so the body keeps
+// both keys, the card masked, over the blank before-image, with the read's flags and the cursor
+// on the name (3300, lines 1212-1214).
+function HeldCardReadRefusal(
+    text: string,
+    status: number,
+    flaggedKeys: readonly CardFieldName[],
+): KeyRefusalCase {
+    return {
+        text,
+        status,
+        state: UpdateScreenState.SHOW_DETAILS,
+        fieldErrors: flaggedKeys,
+        cursorField: "embossed_name",
+        echoedKeys: FETCHED_KEYS,
+        shownKeys: FETCHED_KEYS,
+    };
 }
 
 // 1210 or 1220 refuses a typed key (400); the 9100 read of valid keys finds no card (404) or
@@ -881,30 +972,34 @@ const TYPED_KEY_REFUSAL_CASES: readonly KeyRefusalCase[] = [
     TypedKeyRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ACCOUNT_FLAGGED, VALID_TYPED_KEYS),
 ];
 
-// An invalid or expired card_ref (404: the list's account echoed, no card), and a failed CARDDAT
-// read of the card it names (503: its masked number echoed).
+// An invalid or expired card_ref (404: the list's account echoed, no card) on the key screen; a
+// CARDDAT read of the card it names that finds none (404, both keys flagged) or fails (503, the
+// account flagged) in SHOW_DETAILS with its masked number echoed.
 const ENTRY_FETCH_REFUSAL_CASES: readonly KeyRefusalCase[] = [
     HeldCardRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, BOTH_KEYS_FLAGGED, LIST_ENTRY_KEYS),
-    HeldCardRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ACCOUNT_FLAGGED, FETCHED_KEYS),
+    HeldCardReadRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, KEY_FIELD_NAMES),
+    HeldCardReadRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ["acct_id"]),
 ];
 
-// RereadCard's failed CARDDAT read echoes the held keys (503); an invalid or expired card_ref
-// path (BindStateToPath, 404) echoes none, so neither the card nor the token shows.
+// RereadCard's CARDDAT read that fails (503) or finds no card (404) echoes the held keys in
+// SHOW_DETAILS; an invalid or expired card_ref path (BindStateToPath, 404) echoes none on the key
+// screen, so neither the card nor the token shows.
 const CANCEL_REFUSAL_CASES: readonly KeyRefusalCase[] = [
-    HeldCardRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ACCOUNT_FLAGGED, FETCHED_KEYS),
+    HeldCardReadRefusal(MSG_CARDDAT_READ_ERROR, HTTP_FILE_ERROR, ["acct_id"]),
+    HeldCardReadRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, KEY_FIELD_NAMES),
     HeldCardRefusal(MSG_CARD_NOT_FOUND, HTTP_NOT_FOUND, BOTH_KEYS_FLAGGED, NO_KEYS),
 ];
 
-function ShowsHeaderAndLegend(): void {
+function ShowsHeader(): void {
     RenderKeyScreen();
     expect(screen.getByRole("heading", { level: 1, name: SCREEN_TITLE })).toBeInTheDocument();
     expect(screen.getByText(TRANSACTION_LINE)).toBeInTheDocument();
     expect(screen.getByText(PROGRAM_LINE)).toBeInTheDocument();
-    const legend = screen.getByRole("group", { name: "Function keys" });
-    const buttonNames = within(legend)
-        .getAllByRole("button")
-        .map((button) => button.textContent);
-    expect(buttonNames).toEqual(LEGEND_BUTTON_NAMES);
+}
+
+async function ShowsLegendOfState({ state, buttonNames }: LegendCase): Promise<void> {
+    await RenderInState(state);
+    expect(LegendButtonNames()).toEqual(buttonNames);
 }
 
 async function FetchesSelectedCard(): Promise<void> {
@@ -951,15 +1046,18 @@ async function CutsOverlongEntryKey(overlongCase: OverlongAccountIdCase): Promis
     await WaitForIdle();
 }
 
-// The card_ref path segment, the held screen_token, and the four detail inputs for ENTER and F5.
+// The card_ref path segment, the held screen_token, and the inputs the state leaves editable for
+// ENTER and F5, whether the key's button is shown or the key is dark.
 async function SendsHeldToken(actionKeyCase: ActionKeyCase): Promise<void> {
-    const user = await RenderFromList(UpdateScreenState.SHOW_DETAILS);
-    await PressFunctionKey(user, actionKeyCase, actionKeyCase.method);
+    const { state, method } = actionKeyCase;
+    const user = await RenderFromList(state);
+    ExpectLegendButton(actionKeyCase, state);
+    await PressFunctionKey(user, actionKeyCase, method);
     expect(mockUpdateCard).toHaveBeenCalledTimes(1);
     ExpectUpdateRequest(TEST_CARD_REF, {
         action: actionKeyCase.action,
         screen_token: FIRST_SCREEN_TOKEN,
-        fields: FieldsSentAfterFetch(actionKeyCase, UpdateScreenState.SHOW_DETAILS, TEST_FIELDS),
+        fields: FieldsSentAfterFetch(actionKeyCase, state, TEST_FIELDS),
     });
 }
 
@@ -1063,7 +1161,7 @@ async function FreezesFieldsDuringEnter(answerCase: EditableByStateCase): Promis
     await WaitForIdle();
     ExpectOnlyEditable(answerCase.editableNames);
     expect(InputOf("embossed_name")).toHaveValue(EDITED_EMBOSSED_NAME);
-    await PressFunctionKey(user, SAVE_KEY);
+    await PressFunctionKey(user, SAVE_KEY, MethodShownIn(SAVE_KEY, answerCase.state));
     ExpectUpdateRequest(TEST_CARD_REF, {
         action: UpdateAction.SAVE,
         screen_token: NEXT_SCREEN_TOKEN,
@@ -1111,7 +1209,7 @@ async function AdoptsRefusedSave(adoptionCase: AdoptionCase): Promise<void> {
 async function ResetsAfterFinishedChange(finishedCase: FinishedKeyCase): Promise<void> {
     const user = await RenderFromList(finishedCase.state);
     QueueUpdateOutcome(HTTP_OK, EmptyKeyScreen());
-    await PressFunctionKey(user, finishedCase);
+    await PressFunctionKey(user, finishedCase, MethodShownIn(finishedCase, finishedCase.state));
     ExpectUpdateRequest(TEST_CARD_REF, {
         action: finishedCase.action,
         screen_token: FIRST_SCREEN_TOKEN,
@@ -1159,10 +1257,10 @@ async function MarksEveryFailingField(): Promise<void> {
     expect(screen.queryByText(MSG_EXPIRY_YEAR)).not.toBeInTheDocument();
 }
 
-// The DETAILS_NOT_FETCHED key screen a refused key edit or read answers with: the keys echoed,
-// the details blank, a fresh not-fetched screen_token, and no card held.
+// The screen a refused key edit or read answers with, in the case's state: the keys echoed, the
+// details blank and a fresh screen_token; an error body carries no card_ref.
 function KeyRefusalScreen(refusalCase: KeyRefusalCase): CardScreen {
-    return BuildCardScreen(UpdateScreenState.DETAILS_NOT_FETCHED, {
+    return BuildCardScreen(refusalCase.state, {
         fields: { ...BLANK_FIELDS, ...refusalCase.echoedKeys },
         screen_token: NEXT_SCREEN_TOKEN,
         card_ref: "",
@@ -1189,11 +1287,12 @@ function ExpectRefusalScreen({ text, state, flagged, shownFields }: ExpectedRefu
     ExpectOnlyEditable(EDITABLE_NAMES_BY_STATE[state]);
 }
 
-// The key screen under the key prompt: only the keys typable, the details blank.
+// The refusal under its state's information line, the details blank: on the key screen only the
+// keys typable, in SHOW_DETAILS only the details.
 function ExpectKeyRefusalScreen(refusalCase: KeyRefusalCase): void {
     ExpectRefusalScreen({
         text: refusalCase.text,
-        state: UpdateScreenState.DETAILS_NOT_FETCHED,
+        state: refusalCase.state,
         flagged: refusalCase,
         shownFields: { ...BLANK_FIELDS, ...refusalCase.shownKeys },
     });
@@ -1244,11 +1343,12 @@ async function RenderRefusedEntry(refusalCase: KeyRefusalCase): Promise<UserEven
     return user;
 }
 
-// A card list selection shown in SHOW_DETAILS whose F12 re-read the server refuses.
+// A card list selection shown in SHOW_DETAILS, where FKEYSC is dark, whose F12 re-read the server
+// refuses.
 async function RenderRefusedCancel(refusalCase: KeyRefusalCase): Promise<UserEvent> {
     const user = await RenderFromList(UpdateScreenState.SHOW_DETAILS);
     QueueUpdateOutcome(refusalCase.status, KeyRefusalScreen(refusalCase));
-    await PressFunctionKey(user, CANCEL_KEY);
+    await PressFunctionKey(user, CANCEL_KEY, "key");
     return user;
 }
 
@@ -1269,9 +1369,20 @@ const HELD_CARD_REFUSAL_CASES: readonly HeldCardRefusalCase[] = [
     ...HeldCardRefusals("F12 re-read", RenderRefusedCancel, CANCEL_REFUSAL_CASES),
 ];
 
-const HELD_CARD_RETRY_CASES: readonly HeldCardRetryCase[] = HELD_CARD_REFUSAL_CASES.flatMap(
-    (refusal) => REQUEST_KEYS.map((updateKey) => ({ ...updateKey, ...refusal })),
-);
+function HeldCardRefusalsIn(state: UpdateScreenState): HeldCardRefusalCase[] {
+    return HELD_CARD_REFUSAL_CASES.filter(({ refusalCase }) => refusalCase.state === state);
+}
+
+function RetryCasesOf(refusals: readonly HeldCardRefusalCase[]): HeldCardRetryCase[] {
+    return refusals.flatMap((refusal) =>
+        REQUEST_KEYS.map((updateKey) => ({ ...updateKey, ...refusal })),
+    );
+}
+
+// The refusals that leave the key screen with the card_ref held, and those in SHOW_DETAILS.
+const UNFETCHED_REFUSAL_CASES = HeldCardRefusalsIn(UpdateScreenState.DETAILS_NOT_FETCHED);
+const UNFETCHED_RETRY_CASES = RetryCasesOf(UNFETCHED_REFUSAL_CASES);
+const SHOWN_DETAILS_RETRY_CASES = RetryCasesOf(HeldCardRefusalsIn(UpdateScreenState.SHOW_DETAILS));
 
 // The selection is fetched once by its card_ref and the list's account; nothing is written.
 async function RefusesEntryFetch(refusalCase: KeyRefusalCase): Promise<void> {
@@ -1313,7 +1424,7 @@ async function CancelsAfterStructuralRejection(): Promise<void> {
     const user = await RenderFromList(UpdateScreenState.SHOW_DETAILS);
     await RejectNonCp037Name(user);
     QueueUpdateOutcome(HTTP_OK, REREAD_SCREEN);
-    await PressFunctionKey(user, CANCEL_KEY);
+    await PressFunctionKey(user, CANCEL_KEY, "key");
     ExpectUpdateRequest(TEST_CARD_REF, {
         action: UpdateAction.CANCEL,
         screen_token: FIRST_SCREEN_TOKEN,
@@ -1331,7 +1442,7 @@ async function RetriesHeldCardRef(retryCase: HeldCardRetryCase): Promise<void> {
     const user = await retryCase.RenderRefusal(retryCase.refusalCase);
     const writeCount = mockUpdateCard.mock.calls.length;
     mockFetchCardForEdit.mockResolvedValueOnce(BuildCardScreen(UpdateScreenState.SHOW_DETAILS));
-    await PressFunctionKey(user, retryCase);
+    await PressFunctionKey(user, retryCase, MethodShownIn(retryCase, retryCase.refusalCase.state));
     expect(mockFetchCardForEdit).toHaveBeenCalledTimes(2);
     expect(mockFetchCardForEdit.mock.lastCall).toStrictEqual([
         TEST_CARD_REF,
@@ -1341,6 +1452,20 @@ async function RetriesHeldCardRef(retryCase: HeldCardRetryCase): Promise<void> {
     expect(InputOf("embossed_name")).toHaveValue(TEST_EMBOSSED_NAME);
     expect(ShownAlerts()).toEqual([[INFO_DETAILS_SHOWN, "info"]]);
     ExpectOnlyEditable(DETAIL_FIELD_NAMES);
+}
+
+// A SHOW_DETAILS refusal holds both keys in its screen_token, so each key is a PUT by the held
+// card_ref under that token, with the blank detail inputs for ENTER and F5 and no field for F12;
+// the card is never fetched again.
+async function SendsRefusalTokenByCardRef(retryCase: HeldCardRetryCase): Promise<void> {
+    const user = await retryCase.RenderRefusal(retryCase.refusalCase);
+    await PressFunctionKey(user, retryCase, MethodShownIn(retryCase, retryCase.refusalCase.state));
+    expect(mockFetchCardForEdit).toHaveBeenCalledTimes(1);
+    ExpectUpdateRequest(TEST_CARD_REF, {
+        action: retryCase.action,
+        screen_token: NEXT_SCREEN_TOKEN,
+        fields: FieldsSentAfterFetch(retryCase, UpdateScreenState.SHOW_DETAILS, BLANK_FIELDS),
+    });
 }
 
 // A typed card number replaces the held card_ref, so ENTER is the not-fetched PUT keyed by it,
@@ -1413,9 +1538,13 @@ afterEach(() => {
 });
 
 describe("COCRDUPC BMS COCRDUP content on /cards/update", () => {
-    it("COCRDUPC shows the title, TRNNAME CCUP, PGMNAME COCRDUPC and the PF-key legend", () => {
-        ShowsHeaderAndLegend();
+    it("COCRDUPC shows the title, TRNNAME CCUP and PGMNAME COCRDUPC", () => {
+        ShowsHeader();
     });
+
+    it.each(LEGEND_CASES)("COCRDUPC $state shows the PF-key legend $buttonNames", (legendCase) =>
+        ShowsLegendOfState(legendCase),
+    );
 
     it.each(FIELD_CASES)(
         "COCRDUPC renders $label with the BMS LENGTH $maxLength",
@@ -1450,7 +1579,7 @@ describe("COCRDUPC 3300-SETUP-SCREEN-ATTRS field protection on /cards/update", (
 
 describe("COCRDUPC ENTER, F5 and F12 requests on /cards/update", () => {
     it.each(ACTION_KEY_CASES)(
-        "COCRDUPC $buttonName by $method sends $action with the held screen_token",
+        "COCRDUPC $state $buttonName by $method sends $action with the held screen_token",
         (actionKeyCase) => SendsHeldToken(actionKeyCase),
     );
 
@@ -1535,7 +1664,9 @@ describe("COCRDUPC message-line literals on /cards/update", () => {
         FlagsClearedCardName());
 });
 
-// Each refusal answers with the DETAILS_NOT_FETCHED key screen, which the page adopts.
+// Each refusal answers with its state's screen, which the page adopts: the DETAILS_NOT_FETCHED
+// key screen for typed keys and an invalid card_ref, and SHOW_DETAILS with both keys kept for a
+// failed CARDDAT read of a held card.
 describe("COCRDUPC key edit and CARDDAT read refusals on /cards/update", () => {
     it.each(TYPED_KEY_REFUSAL_CASES)(
         "COCRDUPC ENTER on typed keys: $status $text flags $fieldErrors",
@@ -1543,12 +1674,12 @@ describe("COCRDUPC key edit and CARDDAT read refusals on /cards/update", () => {
     );
 
     it.each(ENTRY_FETCH_REFUSAL_CASES)(
-        "COCRDUPC card list entry fetch: $status $text flags $fieldErrors",
+        "COCRDUPC card list entry fetch: $status $text in $state flags $fieldErrors",
         (refusalCase) => RefusesEntryFetch(refusalCase),
     );
 
     it.each(CANCEL_REFUSAL_CASES)(
-        "COCRDUPC F12 from SHOW_DETAILS: $status $text flags $fieldErrors",
+        "COCRDUPC F12 from SHOW_DETAILS: $status $text in $state flags $fieldErrors",
         (refusalCase) => RefusesCancel(refusalCase),
     );
 });
@@ -1559,16 +1690,22 @@ describe("COCRDUPC F12 after a 422 structural rejection on /cards/update", () =>
 });
 
 // COCRDUPC lines 482-497 read a card list session's card by CDEMO-CARD-NUM, which the held
-// card_ref stands for; until it is fetched no card number is on the screen to send.
+// card_ref stands for; until it is fetched no card number is on the screen to send. A failed read
+// of a valid card_ref is SHOW_DETAILS, so its next key is a PUT under the refusal's screen_token.
 describe("COCRDUPC the held card_ref after a refused read on /cards/update", () => {
-    it.each(HELD_CARD_RETRY_CASES)(
+    it.each(UNFETCHED_RETRY_CASES)(
         "COCRDUPC after a $refusalCase.status $refusedRead, $buttonName reads the card_ref again",
         (retryCase) => RetriesHeldCardRef(retryCase),
     );
 
-    it.each(HELD_CARD_REFUSAL_CASES)(
+    it.each(UNFETCHED_REFUSAL_CASES)(
         "COCRDUPC after a $refusalCase.status $refusedRead, a typed card number is sent by PUT",
         (refusal) => KeysTypedCardAfterHeldCardRefusal(refusal),
+    );
+
+    it.each(SHOWN_DETAILS_RETRY_CASES)(
+        "COCRDUPC after a $refusalCase.status $refusedRead in SHOW_DETAILS, $buttonName is a PUT",
+        (retryCase) => SendsRefusalTokenByCardRef(retryCase),
     );
 });
 

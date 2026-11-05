@@ -532,6 +532,41 @@ it.each(EXIT_CASES)(
     },
 );
 
+// COMEN01C WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy), then
+// SEND-MENU-SCREEN. No option is sent, OPTION keeps its keyed text and is not flagged, and the
+// cursor goes back to OPTION, the IC field. The literal is core/messages.py INVALID_KEY_MESSAGE.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
+// The PF keys outside the COMEN01 legend ENTER=Continue  F3=Exit.
+const UNBOUND_KEYS: readonly string[] = ["F4", "F5", "F7", "F8", "F12"];
+
+it.each(UNBOUND_KEYS)(
+    "COMEN01C %s shows the invalid-key literal in red with the cursor on OPTION",
+    async (key) => {
+        const user = await RenderLoadedScreen();
+        await user.type(OptionInput(), "8");
+        await PressKey(key);
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+        expect(OptionInput()).toHaveValue("8");
+        expect(OptionInput()).toHaveFocus();
+        expect(OptionInput()).toHaveAttribute("aria-invalid", "false");
+        expect(mockSelectMainMenuOption).not.toHaveBeenCalled();
+        expect(mockLogout).not.toHaveBeenCalled();
+        expect(mockRouterPush).not.toHaveBeenCalled();
+        expect(mockRouterReplace).not.toHaveBeenCalled();
+    },
+);
+
+it("COMEN01C F5 again after the cursor left OPTION puts it back on OPTION", async () => {
+    const user = await RenderLoadedScreen();
+    await PressKey("F5");
+    await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+    await user.tab();
+    expect(OptionInput()).not.toHaveFocus();
+    await PressKey("F5");
+    expect(OptionInput()).toHaveFocus();
+    await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+});
+
 it.each(UNAUTHORIZED_CASES)(
     "COMEN01C 401 on $callName shows no message and leaves the redirect to apiClient",
     async ({ ArrangeAndTrigger }) => {
@@ -802,6 +837,24 @@ it.each(POINTER_SELECTION_CASES)(
         expect(OptionInput()).toHaveValue("11");
     },
 );
+
+// The keyboard lock covers every PF key: one pressed during a selection is answered by nothing.
+it("COMEN01C answers no other PF key while a selection is in flight", async () => {
+    const answerSelection = HoldSelection();
+    const user = await RenderLoadedScreen();
+    await user.type(OptionInput(), "11");
+    await user.click(KeyButton(CONTINUE_BUTTON_NAME));
+    expect(KeyButton(CONTINUE_BUTTON_NAME)).toBeDisabled();
+    for (const key of UNBOUND_KEYS) {
+        await PressKey(key);
+    }
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    await answerSelection(NOT_INSTALLED_ANSWER);
+    await WaitForIdle();
+    const alertTexts = screen.queryAllByRole("alert").map((alert) => alert.textContent);
+    expect(alertTexts).toEqual([NOT_INSTALLED_MESSAGE]);
+    expect(mockSelectMainMenuOption).toHaveBeenCalledTimes(1);
+});
 
 // The routed page's text once its payload has loaded.
 const NEXT_PAGE_TEXT = "Account View page";

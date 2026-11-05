@@ -92,7 +92,7 @@ const SIGN_ON_BUTTON = "Sign-on (Enter)";
 const EXIT_BUTTON = "Exit (F3)";
 const FUNCTION_KEY_GROUP = "Function keys";
 const BUSY_INDICATOR = "Processing";
-// No AID key other than ENTER and PF3 reaches COSGN00C from this page.
+// The PF keys outside the COSGN00 legend, which COSGN00C answers in its WHEN OTHER branch.
 const UNBOUND_KEYS: readonly string[] = ["F4", "F5", "F7", "F8", "F12"];
 
 const USER_ID_REQUIRED_MESSAGE = "Please enter User ID ...";
@@ -102,6 +102,8 @@ const WRONG_PASSWORD_MESSAGE = "Wrong Password. Try again ...";
 const UNABLE_TO_VERIFY_MESSAGE = "Unable to verify the User ...";
 const LOGIN_LOCKED_MESSAGE = "Too many failed attempts. Try again later ...";
 const THANK_YOU_MESSAGE = "Thank you for using CardDemo application...";
+// CSMSG01Y CCDA-MSG-INVALID-KEY without its PIC X(50) padding, as core/messages.py holds it.
+const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
 // CSMSG02Y ABEND-MSG: a 500 has no legacy body, because the backend has no catch-all handler.
 const ABEND_MESSAGE = "UNEXPECTED ABEND OCCURRED.";
 
@@ -608,16 +610,60 @@ describe("COSGN00C PF3 sign-off (SEND-PLAIN-TEXT) on /signon", () => {
     );
 });
 
+// COSGN00C WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY, then SEND-SIGNON-SCREEN.
+// Nothing is sent to the server, the typed values stay, no field is flagged, and the cursor goes
+// back to USERID, the IC field, from Password where the typing left it.
 describe("COSGN00C keys outside the COSGN00 legend on /signon", () => {
-    it("COSGN00C binds no PF key beyond ENTER=Sign-on  F3=Exit", async () => {
+    it.each(UNBOUND_KEYS)(
+        "COSGN00C %s shows the invalid-key literal in red with the cursor on User ID",
+        async (key) => {
+            const { user } = await RenderScreen();
+            await TypeCredentials(user, TYPED_CREDENTIALS);
+            await PressKey(key);
+            await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+            expect(loginMock).not.toHaveBeenCalled();
+            expect(logoutMock).not.toHaveBeenCalled();
+            expect(CredentialInput("user_id")).toHaveValue(TYPED_CREDENTIALS.user_id);
+            expect(CredentialInput("password")).toHaveValue(TYPED_CREDENTIALS.password);
+            expect(CredentialInput("user_id")).toHaveFocus();
+            expect(CredentialInput("user_id")).toHaveAttribute("aria-invalid", "false");
+            expect(CredentialInput("password")).toHaveAttribute("aria-invalid", "false");
+            ExpectNoNavigation();
+        },
+    );
+});
+
+describe("COSGN00C invalid key after a sign-off on /signon", () => {
+    it("COSGN00C F5 after the F3 sign-off replaces the thank-you notice", async () => {
         await RenderScreen();
+        await PressKey("F3");
+        await ExpectAlert(THANK_YOU_MESSAGE, "info");
+        await WaitForIdle();
+        await PressKey("F5");
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+        const alertTexts = screen.getAllByRole("alert").map((alert) => alert.textContent);
+        expect(alertTexts).toEqual([INVALID_KEY_MESSAGE]);
+        expect(logoutMock).toHaveBeenCalledTimes(1);
+        expect(CredentialInput("user_id")).toHaveFocus();
+    });
+});
+
+describe("COSGN00C keys outside the legend while the sign-on call is in flight", () => {
+    it("COSGN00C answers no other PF key until the sign-on call settles", async () => {
+        const resolveLogin = DeferLogin();
+        const { user } = await RenderScreen();
+        await TypeCredentials(user, TYPED_CREDENTIALS);
+        await user.click(SignOnButton());
+        expect(SignOnButton()).toBeDisabled();
         for (const key of UNBOUND_KEYS) {
             await PressKey(key);
         }
-        expect(loginMock).not.toHaveBeenCalled();
-        expect(logoutMock).not.toHaveBeenCalled();
         expect(screen.queryAllByRole("alert")).toHaveLength(0);
-        expect(screen.queryAllByRole("status")).toHaveLength(0);
+        await resolveLogin(REGULAR_SIGN_ON);
+        await WaitForIdle();
+        expect(mockRouterPush).toHaveBeenCalledWith(REGULAR_SIGN_ON.next_route);
+        expect(loginMock).toHaveBeenCalledTimes(1);
+        expect(screen.queryAllByRole("alert")).toHaveLength(0);
     });
 });
 

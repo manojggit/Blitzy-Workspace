@@ -33,7 +33,12 @@ import {
     type RouteAllowance,
 } from "@/lib/apiClient";
 import { useSession } from "@/lib/session";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+    type InvalidKeyAction,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CA00";
 const PROGRAM_NAME = "COADM01C";
@@ -125,6 +130,7 @@ interface MenuCommandInputs {
 interface MenuCommands {
     isBusy: boolean;
     keys: FunctionKeyDefinition[];
+    invalidKeyAction: InvalidKeyAction;
     onSelectOption: (optionText: string) => void;
 }
 
@@ -258,6 +264,17 @@ async function HandleSignOff(actions: MenuActions): Promise<void> {
     actions.Navigate(SIGN_ON_ROUTE);
 }
 
+// WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY in red. No option is sent, so the
+// OPTION text stays as keyed and is not in error. Each press is a new message, so the cursor
+// returns to OPTION, the IC field, even after it left it.
+function ShowInvalidKey(actions: MenuActions): void {
+    actions.ShowMessage({
+        message: INVALID_KEY_MESSAGE,
+        severity: ERROR_SEVERITY,
+        hasOptionError: false,
+    });
+}
+
 // The map legend "ENTER=Continue  F3=Exit"; the keyboard is locked while a call is in flight.
 function BuildFunctionKeys(handlers: FunctionKeyHandlers): FunctionKeyDefinition[] {
     return [
@@ -340,6 +357,8 @@ function useMenuActions(showMessage: MenuActions["ShowMessage"]): MenuActionsSta
     return { actions, isCalling: isBusy, isNavigating };
 }
 
+// Any other PF key is refused while busy, like ENTER and F3. The action is built on each render,
+// as the keys are, from the actions of that render.
 function useMenuCommands(inputs: MenuCommandInputs): MenuCommands {
     const { actions, isCalling, isNavigating } = useMenuActions(inputs.ShowMessage);
     const isBusy = inputs.isLoading || isCalling || isNavigating;
@@ -351,7 +370,8 @@ function useMenuCommands(inputs: MenuCommandInputs): MenuCommands {
         onContinue: () => onSelectOption(inputs.optionText),
         onExit: () => void HandleSignOff(actions),
     });
-    return { isBusy, keys, onSelectOption };
+    const invalidKeyAction = { onPress: () => ShowInvalidKey(actions), disabled: isBusy };
+    return { isBusy, keys, invalidKeyAction, onSelectOption };
 }
 
 function useAdminMenu(): AdminMenuState {
@@ -441,7 +461,7 @@ function AdminMenuBody({ adminMenu }: AdminMenuBodyProps) {
 
 function AdminMenuScreen() {
     const adminMenu = useAdminMenu();
-    useFunctionKeys(adminMenu.keys);
+    useFunctionKeys(adminMenu.keys, adminMenu.invalidKeyAction);
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}

@@ -8,6 +8,7 @@ import { useRouter } from "next/navigation";
 import {
     Suspense,
     useEffect,
+    useMemo,
     useRef,
     useState,
     useTransition,
@@ -50,7 +51,12 @@ import {
     type UserSelection,
     type UserSelectionErrorResponse,
 } from "@/lib/api/users";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+    type InvalidKeyAction,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CU00";
 const PROGRAM_NAME = "COUSR00C";
@@ -393,6 +399,18 @@ function BuildKeys(
     ];
 }
 
+// COUSR00C WHEN OTHER (lines 132-135): MOVE 'Y' TO WS-ERR-FLG, MOVE -1 TO USRIDINL and
+// CCDA-MSG-INVALID-KEY. No file is browsed, so the rows, the selection codes, the search text and
+// the page stay as they stood; a new feedback object puts the cursor back on USRIDIN.
+function ShowInvalidKey(setScreen: ScreenUpdate): void {
+    const feedback: CompleteScreenFeedback = {
+        ...EMPTY_FEEDBACK,
+        message: INVALID_KEY_MESSAGE,
+        cursor_field: SEARCH_FIELD,
+    };
+    PatchScreen(setScreen, { feedback });
+}
+
 // Each row is keyed by its screen position, the SELnnnn field it shows, never by its user.
 function ToSelectionRows(screen: ListScreenState): SelectionRow[] {
     return screen.rows.map((row, position) => ({
@@ -429,8 +447,8 @@ function AbortPageRead(controllerRef: ReadControllerRef): void {
 }
 
 // React recognises hooks only by the camelCase "use" prefix, so useFirstEntry, usePageRead,
-// useCursorFocus and useUserList are a framework-mandated exception to the MK_Modernization
-// Rule's PascalCase function naming.
+// useCursorFocus, useInvalidKeyAction and useUserList are a framework-mandated exception to the
+// MK_Modernization Rule's PascalCase function naming.
 
 // The pending message is taken once, so an effect React runs twice still shows it. Leaving the
 // screen abandons the first browse; StrictMode's second run then browses again.
@@ -466,10 +484,20 @@ function useCursorFocus(feedback: CompleteScreenFeedback, fieldRefs: RefObject<F
     }, [feedback, fieldRefs]);
 }
 
+// A PF key the legend lacks answers with the WHEN OTHER branch, and like every key it waits while a
+// call runs, so the call's answer is the message shown.
+function useInvalidKeyAction(setScreen: ScreenUpdate, isBusy: boolean): InvalidKeyAction {
+    return useMemo(
+        () => ({ onPress: () => ShowInvalidKey(setScreen), disabled: isBusy }),
+        [setScreen, isBusy],
+    );
+}
+
 interface UserListModel {
     screen: ListScreenState;
     setScreen: ScreenUpdate;
     keys: FunctionKeyDefinition[];
+    invalidKeyAction: InvalidKeyAction;
     searchInputRef: Ref<HTMLInputElement>;
     isBusy: boolean;
 }
@@ -488,7 +516,8 @@ function useUserList(): UserListModel {
     };
     const isBusy = screen.isBusy || isNavigating;
     const keys = BuildKeys({ setScreen, router, startPageRead, startNavigation }, screen, isBusy);
-    return { screen, setScreen, keys, searchInputRef, isBusy };
+    const invalidKeyAction = useInvalidKeyAction(setScreen, isBusy);
+    return { screen, setScreen, keys, invalidKeyAction, searchInputRef, isBusy };
 }
 
 interface UserSearchBarProps {
@@ -566,7 +595,7 @@ function UserSearchBar({ page, pageStatus, ...searchFieldProps }: UserSearchBarP
     );
 }
 
-type UserListBodyProps = Omit<UserListModel, "keys" | "isBusy">;
+type UserListBodyProps = Omit<UserListModel, "keys" | "invalidKeyAction" | "isBusy">;
 
 type UserRowsProps = Pick<UserListBodyProps, "screen" | "setScreen">;
 
@@ -610,8 +639,8 @@ function UserListBody({ screen, setScreen, searchInputRef }: UserListBodyProps) 
 }
 
 function UserListScreen() {
-    const { keys, isBusy, ...model } = useUserList();
-    useFunctionKeys(keys);
+    const { keys, invalidKeyAction, isBusy, ...model } = useUserList();
+    useFunctionKeys(keys, invalidKeyAction);
     return (
         <ScreenShell
             {...SCREEN_IDENTITY}

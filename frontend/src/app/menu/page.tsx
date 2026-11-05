@@ -46,7 +46,12 @@ import {
     type RouteAllowance,
 } from "@/lib/apiClient";
 import { useSession } from "@/lib/session";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+    type InvalidKeyAction,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CM00";
 const PROGRAM_NAME = "COMEN01C";
@@ -156,6 +161,7 @@ interface FunctionKeyInputs {
 
 interface MenuControls {
     keys: readonly FunctionKeyDefinition[];
+    invalidKeyAction: InvalidKeyAction;
     SelectListedOption: (option: MenuOption) => void;
 }
 
@@ -168,6 +174,7 @@ interface MainMenuState {
     feedback: MenuFeedback;
     inputRef: RefObject<HTMLInputElement | null>;
     keys: readonly FunctionKeyDefinition[];
+    invalidKeyAction: InvalidKeyAction;
     SetOptionText: (optionText: string) => void;
     SelectListedOption: (option: MenuOption) => void;
 }
@@ -237,6 +244,17 @@ function UnexpectedRouteFeedback(): MenuFeedback {
         ...NO_FEEDBACK,
         isError: true,
         message: ABEND_MESSAGE,
+        severity: SeverityForOutcome(FAILED_CALL_OUTCOME),
+    };
+}
+
+// WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY in red. No option is sent, so the
+// OPTION text stays as keyed and is not in error; the cursor goes back to OPTION, the IC field.
+function InvalidKeyFeedback(): MenuFeedback {
+    return {
+        ...NO_FEEDBACK,
+        isError: true,
+        message: INVALID_KEY_MESSAGE,
         severity: SeverityForOutcome(FAILED_CALL_OUTCOME),
     };
 }
@@ -406,8 +424,8 @@ function useMenuActionContext(callContext: ScreenCallContext): MenuActionState {
     return { actionContext, isNavigating };
 }
 
-// The COMEN01 legend; no other key is bound, and this screen passes no invalid-key action, so
-// useFunctionKeys swallows any other PF key without an answer.
+// The COMEN01 legend; no other key is bound. COMEN01C answers any other PF key in its WHEN OTHER
+// branch with the invalid-key literal (InvalidKeyFeedback).
 function BuildFunctionKeys(inputs: FunctionKeyInputs): FunctionKeyDefinition[] {
     const { actionContext, optionText, isBusy } = inputs;
     return [
@@ -426,17 +444,24 @@ function BuildFunctionKeys(inputs: FunctionKeyInputs): FunctionKeyDefinition[] {
     ];
 }
 
+// Each invalid key shows a new feedback, so the cursor returns to OPTION even after it left it.
+// The key is refused while the screen is busy, like ENTER and F3.
 function useMenuControls(inputs: FunctionKeyInputs): MenuControls {
     const { actionContext, optionText, isBusy } = inputs;
     const keys = useMemo(
         () => BuildFunctionKeys({ actionContext, optionText, isBusy }),
         [actionContext, optionText, isBusy],
     );
+    const { callContext } = actionContext;
+    const invalidKeyAction = useMemo(
+        () => ({ onPress: () => callContext.ShowFeedback(InvalidKeyFeedback()), disabled: isBusy }),
+        [callContext, isBusy],
+    );
     const selectListedOption = useCallback(
         (option: MenuOption) => void SubmitOption(actionContext, String(option.number)),
         [actionContext],
     );
-    return { keys, SelectListedOption: selectListedOption };
+    return { keys, invalidKeyAction, SelectListedOption: selectListedOption };
 }
 
 // ENTER sends the OPTION text as keyed; a click on a listed option sends that option's number. The
@@ -447,7 +472,7 @@ function useMainMenu(): MainMenuState {
     const options = useMenuOptions(callContext);
     const { actionContext, isNavigating } = useMenuActionContext(callContext);
     const isBusy = isCalling || isNavigating;
-    const { keys, SelectListedOption } = useMenuControls({ actionContext, optionText, isBusy });
+    const controls = useMenuControls({ actionContext, optionText, isBusy });
     return {
         options: options ?? NO_OPTIONS,
         isMapPending: options === null,
@@ -456,9 +481,8 @@ function useMainMenu(): MainMenuState {
         isOptionInError: IsOptionInError(feedback),
         feedback,
         inputRef,
-        keys,
+        ...controls,
         SetOptionText: setOptionText,
-        SelectListedOption,
     };
 }
 
@@ -564,7 +588,7 @@ function MainMenuContent({ menu }: MainMenuContentProps) {
 
 function MainMenuScreen() {
     const menu = useMainMenu();
-    useFunctionKeys(menu.keys);
+    useFunctionKeys(menu.keys, menu.invalidKeyAction);
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}

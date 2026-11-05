@@ -37,7 +37,13 @@ import {
     type UserDetailResponse,
     type UserMessageResponse,
 } from "@/lib/api/users";
-import { useFunctionKeys, type FunctionKeyDefinition, type PfKey } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+    type InvalidKeyAction,
+    type PfKey,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CU02";
 const PROGRAM_NAME = "COUSR02C";
@@ -70,7 +76,7 @@ type UserFieldValues = Record<UserFieldName, string>;
 type FieldRefs = Record<UserFieldName, RefObject<HTMLInputElement | null>>;
 type AppRouter = ReturnType<typeof useRouter>;
 // The controller of the fetch in flight, null once it settles. A newer fetch and the screen's
-// unmount abort it; the saves are writes and never take a signal.
+// unmount abort it; the saves are writes, never take a signal, and are refused while it is set.
 type FetchControllerRef = RefObject<AbortController | null>;
 
 // One COUSR2A input: the BMS INITIAL label, the field LENGTH and the PASSWD and USRTYPE hints.
@@ -97,7 +103,9 @@ interface SuccessOutcome {
     isCompletedWrite: boolean;
 }
 
-// Everything the PF-key handlers read or change.
+// Everything the PF-key handlers read or change. isInFlightRef is the synchronous write lock: true
+// from the F5 or F3 that sends a save until that request settles, so a key pressed before the busy
+// render reaches the keys is refused.
 interface UpdateScreenContext {
     values: UserFieldValues;
     SetValues: Dispatch<SetStateAction<UserFieldValues>>;
@@ -109,6 +117,7 @@ interface UpdateScreenContext {
     startNavigation: TransitionStartFunction;
     openedFromList: boolean;
     fetchControllerRef: FetchControllerRef;
+    isInFlightRef: RefObject<boolean>;
 }
 
 interface RoutedNavigation {
@@ -265,11 +274,29 @@ function ApplyFailure(context: UpdateScreenContext, error: unknown): void {
     ClearPassword(context);
 }
 
+// A save in flight holds the in-flight lock; a fetch in flight holds fetchControllerRef, which
+// ENTER sets as it sends the read and the owning read clears as it settles. Both are refs, so they
+// hold in the same turn as the press that started the call, before the busy render.
+function IsCallInFlight(context: UpdateScreenContext): boolean {
+    return context.isInFlightRef.current || context.fetchControllerRef.current !== null;
+}
+
+// F5 and F3 each send one UPDATE-USER-INFO, and only while no call is in flight, as the 3270
+// keyboard stays locked from the AID until the answer. The disabled keys take effect only a render
+// after the press, so in that gap a second save is refused, and one press sends one PUT; a save
+// pressed in ENTER's turn is refused too, so no PUT carries the values from before the read and
+// the read's answer never replaces the save's. The lock clears when the save settles, a rethrown
+// defect included.
 async function RunBusy(context: UpdateScreenContext, work: () => Promise<void>): Promise<void> {
+    if (IsCallInFlight(context)) {
+        return;
+    }
+    context.isInFlightRef.current = true;
     context.SetIsBusy(true);
     try {
         await work();
     } finally {
+        context.isInFlightRef.current = false;
         context.SetIsBusy(false);
     }
 }
@@ -363,7 +390,13 @@ async function SaveIgnoringOutcome(context: UpdateScreenContext): Promise<void> 
     }
 }
 
+// ENTER is refused while a save is in flight, so the save's answer lands on the screen that sent
+// it. A fetch takes no lock: a newer ENTER supersedes the fetch still in flight, and only the saves
+// wait for it.
 async function HandleFetch(context: UpdateScreenContext): Promise<void> {
+    if (context.isInFlightRef.current) {
+        return;
+    }
     await RunFetch(context, context.values.user_id);
 }
 
@@ -390,13 +423,21 @@ async function HandleSaveAndExit(context: UpdateScreenContext): Promise<void> {
     });
 }
 
-// CLEAR-CURRENT-SCREEN: every field and the message blank, the cursor on USRIDIN.
+// CLEAR-CURRENT-SCREEN: every field and the message blank, the cursor on USRIDIN. It is refused
+// while a save is in flight, so the save's answer still lands on the screen that sent it.
 function HandleClear(context: UpdateScreenContext): void {
+    if (context.isInFlightRef.current) {
+        return;
+    }
     context.SetValues(EMPTY_FIELD_VALUES);
     context.SetFeedback({ ...EMPTY_FEEDBACK, cursorField: USER_ID_FIELD });
 }
 
+// PF12 leaves the screen. It is refused while a save is in flight, so the answer is always shown.
 function HandleCancel(context: UpdateScreenContext): void {
+    if (context.isInFlightRef.current) {
+        return;
+    }
     context.router.push(ADMIN_MENU_ROUTE);
 }
 
@@ -409,6 +450,9 @@ const KEY_ACTIONS: readonly KeyAction[] = [
     { key: "F12", label: "Cancel", Run: HandleCancel },
 ];
 
+// Every key waits while a call runs, so one F5 or F3 is one write. Disabling takes effect a render
+// after the press, so each handler also refuses a press made in that gap while a save is in flight
+// through the in-flight lock.
 function BuildFunctionKeys(context: UpdateScreenContext, isBusy: boolean): FunctionKeyDefinition[] {
     return KEY_ACTIONS.map(({ key, label, Run }) => ({
         key,
@@ -418,6 +462,28 @@ function BuildFunctionKeys(context: UpdateScreenContext, isBusy: boolean): Funct
             void Run(context);
         },
     }));
+}
+
+// COUSR02C WHEN OTHER (lines 127-129): MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY in red. No
+// file is read or written, so every keyed value, the typed password included, stays; the SEND's
+// CURSOR, with no field's length at -1, puts the cursor on USRIDIN, the map's IC field. It is
+// refused while a save is in flight, so the save's answer is the message shown.
+function ShowInvalidKey(context: UpdateScreenContext): void {
+    if (context.isInFlightRef.current) {
+        return;
+    }
+    context.SetFeedback({
+        ...EMPTY_FEEDBACK,
+        message: INVALID_KEY_MESSAGE,
+        severity: SeverityForOutcome(ERROR_OUTCOME),
+        cursorField: USER_ID_FIELD,
+    });
+}
+
+// A PF key the legend lacks answers with the WHEN OTHER branch, and like every key it waits while a
+// call runs; a press made before the busy render meets the in-flight lock instead.
+function BuildInvalidKeyAction(context: UpdateScreenContext, isBusy: boolean): InvalidKeyAction {
+    return { onPress: () => ShowInvalidKey(context), disabled: isBusy };
 }
 
 // A message carried across the navigation that opened the screen shows on first entry.
@@ -447,7 +513,7 @@ function AbortPendingFetch(
     hasStartedRef.current = false;
 }
 
-// React recognises hooks only by the camelCase "use" prefix, so the five hook names below are a
+// React recognises hooks only by the camelCase "use" prefix, so the six hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 
 // Leaving the screen aborts the fetch in flight. React Strict Mode's rehearsal unmount aborts the
@@ -496,6 +562,14 @@ function useRoutedNavigation(): RoutedNavigation {
     return { router, isNavigating, startNavigation };
 }
 
+// The context is rebuilt on every render, so the fetch that owns the screen and the in-flight lock
+// are each one ref for the screen's life, which every rebuilt context holds.
+function useScreenCallRefs(): Pick<UpdateScreenContext, "fetchControllerRef" | "isInFlightRef"> {
+    const fetchControllerRef = useRef<AbortController | null>(null);
+    const isInFlightRef = useRef(false);
+    return { fetchControllerRef, isInFlightRef };
+}
+
 // The screen is busy while a call runs and, after F3's save, until the routed screen renders.
 function useUserUpdate(userId: string | null): UserUpdateModel {
     const { router, isNavigating, startNavigation } = useRoutedNavigation();
@@ -511,7 +585,7 @@ function useUserUpdate(userId: string | null): UserUpdateModel {
         router,
         startNavigation,
         openedFromList: userId !== null,
-        fetchControllerRef: useRef<AbortController | null>(null),
+        ...useScreenCallRefs(),
     };
     useInitialFetch(context, userId);
     useCursorFocus(feedback, fieldRefs);
@@ -593,7 +667,7 @@ function FeedbackLine({ feedback }: FeedbackLineProps) {
 function UserUpdateScreen({ selectedUserId }: UserUpdateScreenProps) {
     const model = useUserUpdate(selectedUserId);
     const keys = BuildFunctionKeys(model.context, model.isBusy);
-    useFunctionKeys(keys);
+    useFunctionKeys(keys, BuildInvalidKeyAction(model.context, model.isBusy));
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}
@@ -633,7 +707,9 @@ function UserUpdateEntry() {
     );
 }
 
-// useSearchParams needs a Suspense boundary, or the static build cannot prerender the route.
+// useSearchParams needs a Suspense boundary wherever Next.js prerenders a page. The route layout
+// renders this one on demand, so the query is known on the first render and the empty fallback
+// never shows.
 export default function AdminUsersUpdatePage() {
     return (
         <Suspense fallback={null}>

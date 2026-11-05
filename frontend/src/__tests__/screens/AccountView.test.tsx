@@ -761,6 +761,43 @@ describe("COACTVWC ENTER on /accounts/view", () => {
     });
 });
 
+// COACTVWC PFK-INVALID: an AID other than ENTER and PF3 does SET CCARD-AID-ENTER, so the key never
+// reaches the browser and runs the ENTER search with ACCTSID as typed.
+const PFK_INVALID_KEYS: readonly string[] = ["F4", "F5", "F7", "F12"];
+
+// A key the legend lacks, pressed in the focused field; the event tells whether its browser
+// default was blocked.
+async function PressUnboundKey(keyName: string): Promise<KeyboardEvent> {
+    const keyEvent = new KeyboardEvent("keydown", {
+        key: keyName,
+        bubbles: true,
+        cancelable: true,
+    });
+    await act(async () => {
+        document.activeElement?.dispatchEvent(keyEvent);
+    });
+    return keyEvent;
+}
+
+async function SearchesForInvalidKey(keyName: string): Promise<void> {
+    mockViewAccount.mockResolvedValue(BuildAccountView());
+    const user = RenderScreen();
+    await user.type(AccountIdInput(), TEST_ACCOUNT_ID);
+    const keyEvent = await PressUnboundKey(keyName);
+    await WaitForBalance(TEST_ACCOUNT_VIEW.curr_balance_edited);
+    expect(keyEvent.defaultPrevented).toBe(true);
+    expect(mockViewAccount).toHaveBeenCalledTimes(1);
+    expect(mockViewAccount).toHaveBeenCalledWith(TEST_ACCOUNT_ID, READ_OPTIONS);
+    expect(mockRouterPush).not.toHaveBeenCalled();
+}
+
+describe("COACTVWC PFK-INVALID keys on /accounts/view", () => {
+    it.each(PFK_INVALID_KEYS)(
+        "COACTVWC %s is processed as ENTER: ACCTSID sent as typed, the browser default blocked",
+        SearchesForInvalidKey,
+    );
+});
+
 describe("COACTVWC legacy messages on /accounts/view", () => {
     it.each(LEGACY_MESSAGE_CASES)("COACTVWC shows %p (HTTP %i) in red", async (literal, status) => {
         const body = BuildErrorBody({ message: literal });

@@ -568,6 +568,64 @@ describe("COUSR01C WHEN OTHER (PF12) on /admin/users/add", () => {
     );
 });
 
+// Every PF key the legend lacks takes the same WHEN OTHER branch as PF12.
+const UNBOUND_KEYS: readonly string[] = ["F5", "F7"];
+
+function KeyDownOf(keyName: string): KeyboardEvent {
+    return new KeyboardEvent("keydown", { key: keyName, bubbles: true, cancelable: true });
+}
+
+// A PF key the legend lacks, pressed where the cursor is; the event tells whether its browser
+// default was blocked.
+async function PressUnboundKey(keyName: string): Promise<KeyboardEvent> {
+    const keyEvent = KeyDownOf(keyName);
+    await act(async () => {
+        (document.activeElement ?? document.body).dispatchEvent(keyEvent);
+    });
+    return keyEvent;
+}
+
+describe("COUSR01C WHEN OTHER (a PF key the legend lacks) on /admin/users/add", () => {
+    it.each(UNBOUND_KEYS)(
+        "COUSR01C %s shows the invalid-key literal in red with the cursor on FNAME, calls nothing",
+        async (keyName) => {
+            const user = RenderScreen();
+            await FillUser(user, KEYED_USER);
+            expect(FieldInput("user_type")).toHaveFocus();
+            const keyEvent = await PressUnboundKey(keyName);
+            await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+            expect(keyEvent.defaultPrevented).toBe(true);
+            ExpectFieldValues(KEYED_USER);
+            ExpectInvalidFields([]);
+            await waitFor(() => expect(FieldInput("first_name")).toHaveFocus());
+            ExpectNoCallOrNavigation();
+        },
+    );
+});
+
+// In ENTER's own turn the in-flight lock refuses the key; after the busy render the disabled
+// invalid-key action does. Either way the add's answer is the message shown.
+describe("COUSR01C a PF key the legend lacks during the write on /admin/users/add", () => {
+    it.each(UNBOUND_KEYS)(
+        "COUSR01C %s while the add is in flight answers nothing; the add's answer shows",
+        async (keyName) => {
+            const settleAdd = DeferAddUser();
+            await FillUser(RenderScreen(), KEYED_USER);
+            act(() => {
+                window.dispatchEvent(KeyDownOf(KEYBOARD_KEYS.ENTER));
+                window.dispatchEvent(KeyDownOf(keyName));
+            });
+            ExpectOneAddInFlight();
+            expect(LegendButton("ENTER")).toBeDisabled();
+            expect((await PressUnboundKey(keyName)).defaultPrevented).toBe(true);
+            ExpectOneAddInFlight();
+            await AnswerAdded(settleAdd);
+            await ExpectAlert(ADDED_MESSAGE, "success");
+            ExpectFieldValues(BLANK_USER);
+        },
+    );
+});
+
 describe("COUSR01C PF4 (CLEAR-CURRENT-SCREEN) on /admin/users/add", () => {
     it.each(PRESS_METHODS)(
         "COUSR01C PF4 by %s blanks every field and the message",

@@ -37,7 +37,12 @@ import {
     type OutcomeFlags,
 } from "@/lib/apiClient";
 import { DeleteUser, FetchUser, UserFetchScreen, type UserDetailResponse } from "@/lib/api/users";
-import { useFunctionKeys, type FunctionKeyDefinition } from "@/lib/useFunctionKeys";
+import {
+    INVALID_KEY_MESSAGE,
+    useFunctionKeys,
+    type FunctionKeyDefinition,
+    type InvalidKeyAction,
+} from "@/lib/useFunctionKeys";
 
 const TRANSACTION_ID = "CU03";
 const PROGRAM_NAME = "COUSR03C";
@@ -71,7 +76,7 @@ type FieldRefs = Readonly<Record<UserDeleteFieldName, RefObject<HTMLInputElement
 type AppRouter = ReturnType<typeof useRouter>;
 
 // The controller of the fetch in flight, null once it settles. A newer fetch and the screen's
-// unmount abort it; the delete is a write and never takes a signal.
+// unmount abort it; the delete is a write, never takes a signal, and is refused while it is set.
 type FetchControllerRef = RefObject<AbortController | null>;
 
 interface FieldDefinition {
@@ -90,14 +95,17 @@ interface FeedbackState {
     cursorField: string | null;
 }
 
-// The setters and router the fetch, delete and clear operations update the screen through, and
-// the fetch that owns the screen.
+// The setters and router the fetch, delete and clear operations update the screen through, the
+// fetch that owns the screen, and the synchronous write lock: isInFlightRef is true from the F5
+// that sends the delete until that request settles, so a key pressed before the busy render
+// reaches the keys is refused.
 interface DeleteScreenContext {
     setValues: Dispatch<SetStateAction<UserDeleteValues>>;
     setFeedback: Dispatch<SetStateAction<FeedbackState>>;
     setIsBusy: Dispatch<SetStateAction<boolean>>;
     router: AppRouter;
     fetchControllerRef: FetchControllerRef;
+    isInFlightRef: RefObject<boolean>;
 }
 
 interface DeleteScreenState extends DeleteScreenContext {
@@ -114,6 +122,7 @@ interface UserDeleteActions {
     HandleBack: () => void;
     HandleClear: () => void;
     HandleCancel: () => void;
+    HandleInvalidKey: () => void;
 }
 
 interface UserDeleteScreenModel extends DeleteScreenState {
@@ -248,16 +257,33 @@ function BeginScreenCall(context: DeleteScreenContext): void {
     context.setIsBusy(true);
 }
 
+// A delete in flight holds the in-flight lock; a fetch in flight holds fetchControllerRef, which
+// ENTER sets as it sends the read and the owning read clears as it settles. Both are refs, so they
+// hold in the same turn as the press that started the call, before the busy render.
+function IsCallInFlight(context: DeleteScreenContext): boolean {
+    return context.isInFlightRef.current || context.fetchControllerRef.current !== null;
+}
+
+// F5 sends one DELETE-USER-INFO, and only while no call is in flight, as the 3270 keyboard stays
+// locked from the AID until the answer. The disabled keys take effect only a render after the
+// press, so in that gap a second F5 is refused, and one press sends one DELETE; an F5 pressed in
+// ENTER's turn is refused too, so the read's late answer never shows a user just deleted. The lock
+// clears when the delete settles, a rethrown defect included.
 async function RunScreenCall(
     context: DeleteScreenContext,
     operation: () => Promise<void>,
 ): Promise<void> {
+    if (IsCallInFlight(context)) {
+        return;
+    }
+    context.isInFlightRef.current = true;
     BeginScreenCall(context);
     try {
         await operation();
     } catch (error) {
         ShowCallError(context, error);
     } finally {
+        context.isInFlightRef.current = false;
         context.setIsBusy(false);
     }
 }
@@ -310,8 +336,13 @@ async function ReadForDelete(
     }
 }
 
-// PROCESS-ENTER-KEY: the protected fields are blanked before USRSEC is read.
+// PROCESS-ENTER-KEY: the protected fields are blanked before USRSEC is read. ENTER is refused while
+// a delete is in flight, so the delete's answer lands on the screen that sent it. A fetch takes no
+// lock: a newer ENTER supersedes the fetch still in flight, and only the delete waits for it.
 async function FetchForDelete(context: DeleteScreenContext, userIdText: string): Promise<void> {
+    if (context.isInFlightRef.current) {
+        return;
+    }
     const controller = TakeOverFetch(context);
     context.setValues((current) => ({ ...EMPTY_VALUES, user_id: current.user_id }));
     BeginScreenCall(context);
@@ -332,10 +363,34 @@ async function DeleteForScreen(context: DeleteScreenContext, userIdText: string)
     });
 }
 
-// CLEAR-CURRENT-SCREEN: client only, with the cursor back on the user ID.
+// CLEAR-CURRENT-SCREEN: client only, with the cursor back on the user ID. It is refused while a
+// delete is in flight, so the delete's answer still lands on the screen that sent it.
 function ClearScreen(context: DeleteScreenContext): void {
+    if (context.isInFlightRef.current) {
+        return;
+    }
     context.setValues(EMPTY_VALUES);
     context.setFeedback(OutcomeFeedback("", PROMPT_OUTCOME, USER_ID_FIELD));
+}
+
+// COUSR03C WHEN OTHER (lines 126-128): MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY in red. No
+// file is read or deleted, so the keyed user ID and the details shown stay; the SEND's CURSOR, with
+// no field's length at -1, puts the cursor on USRIDIN, the map's IC field. It is refused while a
+// delete is in flight, so the delete's answer is the message shown.
+function ShowInvalidKey(context: DeleteScreenContext): void {
+    if (context.isInFlightRef.current) {
+        return;
+    }
+    context.setFeedback(OutcomeFeedback(INVALID_KEY_MESSAGE, ERROR_OUTCOME, USER_ID_FIELD));
+}
+
+// PF3 and PF12 leave the screen. Each is refused while a delete is in flight, so the answer is
+// always shown.
+function LeaveScreen(context: DeleteScreenContext, route: string): void {
+    if (context.isInFlightRef.current) {
+        return;
+    }
+    context.router.push(route);
 }
 
 // The first entry shows the message another screen left for it, in the ERRMSG default red.
@@ -360,6 +415,9 @@ function AbortPendingFetch(
     hasEnteredRef.current = false;
 }
 
+// Every key waits while a call runs, so one F5 is one delete. Disabling takes effect a render after
+// the press, so each action also refuses a press made in that gap while a delete is in flight
+// through the in-flight lock.
 function BuildFunctionKeys(actions: UserDeleteActions, isBusy: boolean): FunctionKeyDefinition[] {
     return [
         { key: "ENTER", label: "Fetch", onPress: actions.HandleFetch, disabled: isBusy },
@@ -368,6 +426,12 @@ function BuildFunctionKeys(actions: UserDeleteActions, isBusy: boolean): Functio
         { key: "F5", label: "Delete", onPress: actions.HandleDelete, disabled: isBusy },
         { key: "F12", label: "Cancel", onPress: actions.HandleCancel, disabled: isBusy },
     ];
+}
+
+// A PF key the legend lacks answers with the WHEN OTHER branch, and like every key it waits while a
+// call runs; a press made before the busy render meets the in-flight lock instead.
+function BuildInvalidKeyAction(actions: UserDeleteActions, isBusy: boolean): InvalidKeyAction {
+    return { onPress: actions.HandleInvalidKey, disabled: isBusy };
 }
 
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
@@ -397,19 +461,22 @@ function useDeleteScreenState(selectedUserId: string): DeleteScreenState {
     const [isBusy, setIsBusy] = useState(false);
     const fieldRefs = useFieldRefs();
     const fetchControllerRef = useRef<AbortController | null>(null);
+    const isInFlightRef = useRef(false);
     const router = useRouter();
     const onUserIdChange = useCallback((userIdText: string) => {
         setValues((current) => ({ ...current, user_id: userIdText }));
     }, []);
     const screenState = { values, setValues, feedback, setFeedback, isBusy, setIsBusy, router };
-    return { ...screenState, fieldRefs, fetchControllerRef, onUserIdChange };
+    return { ...screenState, fieldRefs, fetchControllerRef, isInFlightRef, onUserIdChange };
 }
 
+// The in-flight lock is one ref for the screen's life, so the context holds the same lock however
+// often it is rebuilt.
 function useDeleteScreenContext(state: DeleteScreenState): DeleteScreenContext {
-    const { setValues, setFeedback, setIsBusy, router, fetchControllerRef } = state;
+    const { setValues, setFeedback, setIsBusy, router, fetchControllerRef, isInFlightRef } = state;
     return useMemo(
-        () => ({ setValues, setFeedback, setIsBusy, router, fetchControllerRef }),
-        [setValues, setFeedback, setIsBusy, router, fetchControllerRef],
+        () => ({ setValues, setFeedback, setIsBusy, router, fetchControllerRef, isInFlightRef }),
+        [setValues, setFeedback, setIsBusy, router, fetchControllerRef, isInFlightRef],
     );
 }
 
@@ -423,9 +490,10 @@ function useUserDeleteActions(
             HandleFetch: () => void FetchForDelete(context, userIdText),
             HandleDelete: () => void DeleteForScreen(context, userIdText),
             HandleBack: () =>
-                context.router.push(cameFromList ? USER_LIST_ROUTE : ADMIN_MENU_ROUTE),
+                LeaveScreen(context, cameFromList ? USER_LIST_ROUTE : ADMIN_MENU_ROUTE),
             HandleClear: () => ClearScreen(context),
-            HandleCancel: () => context.router.push(ADMIN_MENU_ROUTE),
+            HandleCancel: () => LeaveScreen(context, ADMIN_MENU_ROUTE),
+            HandleInvalidKey: () => ShowInvalidKey(context),
         }),
         [context, userIdText, cameFromList],
     );
@@ -561,7 +629,7 @@ function UserDetailFields(props: UserDetailFieldsProps) {
 function UserDeleteScreen(props: UserDeleteScreenProps) {
     const screen = useUserDelete(props.selectedUserId, props.cameFromList);
     const keys = BuildFunctionKeys(screen.actions, screen.isBusy);
-    useFunctionKeys(keys);
+    useFunctionKeys(keys, BuildInvalidKeyAction(screen.actions, screen.isBusy));
     return (
         <ScreenShell {...SCREEN_IDENTITY} isBusy={screen.isBusy}>
             <UserDetailFields
@@ -600,7 +668,9 @@ function UserDeleteEntry() {
     );
 }
 
-// useSearchParams needs a Suspense boundary, or the static prerender of the route fails.
+// useSearchParams needs a Suspense boundary wherever Next.js prerenders a page. The route layout
+// renders this one on demand, so the query is known on the first render and the empty fallback
+// never shows.
 export default function AdminUsersDeletePage() {
     return (
         <Suspense fallback={null}>
