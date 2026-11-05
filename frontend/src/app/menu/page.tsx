@@ -274,7 +274,8 @@ function IsOptionInError(feedback: MenuFeedback): boolean {
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 //
 // An error moves the cursor to the OPTION field, as the BMS IC attribute and MOVE -1 TO OPTIONL
-// placed it on every send of the map.
+// placed it on every send of the map. Focusing OPTION while it already has focus scrolls nothing,
+// so the message line, which takes the same feedback as its outcome, brings it back into view.
 function useMenuFeedback(): MenuFeedbackState {
     const [feedback, setFeedback] = useState<MenuFeedback>(NO_FEEDBACK);
     const inputRef = useRef<HTMLInputElement>(null);
@@ -467,8 +468,8 @@ function ShowInvalidKey(callContext: ScreenCallContext): void {
     callContext.ShowFeedback(InvalidKeyFeedback());
 }
 
-// Each invalid key shows a new feedback, so the cursor returns to OPTION even after it left it.
-// The key is refused while the screen is busy or a call is in flight, like ENTER and F3.
+// Each invalid key shows a new feedback, so the cursor returns to OPTION, in view, even after it
+// left it. The key is refused while the screen is busy or a call is in flight, like ENTER and F3.
 function useMenuControls(inputs: FunctionKeyInputs): MenuControls {
     const { actionContext, optionText, isBusy } = inputs;
     const keys = useMemo(
@@ -595,6 +596,9 @@ function MenuSelection({ menu }: MainMenuContentProps) {
     );
 }
 
+// Every outcome sets another feedback object and typing leaves it alone, so its identity is the
+// outcome: an invalid key pressed again, with the same literal, still keeps OPTION in view when
+// the user scrolled away from it while it kept the cursor.
 function MainMenuContent({ menu }: MainMenuContentProps) {
     return (
         <Stack spacing={4}>
@@ -603,6 +607,7 @@ function MainMenuContent({ menu }: MainMenuContentProps) {
                 message={menu.feedback.message}
                 severity={menu.feedback.severity}
                 infoMessage={menu.feedback.infoMessage}
+                outcomeKey={menu.feedback}
             />
             <FunctionKeyBar keys={menu.keys} />
         </Stack>

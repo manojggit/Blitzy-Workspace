@@ -309,8 +309,8 @@ async function SubmitExit(context: SignOnContext): Promise<void> {
 
 // WHEN OTHER reads no file, so nothing reaches the server: the typed User ID and Password stay,
 // and the invalid-key literal takes the sign-off notice's place, as ENTER and F3 clear that
-// notice. Each press is a new feedback, so the cursor returns to USERID every time. It is refused
-// while a call is in flight, so the call's answer is what the screen shows.
+// notice. Each press is a new feedback, so the cursor returns to USERID, in view, every time. It
+// is refused while a call is in flight, so the call's answer is what the screen shows.
 function ShowInvalidKey(form: SignOnForm): void {
     if (form.isInFlightRef.current) {
         return;
@@ -404,7 +404,9 @@ function useFieldRefs(): FieldRefs {
 }
 
 // Replaces MOVE -1 TO USERIDL / PASSWDL with SEND ... CURSOR. Every new feedback moves the focus,
-// even one that names the same field again after the user tabbed or clicked away.
+// even one that names the same field again after the user tabbed or clicked away. Focusing a
+// field that already has focus scrolls nothing, so the message line, which takes the same
+// feedback as its outcome, brings that field back into view.
 function useCursorFocus(fieldRefs: FieldRefs, feedback: SignOnFeedback): void {
     useEffect(() => {
         const { cursorField } = feedback;
@@ -523,6 +525,9 @@ function ThankYouNotice({ text }: ThankYouNoticeProps) {
 
 // The ERRMSG line below the form. A sign-off, from this screen's F3 or a menu's, leaves that line
 // blank, and its thank-you notice takes the line's place until the next PF key or ENTER clears it.
+// Every outcome sets another feedback object and typing leaves it alone, so its identity is the
+// outcome: an invalid key pressed again, with the same literal, still keeps the cursor field it
+// refocuses in view when the user scrolled away from it.
 function SignOnMessages({ form }: SignOnFormProps) {
     if (!IsBlankText(form.thankYouText)) {
         return <ThankYouNotice text={form.thankYouText} />;
@@ -532,6 +537,7 @@ function SignOnMessages({ form }: SignOnFormProps) {
             message={form.feedback.message}
             severity={form.feedback.severity}
             infoMessage={form.feedback.infoMessage}
+            outcomeKey={form.feedback}
         />
     );
 }

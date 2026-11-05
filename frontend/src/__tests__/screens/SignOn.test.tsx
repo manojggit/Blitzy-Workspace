@@ -692,6 +692,50 @@ describe("COSGN00C invalid key after a sign-off on /signon", () => {
     });
 });
 
+// An outlined field's height, and where the user left User ID: scrolled above the viewport while
+// it kept the cursor, so focusing it again for the next outcome scrolls nothing.
+const FIELD_HEIGHT = 56;
+const FIELD_ABOVE_VIEWPORT_TOP = -368;
+
+// jsdom lays nothing out and scrolls nothing: the field's row is laid out above the viewport, and
+// each window.scrollBy, which MessageLine calls with ScrollToOptions, moves it as a browser would.
+function LayOutFieldAboveViewport(field: HTMLElement): void {
+    let scrolledBy = 0;
+    jest.spyOn(field, "getBoundingClientRect").mockImplementation(
+        () => new DOMRect(0, FIELD_ABOVE_VIEWPORT_TOP - scrolledBy, 0, FIELD_HEIGHT),
+    );
+    jest.spyOn(window, "scrollBy").mockImplementation((...args: unknown[]) => {
+        const [options] = args as [ScrollToOptions];
+        scrolledBy += options.top ?? 0;
+    });
+}
+
+function ExpectWhollyInViewport(field: HTMLElement): void {
+    const row = field.getBoundingClientRect();
+    expect(row.top).toBeGreaterThanOrEqual(0);
+    expect(row.bottom).toBeLessThanOrEqual(window.innerHeight);
+}
+
+// The same invalid-key literal again is still a new SEND-SIGNON-SCREEN: the cursor field, which
+// kept focus while the user scrolled away from it, is brought back into view.
+describe("COSGN00C invalid key again with User ID scrolled out of view on /signon", () => {
+    afterEach(() => {
+        jest.restoreAllMocks();
+    });
+
+    it("COSGN00C F5 again brings the focused User ID field back into view", async () => {
+        await RenderScreen();
+        await PressKey("F5");
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+        const field = CredentialInput("user_id");
+        LayOutFieldAboveViewport(field);
+        await PressKey("F5");
+        await waitFor(() => ExpectWhollyInViewport(field));
+        expect(field).toHaveFocus();
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+    });
+});
+
 describe("COSGN00C keys outside the legend while the sign-on call is in flight", () => {
     it("COSGN00C answers no other PF key until the sign-on call settles", async () => {
         const resolveLogin = DeferLogin();

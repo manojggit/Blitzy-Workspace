@@ -125,6 +125,10 @@ interface CurrentBalanceDisplayProps {
     currentBalance: string | null;
 }
 
+interface BillPayMessageLineProps {
+    feedback: BillPayFeedback;
+}
+
 const EMPTY_FORM: Readonly<BillPayFormState> = { acctId: "", confirm: "", currentBalance: null };
 
 // INITIALIZE-ALL-FIELDS: every field and the message blank, the cursor on ACTIDIN.
@@ -415,9 +419,22 @@ function BillPayFields({ screen }: BillPayFieldsProps) {
     );
 }
 
+// Every answer, F4 and refused key sets a new feedback object, and typing never does, so its
+// identity is the outcome: one repeating the lines shown, such as a second F4, still keeps the
+// cursor field, which it focuses again without scrolling, in view.
+function BillPayMessageLine({ feedback }: BillPayMessageLineProps) {
+    return (
+        <MessageLine
+            message={feedback.message}
+            severity={feedback.severity}
+            infoMessage={feedback.infoMessage}
+            outcomeKey={feedback}
+        />
+    );
+}
+
 function BillPayScreen() {
     const screen = useBillPayScreen();
-    const { feedback } = screen;
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}
@@ -426,11 +443,7 @@ function BillPayScreen() {
             isBusy={screen.isBusy}
         >
             <BillPayFields screen={screen} />
-            <MessageLine
-                message={feedback.message}
-                severity={feedback.severity}
-                infoMessage={feedback.infoMessage}
-            />
+            <BillPayMessageLine feedback={screen.feedback} />
             <FunctionKeyBar keys={screen.keys} />
         </ScreenShell>
     );

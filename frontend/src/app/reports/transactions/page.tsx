@@ -52,7 +52,11 @@ import {
 import DownloadIcon from "@mui/icons-material/Download";
 import axios, { type AxiosError } from "axios";
 
-import { REPORT_TITLE_SEGMENTS_STYLE, WRAPPING_ROW_STYLE } from "@/app/theme";
+import {
+    REPORT_TITLE_SEGMENTS_STYLE,
+    StickyHeadScrollRegionStyle,
+    WRAPPING_ROW_STYLE,
+} from "@/app/theme";
 import { ConfirmField } from "@/components/ConfirmField";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import {
@@ -150,11 +154,10 @@ const REPORT_LINES_REGION_PROPS = {
     tabIndex: 0,
 } as const;
 // Bounds the table so its sticky headings stay in view and the PF-key bar stays reachable below a
-// long report; theme spacing units, 4 dp each.
+// long report; theme spacing units, 4 dp each. The region cues the lines it hides at its sides and
+// bottom, and shows the M3 focus ring, as the list tables' regions do.
 const REPORT_TABLE_MAX_HEIGHT_UNITS = 150;
-const REPORT_TABLE_STYLE: SxProps<Theme> = {
-    maxHeight: (theme) => theme.spacing(REPORT_TABLE_MAX_HEIGHT_UNITS),
-};
+const REPORT_TABLE_STYLE = StickyHeadScrollRegionStyle(REPORT_TABLE_MAX_HEIGHT_UNITS);
 // The screen mounts the TRANREPT lines a page at a time, so a report of any length mounts a
 // bounded number of rows. These pages only view the print report: CBTRN03C's own page breaks stay
 // in its lines, and both downloads hold every line.
@@ -491,6 +494,9 @@ interface FeedbackStore {
 interface FieldFocus {
     bindRef: FieldRefBinder;
     requestFocus: FocusRequester;
+    // The latest cursor placement. Every outcome makes exactly one, so it is that outcome's
+    // identity.
+    focusRequest: FocusRequest;
 }
 
 interface ReportSubmission {
@@ -532,6 +538,8 @@ interface ReportForm extends ReportRequests {
     feedback: FeedbackState;
     result: ReportResult | null;
     bindRef: FieldRefBinder;
+    // The cursor placement of the outcome shown, which identifies that outcome.
+    focusRequest: FocusRequest;
 }
 
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
@@ -572,7 +580,7 @@ function useFieldFocus(): FieldFocus {
     const requestFocus = useCallback((field: string | null) => {
         setFocusRequest((current) => ({ field: ToCursorField(field), seq: current.seq + 1 }));
     }, []);
-    return { bindRef, requestFocus };
+    return { bindRef, requestFocus, focusRequest };
 }
 
 type StoreChangeListener = () => void;
@@ -855,13 +863,13 @@ function useReportForm(): ReportForm {
     const { inputs, setInputs, setReportType, setTextInput } = useReportInputs();
     const { feedback, setFeedback } = useFeedback();
     const [result, setResult] = useState<ReportResult | null>(null);
-    const { bindRef, requestFocus } = useFieldFocus();
+    const { requestFocus, ...fieldFocus } = useFieldFocus();
     const setters = useMemo(
         () => ({ setInputs, setFeedback, setResult, requestFocus }),
         [setInputs, setFeedback, setResult, requestFocus],
     );
     const requests = useReportRequests(inputs, setters);
-    return { inputs, setReportType, setTextInput, feedback, result, bindRef, ...requests };
+    return { inputs, setReportType, setTextInput, feedback, result, ...fieldFocus, ...requests };
 }
 
 interface ReportTypeSelectorProps {
@@ -1149,13 +1157,17 @@ function ReportCriteriaSection({ form }: ReportFormSectionProps) {
     );
 }
 
-// ERRMSG and INFOMSG. Every flagged control names the ERRMSG Alert as its description.
+// ERRMSG and INFOMSG. Every flagged control names the ERRMSG Alert as its description. Every
+// outcome, and nothing else, places the cursor with a new focus request, so that request is the
+// outcome's identity: one repeating the lines shown, such as a second refusal of ENTER with no
+// report type, still keeps the cursor control, which it focuses again without scrolling, in view.
 function ReportMessageLine({ form }: ReportFormSectionProps) {
     return (
         <MessageLine
             message={form.feedback.message}
             severity={form.feedback.severity}
             infoMessage={form.feedback.infoMessage}
+            outcomeKey={form.focusRequest}
         />
     );
 }

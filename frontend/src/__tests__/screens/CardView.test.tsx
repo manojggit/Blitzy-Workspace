@@ -1161,3 +1161,104 @@ describe("COCRDSLC a cancelled read on /cards/view", () => {
         expect(screen.getByRole("button", { name: SEARCH_BUTTON_NAME })).toBeEnabled();
     });
 });
+
+// The account key, still focused, left above the viewport when the user scrolled down to the
+// legend and pressed ENTER: focusing it again for the answer scrolls nothing by itself.
+const CURSOR_FIELD_ABOVE_VIEWPORT_TOP = -368;
+const CURSOR_FIELD_HEIGHT = 56;
+// The scroll margin the message line's style keeps between the viewport top and the cursor field.
+const LINE_SCROLL_MARGIN_PIXELS = 4;
+const CURSOR_FIELD_REVEAL_SCROLL = Math.floor(
+    CURSOR_FIELD_ABOVE_VIEWPORT_TOP - LINE_SCROLL_MARGIN_PIXELS,
+);
+
+// An ENTER answer that shows exactly the lines the answer before it showed.
+interface RepeatedAnswer {
+    answerName: string;
+    QueueAnswer: () => void;
+}
+
+// Such an answer to ENTER pressed by the Search Cards button or the Enter key.
+interface RepeatedAnswerCase extends RepeatedAnswer {
+    actionName: string;
+    Press: ScreenAction;
+}
+
+const ACCOUNT_FILTER_REFUSAL = BuildErrorBody({
+    message: ACCOUNT_FILTER_MESSAGE,
+    field_errors: [ACCT_ID_FIELD],
+});
+
+// A found card brings its information line alone every time; a refused key its literal.
+const REPEATED_ANSWERS: readonly RepeatedAnswer[] = [
+    {
+        answerName: "a found card",
+        QueueAnswer: () => mockViewCard.mockResolvedValue(BuildCardDetail()),
+    },
+    {
+        answerName: "the account filter literal",
+        QueueAnswer: () =>
+            mockViewCard.mockRejectedValue(
+                BuildAxiosError(HTTP_EDIT_FAILURE, ACCOUNT_FILTER_REFUSAL),
+            ),
+    },
+];
+
+const REPEATED_ANSWER_CASES: readonly RepeatedAnswerCase[] = REPEATED_ANSWERS.flatMap((answer) =>
+    SEARCH_ACTIONS.map(([actionName, press]) => ({ ...answer, actionName, Press: press })),
+);
+
+// window.scrollBy, by which the message line keeps the focused control in view; jsdom implements
+// none and reports each call.
+let scrollBySpy: jest.SpiedFunction<typeof window.scrollBy>;
+
+// Resolves in an animation frame requested after the message line's own, which jsdom runs in
+// request order.
+function NextAnimationFrame(): Promise<void> {
+    return new Promise((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+    });
+}
+
+// Lays the focused account key out above the viewport; jsdom lays nothing out by itself.
+function LayCursorFieldAboveViewport(): HTMLElement {
+    const cursorField = InputFor(ACCOUNT_LABEL);
+    expect(cursorField).toHaveFocus();
+    const box = new DOMRect(0, CURSOR_FIELD_ABOVE_VIEWPORT_TOP, 0, CURSOR_FIELD_HEIGHT);
+    jest.spyOn(cursorField, "getBoundingClientRect").mockReturnValue(box);
+    return cursorField;
+}
+
+// Every lookup blanks both lines before its answer, and every answer shows text, so a repeated
+// answer is a new outcome and the cursor field that kept the focus is scrolled back into view.
+// The interval timers are fake, so a waitFor would look again only on a DOM change, which the
+// scroll makes none of; the frame the answer requested runs before the one awaited here.
+async function KeepsCursorFieldInViewOnRepeat(repeat: RepeatedAnswerCase): Promise<void> {
+    repeat.QueueAnswer();
+    const user = RenderScreen();
+    await repeat.Press(user);
+    await WaitForLookupEnd();
+    await NextAnimationFrame();
+    const cursorField = LayCursorFieldAboveViewport();
+    await repeat.Press(user);
+    await WaitForLookupEnd();
+    expect(mockViewCard).toHaveBeenCalledTimes(2);
+    await NextAnimationFrame();
+    expect(scrollBySpy).toHaveBeenLastCalledWith({ top: CURSOR_FIELD_REVEAL_SCROLL });
+    expect(cursorField).toHaveFocus();
+}
+
+describe("COCRDSLC cursor field kept in view on a repeated answer on /cards/view", () => {
+    beforeEach(() => {
+        scrollBySpy = jest.spyOn(window, "scrollBy").mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+        scrollBySpy.mockRestore();
+    });
+
+    it.each(REPEATED_ANSWER_CASES)(
+        "COCRDSLC $actionName answered again with $answerName scrolls the cursor into view",
+        KeepsCursorFieldInViewOnRepeat,
+    );
+});

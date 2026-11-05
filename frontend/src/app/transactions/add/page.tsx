@@ -723,7 +723,10 @@ function TransactionAddFields({ form }: FieldGroupProps) {
     );
 }
 
-// ScreenShell's Stack spaces the form, the message line and the key bar.
+// ScreenShell's Stack spaces the form, the message line and the key bar. Every answer, F4 and
+// refused key sets a new feedback object, and typing never does, so its identity is the outcome:
+// one repeating the lines shown, such as a second F4, still keeps the cursor field, which it
+// focuses again without scrolling, in view.
 function TransactionAddScreen() {
     const { form, feedback, isBusy, keys } = useTransactionAdd();
     return (
@@ -738,6 +741,7 @@ function TransactionAddScreen() {
                 message={feedback.message}
                 severity={feedback.severity}
                 infoMessage={feedback.infoMessage}
+                outcomeKey={feedback}
             />
             <FunctionKeyBar keys={keys} />
         </ScreenShell>

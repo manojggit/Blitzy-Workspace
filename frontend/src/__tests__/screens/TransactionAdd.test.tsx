@@ -701,6 +701,30 @@ it("COTRN02C added: INITIALIZE-ALL-FIELDS blanks every field, the cursor on ACTI
     expect(InputOf("acct_id")).toHaveFocus();
 });
 
+// A PF key never moved the 3270 cursor: Continue, reached by Tab from CONFIRM and pressed with
+// Enter, gives the focus back to CONFIRM once the call disables it, never to the page body, until
+// the answer puts the cursor on ACTIDIN.
+it("COTRN02C Enter on Continue tabbed to from CONFIRM keeps CONFIRM focused", async () => {
+    const { promise, resolve } = Promise.withResolvers<TransactionAddResponse>();
+    mockAddTransaction.mockReturnValueOnce(promise);
+    const user = RenderScreen();
+    await FillForm(user, E2E_LIKE_INPUT);
+    const continueButton = screen.getByRole("button", { name: MAP_KEYS.ENTER.button });
+    await user.tab();
+    expect(continueButton).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(continueButton).toBeDisabled();
+    expect(document.activeElement).toBe(InputOf("confirm"));
+    await act(async () => {
+        resolve(ADDED_RESPONSE);
+    });
+    await ExpectAlert(ADDED_MESSAGE, "success");
+    expect(mockAddTransaction).toHaveBeenCalledWith(
+        RequestOf(TransactionAddAction.ENTER, E2E_LIKE_INPUT),
+    );
+    expect(InputOf("acct_id")).toHaveFocus();
+});
+
 it.each(KEY_METHODS)(
     "COTRN02C F5 by %s sends copy_last with the entered account and shows the copied fields",
     async (method) => {
@@ -866,3 +890,81 @@ it("COTRN02C 401 session refusal goes to sign-on through the apiClient intercept
     expect(screen.queryByRole("alert")).toBeNull();
     expect(mockRouterPush).not.toHaveBeenCalled();
 });
+
+// ACTIDIN laid out above the viewport, as after the user scrolled the page down with the cursor
+// left in it. jsdom lays nothing out, so the field reports this box, and window.scrollBy moves it
+// by the scroll the page asks for, as a browser scrolling the window would.
+const FIELD_TOP_ABOVE_VIEWPORT = -400;
+const FIELD_BOX_HEIGHT = 56;
+
+function ScrollTopOf(scrollOptions: unknown): number {
+    if (typeof scrollOptions === "object" && scrollOptions !== null && "top" in scrollOptions) {
+        return Number(scrollOptions.top);
+    }
+    return 0;
+}
+
+function LayOutAboveViewport(field: HTMLElement): void {
+    let fieldTop = FIELD_TOP_ABOVE_VIEWPORT;
+    jest.spyOn(field, "getBoundingClientRect").mockImplementation(
+        () => new DOMRect(0, fieldTop, 0, FIELD_BOX_HEIGHT),
+    );
+    jest.spyOn(window, "scrollBy").mockImplementation((...scrollArguments: unknown[]) => {
+        fieldTop -= ScrollTopOf(scrollArguments[0]);
+    });
+}
+
+function ExpectWhollyInView(field: HTMLElement): void {
+    const box = field.getBoundingClientRect();
+    expect(box.top).toBeGreaterThanOrEqual(0);
+    expect(box.bottom).toBeLessThanOrEqual(window.innerHeight);
+}
+
+// Resolves in a frame requested now, which jsdom runs after every frame requested before it.
+async function NextAnimationFrame(): Promise<void> {
+    await act(
+        () =>
+            new Promise<void>((resolve) => {
+                window.requestAnimationFrame(() => resolve());
+            }),
+    );
+}
+
+// A key pressed by its button, which leaves the cursor in ACTIDIN, and the outcome it repeats:
+// ENTER on the blank form refused again, or F4's blank CLEAR-CURRENT-SCREEN line again.
+interface RepeatedOutcomeCase {
+    outcome: string;
+    mapKey: MapKey;
+}
+
+const REPEATED_OUTCOME_CASES: readonly RepeatedOutcomeCase[] = [
+    { outcome: ACCOUNT_OR_CARD_REQUIRED_MESSAGE, mapKey: "ENTER" },
+    { outcome: "the blank line of CLEAR-CURRENT-SCREEN", mapKey: "F4" },
+];
+
+const BLANK_FORM_REFUSAL = ErrorFlagCase(
+    HTTP_EDIT_FAILURE,
+    ACCOUNT_OR_CARD_REQUIRED_MESSAGE,
+    "acct_id",
+    BLANK_SCREEN,
+);
+
+// Each outcome is new, even one repeating the lines shown. It focuses ACTIDIN again, which
+// scrolls nothing while the field already has focus, so the message line brings the field the
+// user scrolled away from back into view.
+it.each(REPEATED_OUTCOME_CASES)(
+    "COTRN02C $mapKey repeating $outcome scrolls the focused ACTIDIN back into view",
+    async ({ mapKey }) => {
+        MockOutcome(BLANK_FORM_REFUSAL);
+        const user = RenderScreen();
+        await UseMapKey(user, mapKey, "button");
+        await WaitUntilIdle();
+        await NextAnimationFrame();
+        expect(InputOf("acct_id")).toHaveFocus();
+        LayOutAboveViewport(InputOf("acct_id"));
+        await UseMapKey(user, mapKey, "button");
+        await WaitUntilIdle();
+        await waitFor(() => ExpectWhollyInView(InputOf("acct_id")));
+        expect(InputOf("acct_id")).toHaveFocus();
+    },
+);

@@ -470,13 +470,18 @@ function ForcedBoundary(systemColor: string): string {
 }
 
 /**
- * The touch-target layer of a button with a border. The layer is placed from the padding box,
- * inside the border, so it reaches the border's width further to stay 4 px past the border box
- * above and below, keeping the target 48 px tall.
+ * Where the touch-target layer of a control with a border sits above and below it. The layer is
+ * placed from the padding box, inside the border, so it reaches the border's width further to stay
+ * 4 px past the border box above and below, keeping the target 48 px tall.
  */
-function BorderedTouchTargetStyle(borderWidthPx: number): CSSObject {
+function BorderedTouchTargetInset(borderWidthPx: number): CSSObject {
     const insetPx = -(TOUCH_TARGET_OVERHANG_PX + borderWidthPx);
-    return { "&::after": { top: insetPx, bottom: insetPx } };
+    return { top: insetPx, bottom: insetPx };
+}
+
+/** The touch-target layer of a button with a border, 4 px past the border box. */
+function BorderedTouchTargetStyle(borderWidthPx: number): CSSObject {
+    return { "&::after": BorderedTouchTargetInset(borderWidthPx) };
 }
 
 /** The M3 elevation level, 0 to 5, that one of MUI's elevation indices renders. */
@@ -602,10 +607,44 @@ function BuildSegmentStyle({ theme }: ThemedStyleProps): CSSObject {
 
 /**
  * A medium segment is 40 px tall like the M3 common button, its border included: 8 px above and
- * below its 20 px label and 12 px beside it, on the 4 dp grid.
+ * below its 20 px label and 12 px beside it, on the 4 dp grid. Like the button, it sits inside a
+ * 48 px touch target that reaches 4 px past its border above and below, never sideways, so
+ * side-by-side segments never share a target.
  */
 function BuildMediumSegmentStyle({ theme }: ThemedStyleProps): CSSObject {
-    return { minHeight: M3_BUTTON_HEIGHT_PX, padding: theme.spacing(2, 3) };
+    return {
+        minHeight: M3_BUTTON_HEIGHT_PX,
+        padding: theme.spacing(2, 3),
+        "&::after": {
+            ...BUTTON_TOUCH_TARGET_STYLE,
+            ...BorderedTouchTargetInset(OUTLINED_BORDER_WIDTH_PX),
+        },
+    };
+}
+
+// The segments of a vertical group below the first, which MUI pulls up over the one above it.
+const LATER_STACKED_SEGMENT_SELECTOR =
+    "& .MuiToggleButtonGroup-middleButton, & .MuiToggleButtonGroup-lastButton";
+// Stacked 40 px segments need room for their 48 px touch targets: the gap between two of them
+// holds the 4 px each target reaches past its segment, so neighbouring targets meet in the middle
+// of the gap and never overlap.
+const STACKED_SEGMENT_GAP_PX = 2 * TOUCH_TARGET_OVERHANG_PX;
+
+/**
+ * The segments of a vertical group, kept at their 40 px medium height with their touch targets.
+ * MUI stacks them edge to edge, each below the first pulled 1 px up over the one above with a
+ * transparent top border; here each sits clear of the one above, past the gap, and draws its top
+ * border again in the segment's own border colour, enabled or disabled.
+ */
+function BuildStackedSegmentsStyle({ theme }: ThemedStyleProps): CSSObject {
+    return {
+        rowGap: STACKED_SEGMENT_GAP_PX,
+        [LATER_STACKED_SEGMENT_SELECTOR]: {
+            marginTop: 0,
+            borderTopColor: theme.palette.m3.outline,
+            "&.Mui-disabled": { borderTopColor: theme.palette.action.disabledBackground },
+        },
+    };
 }
 
 /** The M3 focus ring itself; under forced colours it takes the Highlight system colour. */
@@ -1114,7 +1153,10 @@ export const CARD_DEMO_THEME = createTheme({
             variants: [{ props: { variant: "tonal" }, style: BuildTonalButtonStyle }],
         },
         MuiToggleButtonGroup: {
-            styleOverrides: { root: { borderRadius: M3_SHAPE_SCALE.extraLarge } },
+            styleOverrides: {
+                root: { borderRadius: M3_SHAPE_SCALE.extraLarge },
+                vertical: BuildStackedSegmentsStyle,
+            },
         },
         MuiToggleButton: {
             defaultProps: NO_FOCUS_RIPPLE_PROPS,
@@ -1199,53 +1241,151 @@ export const VISUALLY_HIDDEN_STYLE: SxProps<Theme> = {
     width: "1px",
 };
 
-// The edge cue of a horizontally scrolling region, in theme spacing units: a shadow 12 px deep at
-// each edge, under a 40 px cover in the paper colour whose solid first 12 px hide that shadow.
+// The edge cue of a scrolling region, in theme spacing units: a shadow 12 px deep at each edge,
+// under a 40 px cover in the paper colour whose solid first 12 px hide that shadow.
 const SCROLL_SHADOW_WIDTH_UNITS = 3;
 const SCROLL_COVER_WIDTH_UNITS = 10;
 const SCROLL_COVER_SOLID_STOP = "30%";
 const FOCUS_VISIBLE_PSEUDO_SELECTOR = "&:focus-visible";
 
-/**
- * The edge cue's images: a cover in the paper colour at the left and right edges, then a shadow in
- * the shadow role at each. Table cells have no fill, so the cue shows through them.
- */
-function ScrollEdgeCueImages(theme: StyleTheme): string {
-    const cover = theme.palette.background.paper;
-    const shadow = alpha(M3_COLOR_TOKENS.shadow, M3_KEY_SHADOW_OPACITY);
-    return [
-        `linear-gradient(to right, ${cover} ${SCROLL_COVER_SOLID_STOP}, transparent)`,
-        `linear-gradient(to left, ${cover} ${SCROLL_COVER_SOLID_STOP}, transparent)`,
-        `linear-gradient(to right, ${shadow}, transparent)`,
-        `linear-gradient(to left, ${shadow}, transparent)`,
-    ].join(", ");
+// One edge of a scrolling region that can hide content: where its cue's layers sit, the direction
+// they fade in, from the edge into the region, and whether they run the region's full height, at a
+// side edge, or its full width, at the bottom edge.
+interface ScrollCueEdge {
+    position: string;
+    fadeDirection: string;
+    spansHeight: boolean;
 }
 
-/** The edge cue's image sizes, in the order its images are listed: two covers, two shadows. */
-function ScrollEdgeCueSizes(theme: StyleTheme): string {
-    const coverSize = `${theme.spacing(SCROLL_COVER_WIDTH_UNITS)} 100%`;
-    const shadowSize = `${theme.spacing(SCROLL_SHADOW_WIDTH_UNITS)} 100%`;
-    return [coverSize, coverSize, shadowSize, shadowSize].join(", ");
+// The cover or the shadow of an edge cue: its gradient's colour stops, how deep it reaches into
+// the region, and its background attachment.
+interface ScrollCueLayerKind {
+    colourStops: string;
+    depth: string;
+    attachment: string;
 }
 
-/**
- * A scrolling region the keyboard reaches as a tab stop, as an sx style whose theme-dependent
- * values are theme callbacks. Each edge shows a shadow in the shadow role only while content lies
- * beyond it: the paper-coloured covers scroll with the content (attachment local) and hide the
- * shadows fixed to the edges (attachment scroll) wherever the content's own edge is in view. A
- * thin scrollbar in the outline role shows where the platform draws one, and the M3 focus ring
- * while the region holds visible focus.
- */
-export const SCROLL_REGION_STYLE: SxProps<Theme> = {
-    backgroundImage: ScrollEdgeCueImages,
-    backgroundPosition: "left center, right center, left center, right center",
-    backgroundSize: ScrollEdgeCueSizes,
-    backgroundRepeat: "no-repeat",
-    backgroundAttachment: "local, local, scroll, scroll",
-    scrollbarWidth: "thin",
-    scrollbarColor: (theme) => `${theme.palette.m3.outline} transparent`,
-    [FOCUS_VISIBLE_PSEUDO_SELECTOR]: FocusRingStyle,
+// One background layer of an edge cue, by the background property that holds each value.
+interface ScrollCueLayer {
+    image: string;
+    position: string;
+    size: string;
+    attachment: string;
+}
+
+const LEFT_SCROLL_EDGE: ScrollCueEdge = {
+    position: "left center",
+    fadeDirection: "to right",
+    spansHeight: true,
 };
+const RIGHT_SCROLL_EDGE: ScrollCueEdge = {
+    position: "right center",
+    fadeDirection: "to left",
+    spansHeight: true,
+};
+const BOTTOM_SCROLL_EDGE: ScrollCueEdge = {
+    position: "center bottom",
+    fadeDirection: "to top",
+    spansHeight: false,
+};
+// A region cues both sides. Where its heading row sticks to its top, it cues its bottom too: the
+// sticky headings hold the top edge, and their fill would cover a cue there.
+const SIDE_SCROLL_EDGES = [LEFT_SCROLL_EDGE, RIGHT_SCROLL_EDGE] as const;
+const STICKY_HEAD_SCROLL_EDGES = [LEFT_SCROLL_EDGE, RIGHT_SCROLL_EDGE, BOTTOM_SCROLL_EDGE] as const;
+
+/** One kind of cue layer at each given edge, reaching the kind's depth into the region. */
+function ScrollCueLayers(
+    edges: readonly ScrollCueEdge[],
+    kind: ScrollCueLayerKind,
+): ScrollCueLayer[] {
+    return edges.map((edge) => ({
+        image: `linear-gradient(${edge.fadeDirection}, ${kind.colourStops}, transparent)`,
+        position: edge.position,
+        size: edge.spansHeight ? `${kind.depth} 100%` : `100% ${kind.depth}`,
+        attachment: kind.attachment,
+    }));
+}
+
+/**
+ * The cover and the shadow at each given edge, every cover drawn over every shadow: the covers
+ * scroll with the content (attachment local) and the shadows stay fixed to the region's edges
+ * (attachment scroll).
+ */
+function ScrollCueLayersAt(theme: StyleTheme, edges: readonly ScrollCueEdge[]): ScrollCueLayer[] {
+    const cover: ScrollCueLayerKind = {
+        colourStops: `${theme.palette.background.paper} ${SCROLL_COVER_SOLID_STOP}`,
+        depth: theme.spacing(SCROLL_COVER_WIDTH_UNITS),
+        attachment: "local",
+    };
+    const shadow: ScrollCueLayerKind = {
+        colourStops: alpha(M3_COLOR_TOKENS.shadow, M3_KEY_SHADOW_OPACITY),
+        depth: theme.spacing(SCROLL_SHADOW_WIDTH_UNITS),
+        attachment: "scroll",
+    };
+    return [...ScrollCueLayers(edges, cover), ...ScrollCueLayers(edges, shadow)];
+}
+
+/** One background property's values across the cue layers, top layer first. */
+function JoinLayerValues(
+    layers: readonly ScrollCueLayer[],
+    property: keyof ScrollCueLayer,
+): string {
+    return layers.map((layer) => layer[property]).join(", ");
+}
+
+/**
+ * Each given edge of a scrolling region shows a shadow in the shadow role only while content lies
+ * beyond it: the paper-coloured covers hide the shadows wherever the content's own edge is in view.
+ * Table cells have no fill, so the cue shows through them.
+ */
+function ScrollEdgeCueStyle(theme: StyleTheme, edges: readonly ScrollCueEdge[]): CSSObject {
+    const layers = ScrollCueLayersAt(theme, edges);
+    return {
+        backgroundImage: JoinLayerValues(layers, "image"),
+        backgroundPosition: JoinLayerValues(layers, "position"),
+        backgroundSize: JoinLayerValues(layers, "size"),
+        backgroundRepeat: "no-repeat",
+        backgroundAttachment: JoinLayerValues(layers, "attachment"),
+    };
+}
+
+/**
+ * A scrolling region the keyboard reaches as a tab stop: the edge cue on each given edge that
+ * hides content, a thin scrollbar in the outline role where the platform draws one, and the M3
+ * focus ring while it holds visible focus.
+ */
+function ScrollRegionStyle(theme: StyleTheme, edges: readonly ScrollCueEdge[]): CSSObject {
+    return {
+        ...ScrollEdgeCueStyle(theme, edges),
+        scrollbarWidth: "thin",
+        scrollbarColor: `${theme.palette.m3.outline} transparent`,
+        [FOCUS_VISIBLE_PSEUDO_SELECTOR]: FocusRingStyle(theme),
+    };
+}
+
+/** The scrolling region of the given edges as an sx style, resolved against the theme. */
+function ScrollRegionSx(edges: readonly ScrollCueEdge[]): SxProps<Theme> {
+    return (theme) => ScrollRegionStyle(theme, edges);
+}
+
+/**
+ * A scrolling region the keyboard reaches as a tab stop, as an sx style: the edge cue on each side
+ * that hides content, a thin scrollbar in the outline role where the platform draws one, and the M3
+ * focus ring while it holds visible focus.
+ */
+export const SCROLL_REGION_STYLE: SxProps<Theme> = ScrollRegionSx(SIDE_SCROLL_EDGES);
+
+/**
+ * A scrolling region at most the given height, in theme spacing units, whose heading row sticks to
+ * its top, as an sx style: SCROLL_REGION_STYLE with the edge cue at its bottom as well, so lines
+ * hidden below the fold are signalled.
+ */
+export function StickyHeadScrollRegionStyle(maxHeightUnits: number): SxProps<Theme> {
+    return (theme) => ({
+        ...ScrollRegionStyle(theme, STICKY_HEAD_SCROLL_EDGES),
+        maxHeight: theme.spacing(maxHeightUnits),
+    });
+}
 
 // A cell text wider than its fixed column breaks inside it rather than run under the next column.
 const TABLE_CELL_SELECTOR = "& .MuiTableCell-root";

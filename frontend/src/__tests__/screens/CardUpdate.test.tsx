@@ -1730,3 +1730,86 @@ describe("COCRDUPC session refusal on /cards/update", () => {
     it("COCRDUPC a 401 on ENTER shows nothing; the interceptor owns /signon", () =>
         LeavesUpdate401ToInterceptor());
 });
+
+// The cursor field, still focused, left above the viewport when the user scrolled down to the
+// legend and pressed ENTER: focusing it again for the answer scrolls nothing by itself.
+const CURSOR_FIELD_ABOVE_VIEWPORT_TOP = -368;
+const CURSOR_FIELD_HEIGHT = 56;
+// The scroll margin the message line's style keeps between the viewport top and the cursor field.
+const LINE_SCROLL_MARGIN_PIXELS = 4;
+const CURSOR_FIELD_REVEAL_SCROLL = Math.floor(
+    CURSOR_FIELD_ABOVE_VIEWPORT_TOP - LINE_SCROLL_MARGIN_PIXELS,
+);
+
+// An ENTER answered twice with the same literal and cursor, by the Process button or the key.
+interface RepeatedLiteralCase {
+    literalCase: LiteralCase;
+    method: InputMethod;
+}
+
+// A detail edit puts the cursor on a detail field and a key edit on a key; neither answer changes
+// the field's protection, so the focused field is never replaced.
+const REPEATED_LITERAL_CASES: readonly RepeatedLiteralCase[] = [
+    DetailEditCase(MSG_EXPIRY_MONTH, "expiry_month"),
+    KeyEditCase(MSG_ACCOUNT_NOT_PROVIDED, "acct_id"),
+].flatMap((literalCase) => INPUT_METHODS.map((method) => ({ literalCase, method })));
+
+// window.scrollBy, by which the message line keeps the focused control in view; jsdom implements
+// none and reports each call.
+let scrollBySpy: jest.SpiedFunction<typeof window.scrollBy>;
+
+// Resolves in an animation frame requested after the message line's own, which jsdom runs in
+// request order.
+function NextAnimationFrame(): Promise<void> {
+    return new Promise((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+    });
+}
+
+// Lays the focused cursor_field input of the answer out above the viewport; jsdom lays nothing
+// out by itself.
+function LayCursorFieldAboveViewport(cardScreen: CardScreen): HTMLInputElement {
+    const fieldCase = FIELD_CASES.find(({ name }) => name === cardScreen.cursor_field);
+    if (fieldCase === undefined) {
+        throw new Error(`No COCRDUP field case for ${String(cardScreen.cursor_field)}`);
+    }
+    const cursorField = InputOf(fieldCase.name);
+    expect(cursorField).toHaveFocus();
+    const box = new DOMRect(0, CURSOR_FIELD_ABOVE_VIEWPORT_TOP, 0, CURSOR_FIELD_HEIGHT);
+    jest.spyOn(cursorField, "getBoundingClientRect").mockReturnValue(box);
+    return cursorField;
+}
+
+// Each answer is a new outcome even when its lines repeat, so the cursor field that kept the
+// focus is scrolled back into view, as the 3270 showed the whole map after every key.
+async function KeepsCursorFieldInViewOnRepeat({ literalCase, method }: RepeatedLiteralCase) {
+    const user = await RenderInState(literalCase.startState);
+    QueueUpdateOutcome(literalCase.status, literalCase.cardScreen);
+    QueueUpdateOutcome(literalCase.status, literalCase.cardScreen);
+    await PressFunctionKey(user, literalCase.functionKey, method);
+    await NextAnimationFrame();
+    const cursorField = LayCursorFieldAboveViewport(literalCase.cardScreen);
+    await PressFunctionKey(user, literalCase.functionKey, method);
+    expect(mockUpdateCard).toHaveBeenCalledTimes(2);
+    expect(ShownAlerts()).toEqual(literalCase.expectedAlerts);
+    // The interval timers are fake, so a waitFor would look again only on a DOM change, which the
+    // scroll makes none of; the frame the answer requested runs before the one awaited here.
+    await NextAnimationFrame();
+    expect(scrollBySpy.mock.calls).toEqual([[{ top: CURSOR_FIELD_REVEAL_SCROLL }]]);
+    expect(cursorField).toHaveFocus();
+}
+
+describe("COCRDUPC cursor field kept in view on a repeated answer on /cards/update", () => {
+    beforeEach(() => {
+        scrollBySpy = jest.spyOn(window, "scrollBy").mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+        scrollBySpy.mockRestore();
+    });
+
+    it.each(REPEATED_LITERAL_CASES)(
+        "COCRDUPC $literalCase.text answering ENTER by $method twice scrolls the cursor into view",
+        KeepsCursorFieldInViewOnRepeat,
+    );
+});

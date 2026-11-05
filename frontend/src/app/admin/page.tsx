@@ -288,8 +288,8 @@ async function RunExclusive(
 
 // WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY in red. No option is sent, so the
 // OPTION text stays as keyed and is not in error. Each press is a new message, so the cursor
-// returns to OPTION, the IC field, even after it left it. It is refused while a call is in
-// flight, so the call's answer is the message shown.
+// returns to OPTION, the IC field, in view, even after it left it. It is refused while a call is
+// in flight, so the call's answer is the message shown.
 function ShowInvalidKey(actions: MenuActions): void {
     if (actions.isInFlightRef.current) {
         return;
@@ -331,7 +331,9 @@ function useBusyTracker(): BusyTracker {
 
 // The OPTION field keeps the text as keyed. OPTION carries the map's IC attribute, so every
 // SEND-MENU-SCREEN ERASE puts the cursor back on it, the field error (MOVE -1 TO OPTIONL)
-// included; focus also stays on the screen when a disabled Continue button drops it.
+// included; focus also stays on the screen when a disabled Continue button drops it. Focusing
+// OPTION while it already has focus scrolls nothing, so the message line, which takes the same
+// screen message as its outcome, brings it back into view.
 function useOptionEntry(screenMessage: ScreenMessage): OptionEntryFieldProps {
     const [optionText, setOptionText] = useState("");
     const inputRef = useRef<HTMLInputElement | null>(null);
@@ -472,6 +474,9 @@ function OptionEntryField(props: OptionEntryFieldProps) {
     );
 }
 
+// Every outcome sets another screen message object and typing leaves it alone, so its identity
+// is the outcome: an invalid key pressed again, with the same literal, still keeps OPTION in view
+// when the user scrolled away from it while it kept the cursor.
 function AdminMenuBody({ adminMenu }: AdminMenuBodyProps) {
     return (
         <>
@@ -484,6 +489,7 @@ function AdminMenuBody({ adminMenu }: AdminMenuBodyProps) {
             <MessageLine
                 message={adminMenu.screenMessage.message}
                 severity={adminMenu.screenMessage.severity}
+                outcomeKey={adminMenu.screenMessage}
             />
             <FunctionKeyBar keys={adminMenu.keys} />
         </>

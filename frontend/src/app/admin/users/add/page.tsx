@@ -223,25 +223,26 @@ async function HandleAddUser(context: UserAddContext): Promise<void> {
 }
 
 // PF4, CLEAR-CURRENT-SCREEN: INITIALIZE-ALL-FIELDS blanks the inputs and the message. It is refused
-// while an add is in flight, so the answer still lands on the form that was sent.
+// while an add is in flight, so the answer still lands on the form that was sent. Each press sets
+// its own copy of the blank feedback, so a second PF4 is a new outcome too.
 function HandleClear(context: UserAddContext): void {
     if (context.isInFlightRef.current) {
         return;
     }
     context.setFieldValues(EMPTY_FIELD_VALUES);
-    context.setFeedback(NO_FEEDBACK);
+    context.setFeedback({ ...NO_FEEDBACK });
     context.RequestFocus(INITIAL_FOCUS_FIELD);
 }
 
 // COUSR01C WHEN OTHER (lines 98-102): the legend shows F12=Exit, but PF12 has no handler, so PF12
 // and every other PF key the legend lacks send the keyed values back unchanged with the
 // invalid-key literal. It is refused while an add is in flight, so the answer's message is the one
-// shown.
+// shown. Each press sets its own copy of that feedback, so a repeated key is a new outcome too.
 function HandleInvalidKey(context: UserAddContext): void {
     if (context.isInFlightRef.current) {
         return;
     }
-    context.setFeedback(INVALID_KEY_FEEDBACK);
+    context.setFeedback({ ...INVALID_KEY_FEEDBACK });
     context.RequestFocus(INITIAL_FOCUS_FIELD);
 }
 
@@ -423,7 +424,9 @@ function UserAddFields(props: UserAddFieldsProps) {
 
 // No form element: useFunctionKeys handles ENTER from any input, and a native submit would add a
 // second action. ScreenShell's Stack spaces the three sections, so they need no wrapper of their
-// own.
+// own. Every outcome sets a new feedback object, which typing and the busy state keep, so its
+// identity is the outcome: ENTER, PF4 or PF12 answered again alike brings the focused cursor field
+// back into view.
 function UserAddScreen() {
     const screen = useUserAdd();
     return (
@@ -434,7 +437,11 @@ function UserAddScreen() {
                 fieldElementsRef={screen.fieldElementsRef}
                 onFieldChange={screen.SetFieldValue}
             />
-            <MessageLine message={screen.feedback.message} severity={screen.feedback.severity} />
+            <MessageLine
+                message={screen.feedback.message}
+                severity={screen.feedback.severity}
+                outcomeKey={screen.feedback}
+            />
             <FunctionKeyBar keys={screen.keys} />
         </ScreenShell>
     );

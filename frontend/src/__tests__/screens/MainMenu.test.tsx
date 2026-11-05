@@ -567,6 +567,50 @@ it("COMEN01C F5 again after the cursor left OPTION puts it back on OPTION", asyn
     await ExpectAlert(INVALID_KEY_MESSAGE, "error");
 });
 
+// An outlined field's height, and where the user left OPTION: scrolled above the viewport while
+// it kept the cursor, so focusing it again for the next outcome scrolls nothing.
+const FIELD_HEIGHT = 56;
+const FIELD_ABOVE_VIEWPORT_TOP = -368;
+
+// jsdom lays nothing out and scrolls nothing: the field's row is laid out above the viewport, and
+// each window.scrollBy, which MessageLine calls with ScrollToOptions, moves it as a browser would.
+function LayOutFieldAboveViewport(field: HTMLElement): void {
+    let scrolledBy = 0;
+    jest.spyOn(field, "getBoundingClientRect").mockImplementation(
+        () => new DOMRect(0, FIELD_ABOVE_VIEWPORT_TOP - scrolledBy, 0, FIELD_HEIGHT),
+    );
+    jest.spyOn(window, "scrollBy").mockImplementation((...args: unknown[]) => {
+        const [options] = args as [ScrollToOptions];
+        scrolledBy += options.top ?? 0;
+    });
+}
+
+function ExpectWhollyInViewport(field: HTMLElement): void {
+    const row = field.getBoundingClientRect();
+    expect(row.top).toBeGreaterThanOrEqual(0);
+    expect(row.bottom).toBeLessThanOrEqual(window.innerHeight);
+}
+
+// The same invalid-key literal again is still a new SEND-MENU-SCREEN: OPTION, which kept the
+// cursor while the user scrolled away from it, is brought back into view.
+describe("COMEN01C invalid key again with OPTION scrolled out of view", () => {
+    afterEach(() => {
+        jest.restoreAllMocks();
+    });
+
+    it("COMEN01C F5 again brings the focused OPTION field back into view", async () => {
+        await RenderLoadedScreen();
+        await PressKey("F5");
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+        const field = OptionInput();
+        LayOutFieldAboveViewport(field);
+        await PressKey("F5");
+        await waitFor(() => ExpectWhollyInViewport(field));
+        expect(field).toHaveFocus();
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+    });
+});
+
 it.each(UNAUTHORIZED_CASES)(
     "COMEN01C 401 on $callName shows no message and leaves the redirect to apiClient",
     async ({ ArrangeAndTrigger }) => {

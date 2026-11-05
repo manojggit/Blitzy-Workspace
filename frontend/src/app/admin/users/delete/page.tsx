@@ -222,11 +222,15 @@ function ErrorFeedback(error: unknown): FeedbackState {
     };
 }
 
+// Every answer, PF4 and the invalid-key literal set a new feedback object, which typing and the
+// busy state keep, so its identity is the outcome: PF4 or a PF key the legend lacks pressed again
+// brings the focused cursor field back into view, though the line shows the same text.
 function MessageLinePropsOf(feedback: FeedbackState): MessageLineProps {
     return {
         message: feedback.message,
         severity: feedback.severity,
         infoMessage: feedback.infoMessage,
+        outcomeKey: feedback,
     };
 }
 

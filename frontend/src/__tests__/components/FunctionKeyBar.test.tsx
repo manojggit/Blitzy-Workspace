@@ -2,9 +2,9 @@
 // (bms/COSGN00.bms, bms/COACTUP.bms, bms/COCRDLI.bms, bms/COTRN00.bms, bms/COBIL00.bms).
 import { TextField } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent, { PointerEventsCheckLevel } from "@testing-library/user-event";
-import type { ReactElement } from "react";
+import { useState, type ReactElement, type ReactNode } from "react";
 
 import { CARD_DEMO_THEME } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
@@ -192,6 +192,145 @@ describe("FunctionKeyBar pointer press", () => {
                 definition.key === legendCase.key ? 1 : 0,
             );
             expect(PressCounts(definitions)).toEqual(expectedCounts);
+        },
+    );
+});
+
+// The gaps between the keys belong to the legend group, which a pointer press does not focus.
+describe("FunctionKeyBar pointer press between the keys", () => {
+    it("PF legend pointer press between the keys keeps the cursor in its field", async () => {
+        const user = userEvent.setup();
+        const field = RenderLegendBesideField(BuildDefinitions());
+        await user.click(field);
+        const group = screen.getByRole("group", { name: "Function keys" });
+        expect(group).toHaveAttribute("tabindex", "-1");
+        expect(fireEvent.mouseDown(group)).toBe(false);
+        await user.click(group);
+        expect(field).toHaveFocus();
+    });
+});
+
+// The key a keyboard user tabs to first, and the key the busy screen leaves enabled, as CT00
+// leaves F3 enabled while ENTER, F7 and F8 are disabled.
+const FIRST_KEY_NAME = "Sign-on (Enter)";
+const EXIT_KEY_NAME = "Exit (F3)";
+
+interface KeyboardActivationCase {
+    activation: string;
+    keys: string;
+}
+
+// A focused button clicks itself on Enter and on Space, with the focus left on it.
+const KEYBOARD_ACTIVATION_CASES: readonly KeyboardActivationCase[] = [
+    { activation: "Enter", keys: "{Enter}" },
+    { activation: "Space", keys: " " },
+];
+
+// Where the focus rests when a rerender disables keys, and the one key it leaves enabled.
+interface KeptFocusCase {
+    focused: string;
+    enabledKey: PfKey | null;
+    FocusedElement: () => HTMLElement;
+}
+
+function CursorField(): HTMLElement {
+    return screen.getByRole("textbox", { name: CURSOR_FIELD_LABEL });
+}
+
+const KEPT_FOCUS_CASES: readonly KeptFocusCase[] = [
+    { focused: "its field", enabledKey: null, FocusedElement: CursorField },
+    {
+        focused: "the enabled F3 key",
+        enabledKey: "F3",
+        FocusedElement: () => screen.getByRole("button", { name: EXIT_KEY_NAME }),
+    },
+];
+
+function ThemeWrapper(props: { children: ReactNode }) {
+    return <ThemeProvider theme={CARD_DEMO_THEME}>{props.children}</ThemeProvider>;
+}
+
+// A busy screen: any key's press disables every key, as a page's busy render disables the keys
+// of the request the press starts. withField puts the cursor's field ahead of the legend.
+function BusyLegend(props: { withField: boolean }) {
+    const [isBusy, setIsBusy] = useState(false);
+    const definitions = LEGEND_CASES.map(({ key, label }) => ({
+        key,
+        label,
+        onPress: () => setIsBusy(true),
+        disabled: isBusy,
+    }));
+    return (
+        <>
+            {props.withField ? <TextField label={CURSOR_FIELD_LABEL} /> : null}
+            <FunctionKeyBar keys={definitions} />
+        </>
+    );
+}
+
+function LegendBesideField(props: { definitions: readonly FunctionKeyDefinition[] }) {
+    return (
+        <>
+            <TextField label={CURSOR_FIELD_LABEL} />
+            <FunctionKeyBar keys={props.definitions} />
+        </>
+    );
+}
+
+// Every legend key disabled except enabledKey, if one is given.
+function DefinitionsEnabling(enabledKey: PfKey | null): FunctionKeyDefinition[] {
+    return BuildDefinitions().map((definition) => ({
+        ...definition,
+        disabled: definition.key !== enabledKey,
+    }));
+}
+
+// Tabs from where the focus rests to the first key and presses it from the keyboard.
+async function PressFirstKeyByKeyboard(keys: string): Promise<HTMLElement> {
+    const user = userEvent.setup();
+    await user.tab();
+    const button = screen.getByRole("button", { name: FIRST_KEY_NAME });
+    expect(button).toHaveFocus();
+    await user.keyboard(keys);
+    expect(button).toBeDisabled();
+    return button;
+}
+
+// A PF key never moved the 3270 cursor: Enter or Space on a key reached by Tab runs it, and when
+// the busy render disables that key the cursor is back in the field it was in, never on the
+// disabled key or the page body. With no such field the legend group itself keeps the focus.
+describe("FunctionKeyBar keyboard press of a key the press disables", () => {
+    it.each(KEYBOARD_ACTIVATION_CASES)(
+        "PF legend $activation on a key reached by Tab returns the cursor to its field",
+        async ({ keys }) => {
+            RenderWithTheme(<BusyLegend withField />);
+            act(() => CursorField().focus());
+            const button = await PressFirstKeyByKeyboard(keys);
+            expect(CursorField()).toHaveFocus();
+            expect(button).not.toHaveFocus();
+        },
+    );
+
+    it("PF legend Enter with no field focused first leaves the focus on the group", async () => {
+        RenderWithTheme(<BusyLegend withField={false} />);
+        await PressFirstKeyByKeyboard("{Enter}");
+        expect(screen.getByRole("group", { name: "Function keys" })).toHaveFocus();
+    });
+});
+
+// Only a disabled key that holds the focus gives it up: a field or a key left enabled keeps it.
+describe("FunctionKeyBar keys disabled by a rerender", () => {
+    it.each(KEPT_FOCUS_CASES)(
+        "PF legend disabled by a rerender leaves the focus on $focused",
+        ({ enabledKey, FocusedElement }) => {
+            const { rerender } = render(<LegendBesideField definitions={BuildDefinitions()} />, {
+                wrapper: ThemeWrapper,
+            });
+            act(() => CursorField().focus());
+            act(() => FocusedElement().focus());
+            rerender(<LegendBesideField definitions={DefinitionsEnabling(enabledKey)} />);
+            expect(FocusedElement()).toHaveFocus();
+            expect(screen.getByRole("button", { name: FIRST_KEY_NAME })).toBeDisabled();
         },
     );
 });

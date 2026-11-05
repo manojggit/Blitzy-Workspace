@@ -643,6 +643,77 @@ describe("COUSR01C PF4 (CLEAR-CURRENT-SCREEN) on /admin/users/add", () => {
     );
 });
 
+// FNAME kept focused while the user scrolled down to the key bar lies above the viewport, and
+// focusing it again for the next answer scrolls nothing by itself.
+const FIELD_ABOVE_VIEWPORT_TOP = -368;
+const FIELD_HEIGHT = 56;
+// The gap the message line leaves between the viewport top and the cursor field it scrolls back
+// to: its scroll margin, one theme spacing unit, while a line shows, and none while it is blank.
+const SHOWN_LINE_SCROLL_MARGIN = 4;
+const BLANK_LINE_SCROLL_MARGIN = 0;
+
+interface RepeatedAnswerCase {
+    key: LegendKey;
+    answer: string;
+    scrollMargin: number;
+}
+
+// A key pressed twice and answered alike, the cursor on FNAME both times: ENTER's first presence
+// check on a blank screen, PF12's invalid-key literal, and PF4's blank message line.
+const REPEATED_ANSWER_CASES: readonly RepeatedAnswerCase[] = [
+    { key: "ENTER", answer: FIRST_NAME_EMPTY_MESSAGE, scrollMargin: SHOWN_LINE_SCROLL_MARGIN },
+    { key: "F12", answer: INVALID_KEY_MESSAGE, scrollMargin: SHOWN_LINE_SCROLL_MARGIN },
+    { key: "F4", answer: "a blank message line", scrollMargin: BLANK_LINE_SCROLL_MARGIN },
+];
+
+// Resolves in an animation frame requested after the message line's own, which jsdom runs in
+// request order.
+function NextAnimationFrame(): Promise<void> {
+    return new Promise((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+    });
+}
+
+// A legend key pressed by pointer, which leaves the cursor where it is, once its answer shows.
+async function PressByPointerAndSettle(user: UserEvent, key: LegendKey): Promise<void> {
+    await PressLegend(user, key, "click");
+    await waitFor(() => expect(LegendButton("ENTER")).toBeEnabled());
+    await NextAnimationFrame();
+}
+
+function LayOutAboveViewport(field: HTMLElement): void {
+    const aboveViewport = new DOMRect(0, FIELD_ABOVE_VIEWPORT_TOP, 0, FIELD_HEIGHT);
+    jest.spyOn(field, "getBoundingClientRect").mockReturnValue(aboveViewport);
+}
+
+// The window.scrollBy calls made while the steps run; jsdom implements no scrolling, so a spy
+// stands in for it until they end.
+async function WindowScrollsDuring(steps: () => Promise<void>): Promise<unknown[]> {
+    const scrollBySpy = jest.spyOn(window, "scrollBy").mockImplementation(() => undefined);
+    try {
+        await steps();
+        return [...scrollBySpy.mock.calls];
+    } finally {
+        scrollBySpy.mockRestore();
+    }
+}
+
+describe("COUSR01C cursor brought back into view by a repeated answer on /admin/users/add", () => {
+    it.each(REPEATED_ANSWER_CASES)(
+        "COUSR01C $key answered by $answer again scrolls the focused FNAME back into view",
+        async ({ key, scrollMargin }) => {
+            ArrangeAddUser(HTTP_EDIT_FAILURE, FIRST_NAME_EMPTY_MESSAGE, "first_name");
+            const user = RenderScreen();
+            await PressByPointerAndSettle(user, key);
+            expect(FieldInput("first_name")).toHaveFocus();
+            LayOutAboveViewport(FieldInput("first_name"));
+            const scrolls = await WindowScrollsDuring(() => PressByPointerAndSettle(user, key));
+            expect(scrolls).toEqual([[{ top: FIELD_ABOVE_VIEWPORT_TOP - scrollMargin }]]);
+            expect(FieldInput("first_name")).toHaveFocus();
+        },
+    );
+});
+
 describe("COUSR01C PF3 (XCTL COADM01C) on /admin/users/add", () => {
     it.each(PRESS_METHODS)("COUSR01C PF3 by %s returns to the admin menu", async (method) => {
         const user = RenderScreen();

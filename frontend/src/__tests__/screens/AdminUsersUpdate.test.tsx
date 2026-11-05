@@ -909,6 +909,79 @@ describe("COUSR02C PF4 (CLEAR-CURRENT-SCREEN)", () => {
     );
 });
 
+// USRIDIN kept focused while the user scrolled down to the key bar lies above the viewport, and
+// focusing it again for the next answer scrolls nothing by itself.
+const FIELD_ABOVE_VIEWPORT_TOP = -368;
+const FIELD_HEIGHT = 56;
+// The gap the message line leaves between the viewport top and the cursor field it scrolls back
+// to: its scroll margin, one theme spacing unit, while a line shows, and none while it is blank.
+const SHOWN_LINE_SCROLL_MARGIN = 4;
+const BLANK_LINE_SCROLL_MARGIN = 0;
+
+interface RepeatedAnswerCase {
+    action: ScreenAction;
+    answer: string;
+    scrollMargin: number;
+}
+
+// A key pressed twice over the fetched user and answered alike, the cursor on USRIDIN both times:
+// ENTER's read prompt, and PF4's blank message line.
+const REPEATED_ANSWER_CASES: readonly RepeatedAnswerCase[] = [
+    { action: FETCH_ACTION, answer: PRESS_PF5_MESSAGE, scrollMargin: SHOWN_LINE_SCROLL_MARGIN },
+    {
+        action: CLEAR_ACTION,
+        answer: "a blank message line",
+        scrollMargin: BLANK_LINE_SCROLL_MARGIN,
+    },
+];
+
+// Resolves in an animation frame requested after the message line's own, which jsdom runs in
+// request order.
+function NextAnimationFrame(): Promise<void> {
+    return new Promise((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+    });
+}
+
+// A legend key pressed by pointer, which leaves the cursor where it is, once its answer shows.
+async function PressByPointerAndSettle(view: ScreenView, action: ScreenAction): Promise<void> {
+    await Trigger(view, action, "click");
+    await WaitForIdle();
+    await NextAnimationFrame();
+}
+
+function LayOutAboveViewport(field: HTMLElement): void {
+    const aboveViewport = new DOMRect(0, FIELD_ABOVE_VIEWPORT_TOP, 0, FIELD_HEIGHT);
+    jest.spyOn(field, "getBoundingClientRect").mockReturnValue(aboveViewport);
+}
+
+// The window.scrollBy calls made while the steps run; jsdom implements no scrolling, so a spy
+// stands in for it until they end.
+async function WindowScrollsDuring(steps: () => Promise<void>): Promise<unknown[]> {
+    const scrollBySpy = jest.spyOn(window, "scrollBy").mockImplementation(() => undefined);
+    try {
+        await steps();
+        return [...scrollBySpy.mock.calls];
+    } finally {
+        scrollBySpy.mockRestore();
+    }
+}
+
+describe("COUSR02C cursor brought back into view by a repeated answer", () => {
+    it.each(REPEATED_ANSWER_CASES)(
+        "COUSR02C $action.buttonName answered by $answer again scrolls USRIDIN back into view",
+        async ({ action, scrollMargin }) => {
+            const view = await RenderFromList();
+            await PressByPointerAndSettle(view, action);
+            expect(FieldInput(USER_ID_LABEL)).toHaveFocus();
+            LayOutAboveViewport(FieldInput(USER_ID_LABEL));
+            const scrolls = await WindowScrollsDuring(() => PressByPointerAndSettle(view, action));
+            expect(scrolls).toEqual([[{ top: FIELD_ABOVE_VIEWPORT_TOP - scrollMargin }]]);
+            expect(FieldInput(USER_ID_LABEL)).toHaveFocus();
+        },
+    );
+});
+
 // COUSR02C WHEN OTHER (lines 127-129): an AID outside ENTER, PF3, PF4, PF5 and PF12 sets ERR-FLG
 // and sends CCDA-MSG-INVALID-KEY (cpy/CSMSG01Y.cpy) over the map as received. Nothing is read or
 // written, and the SEND's CURSOR puts the cursor on USRIDIN, the map's IC field.

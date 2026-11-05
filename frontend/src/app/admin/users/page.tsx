@@ -691,6 +691,9 @@ function UserListBody({ screen, setScreen, searchInputRef }: UserListBodyProps) 
     );
 }
 
+// Every answer and the invalid-key literal set a new feedback object, which typing, a code change
+// and the busy state keep, so its identity is the outcome: F8 answered again with the same
+// literal, or with another blank one, brings the focused USRIDIN back into view.
 function UserListScreen() {
     const { keys, invalidKeyAction, isBusy, ...model } = useUserList();
     useFunctionKeys(keys, invalidKeyAction);
@@ -705,6 +708,7 @@ function UserListScreen() {
                 message={model.screen.feedback.message}
                 severity={LIST_MESSAGE_SEVERITY}
                 infoMessage={model.screen.feedback.info_message}
+                outcomeKey={model.screen.feedback}
             />
             <FunctionKeyBar keys={keys} />
         </ScreenShell>

@@ -888,9 +888,27 @@ function CardListContent({ model }: CardListContentProps) {
     );
 }
 
+interface CardListMessageLineProps {
+    messages: ScreenMessages;
+}
+
+// The ERRMSG and INFOMSG lines. Each answer, and a pending message on entry, sets a new messages
+// object, which typing, the selection codes and the busy state never replace, so its identity is
+// the outcome: a page or a literal answered again with the same lines still counts as a new
+// outcome, and the cursor field that kept the focus is brought back into view.
+function CardListMessageLine({ messages }: CardListMessageLineProps) {
+    return (
+        <MessageLine
+            message={messages.message}
+            severity={messages.severity}
+            infoMessage={messages.infoMessage}
+            outcomeKey={messages}
+        />
+    );
+}
+
 function CardListScreen() {
     const model = useCardListScreen();
-    const { message, severity, infoMessage } = model.messages;
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}
@@ -899,7 +917,7 @@ function CardListScreen() {
             isBusy={model.isBusy}
         >
             <CardListContent model={model} />
-            <MessageLine message={message} severity={severity} infoMessage={infoMessage} />
+            <CardListMessageLine messages={model.messages} />
             <FunctionKeyBar keys={model.keys} />
         </ScreenShell>
     );

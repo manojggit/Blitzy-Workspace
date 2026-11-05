@@ -1,7 +1,7 @@
 // Replaces: BMS ERRMSG/INFOMSG fields; copybooks CSMSG01Y, CSMSG02Y
 "use client";
 
-import { Alert, Stack } from "@mui/material";
+import { Alert, Stack, formControlClasses, inputLabelClasses } from "@mui/material";
 import { useEffect, useRef, type RefObject } from "react";
 import { MESSAGE_LINE_STYLE } from "@/app/theme";
 import type { MessageSeverity } from "@/lib/apiClient";
@@ -95,10 +95,6 @@ function IsNewOutcome(previous: ShownOutcome, current: ShownOutcome): boolean {
     );
 }
 
-function ShowsAnyLine(outcome: ShownOutcome): boolean {
-    return outcome.message !== "" || outcome.infoMessage !== "";
-}
-
 // Whether the ERRMSG line reports the new outcome: it shows text, and that text or the outcome
 // identity changed. Other INFOMSG text alone only updates the screen's standing prompt.
 function ErrorLineReportsNewOutcome(previous: ShownOutcome, current: ShownOutcome): boolean {
@@ -157,22 +153,86 @@ function NearestRevealScroll(
     return 0;
 }
 
-// Whether the element is still wholly inside the viewport once the window scrolls by scrollBy.
-function StaysInView(element: DOMRect, scrollBy: number, viewportHeight: number): boolean {
-    return element.top - scrollBy >= 0 && element.bottom - scrollBy <= viewportHeight;
+// The rows a box or a control takes on screen, as offsets from the viewport top.
+interface BlockExtent {
+    top: number;
+    bottom: number;
 }
 
-// Whether revealing the line keeps the focused element wholly in view. With nothing focused
-// there is no cursor to lose sight of.
-function RevealKeepsFocusInView(wrapper: HTMLElement): boolean {
+// Whether the extent is still wholly inside the viewport once the window scrolls by scrollBy.
+function StaysInView(extent: BlockExtent, scrollBy: number, viewportHeight: number): boolean {
+    return extent.top - scrollBy >= 0 && extent.bottom - scrollBy <= viewportHeight;
+}
+
+// The element holding focus; none while focus rests on the document body.
+function FocusedElement(): Element | null {
     const focused = document.activeElement;
     if (focused === null || focused === document.body) {
+        return null;
+    }
+    return focused;
+}
+
+// Whether the engine lays the box out; an element that is not rendered reports an all-zero box.
+function IsRendered(box: DOMRect): boolean {
+    return box.width > 0 || box.height > 0;
+}
+
+// How far the focus ring an element draws reaches outside its border box: the outline's width
+// and offset together. No outline, or a ring drawn inset within the box, reaches nowhere.
+function OutlineReachOf(element: Element): number {
+    const style = window.getComputedStyle(element);
+    if (style.outlineStyle === "none") {
+        return 0;
+    }
+    return Math.max(0, PixelsOf(style.outlineWidth) + PixelsOf(style.outlineOffset));
+}
+
+// The parts of the focused control: the focused element; the form control root around it, which
+// pads the input and draws a filled field's underline at its bottom edge; and that root's label,
+// which MUI raises above the root's top edge on an outlined field.
+function ControlPartsOf(focused: Element): Element[] {
+    const root = focused.closest(`.${formControlClasses.root}`);
+    if (root === null) {
+        return [focused];
+    }
+    const label = root.querySelector(`.${inputLabelClasses.root}`);
+    return label === null ? [focused, root] : [focused, root, label];
+}
+
+function ExtentAround(extent: BlockExtent | null, box: BlockExtent): BlockExtent {
+    if (extent === null) {
+        return box;
+    }
+    return { top: Math.min(extent.top, box.top), bottom: Math.max(extent.bottom, box.bottom) };
+}
+
+// The rows the focused control takes on screen, with the focus ring the focused element draws;
+// null while no part of the control is rendered.
+function ControlExtentOf(focused: Element): BlockExtent | null {
+    let extent: BlockExtent | null = null;
+    for (const part of ControlPartsOf(focused)) {
+        const box = part.getBoundingClientRect();
+        if (IsRendered(box)) {
+            const reach = part === focused ? OutlineReachOf(focused) : 0;
+            extent = ExtentAround(extent, { top: box.top - reach, bottom: box.bottom + reach });
+        }
+    }
+    return extent;
+}
+
+// Whether revealing the line keeps the focused control wholly in view. With nothing focused, or
+// no part of the focused control rendered, there is no cursor to lose sight of.
+function RevealKeepsFocusInView(wrapper: HTMLElement): boolean {
+    const focused = FocusedElement();
+    const control = focused === null ? null : ControlExtentOf(focused);
+    if (control === null) {
         return true;
     }
     const viewportHeight = window.innerHeight;
     const line = wrapper.getBoundingClientRect();
     const scrollBy = NearestRevealScroll(line, ScrollMarginOf(wrapper), viewportHeight);
-    return StaysInView(focused.getBoundingClientRect(), scrollBy, viewportHeight);
+    return StaysInView(control, scrollBy, viewportHeight);
 }
 
 // Whether the stuck line can pass over the focused element. A sticky element never leaves its
@@ -183,52 +243,92 @@ function LineCanCover(wrapper: HTMLElement, focused: Element): boolean {
     return lineBlock !== null && lineBlock.contains(focused) && !wrapper.contains(focused);
 }
 
-// How far the window scrolls down for the focused field to end one scroll margin above the stuck
-// line, and 0 while the line covers no part of it. A field taller than the room above the line
-// scrolls only until its top reaches the viewport top, so the field's top stays in sight.
-function FocusClearance(wrapper: HTMLElement): number {
-    const focused = document.activeElement;
-    if (focused === null || !LineCanCover(wrapper, focused)) {
-        return 0;
-    }
-    const field = focused.getBoundingClientRect();
+// Whether the line lies over the control's rows, or will once the control scrolls into view: it
+// reaches below the control's top, or it is stuck to the viewport bottom while a control that
+// comes before it waits below the fold, from where scrolling brings it up beneath the line.
+function LineReachesControl(wrapper: HTMLElement, focused: Element, control: BlockExtent): boolean {
     const line = wrapper.getBoundingClientRect();
-    if (field.top >= line.bottom) {
-        return 0;
+    if (control.top < line.bottom) {
+        return true;
     }
-    const overlap = field.bottom + ScrollMarginOf(wrapper).top - line.top;
-    return Math.min(overlap, field.top);
+    const isStuck = Math.ceil(line.bottom) >= window.innerHeight;
+    const focusedPosition = wrapper.compareDocumentPosition(focused);
+    return isStuck && (focusedPosition & Node.DOCUMENT_POSITION_PRECEDING) !== 0;
 }
 
-// Moves a focused field the stuck line covers to just above the line, so the line never hides
-// the cursor. A line not rendered, as both its texts are blank, covers nothing.
-function KeepFocusClearOfLine(wrapper: HTMLElement | null): void {
+// The rows of the viewport the focused control must fit in, and the gap it keeps from their
+// edges. Where the line can lie over the control, the room ends at the line's top; otherwise it
+// is the whole viewport. A shown line's scroll margin is the gap; with no line there is none.
+interface FocusRoom {
+    lowerEdge: number;
+    margin: number;
+}
+
+function FocusRoomOf(
+    wrapper: HTMLElement | null,
+    focused: Element,
+    control: BlockExtent,
+): FocusRoom {
+    const viewportHeight = window.innerHeight;
     if (wrapper === null) {
+        return { lowerEdge: viewportHeight, margin: 0 };
+    }
+    const margin = ScrollMarginOf(wrapper).top;
+    if (!LineCanCover(wrapper, focused) || !LineReachesControl(wrapper, focused, control)) {
+        return { lowerEdge: viewportHeight, margin };
+    }
+    return { lowerEdge: Math.min(wrapper.getBoundingClientRect().top, viewportHeight), margin };
+}
+
+// How far the window scrolls down (negative: up) for the control to sit wholly in the room, one
+// gap inside its edges. For a control above the viewport it scrolls up until the control's top is
+// one gap below the viewport top. For one reaching below the room it scrolls down until the
+// control's bottom is one gap above the room's lower edge, but never so far that the control's
+// top leaves the viewport, so a control taller than the room keeps its top in sight. A control
+// already inside the room needs no scroll.
+function FocusScroll(control: BlockExtent, room: FocusRoom): number {
+    if (control.top < 0) {
+        return Math.floor(control.top - room.margin);
+    }
+    const overflowBelow = control.bottom + room.margin - room.lowerEdge;
+    if (overflowBelow <= 0) {
+        return 0;
+    }
+    return Math.min(Math.ceil(overflowBelow), control.top);
+}
+
+// Scrolls the window the least that brings the focused control, with its label, root and focus
+// ring, wholly into the viewport and clear of the stuck line, so neither hides the cursor. A line
+// not rendered, as both its texts are blank, covers nothing, and the viewport alone bounds it.
+function KeepFocusInView(wrapper: HTMLElement | null): void {
+    const focused = FocusedElement();
+    const control = focused === null ? null : ControlExtentOf(focused);
+    if (focused === null || control === null) {
         return;
     }
-    const clearance = FocusClearance(wrapper);
-    if (clearance > 0) {
-        window.scrollBy({ top: clearance });
+    const scroll = FocusScroll(control, FocusRoomOf(wrapper, focused, control));
+    if (scroll !== 0) {
+        window.scrollBy({ top: scroll });
     }
 }
 
-// A new outcome is brought into view only when the reveal leaves the focused field wholly in
-// sight, as the whole reveal or none of it, so the cursor placed on cursor_field never scrolls
-// away. Before the user acts, only an outcome the ERRMSG line reports is brought into view; a
-// change of the INFOMSG prompt alone waits for the user to act. The focused field is then
-// cleared of the stuck line, whose height the outcome may have changed.
+// A new outcome's line is brought into view only when the reveal leaves the focused control
+// wholly in sight, as the whole reveal or none of it, so the cursor placed on cursor_field never
+// scrolls away. Before the user acts, only an outcome the ERRMSG line reports is brought into
+// view; a change of the INFOMSG prompt alone waits for the user to act. A blank outcome renders
+// no line to reveal. The focused control is then kept in view and clear of the stuck line, whose
+// height the outcome may have changed, even when it already had focus, so that focusing it again
+// scrolled nothing.
 function RevealLine(
     wrapper: HTMLElement | null,
     userHasActed: boolean,
     errorLineReportsOutcome: boolean,
 ): void {
-    if (wrapper === null) {
-        return;
-    }
-    if ((userHasActed || errorLineReportsOutcome) && RevealKeepsFocusInView(wrapper)) {
+    const mayReveal = userHasActed || errorLineReportsOutcome;
+    if (wrapper !== null && mayReveal && RevealKeepsFocusInView(wrapper)) {
         wrapper.scrollIntoView(REVEAL_SCROLL_OPTIONS);
     }
-    KeepFocusClearOfLine(wrapper);
+    KeepFocusInView(wrapper);
 }
 
 // A task run in the next animation frame; a request while one is pending replaces it. Frame
@@ -285,12 +385,13 @@ function useUserHasActed(): RefObject<boolean> {
     return userHasActedRef;
 }
 
-// Each element focus moves to is cleared of the stuck line in the next animation frame, after the
-// browser's own focus scroll, which takes no account of the line. Leaving the screen cancels a
-// clearance not yet run.
+// Each control focus moves to is kept wholly in view, with its label, root and focus ring, and
+// clear of the stuck line in the next animation frame, after the browser's own focus scroll,
+// which aligns only the focused element's border box and takes no account of the line. This
+// holds whether or not a line is shown. Leaving the screen cancels a clearance not yet run.
 function useFocusClearance(wrapperRef: RefObject<HTMLDivElement | null>): void {
     useEffect(() => {
-        const clearance = NextFrameTaskOf(() => KeepFocusClearOfLine(wrapperRef.current));
+        const clearance = NextFrameTaskOf(() => KeepFocusInView(wrapperRef.current));
         document.addEventListener(FOCUS_MOVE_EVENT, clearance.Request, LISTEN_IN_CAPTURE_PHASE);
         return () => {
             document.removeEventListener(
@@ -304,14 +405,16 @@ function useFocusClearance(wrapperRef: RefObject<HTMLDivElement | null>): void {
 }
 
 // The outcome shown at mount is only recorded, so entering a screen keeps its top in view and
-// StrictMode's repeated mount effect finds nothing new. Each later outcome that shows a line is
-// revealed in the next animation frame, after the page's own effects of the same commit have
-// moved focus to cursor_field, which may have scrolled the page elsewhere, and only when the
-// focused field stays wholly in view after the scroll. Until the user acts on the screen it is
-// revealed only when ERRMSG reports it (non-blank message text, either new or under a new
-// outcomeKey). ERRMSG reports an outcome; INFOMSG is the standing prompt, so a change of it alone
-// is not revealed before the user acts. Once the user has acted, INFOMSG changes count too. The
-// focused field is kept clear of the stuck line after each reveal and each move of focus.
+// StrictMode's repeated mount effect finds nothing new. Each later outcome is handled in the next
+// animation frame, after the page's own effects of the same commit have moved focus to
+// cursor_field, which may have scrolled the page elsewhere or, on a field that already had focus,
+// nothing at all. Its line is revealed only when the focused control stays wholly in view after
+// the scroll. Until the user acts on the screen it is revealed only when ERRMSG reports it
+// (non-blank message text, either new or under a new outcomeKey). ERRMSG reports an outcome;
+// INFOMSG is the standing prompt, so a change of it alone is not revealed before the user acts.
+// Once the user has acted, INFOMSG changes count too. After every new outcome, blank ones
+// included, and every move of focus, the focused control is kept wholly in view and clear of
+// the stuck line.
 function useRevealOnNewOutcome(props: MessageLineProps): RefObject<HTMLDivElement | null> {
     const wrapperRef = useRef<HTMLDivElement | null>(null);
     const previousOutcomeRef = useRef<ShownOutcome | null>(null);
@@ -324,7 +427,7 @@ function useRevealOnNewOutcome(props: MessageLineProps): RefObject<HTMLDivElemen
         const current: ShownOutcome = { message, infoMessage, outcomeKey };
         const previous = previousOutcomeRef.current;
         previousOutcomeRef.current = current;
-        if (previous === null || !IsNewOutcome(previous, current) || !ShowsAnyLine(current)) {
+        if (previous === null || !IsNewOutcome(previous, current)) {
             return undefined;
         }
         const errorLineReportsOutcome = ErrorLineReportsNewOutcome(previous, current);
@@ -401,9 +504,11 @@ function MessageAlert({ text, severity, region }: MessageAlertProps) {
  * user presses a key or a pointer on the screen, only an outcome the ERRMSG line reports (a
  * refusal, an error or a notice such as the thank-you line) is scrolled into view. INFOMSG is the
  * screen's standing prompt: a change of it alone is scrolled into view only once the user has
- * acted, as CAUP's info-line results of ENTER and F5 are. After each reveal and each move of
- * focus, a focused field the stuck line covers is scrolled to just above it, so the line never
- * hides the cursor.
+ * acted, as CAUP's info-line results of ENTER and F5 are. After every new outcome and every move
+ * of focus, the focused control, with its label, its form control root and its focus ring, is
+ * scrolled wholly inside the viewport and to just above the stuck line, so neither the viewport
+ * edges nor the line hide the cursor. That holds for a cursor field that already had focus, which
+ * focusing again does not scroll, and on a screen whose line is blank.
  */
 export function MessageLine(props: MessageLineProps) {
     const wrapperRef = useRevealOnNewOutcome(props);

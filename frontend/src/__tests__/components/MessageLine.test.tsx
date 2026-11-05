@@ -1,9 +1,9 @@
 // Tests MessageLine, which replaces the BMS ERRMSG line (COLOR=RED, ERRMSGI PIC X(78)) and the
 // INFOMSG line (INFOMSGI PIC X(45)) of bms/COACTUP.bms, cpy-bms/COACTUP.CPY and COCRDLI.CPY.
-import { Portal, TextField } from "@mui/material";
+import { Button, Portal, TextField, formControlClasses, inputLabelClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { StrictMode, type ReactElement, type ReactNode } from "react";
+import { StrictMode, type CSSProperties, type ReactElement, type ReactNode } from "react";
 
 import { CARD_DEMO_THEME } from "@/app/theme";
 import {
@@ -366,11 +366,28 @@ const FIELD_HALF_UNDER_LINE: RowLayout = {
     line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
 };
 
+// A field that comes before the stuck line but waits below the fold: scrolling it into view
+// brings it up beneath the line, which stays stuck while its own place is still below the fold.
+const FIELD_BELOW_STUCK_LINE: RowLayout = {
+    layout: "a field below the viewport that comes before the stuck line",
+    field: RowAt(VIEWPORT_HEIGHT + EDGE_GAP, FIELD_HEIGHT),
+    line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+};
+
+// Layouts whose focused field the clearance moves to one scroll margin above the stuck line.
+const FIELDS_CLEARED_TO_LINE: readonly RowLayout[] = [
+    FIELD_HALF_UNDER_LINE,
+    FIELD_BELOW_STUCK_LINE,
+];
+
 const FIELD_TALLER_THAN_ROOM: RowLayout = {
     layout: "a field taller than the room above the stuck line",
     field: RowAt(EDGE_GAP, VIEWPORT_HEIGHT),
     line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
 };
+
+// The line in its own place in the layout, not stuck, with a function key laid out below it.
+const LINE_IN_PLACE_TOP = VIEWPORT_HEIGHT - FIELD_ABOVE_FOLD;
 
 // Layouts in which the stuck line covers no part of the focused element.
 const UNCOVERED_LAYOUTS: readonly RowLayout[] = [
@@ -381,9 +398,167 @@ const UNCOVERED_LAYOUTS: readonly RowLayout[] = [
         line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
     },
     {
-        layout: "a key below the line",
-        field: RowAt(VIEWPORT_HEIGHT + EDGE_GAP, FIELD_HEIGHT),
+        layout: "a key below the line in its place",
+        field: RowAt(LINE_IN_PLACE_TOP + LINE_HEIGHT + EDGE_GAP, FIELD_HEIGHT),
+        line: RowAt(LINE_IN_PLACE_TOP, LINE_HEIGHT),
+    },
+];
+
+// A cursor field that already has focus, left above the viewport when the user scrolled down to
+// press a key, so focusing it again for the next outcome scrolls nothing.
+const FIELD_ABOVE_VIEWPORT_TOP = -368;
+const FIELD_ABOVE_VIEWPORT = RowAt(FIELD_ABOVE_VIEWPORT_TOP, FIELD_HEIGHT);
+
+// A resubmission from the focused field: the outcome that answers it, and the gap the field
+// keeps below the viewport top, the line's scroll margin while a line is shown.
+interface ResubmissionCase {
+    caseName: string;
+    before: MessageLineProps;
+    after: MessageLineProps;
+    margin: number;
+}
+
+const RESUBMISSION_CASES: readonly ResubmissionCase[] = [
+    {
+        caseName: "the same ERRMSG under a new outcomeKey",
+        before: { message: ADMIN_ONLY_MESSAGE, outcomeKey: FIRST_OUTCOME },
+        after: { message: ADMIN_ONLY_MESSAGE, outcomeKey: SECOND_OUTCOME },
+        margin: REVEAL_MARGIN_PIXELS,
+    },
+    {
+        caseName: "another ERRMSG",
+        before: { message: ACCOUNT_FILTER_MESSAGE, outcomeKey: FIRST_OUTCOME },
+        after: { message: ADMIN_ONLY_MESSAGE, outcomeKey: SECOND_OUTCOME },
+        margin: REVEAL_MARGIN_PIXELS,
+    },
+    {
+        caseName: "a new outcomeKey with both lines blank",
+        before: { outcomeKey: FIRST_OUTCOME },
+        after: { message: "", outcomeKey: SECOND_OUTCOME },
+        margin: 0,
+    },
+];
+
+// A field whose form control root and outlined label reach beyond its input: MUI pads the input
+// inside the root, draws a filled field's underline at the root's bottom edge and raises the
+// outlined label above the root's top edge.
+interface ControlPartsLayout extends RowLayout {
+    root: DOMRect;
+    label: DOMRect;
+    expectedScroll: number;
+}
+
+const INPUT_INSET = 16;
+const INPUT_HEIGHT = 24;
+const RAISED_LABEL_OFFSET = 9;
+const LABEL_HEIGHT = 18;
+
+// The input, root and label rows of a field whose root starts at rootTop.
+function ControlPartsAt(rootTop: number): Pick<ControlPartsLayout, "field" | "root" | "label"> {
+    return {
+        field: RowAt(rootTop + INPUT_INSET, INPUT_HEIGHT),
+        root: RowAt(rootTop, FIELD_HEIGHT),
+        label: RowAt(rootTop - RAISED_LABEL_OFFSET, LABEL_HEIGHT),
+    };
+}
+
+// The root ends under the stuck line though the input ends above it; the label reaches above the
+// viewport top though the input and the root start inside it.
+const ROOT_UNDER_LINE_TOP = STUCK_LINE_TOP - FIELD_HEIGHT + EDGE_GAP / 2;
+const ROOT_BELOW_TOP = EDGE_GAP / 8;
+const CONTROL_PARTS_LAYOUTS: readonly ControlPartsLayout[] = [
+    {
+        layout: "the root's bottom edge under the stuck line",
+        ...ControlPartsAt(ROOT_UNDER_LINE_TOP),
         line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+        expectedScroll: ROOT_UNDER_LINE_TOP + FIELD_HEIGHT + REVEAL_MARGIN_PIXELS - STUCK_LINE_TOP,
+    },
+    {
+        layout: "the raised label above the viewport top",
+        ...ControlPartsAt(ROOT_BELOW_TOP),
+        line: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+        expectedScroll: Math.floor(ROOT_BELOW_TOP - RAISED_LABEL_OFFSET - REVEAL_MARGIN_PIXELS),
+    },
+];
+
+// A function key after the message line, as FunctionKeyBar places the PF legend, with the focus
+// ring the theme draws on buttons declared as the longhands jsdom computes.
+const KEY_LABEL = "Forward (F8)";
+const KEY_HEIGHT = 40;
+const RING_WIDTH = "3px";
+const RING_OFFSET = "2px";
+const RING_REACH = Number.parseFloat(RING_WIDTH) + Number.parseFloat(RING_OFFSET);
+const OUTSET_RING: CSSProperties = {
+    outlineStyle: "solid",
+    outlineWidth: RING_WIDTH,
+    outlineOffset: RING_OFFSET,
+};
+// A ring drawn inside the key's box, as the theme draws one on list items and segments.
+const INSET_RING: CSSProperties = {
+    outlineStyle: "solid",
+    outlineWidth: RING_WIDTH,
+    outlineOffset: `-${RING_WIDTH}`,
+};
+const NO_RING: CSSProperties = { outlineStyle: "none" };
+
+// A focused key, its ring, the line beside it, and the window scroll that keeps it wholly in
+// view: none where nothing of it lies outside the viewport.
+interface KeyCase {
+    caseName: string;
+    line: MessageLineProps;
+    lineBox?: DOMRect;
+    ringStyle: CSSProperties;
+    key: DOMRect;
+    expectedScroll: number;
+}
+
+const KEY_FLUSH_WITH_BOTTOM = RowAt(VIEWPORT_HEIGHT - KEY_HEIGHT, KEY_HEIGHT);
+const KEY_BELOW_VIEWPORT = RowAt(VIEWPORT_HEIGHT + EDGE_GAP, KEY_HEIGHT);
+const KEY_JUST_BELOW_TOP = EDGE_GAP / 8;
+
+const KEY_CASES: readonly KeyCase[] = [
+    {
+        caseName: "no line, a key flush with the viewport bottom whose ring reaches past it",
+        line: NO_OUTCOME,
+        ringStyle: OUTSET_RING,
+        key: KEY_FLUSH_WITH_BOTTOM,
+        expectedScroll: RING_REACH,
+    },
+    {
+        caseName: "no line, a key just below the viewport top whose ring reaches above it",
+        line: NO_OUTCOME,
+        ringStyle: OUTSET_RING,
+        key: RowAt(KEY_JUST_BELOW_TOP, KEY_HEIGHT),
+        expectedScroll: Math.floor(KEY_JUST_BELOW_TOP - RING_REACH),
+    },
+    {
+        caseName: "no line, a key flush with the viewport bottom whose ring is inset",
+        line: NO_OUTCOME,
+        ringStyle: INSET_RING,
+        key: KEY_FLUSH_WITH_BOTTOM,
+        expectedScroll: 0,
+    },
+    {
+        caseName: "no line, a ring-less key wholly inside the viewport",
+        line: NO_OUTCOME,
+        ringStyle: NO_RING,
+        key: RowAt(VIEWPORT_HEIGHT - KEY_HEIGHT - EDGE_GAP, KEY_HEIGHT),
+        expectedScroll: 0,
+    },
+    {
+        caseName: "no line, a ring-less key below the viewport",
+        line: NO_OUTCOME,
+        ringStyle: NO_RING,
+        key: KEY_BELOW_VIEWPORT,
+        expectedScroll: KEY_BELOW_VIEWPORT.bottom - VIEWPORT_HEIGHT,
+    },
+    {
+        caseName: "a key below the viewport after the stuck line, which no longer covers it",
+        line: ADMIN_ONLY_OUTCOME,
+        lineBox: RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+        ringStyle: NO_RING,
+        key: KEY_BELOW_VIEWPORT,
+        expectedScroll: KEY_BELOW_VIEWPORT.bottom + REVEAL_MARGIN_PIXELS - VIEWPORT_HEIGHT,
     },
 ];
 
@@ -482,10 +657,18 @@ function FieldBesideLine({ line }: FieldBesideLineProps) {
 }
 
 // The message line's wrapper, which follows the field as the container's last element once a
-// line shows.
-function WrapperAfterField(container: HTMLElement, field: HTMLElement): Element {
+// line shows; null while both lines are blank.
+function ShownWrapperAfter(container: HTMLElement, field: HTMLElement): Element | null {
     const wrapper = container.lastElementChild;
     if (wrapper === null || wrapper.contains(field)) {
+        return null;
+    }
+    return wrapper;
+}
+
+function WrapperAfterField(container: HTMLElement, field: HTMLElement): Element {
+    const wrapper = ShownWrapperAfter(container, field);
+    if (wrapper === null) {
         throw new Error("The message line wrapper is not rendered.");
     }
     return wrapper;
@@ -570,6 +753,80 @@ const CLEARANCE_TRIGGERS: readonly ClearanceTrigger[] = [
 const UNCOVERED_CASES = CLEARANCE_TRIGGERS.flatMap((triggerCase) =>
     UNCOVERED_LAYOUTS.map((rowLayout) => ({ ...triggerCase, ...rowLayout })),
 );
+
+const CLEARED_TO_LINE_CASES = CLEARANCE_TRIGGERS.flatMap((triggerCase) =>
+    FIELDS_CLEARED_TO_LINE.map((rowLayout) => ({ ...triggerCase, ...rowLayout })),
+);
+
+// Answers a resubmission from the focused field laid out above the viewport, with the answer's
+// line, when one shows, stuck to the viewport bottom; then waits for the frame the outcome runs.
+async function ResubmitFromFieldAboveViewport(
+    resubmission: ResubmissionCase,
+): Promise<HTMLElement> {
+    const view = render(<FieldBesideLine line={resubmission.before} />, { wrapper: ThemeWrapper });
+    const field = screen.getByLabelText(FIELD_LABEL);
+    jest.spyOn(field, "getBoundingClientRect").mockReturnValue(FIELD_ABOVE_VIEWPORT);
+    view.rerender(<FieldBesideLine line={resubmission.after} />);
+    const wrapper = ShownWrapperAfter(view.container, field);
+    if (wrapper !== null) {
+        jest.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(
+            RowAt(STUCK_LINE_TOP, LINE_HEIGHT),
+        );
+    }
+    await NextAnimationFrame();
+    return field;
+}
+
+// Focus moving, as Tab moves it, to a field whose input, root and label are laid out as
+// partsLayout places them beside the stuck line, then the frame the clearance runs in.
+async function TabToFieldWithParts(partsLayout: ControlPartsLayout): Promise<void> {
+    const { field } = RenderShownLineScreen(partsLayout);
+    const root = field.closest(`.${formControlClasses.root}`);
+    const label = root === null ? null : root.querySelector(`.${inputLabelClasses.root}`);
+    if (root === null || label === null) {
+        throw new Error("The field renders no form control root or label.");
+    }
+    jest.spyOn(root, "getBoundingClientRect").mockReturnValue(partsLayout.root);
+    jest.spyOn(label, "getBoundingClientRect").mockReturnValue(partsLayout.label);
+    MoveFocusTo(field);
+    await NextAnimationFrame();
+}
+
+interface KeyBesideLineProps {
+    line: MessageLineProps;
+    ringStyle: CSSProperties;
+}
+
+// A function key after the screen's message line, as each page places FunctionKeyBar.
+function KeyBesideLine({ line, ringStyle }: KeyBesideLineProps) {
+    return (
+        <>
+            <MessageLine {...line} />
+            <Button style={ringStyle}>{KEY_LABEL}</Button>
+        </>
+    );
+}
+
+// Focus moving to the key laid out as keyCase places it, beside its line when one is shown,
+// then the frame the clearance runs in.
+async function FocusKeyBesideLine(keyCase: KeyCase): Promise<void> {
+    const view = render(<KeyBesideLine line={keyCase.line} ringStyle={keyCase.ringStyle} />, {
+        wrapper: ThemeWrapper,
+    });
+    const key = screen.getByRole("button", { name: KEY_LABEL });
+    jest.spyOn(key, "getBoundingClientRect").mockReturnValue(keyCase.key);
+    const wrapper = view.container.firstElementChild;
+    if (keyCase.lineBox !== undefined && wrapper !== null && wrapper !== key) {
+        jest.spyOn(wrapper, "getBoundingClientRect").mockReturnValue(keyCase.lineBox);
+    }
+    act(() => key.focus());
+    await NextAnimationFrame();
+}
+
+// The window scrolls the clearance makes: one by a non-zero distance, or none.
+function WindowScrollCalls(scroll: number): ScrollToOptions[][] {
+    return scroll === 0 ? [] : [[{ top: scroll }]];
+}
 
 // The scroll margin of the line's top edge as the engine computes it, 0 where it is unset.
 function LineScrollMarginTop(wrapper: Element): number {
@@ -857,9 +1114,9 @@ describe("MessageLine after the user acts on the screen", () => {
 });
 
 // The clearance scrolls the field up by its overlap with the line, widened by the line's margin.
-async function ClearsFieldHalfUnderLine({ Show }: ClearanceTrigger): Promise<void> {
-    const wrapper = await Show(FIELD_HALF_UNDER_LINE);
-    const { field, line } = FIELD_HALF_UNDER_LINE;
+async function ClearsFieldToLine(clearedCase: ClearanceTrigger & RowLayout): Promise<void> {
+    const wrapper = await clearedCase.Show(clearedCase);
+    const { field, line } = clearedCase;
     const overlap = field.bottom + LineScrollMarginTop(wrapper) - line.top;
     expect(scrollBySpy.mock.calls).toEqual([[{ top: overlap }]]);
 }
@@ -883,9 +1140,9 @@ async function LeavesPortalFieldOverLine(): Promise<void> {
 }
 
 describe("MessageLine clears a focused field the stuck line covers", () => {
-    it.each(CLEARANCE_TRIGGERS)(
-        "when $trigger, a field half under the line scrolls to just above it",
-        ClearsFieldHalfUnderLine,
+    it.each(CLEARED_TO_LINE_CASES)(
+        "when $trigger, $layout scrolls to just above the line",
+        ClearsFieldToLine,
     );
     it.each(CLEARANCE_TRIGGERS)(
         "when $trigger, a field taller than the room above the line scrolls only to the top",
@@ -902,6 +1159,36 @@ describe("MessageLine leaves a focused field the stuck line does not cover", () 
         "a focused field in a portal, which stacks above the line, gets no clearance",
         LeavesPortalFieldOverLine,
     );
+});
+
+describe("MessageLine brings an already focused cursor field back into view", () => {
+    it.each(RESUBMISSION_CASES)(
+        "$caseName: the field above the viewport scrolls down to one gap below its top",
+        async (resubmission) => {
+            const field = await ResubmitFromFieldAboveViewport(resubmission);
+            const top = Math.floor(FIELD_ABOVE_VIEWPORT_TOP - resubmission.margin);
+            expect(scrollBySpy.mock.calls).toEqual([[{ top }]]);
+            expect(scrollIntoViewSpy).not.toHaveBeenCalled();
+            expect(field).toHaveFocus();
+        },
+    );
+});
+
+describe("MessageLine clears the whole focused control, its root and label included", () => {
+    it.each(CONTROL_PARTS_LAYOUTS)(
+        "when focus moves to the field, $layout: scrolls by $expectedScroll",
+        async (partsLayout) => {
+            await TabToFieldWithParts(partsLayout);
+            expect(scrollBySpy.mock.calls).toEqual([[{ top: partsLayout.expectedScroll }]]);
+        },
+    );
+});
+
+describe("MessageLine keeps a focused key and its focus ring in view", () => {
+    it.each(KEY_CASES)("$caseName: scrolls by $expectedScroll", async (keyCase) => {
+        await FocusKeyBesideLine(keyCase);
+        expect(scrollBySpy.mock.calls).toEqual(WindowScrollCalls(keyCase.expectedScroll));
+    });
 });
 
 describe("MessageLine left before the clearance frame", () => {

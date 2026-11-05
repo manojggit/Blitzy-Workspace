@@ -1017,6 +1017,55 @@ describe("COTRN00C keyboard lock while a request is out", () => {
     );
 });
 
+// A paging key reached by Tab from SEL0010, the last Sel code, past Continue and Back, and
+// pressed from the keyboard: Enter on Backward, Space on Forward.
+interface TabbedPageKeyCase {
+    key: ListKey;
+    activation: string;
+    keys: string;
+    tabs: number;
+}
+
+const TABBED_PAGE_KEY_CASES: readonly TabbedPageKeyCase[] = [
+    { key: "F7", activation: "Enter", keys: "{Enter}", tabs: 3 },
+    { key: "F8", activation: "Space", keys: " ", tabs: 4 },
+];
+
+// Puts the cursor in SEL0010 and tabs from it until the case's key has the focus; returns the
+// Sel code tabbed from.
+async function TabFromLastSelection(
+    user: UserEvent,
+    pageKeyCase: TabbedPageKeyCase,
+): Promise<HTMLElement> {
+    const lastSelection = SelectionField(PAGE_SIZE);
+    act(() => lastSelection.focus());
+    for (let press = 0; press < pageKeyCase.tabs; press++) {
+        await user.tab();
+    }
+    expect(KeyButton(pageKeyCase.key)).toHaveFocus();
+    return lastSelection;
+}
+
+// A PF key never moved the 3270 cursor: the key the press disables gives the focus back to the
+// Sel code it was tabbed from, never to the page body, until the answer puts it on TRNIDIN.
+describe("COTRN00C paging key pressed from the keyboard", () => {
+    it.each(TABBED_PAGE_KEY_CASES)(
+        "COTRN00C $activation on the tabbed-to $key keeps the cursor in SEL0010 while it runs",
+        async (pageKeyCase) => {
+            const user = await RenderFirstPage();
+            const { promise, resolve } = Promise.withResolvers<TransactionSelectionResponse>();
+            MockKeyAnswer(pageKeyCase.key, () => promise);
+            const lastSelection = await TabFromLastSelection(user, pageKeyCase);
+            await user.keyboard(pageKeyCase.keys);
+            ExpectRequestKeysDisabled(true);
+            expect(document.activeElement).toBe(lastSelection);
+            resolve(PENDING_ANSWER);
+            await screen.findByText(TranIdFor(20));
+            await waitFor(() => expect(SearchField()).toHaveFocus());
+        },
+    );
+});
+
 // TRNIDIN is read-only while a request is out: typing into it changes nothing.
 async function ExpectSearchLocked(user: UserEvent, heldText: string): Promise<void> {
     expect(SearchField()).toHaveAttribute("readonly");
@@ -1387,6 +1436,86 @@ describe("COTRN00C result status after a refusal", () => {
             await PressKey(user, literalCase.key, "button");
             await ExpectAlert(literalCase.literal, "error");
             expect(ResultStatusRegion().textContent).toBe("");
+        },
+    );
+});
+
+// TRNIDIN laid out above the viewport, as after the user scrolled the page down with the cursor
+// left in it. jsdom lays nothing out, so the field reports this box, and window.scrollBy moves it
+// by the scroll the page asks for, as a browser scrolling the window would.
+const FIELD_TOP_ABOVE_VIEWPORT = -400;
+const FIELD_BOX_HEIGHT = 56;
+
+function ScrollTopOf(scrollOptions: unknown): number {
+    if (typeof scrollOptions === "object" && scrollOptions !== null && "top" in scrollOptions) {
+        return Number(scrollOptions.top);
+    }
+    return 0;
+}
+
+function LayOutAboveViewport(field: HTMLElement): void {
+    let fieldTop = FIELD_TOP_ABOVE_VIEWPORT;
+    jest.spyOn(field, "getBoundingClientRect").mockImplementation(
+        () => new DOMRect(0, fieldTop, 0, FIELD_BOX_HEIGHT),
+    );
+    jest.spyOn(window, "scrollBy").mockImplementation((...scrollArguments: unknown[]) => {
+        fieldTop -= ScrollTopOf(scrollArguments[0]);
+    });
+}
+
+function ExpectWhollyInView(field: HTMLElement): void {
+    const box = field.getBoundingClientRect();
+    expect(box.top).toBeGreaterThanOrEqual(0);
+    expect(box.bottom).toBeLessThanOrEqual(window.innerHeight);
+}
+
+// Resolves in a frame requested now, which jsdom runs after every frame requested before it.
+async function NextAnimationFrame(): Promise<void> {
+    await act(
+        () =>
+            new Promise<void>((resolve) => {
+                window.requestAnimationFrame(() => resolve());
+            }),
+    );
+}
+
+// A key pressed by its button, which leaves the cursor in TRNIDIN; resolves once its answer is
+// applied and the busy bar is gone.
+async function PressAndAwaitAnswer(user: UserEvent, key: ListKey): Promise<void> {
+    await PressKey(user, key, "button");
+    await waitFor(() => expect(screen.queryByRole("progressbar")).toBeNull());
+}
+
+// A key answered with the outcome already shown: the same paging literal, or the blank ERRMSG of
+// a plain page.
+interface RepeatedOutcomeCase {
+    outcome: string;
+    key: ListKey;
+    answer: TransactionListResponse;
+}
+
+const REPEATED_OUTCOME_CASES: readonly RepeatedOutcomeCase[] = [
+    { outcome: BOTTOM_ALREADY, key: "F8", answer: BuildListResponse({ message: BOTTOM_ALREADY }) },
+    { outcome: "a blank ERRMSG", key: "ENTER", answer: BuildListResponse() },
+];
+
+// Each answer is a new outcome, even one repeating the lines shown. It focuses TRNIDIN again,
+// which scrolls nothing while the field already has focus, so the message line brings the field
+// the user scrolled away from back into view.
+describe("COTRN00C TRNIDIN kept in view when an answer repeats the outcome", () => {
+    it.each(REPEATED_OUTCOME_CASES)(
+        "COTRN00C $key answered again with $outcome scrolls TRNIDIN back into view",
+        async ({ key, answer }) => {
+            const user = await RenderFirstPage();
+            MockKeyAnswer(key, () => Promise.resolve(answer));
+            await PressAndAwaitAnswer(user, key);
+            await NextAnimationFrame();
+            expect(SearchField()).toHaveFocus();
+            LayOutAboveViewport(SearchField());
+            MockKeyAnswer(key, () => Promise.resolve(answer));
+            await PressAndAwaitAnswer(user, key);
+            await waitFor(() => ExpectWhollyInView(SearchField()));
+            expect(SearchField()).toHaveFocus();
         },
     );
 });

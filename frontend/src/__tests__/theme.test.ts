@@ -1,7 +1,7 @@
 // Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE,
-// AUTOFILL_KEYFRAMES_STYLE, SCROLL_REGION_STYLE, FixedLayoutTableStyle, RowShareStyle,
-// RowEndAlignmentFrom, STABLE_WIDTH_FIELD_COLUMN_STYLE), the Material Design 3 token theme of
-// AAP 0.5.3–0.5.4.
+// AUTOFILL_KEYFRAMES_STYLE, SCROLL_REGION_STYLE, StickyHeadScrollRegionStyle,
+// FixedLayoutTableStyle, RowShareStyle, RowEndAlignmentFrom, STABLE_WIDTH_FIELD_COLUMN_STYLE), the
+// Material Design 3 token theme of AAP 0.5.3–0.5.4.
 import type { Breakpoint, Theme, TypeAction } from "@mui/material/styles";
 import {
     AUTOFILL_KEYFRAMES_STYLE,
@@ -11,6 +11,7 @@ import {
     RowShareStyle,
     SCROLL_REGION_STYLE,
     STABLE_WIDTH_FIELD_COLUMN_STYLE,
+    StickyHeadScrollRegionStyle,
     VISUALLY_HIDDEN_STYLE,
 } from "@/app/theme";
 
@@ -365,6 +366,9 @@ const SINGLE_LINE_INPUT_SELECTOR = "&:not(textarea)";
 const TOUCH_HOVER_RESTING_OUTLINE_SELECTOR =
     "&:hover:not(.Mui-focused):not(.Mui-error):not(.Mui-disabled) .MuiOutlinedInput-notchedOutline";
 const SM_BREAKPOINT_QUERY = CARD_DEMO_THEME.breakpoints.up("sm");
+// The segments of a vertical ToggleButtonGroup below the first.
+const LATER_STACKED_SEGMENT_SELECTOR =
+    "& .MuiToggleButtonGroup-middleButton, & .MuiToggleButtonGroup-lastButton";
 const FORCED_SELECTED_OPTION_STYLE = {
     forcedColorAdjust: "none",
     backgroundColor: "Highlight",
@@ -487,7 +491,8 @@ const FOCUS_RING_RULES: readonly ThemeRuleExpectation[] = [
     },
 ];
 
-// M3 sizes: 40 dp buttons inside a 48 dp target, 48 dp menu items and icon buttons.
+// M3 sizes: 40 dp buttons and segments inside a 48 dp target, stacked segments spaced for their
+// targets, menu items and icon buttons.
 const TOUCH_TARGET_RULES: readonly ThemeRuleExpectation[] = [
     {
         rule: "a button is at least 40 px tall with 8 px and 24 px padding",
@@ -523,6 +528,41 @@ const TOUCH_TARGET_RULES: readonly ThemeRuleExpectation[] = [
         slot: "text",
         selectorPath: [],
         expectedStyle: { padding: "8px 12px" },
+    },
+    {
+        rule: "a medium segment's pointer target reaches 4 px past its 1 px border, never sideways",
+        component: "MuiToggleButton",
+        slot: "sizeMedium",
+        selectorPath: ["&::after"],
+        expectedStyle: {
+            content: '""',
+            position: "absolute",
+            top: -5,
+            bottom: -5,
+            left: 0,
+            right: 0,
+        },
+    },
+    {
+        rule: "stacked segments sit 8 px apart, room for the 4 px each target reaches past them",
+        component: "MuiToggleButtonGroup",
+        slot: "vertical",
+        selectorPath: [],
+        expectedStyle: { rowGap: 8 },
+    },
+    {
+        rule: "a later stacked segment sits clear of the one above, with an outline top border",
+        component: "MuiToggleButtonGroup",
+        slot: "vertical",
+        selectorPath: [LATER_STACKED_SEGMENT_SELECTOR],
+        expectedStyle: { marginTop: 0, borderTopColor: OUTLINE_HEX },
+    },
+    {
+        rule: "a disabled later stacked segment draws its top border in the disabled colour",
+        component: "MuiToggleButtonGroup",
+        slot: "vertical",
+        selectorPath: [LATER_STACKED_SEGMENT_SELECTOR, DISABLED_SELECTOR],
+        expectedStyle: { borderTopColor: "rgba(29, 27, 32, 0.12)" },
     },
     {
         rule: "an outlined field input is a 24 px line box with 16 px above and below",
@@ -1352,6 +1392,32 @@ const SCROLL_REGION_VALUES = {
     },
 };
 
+// The CR00 report's scrolling region, under its sticky heading row: the list tables' region with a
+// bottom-edge cue as well, made the same way, and at most 150 units (600 px) tall.
+const REPORT_REGION_MAX_HEIGHT_UNITS = 150;
+const STICKY_HEAD_SCROLL_REGION_VALUES = {
+    ...SCROLL_REGION_VALUES,
+    backgroundImage: [
+        "linear-gradient(to right, #F3EDF7 30%, transparent)",
+        "linear-gradient(to left, #F3EDF7 30%, transparent)",
+        "linear-gradient(to top, #F3EDF7 30%, transparent)",
+        "linear-gradient(to right, rgba(0, 0, 0, 0.3), transparent)",
+        "linear-gradient(to left, rgba(0, 0, 0, 0.3), transparent)",
+        "linear-gradient(to top, rgba(0, 0, 0, 0.3), transparent)",
+    ].join(", "),
+    backgroundPosition: [
+        "left center",
+        "right center",
+        "center bottom",
+        "left center",
+        "right center",
+        "center bottom",
+    ].join(", "),
+    backgroundSize: "40px 100%, 40px 100%, 100% 40px, 12px 100%, 12px 100%, 100% 12px",
+    backgroundAttachment: "local, local, local, scroll, scroll, scroll",
+    maxHeight: "600px",
+};
+
 // The list tables' fixed layout: every column keeps its declared width and a wider text breaks
 // inside its column. The minimum width is the columns' total in 4 dp units: the CCLI, CU00 and
 // CT00 totals.
@@ -1794,6 +1860,13 @@ describe("Row end alignment", () => {
 describe("List table scrolling regions", () => {
     it("SCROLL_REGION_STYLE draws edge cues, an outline scrollbar and the M3 focus ring", () => {
         expect(ResolveSx(SCROLL_REGION_STYLE)).toEqual(SCROLL_REGION_VALUES);
+    });
+});
+
+describe("Sticky-head report scrolling region", () => {
+    it("StickyHeadScrollRegionStyle adds a bottom-edge cue and bounds the region's height", () => {
+        const regionStyle = StickyHeadScrollRegionStyle(REPORT_REGION_MAX_HEIGHT_UNITS);
+        expect(ResolveSx(regionStyle)).toEqual(STICKY_HEAD_SCROLL_REGION_VALUES);
     });
 });
 

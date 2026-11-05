@@ -492,6 +492,50 @@ describe("COADM01C invalid key pressed again", () => {
     });
 });
 
+// An outlined field's height, and where the user left OPTION: scrolled above the viewport while
+// it kept the cursor, so focusing it again for the next outcome scrolls nothing.
+const FIELD_HEIGHT = 56;
+const FIELD_ABOVE_VIEWPORT_TOP = -368;
+
+// jsdom lays nothing out and scrolls nothing: the field's row is laid out above the viewport, and
+// each window.scrollBy, which MessageLine calls with ScrollToOptions, moves it as a browser would.
+function LayOutFieldAboveViewport(field: HTMLElement): void {
+    let scrolledBy = 0;
+    jest.spyOn(field, "getBoundingClientRect").mockImplementation(
+        () => new DOMRect(0, FIELD_ABOVE_VIEWPORT_TOP - scrolledBy, 0, FIELD_HEIGHT),
+    );
+    jest.spyOn(window, "scrollBy").mockImplementation((...args: unknown[]) => {
+        const [options] = args as [ScrollToOptions];
+        scrolledBy += options.top ?? 0;
+    });
+}
+
+function ExpectWhollyInViewport(field: HTMLElement): void {
+    const row = field.getBoundingClientRect();
+    expect(row.top).toBeGreaterThanOrEqual(0);
+    expect(row.bottom).toBeLessThanOrEqual(window.innerHeight);
+}
+
+// The same invalid-key literal again is still a new SEND-MENU-SCREEN: OPTION, which kept the
+// cursor while the user scrolled away from it, is brought back into view.
+describe("COADM01C invalid key again with OPTION scrolled out of view", () => {
+    afterEach(() => {
+        jest.restoreAllMocks();
+    });
+
+    it("COADM01C F5 again brings the focused OPTION field back into view", async () => {
+        const user = await RenderLoadedScreen();
+        await PressKey(user, "F5");
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+        const field = OptionField();
+        LayOutFieldAboveViewport(field);
+        await PressKey(user, "F5");
+        await waitFor(() => ExpectWhollyInViewport(field));
+        expect(field).toHaveFocus();
+        await ExpectAlert(INVALID_KEY_MESSAGE, "error");
+    });
+});
+
 // The keyboard lock covers every PF key: one pressed during a selection is answered by nothing.
 describe("COADM01C keys outside the legend while a selection is in flight", () => {
     it("COADM01C answers no other PF key until the selection settles", async () => {

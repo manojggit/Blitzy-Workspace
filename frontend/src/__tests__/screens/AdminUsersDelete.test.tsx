@@ -1004,6 +1004,91 @@ describe("COUSR03C WHEN OTHER (a PF key the legend lacks)", () => {
     );
 });
 
+// USRIDIN kept focused while the user scrolled away from it lies above the viewport, and focusing
+// it again for the next answer scrolls nothing by itself.
+const FIELD_ABOVE_VIEWPORT_TOP = -368;
+const FIELD_HEIGHT = 56;
+// The gap the message line leaves between the viewport top and the cursor field it scrolls back
+// to: its scroll margin, one theme spacing unit, while a line shows, and none while it is blank.
+const SHOWN_LINE_SCROLL_MARGIN = 4;
+const BLANK_LINE_SCROLL_MARGIN = 0;
+// One of the PF keys the legend lacks.
+const REPEATED_UNBOUND_KEY = "F7";
+
+interface RepeatedAnswerCase {
+    press: string;
+    answer: string;
+    Press: (user: UserEvent) => Promise<void>;
+    scrollMargin: number;
+}
+
+// A key pressed twice and answered alike with no call between, the cursor on USRIDIN both times:
+// PF4's blank message line by pointer, and the invalid-key literal of a PF key the legend lacks,
+// pressed where the cursor is. ENTER and PF5 blank the line as they send, so no answer of theirs
+// repeats the line shown before it.
+const REPEATED_ANSWER_CASES: readonly RepeatedAnswerCase[] = [
+    {
+        press: "PF4 by click",
+        answer: "a blank message line",
+        Press: (user) => PressFunction(user, "F4", "click"),
+        scrollMargin: BLANK_LINE_SCROLL_MARGIN,
+    },
+    {
+        press: REPEATED_UNBOUND_KEY,
+        answer: INVALID_KEY_MESSAGE,
+        Press: (user) => user.keyboard(`{${REPEATED_UNBOUND_KEY}}`),
+        scrollMargin: SHOWN_LINE_SCROLL_MARGIN,
+    },
+];
+
+// Resolves in an animation frame requested after the message line's own, which jsdom runs in
+// request order.
+function NextAnimationFrame(): Promise<void> {
+    return new Promise((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+    });
+}
+
+// The case's key pressed, then the frame in which the message line handles its answer.
+async function PressAndSettle(user: UserEvent, repeatedCase: RepeatedAnswerCase): Promise<void> {
+    await repeatedCase.Press(user);
+    await NextAnimationFrame();
+}
+
+function LayOutAboveViewport(field: HTMLElement): void {
+    const aboveViewport = new DOMRect(0, FIELD_ABOVE_VIEWPORT_TOP, 0, FIELD_HEIGHT);
+    jest.spyOn(field, "getBoundingClientRect").mockReturnValue(aboveViewport);
+}
+
+// The window.scrollBy calls made while the steps run; jsdom implements no scrolling, so a spy
+// stands in for it until they end.
+async function WindowScrollsDuring(steps: () => Promise<void>): Promise<unknown[]> {
+    const scrollBySpy = jest.spyOn(window, "scrollBy").mockImplementation(() => undefined);
+    try {
+        await steps();
+        return [...scrollBySpy.mock.calls];
+    } finally {
+        scrollBySpy.mockRestore();
+    }
+}
+
+describe("COUSR03C cursor brought back into view by a repeated answer", () => {
+    it.each(REPEATED_ANSWER_CASES)(
+        "COUSR03C $press answered by $answer again scrolls the focused USRIDIN back into view",
+        async (repeatedCase) => {
+            const user = await RenderFromList();
+            await PressAndSettle(user, repeatedCase);
+            const userIdInput = screen.getByLabelText(USER_ID_LABEL);
+            expect(userIdInput).toHaveFocus();
+            LayOutAboveViewport(userIdInput);
+            const scrolls = await WindowScrollsDuring(() => PressAndSettle(user, repeatedCase));
+            const top = FIELD_ABOVE_VIEWPORT_TOP - repeatedCase.scrollMargin;
+            expect(scrolls).toEqual([[{ top }]]);
+            expect(userIdInput).toHaveFocus();
+        },
+    );
+});
+
 // The keys disable while the delete runs, the invalid-key action with them, so the delete's answer
 // is the message shown.
 describe("COUSR03C a PF key the legend lacks while a delete is in flight", () => {

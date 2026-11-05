@@ -654,12 +654,16 @@ function UserDetailFields({ model }: UserDetailFieldsProps) {
     );
 }
 
+// Every answer, PF4 and the invalid-key literal set a new feedback object, which typing and the
+// busy state keep, so its identity is the outcome: ENTER or PF4 answered again alike brings the
+// focused cursor field back into view.
 function FeedbackLine({ feedback }: FeedbackLineProps) {
     return (
         <MessageLine
             message={feedback.message}
             severity={feedback.severity}
             infoMessage={feedback.infoMessage}
+            outcomeKey={feedback}
         />
     );
 }

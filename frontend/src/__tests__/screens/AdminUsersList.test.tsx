@@ -795,6 +795,86 @@ it("COUSR00C F8 refusal puts the cursor on USRIDIN without marking it in error",
     expect(BodyRowTexts()).toEqual(RowTextsOf(FIRST_PAGE_ROWS));
 });
 
+// USRIDIN kept focused while the user scrolled down to the key bar lies above the viewport, and
+// focusing it again for the next answer scrolls nothing by itself.
+const FIELD_ABOVE_VIEWPORT_TOP = -368;
+const FIELD_HEIGHT = 56;
+// The gap the message line leaves between the viewport top and the cursor field it scrolls back
+// to: its scroll margin, one theme spacing unit, while a line shows, and none while it is blank.
+const SHOWN_LINE_SCROLL_MARGIN = 4;
+const BLANK_LINE_SCROLL_MARGIN = 0;
+
+interface RepeatedAnswerCase {
+    answer: string;
+    Answer: () => Promise<UserListResponse>;
+    scrollMargin: number;
+}
+
+// F8 answered twice alike, the cursor on USRIDIN both times: the end-of-file refusal, or a
+// further page whose ERRMSG line is blank.
+const REPEATED_ANSWER_CASES: readonly RepeatedAnswerCase[] = [
+    {
+        answer: `the refusal '${ALREADY_AT_BOTTOM}'`,
+        Answer: () =>
+            OutcomeOf({ literal: ALREADY_AT_BOTTOM, key: "F8", status: HTTP_BAD_REQUEST }),
+        scrollMargin: SHOWN_LINE_SCROLL_MARGIN,
+    },
+    {
+        answer: "a page with a blank ERRMSG",
+        Answer: () => Promise.resolve(BuildListResponse({ cursor_field: SEARCH_FIELD })),
+        scrollMargin: BLANK_LINE_SCROLL_MARGIN,
+    },
+];
+
+// Resolves in an animation frame requested after the message line's own, which jsdom runs in
+// request order.
+function NextAnimationFrame(): Promise<void> {
+    return new Promise((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+    });
+}
+
+// F8 pressed by pointer, which leaves the cursor where it is, once its answer has been shown.
+async function PageForwardByPointer(user: UserEvent): Promise<void> {
+    await TriggerKey(user, "F8", "button");
+    await ExpectKeysReady();
+    await NextAnimationFrame();
+}
+
+function LayOutAboveViewport(field: HTMLElement): void {
+    const aboveViewport = new DOMRect(0, FIELD_ABOVE_VIEWPORT_TOP, 0, FIELD_HEIGHT);
+    jest.spyOn(field, "getBoundingClientRect").mockReturnValue(aboveViewport);
+}
+
+// The window.scrollBy calls made while the steps run; jsdom implements no scrolling, so a spy
+// stands in for it until they end.
+async function WindowScrollsDuring(steps: () => Promise<void>): Promise<unknown[]> {
+    const scrollBySpy = jest.spyOn(window, "scrollBy").mockImplementation(() => undefined);
+    try {
+        await steps();
+        return [...scrollBySpy.mock.calls];
+    } finally {
+        scrollBySpy.mockRestore();
+    }
+}
+
+describe("COUSR00C cursor brought back into view by a repeated answer", () => {
+    it.each(REPEATED_ANSWER_CASES)(
+        "COUSR00C F8 answered by $answer again scrolls the focused USRIDIN back into view",
+        async ({ Answer, scrollMargin }) => {
+            const user = await RenderLoadedScreen();
+            mockListUsers.mockImplementation(Answer);
+            await PageForwardByPointer(user);
+            expect(SearchField()).toHaveFocus();
+            LayOutAboveViewport(SearchField());
+            const scrolls = await WindowScrollsDuring(() => PageForwardByPointer(user));
+            expect(mockListUsers).toHaveBeenCalledTimes(3);
+            expect(scrolls).toEqual([[{ top: FIELD_ABOVE_VIEWPORT_TOP - scrollMargin }]]);
+            expect(SearchField()).toHaveFocus();
+        },
+    );
+});
+
 it.each(TRIGGERS)(
     "COUSR00C F3 by %s returns to the admin menu (XCTL COADM01C)",
     async (trigger) => {

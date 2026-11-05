@@ -2,8 +2,9 @@
 // Labels and LENGTHs come from bms/COTRN01.bms; the literals are copied verbatim from
 // backend/app/services/transactions/cotrn01c.py, which ports cbl/COTRN01C.cbl lines 149, 285
 // and 292. The API module is mocked, so each response body is the one the backend sends.
+import { formControlClasses } from "@mui/material";
 import { ThemeProvider } from "@mui/material/styles";
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
 import {
     AxiosError,
@@ -869,5 +870,238 @@ describe("COTRN01C displayed-record status once the record leaves the screen", (
         expect(detailStatus.textContent).toBe("");
         expect(messageText).toBe(status.messageText);
         expect(DetailValues()).toEqual(EMPTY_DETAIL_VALUES);
+    });
+});
+
+// A read of SENT_TRAN_ID held until the test answers it: the arrival read of a CT00 selection
+// (typedText empty) or an ENTER read of the typed key.
+interface HeldReadCase {
+    origin: string;
+    queryTranId: string;
+    typedText: string;
+}
+
+interface HeldRead {
+    user: UserEvent;
+    AnswerRead: (detail: TransactionDetailResponse) => void;
+}
+
+// The key a held read was sent with and its record, and another key keyed during that read.
+const SENT_TRAN_ID = "0000000000000010";
+const SENT_DESCRIPTION = "Record ten answered late";
+const SENT_DETAIL: Readonly<TransactionDetailResponse> = BuildTransactionDetail({
+    tran_id: SENT_TRAN_ID,
+    tran_desc: SENT_DESCRIPTION,
+});
+const KEYED_DURING_READ = TEST_TRAN_ID;
+const OUTLINED_INPUT_CLASS = "MuiOutlinedInput-root";
+const HELD_READ_CASES: readonly HeldReadCase[] = [
+    { origin: "the arrival read", queryTranId: SENT_TRAN_ID, typedText: "" },
+    { origin: "an ENTER read", queryTranId: "", typedText: SENT_TRAN_ID },
+];
+
+// ENTER is pressed as a key, so the cursor stays in TRNIDIN as on arrival.
+async function StartHeldRead(readCase: HeldReadCase): Promise<HeldRead> {
+    const answerRead = DeferRead();
+    mockSearchParams = new URLSearchParams(
+        readCase.queryTranId === "" ? {} : { tranId: readCase.queryTranId },
+    );
+    const user = RenderScreen();
+    if (readCase.typedText !== "") {
+        await TypeTranId(user, readCase.typedText);
+        await PressFunctionKey(user, FETCH_KEY, "key");
+    }
+    await screen.findByRole("progressbar");
+    return { user, AnswerRead: answerRead };
+}
+
+// TRNIDIN during its read: read-only, yet outlined as a typable key and holding the cursor.
+function ExpectLockedTranId(): void {
+    expect(TranIdInput()).toHaveAttribute("readonly");
+    expect(TranIdInput().closest(`.${OUTLINED_INPUT_CLASS}`)).not.toBeNull();
+    expect(TranIdInput()).toHaveFocus();
+}
+
+// Text keyed into TRNIDIN during its read: by the keyboard, which a read-only input ignores, and
+// by a change event, which only the page's pending-read guard refuses.
+async function KeyIntoTranId(user: UserEvent): Promise<void> {
+    await user.type(TranIdInput(), KEYED_DURING_READ);
+    fireEvent.change(TranIdInput(), { target: { value: KEYED_DURING_READ } });
+}
+
+// The answer shows beneath the key it was read with: TRNIDIN and Transaction ID agree.
+async function ExpectAnswerUnderSentKey(): Promise<void> {
+    await screen.findByDisplayValue(SENT_DESCRIPTION);
+    expect(TranIdInput()).toHaveValue(SENT_TRAN_ID);
+    expect(DetailInput("Transaction ID:")).toHaveValue(SENT_TRAN_ID);
+}
+
+// The 3270 keyboard locks while the host runs the task, so TRNIDIN keeps the key that was sent.
+describe("COTRN01C TRNIDIN locked during a read", () => {
+    it.each(HELD_READ_CASES)(
+        "COTRN01C keeps TRNIDIN read-only during $origin and shows the answer under its key",
+        async (readCase) => {
+            const { user, AnswerRead } = await StartHeldRead(readCase);
+            ExpectLockedTranId();
+            await KeyIntoTranId(user);
+            expect(TranIdInput()).toHaveValue(SENT_TRAN_ID);
+            AnswerRead(SENT_DETAIL);
+            await ExpectAnswerUnderSentKey();
+            expect(TranIdInput()).not.toHaveAttribute("readonly");
+            await TypeTranId(user, KEYED_DURING_READ);
+            expect(TranIdInput()).toHaveValue(KEYED_DURING_READ);
+            expect(mockViewTransaction.mock.calls).toEqual([[SENT_TRAN_ID, READ_SIGNAL_OPTIONS]]);
+        },
+    );
+});
+
+// A change dispatched in the same turn as ENTER, before React re-renders TRNIDIN read-only.
+describe("COTRN01C text keyed with ENTER", () => {
+    it("COTRN01C refuses text keyed in the turn of ENTER, before TRNIDIN re-renders", async () => {
+        const answerRead = DeferRead();
+        const user = RenderScreen();
+        await TypeTranId(user, SENT_TRAN_ID);
+        act(() => {
+            fireEvent.keyDown(TranIdInput(), { key: "Enter" });
+            fireEvent.change(TranIdInput(), { target: { value: KEYED_DURING_READ } });
+        });
+        expect(TranIdInput()).toHaveValue(SENT_TRAN_ID);
+        expect(mockViewTransaction.mock.calls).toEqual([[SENT_TRAN_ID, READ_SIGNAL_OPTIONS]]);
+        answerRead(SENT_DETAIL);
+        await ExpectAnswerUnderSentKey();
+    });
+});
+
+// An entry as the server renders it, before hydration: a CT00 selection, whose arrival read is
+// due, or a blank selection, which reads nothing.
+interface FirstPaintCase {
+    entry: string;
+    queryTranId: string;
+    isLocked: boolean;
+}
+
+const FIRST_PAINT_CASES: readonly FirstPaintCase[] = [
+    { entry: "a CT00 selection", queryTranId: SENT_TRAN_ID, isLocked: true },
+    { entry: "the main menu", queryTranId: "", isLocked: false },
+    { entry: "an all-blank tranId", queryTranId: "   ", isLocked: false },
+];
+// The legend keys the keyboard lock holds; F3 and F5 stay live to leave the screen.
+const LOCKED_LEGEND_KEYS: readonly FunctionKeyCase[] = [FETCH_KEY, CLEAR_KEY];
+
+// The page's server markup, which runs no effect and so starts no read, parsed into a container
+// outside the document.
+function RenderServerMarkup(queryTranId: string): HTMLElement {
+    const { renderToString } =
+        jest.requireActual<typeof import("react-dom/server.node")>("react-dom/server.node");
+    mockSearchParams = new URLSearchParams(queryTranId === "" ? {} : { tranId: queryTranId });
+    const container = document.createElement("div");
+    container.innerHTML = renderToString(
+        <ThemeProvider theme={CARD_DEMO_THEME}>
+            <TransactionViewPage />
+        </ThemeProvider>,
+    );
+    return container;
+}
+
+// Text keyed between hydration and the arrival read meets a key already read-only, as a 3270
+// keyboard stays locked until the host sends the first map.
+describe("COTRN01C keyboard lock from the first paint", () => {
+    it.each(FIRST_PAINT_CASES)(
+        "COTRN01C first paint of $entry: TRNIDIN, ENTER and F4 locked is $isLocked",
+        (paintCase) => {
+            const markup = within(RenderServerMarkup(paintCase.queryTranId));
+            const tranIdInput = markup.getByLabelText<HTMLInputElement>(TRAN_ID_LABEL);
+            expect(tranIdInput.hasAttribute("readonly")).toBe(paintCase.isLocked);
+            expect(tranIdInput).toHaveAttribute("value", paintCase.queryTranId);
+            expect(markup.queryAllByRole("progressbar")).toHaveLength(paintCase.isLocked ? 1 : 0);
+            const lockedKeys = LOCKED_LEGEND_KEYS.map((functionKey) =>
+                markup.getByRole("button", { name: functionKey.buttonName }),
+            );
+            expect(lockedKeys.map((button) => button.hasAttribute("disabled"))).toEqual(
+                LOCKED_LEGEND_KEYS.map(() => paintCase.isLocked),
+            );
+            expect(mockViewTransaction).not.toHaveBeenCalled();
+        },
+    );
+});
+
+// TRNIDIN scrolled out of view above the viewport while it holds the cursor, as at 375x667 with
+// the window scrolled to the bottom. jsdom lays nothing out, so only the key's form control is
+// given rows here; its input and label stay unrendered, and the control's rows are the whole key.
+const KEY_ROOT_TOP_ABOVE_VIEWPORT = -494;
+const KEY_ROOT_HEIGHT = 56;
+
+// A press on the screen after a read, and the window scrolls it brings: one that brings the
+// key's top to the viewport top, or none. With ERRMSG blank no line shows, so no gap is kept.
+interface KeyInViewCase {
+    action: string;
+    outcome: string;
+    Press: (user: UserEvent) => Promise<void>;
+    windowScrolls: readonly ScrollToOptions[][];
+}
+
+// A read's answer is a new outcome even when it leaves ERRMSG as blank as the answer before it.
+// Text keyed into TRNIDIN answers nothing, so it is no outcome.
+const KEY_IN_VIEW_CASES: readonly KeyInViewCase[] = [
+    {
+        action: "ENTER reads a record with ERRMSG as blank as before",
+        outcome: "scrolls TRNIDIN back into view",
+        Press: async (user) => {
+            await PressFunctionKey(user, FETCH_KEY, "key");
+            await screen.findByDisplayValue(MASKED_CARD_NUMBER);
+        },
+        windowScrolls: [[{ top: KEY_ROOT_TOP_ABOVE_VIEWPORT }]],
+    },
+    {
+        action: "text is keyed into TRNIDIN",
+        outcome: "scrolls nothing",
+        Press: (user) => TypeTranId(user, MISSING_TRAN_ID),
+        windowScrolls: [],
+    },
+];
+
+// Resolves in a frame requested after the message line's own, which jsdom runs in request order.
+function NextAnimationFrame(): Promise<void> {
+    return new Promise((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+    });
+}
+
+// Lays TRNIDIN's form control out above the viewport, moved by each window.scrollBy as the
+// browser's scroll would move it; returns the spied window.scrollBy, which jsdom does not have.
+function LayOutKeyAboveViewport(): jest.SpiedFunction<typeof window.scrollBy> {
+    let scrolledBy = 0;
+    const keyRoot = TranIdInput().closest(`.${formControlClasses.root}`);
+    if (keyRoot === null) {
+        throw new Error("TRNIDIN renders no form control root.");
+    }
+    jest.spyOn(keyRoot, "getBoundingClientRect").mockImplementation(
+        () => new DOMRect(0, KEY_ROOT_TOP_ABOVE_VIEWPORT - scrolledBy, 0, KEY_ROOT_HEIGHT),
+    );
+    return jest
+        .spyOn(window, "scrollBy")
+        .mockImplementation((options?: ScrollToOptions | number) => {
+            if (typeof options === "object") {
+                scrolledBy += options.top ?? 0;
+            }
+        });
+}
+
+// COTRN01C sends the map after every ENTER, so the cursor on TRNIDIN is in view after each read,
+// even when focusing the key that already holds the cursor scrolls nothing.
+describe("COTRN01C TRNIDIN kept in view after a read", () => {
+    afterEach(() => jest.restoreAllMocks());
+
+    it.each(KEY_IN_VIEW_CASES)("COTRN01C $outcome when $action", async (keyCase) => {
+        const user = RenderScreen();
+        await TypeTranId(user, TEST_TRAN_ID);
+        await PressFunctionKey(user, FETCH_KEY, "key");
+        await screen.findByDisplayValue(MASKED_CARD_NUMBER);
+        await NextAnimationFrame();
+        const scrollBySpy = LayOutKeyAboveViewport();
+        await keyCase.Press(user);
+        await NextAnimationFrame();
+        expect(scrollBySpy.mock.calls).toEqual(keyCase.windowScrolls);
+        expect(TranIdInput()).toHaveFocus();
     });
 });

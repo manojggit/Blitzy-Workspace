@@ -231,15 +231,22 @@ interface FetchContext {
 }
 
 // StartRead aborts the read it replaces and returns the new read's signal; AbortRead aborts the
-// read in flight, if any.
+// read in flight, if any. FinishRead marks the read of that signal settled. IsReadPending is true
+// from StartRead until that read settles or is aborted, read at once rather than from a render.
 interface ReadController {
     StartRead: () => AbortSignal;
     AbortRead: () => void;
+    FinishRead: (signal: AbortSignal) => void;
+    IsReadPending: () => boolean;
 }
+
+type ReadPendingGuard = Pick<ReadController, "FinishRead" | "IsReadPending">;
+type ReadControllerRef = RefObject<AbortController | null>;
 
 interface TransactionFetcher {
     Fetch: (text: string) => void;
     AbortFetch: () => void;
+    IsFetchPending: () => boolean;
 }
 
 interface TransactionView extends TransactionFetcher {
@@ -262,6 +269,8 @@ interface ViewKeyActions {
 interface KeyFieldProps {
     value: string;
     isInvalid: boolean;
+    // Read-only while a read is pending; the typable key keeps its outlined look.
+    isLocked: boolean;
     inputRef: RefObject<HTMLInputElement | null>;
     onChange: (text: string) => void;
 }
@@ -406,11 +415,31 @@ function BuildFunctionKeys(actions: ViewKeyActions): readonly FunctionKeyDefinit
 // React recognises hooks only by the camelCase "use" prefix, so the hook names below are a
 // framework-mandated exception to the MK_Modernization Rule's PascalCase function naming.
 
+// Only the read that holds the ref frees it as it settles, so a replaced read that settles late
+// never frees the guard of the read after it. An aborted read is no longer pending, so the read
+// React's development remount starts after its simulated unmount is not refused.
+function useReadPendingGuard(controllerRef: ReadControllerRef): ReadPendingGuard {
+    const finishRead = useCallback(
+        (signal: AbortSignal) => {
+            if (controllerRef.current?.signal === signal) {
+                controllerRef.current = null;
+            }
+        },
+        [controllerRef],
+    );
+    const isReadPending = useCallback(
+        () => controllerRef.current !== null && !controllerRef.current.signal.aborted,
+        [controllerRef],
+    );
+    return { FinishRead: finishRead, IsReadPending: isReadPending };
+}
+
 // Each read owns an AbortController. A new read aborts the one it replaces; F3 and F5 abort the
 // one in flight as they leave, and the unmount does for any other navigation. The browser then
 // stops waiting for an answer nobody will see; the server may still complete the read.
 function useReadController(): ReadController {
     const controllerRef = useRef<AbortController | null>(null);
+    const pendingGuard = useReadPendingGuard(controllerRef);
     const abortRead = useCallback(() => controllerRef.current?.abort(), []);
     useEffect(() => abortRead, [abortRead]);
     const startRead = useCallback(() => {
@@ -419,7 +448,7 @@ function useReadController(): ReadController {
         controllerRef.current = controller;
         return controller.signal;
     }, [abortRead]);
-    return { StartRead: startRead, AbortRead: abortRead };
+    return { StartRead: startRead, AbortRead: abortRead, ...pendingGuard };
 }
 
 // The first entry with CDEMO-CT01-TRN-SELECTED set displays that transaction. The development
@@ -476,21 +505,45 @@ function useInvalidKey(setScreen: ScreenSetter): () => void {
 }
 
 // A non-axios error rejects the returned promise unhandled: it is a defect, never a screen
-// message.
+// message. The read stays pending until it settles, however it settles.
 function useFetchTransaction(setScreen: ScreenSetter): TransactionFetcher {
     const router = useRouter();
-    const { StartRead, AbortRead } = useReadController();
+    const { StartRead, AbortRead, FinishRead, IsReadPending } = useReadController();
     const fetchTransaction = useCallback(
-        (text: string) => void HandleFetch(text, { router, setScreen, signal: StartRead() }),
-        [router, setScreen, StartRead],
+        (text: string) => {
+            const signal = StartRead();
+            void HandleFetch(text, { router, setScreen, signal }).finally(() => FinishRead(signal));
+        },
+        [router, setScreen, StartRead, FinishRead],
     );
-    return { Fetch: fetchTransaction, AbortFetch: AbortRead };
+    return { Fetch: fetchTransaction, AbortFetch: AbortRead, IsFetchPending: IsReadPending };
+}
+
+// TRNIDIN refuses text keyed while a read is pending, at once and before React re-renders the
+// read-only key, so an answer always shows under the key it was read with.
+function GuardedKeySetter(
+    setText: Dispatch<SetStateAction<string>>,
+    isReadPending: () => boolean,
+): (text: string) => void {
+    return (text: string) => {
+        if (!isReadPending()) {
+            setText(text);
+        }
+    };
+}
+
+// A first entry with CDEMO-CT01-TRN-SELECTED set starts with the keyboard locked, as a 3270
+// keyboard stays locked until the host sends the first map. The key rendered on the server and
+// hydrated is read-only from the first paint, so nothing keyed before the arrival read starts
+// can stand above its answer. A blank selection reads nothing and starts unlocked.
+function InitialScreen(initialTranId: string): ViewScreen {
+    return IsBlank(initialTranId) ? CLEARED_SCREEN : FETCHING_SCREEN;
 }
 
 // The key starts as the CT00 selection, as COTRN01C moves CDEMO-CT01-TRN-SELECTED to TRNIDINI.
 function useTransactionView(initialTranId: string): TransactionView {
     const [tranIdText, setTranIdText] = useState(initialTranId);
-    const [screen, setScreen] = useState<ViewScreen>(CLEARED_SCREEN);
+    const [screen, setScreen] = useState<ViewScreen>(() => InitialScreen(initialTranId));
     const tranIdInputRef = useRef<HTMLInputElement>(null);
     const fieldRefs = useMemo<FieldRefs>(() => ({ [TRAN_ID_FIELD]: tranIdInputRef }), []);
     const fetcher = useFetchTransaction(setScreen);
@@ -502,7 +555,7 @@ function useTransactionView(initialTranId: string): TransactionView {
         tranIdText,
         screen,
         tranIdInputRef,
-        ChangeTranIdText: setTranIdText,
+        ChangeTranIdText: GuardedKeySetter(setTranIdText, fetcher.IsFetchPending),
         ...fetcher,
         Clear: clearScreen,
         ShowInvalidKey: useInvalidKey(setScreen),
@@ -536,6 +589,12 @@ function KeyInputProps(isInvalid: boolean) {
     return { maxLength: TRAN_ID_MAX_LENGTH, ...ErrorMessageReference(isInvalid) };
 }
 
+// The 3270 keyboard locks while the host runs the task: the key stays read-only yet focusable
+// until the answer shows beneath it.
+function KeySlotProps(isLocked: boolean, isInvalid: boolean) {
+    return { input: { readOnly: isLocked }, htmlInput: KeyInputProps(isInvalid) };
+}
+
 // TRNIDIN keeps the text exactly as typed: COTRN01C neither upper-cases nor edits it beyond the
 // blank test, and the BMS LENGTH is the only client-side limit.
 function KeyField(props: KeyFieldProps) {
@@ -551,7 +610,7 @@ function KeyField(props: KeyFieldProps) {
                     error={props.isInvalid}
                     inputRef={props.inputRef}
                     onChange={(event) => props.onChange(event.target.value)}
-                    slotProps={{ htmlInput: KeyInputProps(props.isInvalid) }}
+                    slotProps={KeySlotProps(props.isLocked, props.isInvalid)}
                 />
             </Grid>
         </Grid>
@@ -605,11 +664,17 @@ function DetailStatus({ isDetailShown }: DetailStatusProps) {
     );
 }
 
+// The feedback object is the outcome's identity. Every answer, refusal, invalid key and
+// carried-over message makes a new one; the cleared screen and a read in flight share the frozen
+// empty one; text keyed into TRNIDIN keeps the one shown. So a read that leaves ERRMSG as blank as
+// the read before it is still a new outcome, after which the message line scrolls TRNIDIN back
+// into view, which focusing the key that already holds the cursor does not do.
 function MessageLinePropsOf(feedback: ViewFeedback): MessageLineProps {
     return {
         message: feedback.message,
         severity: feedback.severity,
         infoMessage: feedback.infoMessage,
+        outcomeKey: feedback,
     };
 }
 
@@ -621,12 +686,13 @@ function IsTranIdInvalid(feedback: ViewFeedback): boolean {
 // inside it rather than in a second Stack. The Divider replaces the dashed row-8 separator line,
 // and the four buttons replace the row-24 PF legend.
 function ViewContent({ view, functionKeys }: ViewContentProps) {
-    const { detail, feedback } = view.screen;
+    const { detail, feedback, isBusy } = view.screen;
     return (
         <>
             <KeyField
                 value={view.tranIdText}
                 isInvalid={IsTranIdInvalid(feedback)}
+                isLocked={isBusy}
                 inputRef={view.tranIdInputRef}
                 onChange={view.ChangeTranIdText}
             />

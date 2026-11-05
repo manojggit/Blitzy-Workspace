@@ -1622,3 +1622,92 @@ describe("COCRDLIC polite result status on /cards", () => {
         AnnouncesUnactionedSelectionReread,
     );
 });
+
+// The account filter, still focused, left above the viewport when the user scrolled down to the
+// list and pressed ENTER: focusing it again for the answer scrolls nothing by itself.
+const CURSOR_FIELD_ABOVE_VIEWPORT_TOP = -368;
+const CURSOR_FIELD_HEIGHT = 56;
+// The scroll margin the message line's style keeps between the viewport top and the cursor field.
+const LINE_SCROLL_MARGIN_PIXELS = 4;
+const CURSOR_FIELD_REVEAL_SCROLL = Math.floor(
+    CURSOR_FIELD_ABOVE_VIEWPORT_TOP - LINE_SCROLL_MARGIN_PIXELS,
+);
+
+// An ENTER answer that shows exactly the lines the answer before it showed.
+interface RepeatedAnswer {
+    outcomeName: string;
+    QueueAnswer: () => void;
+}
+
+// A page brings the record-actions line alone every time; a refused filter its literal.
+const REPEATED_ANSWERS: readonly RepeatedAnswer[] = [
+    {
+        outcomeName: "the record-actions line of a page",
+        QueueAnswer: () => mockListCards.mockResolvedValue(BuildListResponse()),
+    },
+    {
+        outcomeName: "the account filter literal",
+        QueueAnswer: () =>
+            mockListCards.mockRejectedValue(BuildAxiosError(HTTP_BAD_REQUEST, FilterRefusalBody())),
+    },
+];
+
+interface RepeatedOutcomeCase extends RepeatedAnswer {
+    trigger: KeyTrigger;
+}
+
+const REPEATED_OUTCOME_CASES: readonly RepeatedOutcomeCase[] = REPEATED_ANSWERS.flatMap((answer) =>
+    KEY_TRIGGERS.map((trigger) => ({ ...answer, trigger })),
+);
+
+// window.scrollBy, by which the message line keeps the focused control in view; jsdom implements
+// none and reports each call.
+let scrollBySpy: jest.SpiedFunction<typeof window.scrollBy>;
+
+// Resolves in an animation frame requested after the message line's own, which jsdom runs in
+// request order.
+function NextAnimationFrame(): Promise<void> {
+    return new Promise((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+    });
+}
+
+// Lays the focused account filter out above the viewport; jsdom lays nothing out by itself.
+function LayCursorFieldAboveViewport(): HTMLInputElement {
+    const cursorField = FilterInput(ACCOUNT_FILTER_LABEL);
+    expect(cursorField).toHaveFocus();
+    const box = new DOMRect(0, CURSOR_FIELD_ABOVE_VIEWPORT_TOP, 0, CURSOR_FIELD_HEIGHT);
+    jest.spyOn(cursorField, "getBoundingClientRect").mockReturnValue(box);
+    return cursorField;
+}
+
+// Each answer is a new outcome even when its lines repeat, so the cursor field that kept the
+// focus is scrolled back into view, as the 3270 showed the whole map after every key.
+async function KeepsCursorFieldInViewOnRepeat({ trigger, QueueAnswer }: RepeatedOutcomeCase) {
+    const user = await RenderScreen();
+    QueueAnswer();
+    await PressScreenKey(user, "Enter", trigger);
+    await NextAnimationFrame();
+    const cursorField = LayCursorFieldAboveViewport();
+    await PressScreenKey(user, "Enter", trigger);
+    expect(mockListCards).toHaveBeenCalledTimes(3);
+    await waitFor(() => {
+        expect(scrollBySpy.mock.calls).toEqual([[{ top: CURSOR_FIELD_REVEAL_SCROLL }]]);
+    });
+    expect(cursorField).toHaveFocus();
+}
+
+describe("COCRDLIC cursor field kept in view on a repeated answer on /cards", () => {
+    beforeEach(() => {
+        scrollBySpy = jest.spyOn(window, "scrollBy").mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+        scrollBySpy.mockRestore();
+    });
+
+    it.each(REPEATED_OUTCOME_CASES)(
+        "COCRDLIC ENTER by $trigger answered again with $outcomeName scrolls the cursor into view",
+        KeepsCursorFieldInViewOnRepeat,
+    );
+});

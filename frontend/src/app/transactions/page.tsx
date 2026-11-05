@@ -730,9 +730,23 @@ function TransactionRows({ view }: ListViewProps) {
     );
 }
 
+// Every answer and every refused key sets a new feedback object, and typing or a Sel code never
+// does, so its identity is the outcome: an answer repeating the lines shown, the blank ERRMSG of
+// a plain page included, still keeps TRNIDIN, which it focuses again without scrolling, in view.
+function ListMessageLine({ view }: ListViewProps) {
+    const { feedback } = view.screen;
+    return (
+        <MessageLine
+            message={feedback.message}
+            severity={feedback.severity}
+            infoMessage={feedback.infoMessage}
+            outcomeKey={feedback}
+        />
+    );
+}
+
 function TransactionListScreen() {
     const view = useTransactionList();
-    const { message, severity, infoMessage } = view.screen.feedback;
     return (
         <ScreenShell
             transactionId={TRANSACTION_ID}
@@ -745,7 +759,7 @@ function TransactionListScreen() {
             <Typography variant="bodyMedium" component="p">
                 {SELECTION_INSTRUCTION}
             </Typography>
-            <MessageLine message={message} severity={severity} infoMessage={infoMessage} />
+            <ListMessageLine view={view} />
             <FunctionKeyBar keys={view.keys} />
         </ScreenShell>
     );

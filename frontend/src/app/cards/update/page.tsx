@@ -895,6 +895,25 @@ function CardDetailFields({ view }: FieldSectionProps) {
     );
 }
 
+interface CardUpdateMessageLineProps {
+    feedback: ScreenFeedbackView;
+}
+
+// The ERRMSG and INFOMSG lines. Each answer, and a pending message on entry, sets a new feedback
+// object, which typing never replaces, so its identity is the outcome: a literal answered again
+// with the same lines still counts as a new outcome, and the cursor field that kept the focus is
+// brought back into view.
+function CardUpdateMessageLine({ feedback }: CardUpdateMessageLineProps) {
+    return (
+        <MessageLine
+            message={feedback.message}
+            severity={feedback.severity}
+            infoMessage={feedback.infoMessage}
+            outcomeKey={feedback}
+        />
+    );
+}
+
 function CardUpdateScreen() {
     const { view, feedback, isBusy, legendKeys } = useCardUpdateScreen();
     return (
@@ -906,11 +925,7 @@ function CardUpdateScreen() {
         >
             <CardKeyFields view={view} />
             <CardDetailFields view={view} />
-            <MessageLine
-                message={feedback.message}
-                severity={feedback.severity}
-                infoMessage={feedback.infoMessage}
-            />
+            <CardUpdateMessageLine feedback={feedback} />
             <FunctionKeyBar keys={legendKeys} />
         </ScreenShell>
     );

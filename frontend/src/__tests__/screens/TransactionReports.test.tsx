@@ -115,6 +115,17 @@ const MENU_ROUTE = "/menu";
 
 const REPORT_TABLE_LABEL = "Transaction report";
 const REPORT_LINES_REGION_LABEL = "Transaction report lines";
+// The region's bound in theme spacing units, and its edge cue's layers: a paper-coloured cover at
+// the left, right and bottom edges, over a shadow at each.
+const REPORT_REGION_MAX_HEIGHT_UNITS = 150;
+const REPORT_REGION_CUE_IMAGES = [
+    "linear-gradient(to right, #F3EDF7 30%, transparent)",
+    "linear-gradient(to left, #F3EDF7 30%, transparent)",
+    "linear-gradient(to top, #F3EDF7 30%, transparent)",
+    "linear-gradient(to right, rgba(0, 0, 0, 0.3), transparent)",
+    "linear-gradient(to left, rgba(0, 0, 0, 0.3), transparent)",
+    "linear-gradient(to top, rgba(0, 0, 0, 0.3), transparent)",
+].join(", ");
 // CVTRA07Y TRANSACTION-HEADER-1, trimmed.
 const TABLE_HEADINGS = [
     "Transaction ID",
@@ -1474,6 +1485,29 @@ it("CORPT00C an edit failure naming the part ENTER was pressed in keeps it focus
     ExpectFocusedField(DatePartInput(START_MONTH_PART));
 });
 
+// A PF key never moved the 3270 cursor: Continue, reached by Tab from CONFIRM and pressed with
+// Enter, gives the focus back to CONFIRM once the call disables it, never to the page body, until
+// the submitted report puts the cursor on MONTHLY.
+it("CORPT00C Enter on Continue tabbed to from CONFIRM keeps CONFIRM focused", async () => {
+    const pendingReport = DeferReport();
+    const user = await RenderScreen();
+    await user.click(MonthlyButton());
+    await user.type(ConfirmInput(), "Y");
+    const continueButton = screen.getByRole("button", { name: ENTER_KEY.buttonName });
+    await user.tab();
+    expect(continueButton).toHaveFocus();
+    await user.keyboard("{Enter}");
+    ExpectKeyboardLocked();
+    expect(document.activeElement).toBe(ConfirmInput());
+    await SettleOutcome(pendingReport, SubmittedOutcome(MONTHLY_SUBMITTED_MESSAGE, REPORT_LINES));
+    await ExpectAlert(MONTHLY_SUBMITTED_MESSAGE, "success");
+    expect(mockFetchTransactionReport).toHaveBeenCalledWith(
+        { ...BLANK_TEXT_QUERY, reportType: ReportType.MONTHLY, confirm: "Y" },
+        READ_SIGNAL_OPTIONS,
+    );
+    await waitFor(() => expect(MonthlyButton()).toHaveFocus());
+});
+
 it.each(FLAGGED_REPORT_TYPE_CASES)(
     "CORPT00C marks the Report type group invalid after $name",
     async ({ status, body, chosenLabel }) => {
@@ -1866,6 +1900,17 @@ it("CORPT00C report table scrolls in a named region, the tab stop after CONFIRM"
     await user.click(ConfirmInput());
     await user.tab();
     expect(region).toHaveFocus();
+});
+
+// The bounded region cues the lines it hides below its fold as well as at its sides; the sticky
+// headings hold its top edge.
+it("CORPT00C report region is at most 600 px tall and cues the lines below its fold", async () => {
+    await ShowMonthlyReport();
+    const region = screen.getByRole("region", { name: REPORT_LINES_REGION_LABEL });
+    expect(region).toHaveStyle({
+        maxHeight: CARD_DEMO_THEME.spacing(REPORT_REGION_MAX_HEIGHT_UNITS),
+        backgroundImage: REPORT_REGION_CUE_IMAGES,
+    });
 });
 
 // MUI's start-icon wrapper puts a zero-width space ahead of each link's text, so each link is
@@ -2400,3 +2445,83 @@ it("CORPT00C tells a confirmed empty range by its dates and cursor, not its mess
     ExpectEmptyReportTable();
     ExpectCompleteDownloads(MONTHLY_CONFIRMED_QUERY);
 });
+
+// MONTHLY laid out above the viewport, as after the user scrolled the page down with the cursor
+// left on it. jsdom lays nothing out, so the segment reports this box, and window.scrollBy moves
+// it by the scroll the page asks for, as a browser scrolling the window would.
+const CONTROL_TOP_ABOVE_VIEWPORT = -400;
+const CONTROL_BOX_HEIGHT = 40;
+
+function ScrollTopOf(scrollOptions: unknown): number {
+    if (typeof scrollOptions === "object" && scrollOptions !== null && "top" in scrollOptions) {
+        return Number(scrollOptions.top);
+    }
+    return 0;
+}
+
+function LayOutAboveViewport(control: HTMLElement): void {
+    let controlTop = CONTROL_TOP_ABOVE_VIEWPORT;
+    jest.spyOn(control, "getBoundingClientRect").mockImplementation(
+        () => new DOMRect(0, controlTop, 0, CONTROL_BOX_HEIGHT),
+    );
+    jest.spyOn(window, "scrollBy").mockImplementation((...scrollArguments: unknown[]) => {
+        controlTop -= ScrollTopOf(scrollArguments[0]);
+    });
+}
+
+function ExpectWhollyInView(control: HTMLElement): void {
+    const box = control.getBoundingClientRect();
+    expect(box.top).toBeGreaterThanOrEqual(0);
+    expect(box.bottom).toBeLessThanOrEqual(window.innerHeight);
+}
+
+// Resolves in a frame requested now, which jsdom runs after every frame requested before it.
+async function NextAnimationFrame(): Promise<void> {
+    await act(
+        () =>
+            new Promise<void>((resolve) => {
+                window.requestAnimationFrame(() => resolve());
+            }),
+    );
+}
+
+// A key pressed with the cursor on MONTHLY, and the outcome it repeats: ENTER with no report
+// type refused again, or the invalid-key literal of an unbound key again.
+interface RepeatedOutcomeCase {
+    outcome: string;
+    Press: (user: UserEvent) => Promise<void>;
+}
+
+const REPEATED_OUTCOME_CASES: readonly RepeatedOutcomeCase[] = [
+    {
+        outcome: SELECT_REPORT_TYPE_MESSAGE,
+        Press: (user) => PressScreenKey(user, ENTER_KEY, "click"),
+    },
+    { outcome: INVALID_KEY_MESSAGE, Press: (user) => PressKey(user, "F4") },
+];
+
+// Resolves once the outcome is shown and the busy bar is gone, so ENTER takes the next press.
+async function ExpectOutcomeSettled(outcome: string): Promise<void> {
+    await ExpectAlert(outcome, "error");
+    await waitFor(() => expect(screen.queryByRole("progressbar")).not.toBeInTheDocument());
+}
+
+// Each outcome is new, even one repeating the lines shown. It focuses MONTHLY again, which
+// scrolls nothing while the segment already has focus, so the message line brings the segment
+// the user scrolled away from back into view.
+it.each(REPEATED_OUTCOME_CASES)(
+    "CORPT00C $outcome shown again scrolls the focused MONTHLY back into view",
+    async ({ outcome, Press }) => {
+        MockReportOutcome(EditFailure(SELECT_REPORT_TYPE_MESSAGE, "reportType"));
+        const user = await RenderScreen();
+        await Press(user);
+        await ExpectOutcomeSettled(outcome);
+        await NextAnimationFrame();
+        expect(MonthlyButton()).toHaveFocus();
+        LayOutAboveViewport(MonthlyButton());
+        await Press(user);
+        await ExpectOutcomeSettled(outcome);
+        await waitFor(() => ExpectWhollyInView(MonthlyButton()));
+        expect(MonthlyButton()).toHaveFocus();
+    },
+);
