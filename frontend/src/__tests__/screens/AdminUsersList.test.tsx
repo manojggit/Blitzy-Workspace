@@ -877,6 +877,96 @@ it.each(UNBOUND_KEYS)("COUSR00C %s while an F8 browse runs answers nothing", asy
     expect(mockListUsers).toHaveBeenCalledTimes(2);
 });
 
+// A second ENTER, the bound F3 or F8, or a PF key outside the legend, pressed in ENTER's turn.
+const SAME_TURN_SECOND_KEYS: readonly PfKey[] = ["ENTER", "F3", "F8", "F12"];
+// The delete route the server answers for D on TESTUSR1 (XCTL COUSR03C).
+const DELETE_ROUTE = `/admin/users/delete?userId=${TEST_USER_ID}`;
+// F8 from the last key of the loaded page 1.
+const FIRST_FORWARD_QUERY: UserListQuery = {
+    startKey: FIRST_PAGE_LAST_KEY,
+    direction: Direction.FORWARD,
+    page: 1,
+};
+// F8 again, from the last key of the page 2 the first F8 brought.
+const NEXT_FORWARD_QUERY: UserListQuery = {
+    startKey: OTHER_PAGE_LAST_KEY,
+    direction: Direction.FORWARD,
+    page: 2,
+};
+
+// Keys dispatched on window inside one act, so no render, and no effect handing the keys their
+// disabled state, runs between two presses.
+async function PressInOneTurn(keys: readonly PfKey[]): Promise<void> {
+    await act(async () => {
+        for (const key of keys) {
+            const init = { key: PF_KEY_ACTIONS[key], bubbles: true, cancelable: true };
+            window.dispatchEvent(new KeyboardEvent("keydown", init));
+        }
+    });
+}
+
+// An ENTER selection held in flight until the test answers it, inside act, through the returned
+// function.
+function HoldSelection(): (response: UserSelectionResponse) => Promise<void> {
+    let answerSelection: (response: UserSelectionResponse) => void = () => undefined;
+    mockSelectUsers.mockImplementation(
+        () =>
+            new Promise((resolve) => {
+                answerSelection = resolve;
+            }),
+    );
+    return async (response) => {
+        await act(async () => {
+            answerSelection(response);
+        });
+    };
+}
+
+// The keys disable a render after ENTER, so a key pressed in that gap meets the in-flight lock:
+// one selection is sent, no browse or menu return starts, the selection's route is followed, and
+// the lock then clears.
+it.each(SAME_TURN_SECOND_KEYS)(
+    "COUSR00C ENTER and %s in one turn send one selection, answered as normal",
+    async (secondKey) => {
+        const answerSelection = HoldSelection();
+        const user = await RenderLoadedScreen();
+        await ChooseSelection(user, SELECTED_ROW_NUMBER, "D");
+        await PressInOneTurn(["ENTER", secondKey]);
+        const chosen = { rowNumber: SELECTED_ROW_NUMBER, code: "D" };
+        const selections = ExpectedSelections(FIRST_PAGE_ROWS, chosen);
+        expect(mockSelectUsers).toHaveBeenCalledTimes(1);
+        expect(mockSelectUsers).toHaveBeenCalledWith({ selections, search_user_id: "" });
+        expect(mockListUsers).toHaveBeenCalledTimes(1);
+        expect(mockRouterPush).not.toHaveBeenCalled();
+        expect(screen.queryByRole("alert")).toBeNull();
+        await answerSelection({ route: DELETE_ROUTE });
+        await ExpectKeysReady();
+        expect(mockRouterPush).toHaveBeenCalledTimes(1);
+        expect(mockRouterPush).toHaveBeenCalledWith(DELETE_ROUTE);
+        await PressInOneTurn(["ENTER"]);
+        expect(mockSelectUsers).toHaveBeenCalledTimes(2);
+        expect(mockSelectUsers).toHaveBeenLastCalledWith({ selections, search_user_id: "" });
+    },
+);
+
+// A second F8 in the same turn meets the in-flight lock instead of superseding the first: one
+// browse is sent and never aborted, its page is shown, and the lock then clears.
+it("COUSR00C F8 twice in one turn sends one browse, answered as normal", async () => {
+    await RenderLoadedScreen();
+    const answerBrowse = HoldNextBrowse();
+    await PressInOneTurn(["F8", "F8"]);
+    expect(mockListUsers).toHaveBeenCalledTimes(2);
+    expect(mockListUsers).toHaveBeenLastCalledWith(FIRST_FORWARD_QUERY, READ_OPTIONS);
+    expect(ReadSignal(1)?.aborted).toBe(false);
+    await answerBrowse(BuildListResponse({ rows: OTHER_PAGE_ROWS, page: 2 }));
+    await ExpectKeysReady();
+    expect(BodyRowTexts()).toEqual(RowTextsOf(OTHER_PAGE_ROWS));
+    expect(screen.getByText("Page: 2")).toBeVisible();
+    await PressInOneTurn(["F8"]);
+    expect(mockListUsers).toHaveBeenCalledTimes(3);
+    expect(mockListUsers).toHaveBeenLastCalledWith(NEXT_FORWARD_QUERY, READ_OPTIONS);
+});
+
 // The session refusal has a blank message; the apiClient interceptor, not the page, sends the
 // browser to sign-on, as EIBCALEN = 0 returned to COSGN00C.
 it("COUSR00C 401 on the first browse shows no message; apiClient owns /signon", async () => {

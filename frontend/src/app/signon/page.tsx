@@ -149,10 +149,13 @@ interface CredentialState {
     ClearCredentials: () => void;
 }
 
+// isInFlightRef is the synchronous call lock: true from the ENTER or F3 that sends a call until
+// that call settles, so a key pressed before the busy render reaches the keys is refused.
 interface ScreenState {
     feedback: SignOnFeedback;
     thankYouText: string;
     isBusy: boolean;
+    isInFlightRef: RefObject<boolean>;
     SetFeedback: Dispatch<SetStateAction<SignOnFeedback>>;
     SetThankYouText: Dispatch<SetStateAction<string>>;
     SetBusy: Dispatch<SetStateAction<boolean>>;
@@ -306,22 +309,50 @@ async function SubmitExit(context: SignOnContext): Promise<void> {
 
 // WHEN OTHER reads no file, so nothing reaches the server: the typed User ID and Password stay,
 // and the invalid-key literal takes the sign-off notice's place, as ENTER and F3 clear that
-// notice. Each press is a new feedback, so the cursor returns to USERID every time.
+// notice. Each press is a new feedback, so the cursor returns to USERID every time. It is refused
+// while a call is in flight, so the call's answer is what the screen shows.
 function ShowInvalidKey(form: SignOnForm): void {
+    if (form.isInFlightRef.current) {
+        return;
+    }
     form.SetThankYouText("");
     form.SetFeedback({ ...INVALID_KEY_FEEDBACK });
 }
 
+// One ENTER or F3 call at a time. The disabled keys take effect only a render after the press, so
+// the lock, taken before the call changes anything, refuses a second press in that gap. It clears
+// when the call settles, a rethrown defect included.
+async function RunExclusive(
+    isInFlightRef: RefObject<boolean>,
+    call: () => Promise<void>,
+): Promise<void> {
+    if (isInFlightRef.current) {
+        return;
+    }
+    isInFlightRef.current = true;
+    try {
+        await call();
+    } finally {
+        isInFlightRef.current = false;
+    }
+}
+
 // The COSGN00 legend ENTER=Sign-on  F3=Exit; no other key is bound.
 function BuildSignOnKeys(context: SignOnContext, isBusy: boolean): FunctionKeyDefinition[] {
+    const { isInFlightRef } = context.form;
     return [
         {
             key: "ENTER",
             label: "Sign-on",
-            onPress: () => void SubmitSignOn(context),
+            onPress: () => void RunExclusive(isInFlightRef, () => SubmitSignOn(context)),
             disabled: isBusy,
         },
-        { key: "F3", label: "Exit", onPress: () => void SubmitExit(context), disabled: isBusy },
+        {
+            key: "F3",
+            label: "Exit",
+            onPress: () => void RunExclusive(isInFlightRef, () => SubmitExit(context)),
+            disabled: isBusy,
+        },
     ];
 }
 
@@ -351,11 +382,13 @@ function useScreenState(): ScreenState {
     const [feedback, setFeedback] = useState<SignOnFeedback>(FRESH_SCREEN_FEEDBACK);
     const [thankYouText, setThankYouText] = useState("");
     const [isBusy, setBusy] = useState(false);
+    const isInFlightRef = useRef(false);
     return useMemo(
         () => ({
             feedback,
             thankYouText,
             isBusy,
+            isInFlightRef,
             SetFeedback: setFeedback,
             SetThankYouText: setThankYouText,
             SetBusy: setBusy,
@@ -406,8 +439,9 @@ function useSignOnForm(): SignOnForm {
 }
 
 // The XCTL to the user's menu ends with that menu: the route change runs as a transition, so the
-// screen stays busy until the menu has rendered and a second ENTER cannot sign on again. Any other
-// PF key is refused while busy, like ENTER and F3.
+// screen stays busy until the menu has rendered. The call lock refuses a key pressed before the
+// busy render reaches the keys, and the busy state every key after it, so a second ENTER cannot
+// sign on again. Any other PF key is refused the same way, like ENTER and F3.
 function useSignOnKeys(form: SignOnForm): SignOnKeys {
     const router = useRouter();
     const { RefreshSession, ClearSession } = useSession();

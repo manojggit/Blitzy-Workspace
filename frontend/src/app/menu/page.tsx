@@ -111,7 +111,11 @@ const NO_FEEDBACK: MenuFeedback = {
 };
 
 // What one API call on this screen may change: the progress bar and the message line.
+// isInFlightRef is the synchronous call lock: true from the ENTER, F3 or option click that sends a
+// call until that call settles, so a key pressed before the busy render reaches the keys is
+// refused.
 interface ScreenCallContext {
+    isInFlightRef: RefObject<boolean>;
     SetIsBusy: (isBusy: boolean) => void;
     ShowFeedback: (feedback: MenuFeedback) => void;
     ClearFeedback: () => void;
@@ -287,9 +291,10 @@ function useMenuFeedback(): MenuFeedbackState {
 
 function useScreenCall(): ScreenCallState {
     const [isBusy, setIsBusy] = useState(false);
+    const isInFlightRef = useRef(false);
     const { feedback, inputRef, ShowFeedback, ClearFeedback } = useMenuFeedback();
     const callContext = useMemo<ScreenCallContext>(
-        () => ({ SetIsBusy: setIsBusy, ShowFeedback, ClearFeedback }),
+        () => ({ isInFlightRef, SetIsBusy: setIsBusy, ShowFeedback, ClearFeedback }),
         [ShowFeedback, ClearFeedback],
     );
     return { isBusy, feedback, inputRef, callContext };
@@ -357,11 +362,17 @@ function useMenuOptions(callContext: ScreenCallContext): ShownOptions {
 }
 
 // One call with the progress bar shown and the previous message cleared; an axios failure becomes
-// the message line.
+// the message line. The disabled keys take effect only a render after the press, so the call
+// lock, taken before anything else, refuses a second press in that gap; it clears when the call
+// settles, a rethrown defect included.
 async function RunScreenCall(
     callContext: ScreenCallContext,
     call: () => Promise<void>,
 ): Promise<void> {
+    if (callContext.isInFlightRef.current) {
+        return;
+    }
+    callContext.isInFlightRef.current = true;
     callContext.ClearFeedback();
     callContext.SetIsBusy(true);
     try {
@@ -369,6 +380,7 @@ async function RunScreenCall(
     } catch (error) {
         callContext.ShowFeedback(FeedbackFromError(error));
     } finally {
+        callContext.isInFlightRef.current = false;
         callContext.SetIsBusy(false);
     }
 }
@@ -408,7 +420,9 @@ async function SignOff(context: MenuActionContext): Promise<void> {
 }
 
 // The XCTL ends with the next screen: the route change runs as a transition, so the menu stays
-// busy until the routed page has rendered and a second ENTER cannot send another call.
+// busy until the routed page has rendered. The call lock refuses a key pressed before the busy
+// render reaches the keys, and the busy state every key after it, so a second ENTER cannot send
+// another call.
 function useMenuActionContext(callContext: ScreenCallContext): MenuActionState {
     const router = useRouter();
     const { ClearSession } = useSession();
@@ -444,8 +458,17 @@ function BuildFunctionKeys(inputs: FunctionKeyInputs): FunctionKeyDefinition[] {
     ];
 }
 
+// The WHEN OTHER answer, refused while a call is in flight, so the call's answer is the message
+// shown.
+function ShowInvalidKey(callContext: ScreenCallContext): void {
+    if (callContext.isInFlightRef.current) {
+        return;
+    }
+    callContext.ShowFeedback(InvalidKeyFeedback());
+}
+
 // Each invalid key shows a new feedback, so the cursor returns to OPTION even after it left it.
-// The key is refused while the screen is busy, like ENTER and F3.
+// The key is refused while the screen is busy or a call is in flight, like ENTER and F3.
 function useMenuControls(inputs: FunctionKeyInputs): MenuControls {
     const { actionContext, optionText, isBusy } = inputs;
     const keys = useMemo(
@@ -454,7 +477,7 @@ function useMenuControls(inputs: FunctionKeyInputs): MenuControls {
     );
     const { callContext } = actionContext;
     const invalidKeyAction = useMemo(
-        () => ({ onPress: () => callContext.ShowFeedback(InvalidKeyFeedback()), disabled: isBusy }),
+        () => ({ onPress: () => ShowInvalidKey(callContext), disabled: isBusy }),
         [callContext, isBusy],
     );
     const selectListedOption = useCallback(

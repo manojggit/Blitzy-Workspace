@@ -125,7 +125,8 @@ interface ListScreenState {
 }
 
 type ScreenUpdate = Dispatch<SetStateAction<ListScreenState>>;
-// Starts an F7 or F8 browse: aborts the one still in flight and returns the new one's signal.
+// Starts an F7 or F8 browse: aborts any earlier one left in flight and returns the new one's
+// signal, which leaving the screen aborts.
 type PageReadStarter = () => AbortSignal;
 type ReadControllerRef = RefObject<AbortController | null>;
 
@@ -136,6 +137,9 @@ interface ScreenActions {
     // Runs a selection's route change as a transition, which keeps the screen busy until the
     // routed screen has rendered.
     startNavigation: TransitionStartFunction;
+    // The synchronous call lock: true from the ENTER, F7 or F8 that sends a call until that call
+    // settles, so a key pressed before the busy render reaches the keys is refused.
+    isInFlightRef: RefObject<boolean>;
 }
 
 const EMPTY_FEEDBACK: CompleteScreenFeedback = {
@@ -360,24 +364,54 @@ async function RunBusy(
     await SettleBusy(setScreen, task, signal);
 }
 
+// One ENTER, F7 or F8 call at a time. The disabled keys take effect only a render after the
+// press, so the lock, taken before the call changes anything, refuses a second press in that gap.
+// It clears when the call settles, a rethrown defect included.
+async function RunExclusive(
+    isInFlightRef: RefObject<boolean>,
+    call: () => Promise<void>,
+): Promise<void> {
+    if (isInFlightRef.current) {
+        return;
+    }
+    isInFlightRef.current = true;
+    try {
+        await call();
+    } finally {
+        isInFlightRef.current = false;
+    }
+}
+
 // One server round trip per key press, with every key locked until it answers.
 function BusyKeyPress(actions: ScreenActions, task: () => Promise<void>): () => void {
     return () => {
-        void RunBusy(actions.setScreen, task);
+        void RunExclusive(actions.isInFlightRef, () => RunBusy(actions.setScreen, task));
     };
 }
 
-// F7 or F8: a busy key press whose browse supersedes any browse still in flight.
+// F7 or F8: a busy key press whose browse starts only once the lock is taken, so a second press
+// before it answers is refused rather than superseding it.
 function PageKeyPress(
     actions: ScreenActions,
     screen: ListScreenState,
     direction: Direction,
 ): () => void {
-    return () => {
+    const browse = (): Promise<void> => {
         const signal = actions.startPageRead();
         const task = (): Promise<void> => HandlePage(actions, screen, direction, signal);
-        void RunBusy(actions.setScreen, task, signal);
+        return RunBusy(actions.setScreen, task, signal);
     };
+    return () => {
+        void RunExclusive(actions.isInFlightRef, browse);
+    };
+}
+
+// PF3 is XCTL COADM01C. It is refused while a call is in flight, so the call's answer is shown.
+function HandleBack(actions: ScreenActions): void {
+    if (actions.isInFlightRef.current) {
+        return;
+    }
+    actions.router.push(ADMIN_MENU_ROUTE);
 }
 
 // The legend ENTER=Continue  F3=Back  F7=Backward  F8=Forward, in its order.
@@ -390,7 +424,7 @@ function BuildKeys(
     const enter = BusyKeyPress(actions, () => HandleEnter(actions, screen));
     const backward = PageKeyPress(actions, screen, Direction.BACKWARD);
     const forward = PageKeyPress(actions, screen, Direction.FORWARD);
-    const back = (): void => actions.router.push(ADMIN_MENU_ROUTE);
+    const back = (): void => HandleBack(actions);
     return [
         { key: "ENTER", label: "Continue", onPress: enter, disabled },
         { key: "F3", label: "Back", onPress: back, disabled },
@@ -401,8 +435,12 @@ function BuildKeys(
 
 // COUSR00C WHEN OTHER (lines 132-135): MOVE 'Y' TO WS-ERR-FLG, MOVE -1 TO USRIDINL and
 // CCDA-MSG-INVALID-KEY. No file is browsed, so the rows, the selection codes, the search text and
-// the page stay as they stood; a new feedback object puts the cursor back on USRIDIN.
-function ShowInvalidKey(setScreen: ScreenUpdate): void {
+// the page stay as they stood; a new feedback object puts the cursor back on USRIDIN. It is
+// refused while a call is in flight, so the call's answer is the message shown.
+function ShowInvalidKey(setScreen: ScreenUpdate, isInFlightRef: RefObject<boolean>): void {
+    if (isInFlightRef.current) {
+        return;
+    }
     const feedback: CompleteScreenFeedback = {
         ...EMPTY_FEEDBACK,
         message: INVALID_KEY_MESSAGE,
@@ -447,8 +485,8 @@ function AbortPageRead(controllerRef: ReadControllerRef): void {
 }
 
 // React recognises hooks only by the camelCase "use" prefix, so useFirstEntry, usePageRead,
-// useCursorFocus, useInvalidKeyAction and useUserList are a framework-mandated exception to the
-// MK_Modernization Rule's PascalCase function naming.
+// useCursorFocus, useInvalidKeyAction, useScreenActions and useUserList are a framework-mandated
+// exception to the MK_Modernization Rule's PascalCase function naming.
 
 // The pending message is taken once, so an effect React runs twice still shows it. Leaving the
 // screen abandons the first browse; StrictMode's second run then browses again.
@@ -486,10 +524,14 @@ function useCursorFocus(feedback: CompleteScreenFeedback, fieldRefs: RefObject<F
 
 // A PF key the legend lacks answers with the WHEN OTHER branch, and like every key it waits while a
 // call runs, so the call's answer is the message shown.
-function useInvalidKeyAction(setScreen: ScreenUpdate, isBusy: boolean): InvalidKeyAction {
+function useInvalidKeyAction(
+    setScreen: ScreenUpdate,
+    isInFlightRef: RefObject<boolean>,
+    isBusy: boolean,
+): InvalidKeyAction {
     return useMemo(
-        () => ({ onPress: () => ShowInvalidKey(setScreen), disabled: isBusy }),
-        [setScreen, isBusy],
+        () => ({ onPress: () => ShowInvalidKey(setScreen, isInFlightRef), disabled: isBusy }),
+        [setScreen, isInFlightRef, isBusy],
     );
 }
 
@@ -502,21 +544,32 @@ interface UserListModel {
     isBusy: boolean;
 }
 
+// What the key handlers act through. The call lock is one ref for the screen's life, so the keys
+// rebuilt on every render share it.
+function useScreenActions(
+    setScreen: ScreenUpdate,
+    startNavigation: TransitionStartFunction,
+): ScreenActions {
+    const router = useRouter();
+    const startPageRead = usePageRead();
+    const isInFlightRef = useRef(false);
+    return { setScreen, router, startPageRead, startNavigation, isInFlightRef };
+}
+
 // The screen is busy while a call runs and, after a selection, until the routed screen renders.
 function useUserList(): UserListModel {
-    const router = useRouter();
     const [screen, setScreen] = useState<ListScreenState>(INITIAL_SCREEN);
     const [isNavigating, startNavigation] = useTransition();
     const fieldRefs = useRef<FieldRefs>({});
     useFirstEntry(setScreen);
-    const startPageRead = usePageRead();
+    const actions = useScreenActions(setScreen, startNavigation);
     useCursorFocus(screen.feedback, fieldRefs);
     const searchInputRef = (element: HTMLInputElement | null): void => {
         fieldRefs.current[SEARCH_FIELD] = element;
     };
     const isBusy = screen.isBusy || isNavigating;
-    const keys = BuildKeys({ setScreen, router, startPageRead, startNavigation }, screen, isBusy);
-    const invalidKeyAction = useInvalidKeyAction(setScreen, isBusy);
+    const keys = BuildKeys(actions, screen, isBusy);
+    const invalidKeyAction = useInvalidKeyAction(setScreen, actions.isInFlightRef, isBusy);
     return { screen, setScreen, keys, invalidKeyAction, searchInputRef, isBusy };
 }
 

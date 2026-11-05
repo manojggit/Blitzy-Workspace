@@ -856,6 +856,44 @@ it("COMEN01C answers no other PF key while a selection is in flight", async () =
     expect(mockSelectMainMenuOption).toHaveBeenCalledTimes(1);
 });
 
+// A second ENTER, the bound F3, or a PF key outside the legend, pressed in ENTER's turn.
+const SAME_TURN_SECOND_KEYS: readonly string[] = ["Enter", "F3", "F12"];
+
+// Keys dispatched on window inside one act, so no render, and no effect handing the keys their
+// disabled state, runs between two presses.
+async function PressInOneTurn(keys: readonly string[]): Promise<void> {
+    await act(async () => {
+        for (const key of keys) {
+            const init = { key, bubbles: true, cancelable: true };
+            window.dispatchEvent(new KeyboardEvent("keydown", init));
+        }
+    });
+}
+
+// The keys disable a render after ENTER, so a key pressed in that gap meets the in-flight lock:
+// one selection is sent, its route is followed, and the lock then clears.
+it.each(SAME_TURN_SECOND_KEYS)(
+    "COMEN01C ENTER and %s in one turn send one selection, answered as normal",
+    async (secondKey) => {
+        mockLogout.mockResolvedValue({ message: THANK_YOU_MESSAGE });
+        const answerSelection = HoldSelection();
+        const user = await RenderLoadedScreen();
+        await user.type(OptionInput(), "8");
+        await PressInOneTurn(["Enter", secondKey]);
+        expect(mockSelectMainMenuOption).toHaveBeenCalledTimes(1);
+        expect(mockSelectMainMenuOption).toHaveBeenCalledWith({ option: "8" });
+        expect(mockLogout).not.toHaveBeenCalled();
+        expect(screen.queryAllByRole("alert")).toHaveLength(0);
+        await answerSelection(TRANSACTION_ADD_ANSWER);
+        await WaitForIdle();
+        expect(mockRouterPush).toHaveBeenCalledTimes(1);
+        expect(mockRouterPush).toHaveBeenCalledWith(TRANSACTION_ADD_ANSWER.route);
+        await PressInOneTurn(["Enter"]);
+        expect(mockSelectMainMenuOption).toHaveBeenCalledTimes(2);
+        expect(mockSelectMainMenuOption).toHaveBeenLastCalledWith({ option: "8" });
+    },
+);
+
 // The routed page's text once its payload has loaded.
 const NEXT_PAGE_TEXT = "Account View page";
 // A wait long enough for every task an answered call queued to run.

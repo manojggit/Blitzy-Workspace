@@ -102,11 +102,15 @@ interface BusyTracker {
     TrackBusy: <T>(task: () => Promise<T>) => Promise<T>;
 }
 
+// isInFlightRef is the synchronous call lock: true from the ENTER, F3 or option click that sends a
+// call until that call settles, so a key pressed before the busy render reaches the keys is
+// refused.
 interface MenuActions {
     Navigate: (route: string) => void;
     ShowMessage: (screenMessage: ScreenMessage) => void;
     TrackBusy: BusyTracker["TrackBusy"];
     ClearSession: () => void;
+    isInFlightRef: RefObject<boolean>;
 }
 
 interface MenuActionsState {
@@ -264,10 +268,32 @@ async function HandleSignOff(actions: MenuActions): Promise<void> {
     actions.Navigate(SIGN_ON_ROUTE);
 }
 
+// One ENTER, F3 or option-click call at a time. The disabled keys take effect only a render after
+// the press, so the lock, taken before the call changes anything, refuses a second press in that
+// gap. It clears when the call settles, a rethrown defect included.
+async function RunExclusive(
+    isInFlightRef: RefObject<boolean>,
+    call: () => Promise<void>,
+): Promise<void> {
+    if (isInFlightRef.current) {
+        return;
+    }
+    isInFlightRef.current = true;
+    try {
+        await call();
+    } finally {
+        isInFlightRef.current = false;
+    }
+}
+
 // WHEN OTHER: MOVE 'Y' TO WS-ERR-FLG and CCDA-MSG-INVALID-KEY in red. No option is sent, so the
 // OPTION text stays as keyed and is not in error. Each press is a new message, so the cursor
-// returns to OPTION, the IC field, even after it left it.
+// returns to OPTION, the IC field, even after it left it. It is refused while a call is in
+// flight, so the call's answer is the message shown.
 function ShowInvalidKey(actions: MenuActions): void {
+    if (actions.isInFlightRef.current) {
+        return;
+    }
     actions.ShowMessage({
         message: INVALID_KEY_MESSAGE,
         severity: ERROR_SEVERITY,
@@ -342,33 +368,38 @@ function useMenuLoad(showMessage: (screenMessage: ScreenMessage) => void): MenuL
 }
 
 // The XCTL ends with the next screen: the route change runs as a transition, so the menu stays
-// busy until the routed page has rendered and a second ENTER cannot send another call.
+// busy until the routed page has rendered. The call lock refuses a key pressed before the busy
+// render reaches the keys, and the busy state every key after it, so a second ENTER cannot send
+// another call. The actions are rebuilt on each render, so the lock is one ref for the screen's
+// life that every render's actions share.
 function useMenuActions(showMessage: MenuActions["ShowMessage"]): MenuActionsState {
     const router = useRouter();
     const { ClearSession } = useSession();
     const { isBusy, TrackBusy } = useBusyTracker();
     const [isNavigating, startNavigation] = useTransition();
+    const isInFlightRef = useRef(false);
     const actions: MenuActions = {
         Navigate: (route) => startNavigation(() => router.push(route)),
         ShowMessage: showMessage,
         TrackBusy,
         ClearSession,
+        isInFlightRef,
     };
     return { actions, isCalling: isBusy, isNavigating };
 }
 
-// Any other PF key is refused while busy, like ENTER and F3. The action is built on each render,
-// as the keys are, from the actions of that render.
+// Any other PF key is refused while busy or locked, like ENTER and F3. The action is built on each
+// render, as the keys are, from the actions of that render.
 function useMenuCommands(inputs: MenuCommandInputs): MenuCommands {
     const { actions, isCalling, isNavigating } = useMenuActions(inputs.ShowMessage);
     const isBusy = inputs.isLoading || isCalling || isNavigating;
     const onSelectOption = (optionText: string): void => {
-        void HandleSelectOption(actions, optionText);
+        void RunExclusive(actions.isInFlightRef, () => HandleSelectOption(actions, optionText));
     };
     const keys = BuildFunctionKeys({
         isBusy,
         onContinue: () => onSelectOption(inputs.optionText),
-        onExit: () => void HandleSignOff(actions),
+        onExit: () => void RunExclusive(actions.isInFlightRef, () => HandleSignOff(actions)),
     });
     const invalidKeyAction = { onPress: () => ShowInvalidKey(actions), disabled: isBusy };
     return { isBusy, keys, invalidKeyAction, onSelectOption };

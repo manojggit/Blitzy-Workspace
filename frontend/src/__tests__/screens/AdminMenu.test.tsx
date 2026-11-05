@@ -510,6 +510,51 @@ describe("COADM01C keys outside the legend while a selection is in flight", () =
     });
 });
 
+// A second ENTER, the bound F3, or a PF key outside the legend, pressed in ENTER's turn.
+const SAME_TURN_SECOND_KEYS: readonly string[] = ["Enter", "F3", "F12"];
+
+// Keys dispatched on window inside one act, so no render, and no effect handing the keys their
+// disabled state, runs between two presses.
+async function PressInOneTurn(keys: readonly string[]): Promise<void> {
+    await act(async () => {
+        for (const key of keys) {
+            const init = { key, bubbles: true, cancelable: true };
+            window.dispatchEvent(new KeyboardEvent("keydown", init));
+        }
+    });
+}
+
+// One selection of the keyed option in flight: no sign-off, no message and no route followed.
+function ExpectOneSelectionInFlight(optionText: string): void {
+    expect(mockSelectAdminMenuOption).toHaveBeenCalledTimes(1);
+    expect(mockSelectAdminMenuOption).toHaveBeenCalledWith({ option: optionText });
+    expect(mockLogout).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(mockRouterPush).not.toHaveBeenCalled();
+}
+
+// The keys disable a render after ENTER, so a key pressed in that gap meets the in-flight lock:
+// one selection is sent, its route is followed, and the lock then clears.
+describe("COADM01C keys pressed in the same turn as ENTER", () => {
+    it.each(SAME_TURN_SECOND_KEYS)(
+        "COADM01C ENTER and %s in one turn send one selection, answered as normal",
+        async (secondKey) => {
+            const answerSelection = DeferSelection();
+            const user = await RenderLoadedScreen();
+            await user.type(OptionField(), "1");
+            await PressInOneTurn(["Enter", secondKey]);
+            ExpectOneSelectionInFlight("1");
+            answerSelection(BuildRouteResponse(USER_LIST_ROUTE));
+            await waitFor(() => expect(mockRouterPush).toHaveBeenCalledWith(USER_LIST_ROUTE));
+            await WaitForIdle();
+            expect(mockRouterPush).toHaveBeenCalledTimes(1);
+            await PressInOneTurn(["Enter"]);
+            expect(mockSelectAdminMenuOption).toHaveBeenCalledTimes(2);
+            expect(mockSelectAdminMenuOption).toHaveBeenLastCalledWith({ option: "1" });
+        },
+    );
+});
+
 describe("COADM01C not-installed literal (PGMIDERR-ERR-PARA)", () => {
     it.each(NOT_INSTALLED_CASES)(
         "COADM01C option %d shows the not-installed literal in green",

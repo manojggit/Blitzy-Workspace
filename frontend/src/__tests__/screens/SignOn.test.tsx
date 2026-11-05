@@ -522,6 +522,50 @@ describe("COSGN00C ENTER while the sign-on call is in flight on /signon", () => 
     });
 });
 
+// A second ENTER, the bound F3, or a PF key outside the legend, pressed in ENTER's turn.
+const SAME_TURN_SECOND_KEYS: readonly string[] = ["Enter", "F3", "F12"];
+
+// Keys dispatched on window inside one act, so no render, and no effect handing the keys their
+// disabled state, runs between two presses.
+async function PressInOneTurn(keys: readonly string[]): Promise<void> {
+    await act(async () => {
+        for (const key of keys) {
+            const init = { key, bubbles: true, cancelable: true };
+            window.dispatchEvent(new KeyboardEvent("keydown", init));
+        }
+    });
+}
+
+// One sign-on in flight with the typed values: no sign-off, and no message shown.
+function ExpectOneSignOnInFlight(): void {
+    expect(loginMock).toHaveBeenCalledTimes(1);
+    expect(loginMock).toHaveBeenCalledWith(TYPED_CREDENTIALS);
+    expect(logoutMock).not.toHaveBeenCalled();
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+}
+
+// The keys disable a render after ENTER, so a key pressed in that gap meets the in-flight lock:
+// one sign-on is sent, its answer is followed, and the lock then clears.
+describe("COSGN00C keys pressed in the same turn as ENTER on /signon", () => {
+    it.each(SAME_TURN_SECOND_KEYS)(
+        "COSGN00C ENTER and %s in one turn send one sign-on, answered as normal",
+        async (secondKey) => {
+            const resolveLogin = DeferLogin();
+            const { user } = await RenderScreen();
+            await TypeCredentials(user, TYPED_CREDENTIALS);
+            await PressInOneTurn(["Enter", secondKey]);
+            ExpectOneSignOnInFlight();
+            await resolveLogin(REGULAR_SIGN_ON);
+            await WaitForIdle();
+            expect(mockRouterPush).toHaveBeenCalledTimes(1);
+            expect(mockRouterPush).toHaveBeenCalledWith(REGULAR_SIGN_ON.next_route);
+            await PressInOneTurn(["Enter"]);
+            expect(loginMock).toHaveBeenCalledTimes(2);
+            expect(loginMock).toHaveBeenLastCalledWith(TYPED_CREDENTIALS);
+        },
+    );
+});
+
 // The 3270 keyboard locked from send to response: the cursor stays where it was typed, and
 // neither field takes keystrokes until the answer arrives.
 describe("COSGN00C fields while the sign-on call is in flight on /signon", () => {
