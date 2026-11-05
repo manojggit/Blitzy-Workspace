@@ -684,6 +684,45 @@ describe("COCRDSLC a COCRDLIC selection with an over-long acctId on /cards/view"
     );
 });
 
+// An acctId of exactly the ACCTSID LENGTH is kept whole; the over-long ones are cut as above.
+const BARE_ACCOUNT_ID_CASES: readonly OverlongAccountIdCase[] = [
+    { shape: "11 digits", queryAcctId: TEST_ACCOUNT_ID, keptAcctId: TEST_ACCOUNT_ID },
+    ...OVERLONG_ACCOUNT_ID_CASES,
+];
+
+// 1200-SETUP-SCREEN-VARS moves CDEMO-ACCT-ID to ACCTSID with or without a card number, so an
+// entry naming an account and no card_ref shows it on typable keys beside the key prompt, with
+// CARDSID blank, and waits for ENTER.
+describe("COCRDSLC an acctId entry without a card_ref on /cards/view", () => {
+    it.each(BARE_ACCOUNT_ID_CASES)(
+        "COCRDSLC shows an acctId of $shape on ACCTSID as kept and reads nothing before ENTER",
+        async ({ queryAcctId, keptAcctId }) => {
+            mockSearchParams = new URLSearchParams({ acctId: queryAcctId });
+            RenderScreen();
+            await ExpectAlert(PROMPT_FOR_KEYS_INFO, "info");
+            ExpectTypableKeys();
+            ExpectKeyValues(keptAcctId, "");
+            expect(mockViewCard).not.toHaveBeenCalled();
+            expect(mockViewSelectedCard).not.toHaveBeenCalled();
+        },
+    );
+});
+
+describe("COCRDSLC ENTER after an acctId entry without a card_ref on /cards/view", () => {
+    it("COCRDSLC ENTER sends the typed card number with the seeded account as typed", async () => {
+        mockSearchParams = new URLSearchParams({ acctId: TEST_ACCOUNT_ID });
+        mockViewCard.mockResolvedValue(BuildCardDetail());
+        const user = RenderScreen();
+        await user.type(InputFor(CARD_LABEL), TYPED_CARD_NUMBER);
+        await PressKey(user, "Enter");
+        await ExpectAlert(DETAILS_SHOWN_INFO, "info");
+        expect(mockViewCard.mock.calls).toEqual([ReadCall(TYPED_CARD_NUMBER, TEST_ACCOUNT_ID)]);
+        expect(mockViewSelectedCard).not.toHaveBeenCalled();
+        ExpectKeyValues(TEST_ACCOUNT_ID, TYPED_CARD_NUMBER);
+        ExpectNoCardNumberInUrls();
+    });
+});
+
 // The read on arrival answers with its own information line, so no key prompt is set first.
 describe("COCRDSLC information line from the COCRDLIC card list on /cards/view", () => {
     it("COCRDSLC shows no key prompt while or after the selected card is read", async () => {

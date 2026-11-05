@@ -567,15 +567,12 @@ function GuardedKeySetter(
     };
 }
 
-// A card list selection hands over its account, which ACCTSID shows once a refusal of the
-// selection's keys hands the keys to the user. The card number is never seeded: only its
-// card_ref travels.
-function SeededAccountText({ cardRef, acctId }: EntryKeys): string {
-    return cardRef === "" ? "" : acctId;
-}
-
+// ACCTSID's typed text starts as the account the query hands over, whatever the entry:
+// 1200-SETUP-SCREEN-VARS moves CC-ACCT-ID to ACCTSIDO whenever CDEMO-ACCT-ID is non-zero, with or
+// without a card number. The card number is never seeded: only a card list selection's card_ref
+// travels.
 function useTypedKeys(entry: EntryKeys, isLookupPending: LookupPendingCheck): TypedKeys {
-    const [acctText, setAcctText] = useState(() => SeededAccountText(entry));
+    const [acctText, setAcctText] = useState(entry.acctId);
     const [cardText, setCardText] = useState("");
     return useMemo(
         () => ({
