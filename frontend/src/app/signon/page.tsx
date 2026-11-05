@@ -26,7 +26,7 @@ import {
     type SetStateAction,
 } from "react";
 
-import { START_ALIGNED_COLUMN_STYLE } from "@/app/theme";
+import { STABLE_WIDTH_FIELD_COLUMN_STYLE } from "@/app/theme";
 import { FunctionKeyBar } from "@/components/FunctionKeyBar";
 import { ErrorMessageReference, HelperTextIdOf, MessageLine } from "@/components/MessageLine";
 import { ScreenShell, useScreenBusy } from "@/components/ScreenShell";
@@ -460,10 +460,11 @@ function CredentialField(props: CredentialFieldProps) {
     );
 }
 
-// The fields keep their intrinsic width rather than stretching across the screen.
+// Both fields share one stable width rather than stretching across the screen, so an error icon
+// never widens one of them.
 function CredentialFields({ form }: SignOnFormProps) {
     return (
-        <Stack spacing={4} sx={START_ALIGNED_COLUMN_STYLE}>
+        <Stack spacing={4} sx={STABLE_WIDTH_FIELD_COLUMN_STYLE}>
             {FIELD_DEFINITIONS.map((definition) => (
                 <CredentialField
                     key={definition.name}

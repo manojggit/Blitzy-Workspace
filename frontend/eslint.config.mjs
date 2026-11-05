@@ -1,7 +1,7 @@
 // Frontend lint gate: enforces the MK_Modernization Rule (naming, with upper-case literal
-// constants; 100-character lines; braces; function size; parameter count; no swallowed errors; no
-// raw HTML injection) and the design-system rule that screens use MUI components instead of raw
-// HTML controls and headings.
+// constants and camelCase arrow-function constants; 100-character lines; braces; function size;
+// parameter count; no swallowed errors; no raw HTML injection) and the design-system rule that
+// screens use MUI components instead of raw HTML controls and headings.
 import { defineConfig, globalIgnores } from "eslint/config";
 import nextVitals from "eslint-config-next/core-web-vitals";
 import nextTs from "eslint-config-next/typescript";
@@ -101,6 +101,8 @@ const NAMING_CONVENTION_OPTIONS = [
 
 const UPPER_SNAKE_CASE_PATTERN = /^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$/;
 const TYPE_ASSERTION_NODES = ["TSAsExpression", "TSSatisfiesExpression"];
+// A const bound to one of these, past any type assertion, is a function constant: camelCase.
+const FUNCTION_EXPRESSION_NODES = ["ArrowFunctionExpression", "FunctionExpression"];
 // Next.js reads these route-segment and metadata exports only under their camelCase names.
 const NEXT_FILE_CONVENTION_EXPORTS = [
     "metadata",
@@ -171,6 +173,27 @@ function CreateLiteralConstantCaseVisitor(context) {
     };
 }
 
+function IsFunctionExpression(node) {
+    return FUNCTION_EXPRESSION_NODES.includes(UnwrapTypeAssertions(node).type);
+}
+
+function ReportUpperCaseFunctionConstant(context, declarator) {
+    const { id, init } = declarator;
+    if (id.type !== "Identifier" || init === null || !UPPER_SNAKE_CASE_PATTERN.test(id.name)) {
+        return;
+    }
+    if (IsFunctionExpression(init)) {
+        context.report({ node: id, messageId: "camelCaseFunction", data: { name: id.name } });
+    }
+}
+
+function CreateFunctionConstantCaseVisitor(context) {
+    return {
+        "VariableDeclaration[kind='const'] > VariableDeclarator": (declarator) =>
+            ReportUpperCaseFunctionConstant(context, declarator),
+    };
+}
+
 function ReportLongLines(context) {
     context.sourceCode.lines.forEach((line, index) => {
         const length = [...line].length;
@@ -198,6 +221,15 @@ const LITERAL_CONSTANT_CASE_RULE = {
     create: CreateLiteralConstantCaseVisitor,
 };
 
+const FUNCTION_CONSTANT_CASE_RULE = {
+    meta: {
+        type: "suggestion",
+        schema: [],
+        messages: { camelCaseFunction: "Function constant '{{name}}' must be camelCase." },
+    },
+    create: CreateFunctionConstantCaseVisitor,
+};
+
 const MAX_LINE_LENGTH_RULE = {
     meta: {
         type: "layout",
@@ -208,11 +240,13 @@ const MAX_LINE_LENGTH_RULE = {
 };
 
 // Local rules for checks no installed rule makes: core max-len is deprecated, and
-// naming-convention cannot tell a literal const from a computed one by its initializer.
+// naming-convention cannot tell a literal or function const from a computed one by its
+// initializer.
 const MODERNIZATION_PLUGIN = {
     rules: {
         "max-line-length": MAX_LINE_LENGTH_RULE,
         "literal-constant-case": LITERAL_CONSTANT_CASE_RULE,
+        "function-constant-case": FUNCTION_CONSTANT_CASE_RULE,
     },
 };
 
@@ -235,6 +269,7 @@ export default defineConfig([
         rules: {
             "@typescript-eslint/naming-convention": ["error", ...NAMING_CONVENTION_OPTIONS],
             "modernization/literal-constant-case": "error",
+            "modernization/function-constant-case": "error",
             "modernization/max-line-length": "error",
             "max-lines-per-function": [
                 "error",

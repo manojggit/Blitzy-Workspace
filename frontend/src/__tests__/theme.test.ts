@@ -1,7 +1,8 @@
 // Tests for: frontend/src/app/theme.ts (CARD_DEMO_THEME, VISUALLY_HIDDEN_STYLE,
 // AUTOFILL_KEYFRAMES_STYLE, SCROLL_REGION_STYLE, FixedLayoutTableStyle, RowShareStyle,
-// RowEndAlignmentFrom), the Material Design 3 token theme of AAP 0.5.3–0.5.4.
-import type { Breakpoint, SxProps, Theme, TypeAction } from "@mui/material/styles";
+// RowEndAlignmentFrom, STABLE_WIDTH_FIELD_COLUMN_STYLE), the Material Design 3 token theme of
+// AAP 0.5.3–0.5.4.
+import type { Breakpoint, Theme, TypeAction } from "@mui/material/styles";
 import {
     AUTOFILL_KEYFRAMES_STYLE,
     CARD_DEMO_THEME,
@@ -9,6 +10,7 @@ import {
     RowEndAlignmentFrom,
     RowShareStyle,
     SCROLL_REGION_STYLE,
+    STABLE_WIDTH_FIELD_COLUMN_STYLE,
     VISUALLY_HIDDEN_STYLE,
 } from "@/app/theme";
 
@@ -1363,9 +1365,18 @@ const FIXED_TABLE_MIN_WIDTHS: readonly [number, string][] = [
     [173, "692px"],
 ];
 
-// An sx style written as a theme callback resolves against the CardDemo theme.
-function ResolveSx(style: SxProps<Theme>): unknown {
-    return typeof style === "function" ? style(CARD_DEMO_THEME) : style;
+type SxThemeCallback = (theme: Theme) => unknown;
+
+// An sx style resolves against the CardDemo theme as MUI's sx does: the style itself, a property
+// value or a nested selector's style written as a theme callback is called with the theme.
+function ResolveSx(style: unknown): unknown {
+    const resolved =
+        typeof style === "function" ? (style as SxThemeCallback)(CARD_DEMO_THEME) : style;
+    if (resolved === null || typeof resolved !== "object" || Array.isArray(resolved)) {
+        return resolved;
+    }
+    const entries = Object.entries(resolved).map(([key, value]) => [key, ResolveSx(value)]);
+    return Object.fromEntries(entries);
 }
 
 function FontSizeToPixels(value: string | number | undefined): number {
@@ -1783,6 +1794,16 @@ describe("Row end alignment", () => {
 describe("List table scrolling regions", () => {
     it("SCROLL_REGION_STYLE draws edge cues, an outline scrollbar and the M3 focus ring", () => {
         expect(ResolveSx(SCROLL_REGION_STYLE)).toEqual(SCROLL_REGION_VALUES);
+    });
+});
+
+// A stretching column of one width, so a field in error keeps the width its neighbours have.
+describe("Stable-width field columns (F3A-F03)", () => {
+    it("STABLE_WIDTH_FIELD_COLUMN_STYLE is 216 px on the 4 dp grid, within its container", () => {
+        const columnStyle = STABLE_WIDTH_FIELD_COLUMN_STYLE as Record<string, unknown>;
+        const { width, ...containedValues } = columnStyle;
+        expect(containedValues).toEqual({ maxWidth: 1 });
+        expect(typeof width === "function" && width(CARD_DEMO_THEME)).toBe("216px");
     });
 });
 

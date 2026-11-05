@@ -1207,41 +1207,45 @@ const SCROLL_COVER_SOLID_STOP = "30%";
 const FOCUS_VISIBLE_PSEUDO_SELECTOR = "&:focus-visible";
 
 /**
- * Each edge of a horizontally scrolling region shows a shadow in the shadow role only while content
- * lies beyond it: the paper-coloured covers scroll with the content (attachment local) and hide the
- * shadows fixed to the edges (attachment scroll) wherever the content's own edge is in view. Table
- * cells have no fill, so the cue shows through them.
+ * The edge cue's images: a cover in the paper colour at the left and right edges, then a shadow in
+ * the shadow role at each. Table cells have no fill, so the cue shows through them.
  */
-function ScrollEdgeCueStyle(theme: StyleTheme): CSSObject {
+function ScrollEdgeCueImages(theme: StyleTheme): string {
     const cover = theme.palette.background.paper;
     const shadow = alpha(M3_COLOR_TOKENS.shadow, M3_KEY_SHADOW_OPACITY);
+    return [
+        `linear-gradient(to right, ${cover} ${SCROLL_COVER_SOLID_STOP}, transparent)`,
+        `linear-gradient(to left, ${cover} ${SCROLL_COVER_SOLID_STOP}, transparent)`,
+        `linear-gradient(to right, ${shadow}, transparent)`,
+        `linear-gradient(to left, ${shadow}, transparent)`,
+    ].join(", ");
+}
+
+/** The edge cue's image sizes, in the order its images are listed: two covers, two shadows. */
+function ScrollEdgeCueSizes(theme: StyleTheme): string {
     const coverSize = `${theme.spacing(SCROLL_COVER_WIDTH_UNITS)} 100%`;
     const shadowSize = `${theme.spacing(SCROLL_SHADOW_WIDTH_UNITS)} 100%`;
-    return {
-        backgroundImage: [
-            `linear-gradient(to right, ${cover} ${SCROLL_COVER_SOLID_STOP}, transparent)`,
-            `linear-gradient(to left, ${cover} ${SCROLL_COVER_SOLID_STOP}, transparent)`,
-            `linear-gradient(to right, ${shadow}, transparent)`,
-            `linear-gradient(to left, ${shadow}, transparent)`,
-        ].join(", "),
-        backgroundPosition: "left center, right center, left center, right center",
-        backgroundSize: [coverSize, coverSize, shadowSize, shadowSize].join(", "),
-        backgroundRepeat: "no-repeat",
-        backgroundAttachment: "local, local, scroll, scroll",
-    };
+    return [coverSize, coverSize, shadowSize, shadowSize].join(", ");
 }
 
 /**
- * A scrolling region the keyboard reaches as a tab stop, as an sx style: the edge cue on each side
- * that hides content, a thin scrollbar in the outline role where the platform draws one, and the M3
- * focus ring while it holds visible focus.
+ * A scrolling region the keyboard reaches as a tab stop, as an sx style whose theme-dependent
+ * values are theme callbacks. Each edge shows a shadow in the shadow role only while content lies
+ * beyond it: the paper-coloured covers scroll with the content (attachment local) and hide the
+ * shadows fixed to the edges (attachment scroll) wherever the content's own edge is in view. A
+ * thin scrollbar in the outline role shows where the platform draws one, and the M3 focus ring
+ * while the region holds visible focus.
  */
-export const SCROLL_REGION_STYLE: SxProps<Theme> = (theme) => ({
-    ...ScrollEdgeCueStyle(theme),
+export const SCROLL_REGION_STYLE: SxProps<Theme> = {
+    backgroundImage: ScrollEdgeCueImages,
+    backgroundPosition: "left center, right center, left center, right center",
+    backgroundSize: ScrollEdgeCueSizes,
+    backgroundRepeat: "no-repeat",
+    backgroundAttachment: "local, local, scroll, scroll",
     scrollbarWidth: "thin",
-    scrollbarColor: `${theme.palette.m3.outline} transparent`,
-    [FOCUS_VISIBLE_PSEUDO_SELECTOR]: FocusRingStyle(theme),
-});
+    scrollbarColor: (theme) => `${theme.palette.m3.outline} transparent`,
+    [FOCUS_VISIBLE_PSEUDO_SELECTOR]: FocusRingStyle,
+};
 
 // A cell text wider than its fixed column breaks inside it rather than run under the next column.
 const TABLE_CELL_SELECTOR = "& .MuiTableCell-root";
@@ -1344,11 +1348,19 @@ export const WRAPPING_ROW_STYLE: SxProps<Theme> = { flexWrap: "wrap" };
  */
 export const CENTRE_ALIGNED_ROW_STYLE: SxProps<Theme> = { alignItems: "center" };
 
+// The width of a column of stacked fields, in theme spacing units: 216 px, the resting width of an
+// outlined field sized by its input alone, rounded up to the 4 dp grid.
+const FIELD_COLUMN_WIDTH_UNITS = 54;
+
 /**
- * A column whose items keep their intrinsic width at its start edge rather than stretch across the
- * screen, as an sx style.
+ * A column of fields at its start edge that all share one width, as an sx style. Each field fills
+ * the column, so the error icon's room narrows a field's text rather than widening the field, and
+ * the column never grows wider than its container.
  */
-export const START_ALIGNED_COLUMN_STYLE: SxProps<Theme> = { alignItems: "flex-start" };
+export const STABLE_WIDTH_FIELD_COLUMN_STYLE: SxProps<Theme> = {
+    width: (theme) => theme.spacing(FIELD_COLUMN_WIDTH_UNITS),
+    maxWidth: 1,
+};
 
 /** Text centred in its box, as an sx style. */
 export const CENTRED_TEXT_STYLE: SxProps<Theme> = { textAlign: "center" };
