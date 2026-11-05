@@ -137,10 +137,6 @@ export interface LegacyErrorResponse extends ScreenFeedback {
     message: string;
 }
 
-export interface MessageResponse {
-    message: string;
-}
-
 // The per-call options of a read. signal is the AbortSignal of the AbortController that owns the
 // read, aborted when that owner is disposed or superseded.
 export interface ReadOptions {

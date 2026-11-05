@@ -273,7 +273,12 @@ class CardDetailResponse(ScreenFeedback):
     spaces. The card number is masked, and the card verification code is never returned.
     """
 
-    acct_id: str = Field(description="Account number (ACCTSID, CARD-ACCT-ID).")
+    acct_id: str = Field(
+        description=(
+            "Account number as entered (ACCTSID, CC-ACCT-ID); the card's own CARD-ACCT-ID is "
+            "never read."
+        ),
+    )
     card_ref: str = Field(
         description="The card's card_ref token, so the card number never enters a frontend URL.",
     )

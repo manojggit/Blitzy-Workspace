@@ -4,26 +4,30 @@ The revision logs a skipped seed or truncate at INFO in offline mode and at WARN
 APP_ENV=production. A malformed seed image is logged by whitelisted metadata only (image
 directory, image file name, record number, error and cause classes) and re-raised as an
 ImageFormatError with no record text, because the decoder's message can quote raw field content
-such as a card number or an SSN. The directory and file name in an error line have each control
-character escaped, so a line feed in either cannot split the line. A seeding upgrade sets the
+such as a card number or an SSN. A missing image is logged the same way, with cause
+FileNotFoundError, and the reader's own ImageFormatError is re-raised unchanged, because it names
+only the path. The directory and file name in an error line have each control character
+escaped, so a line feed in either cannot split the line. A seeding upgrade sets the
 seed-provenance marker revision 0008 reads only after the load, and a seeding downgrade clears
 it after the truncate; a skipped or failed run, whose op stub offers only get_bind, issues no
 statement at all. The revision is loaded from its file, and its Alembic context, op proxy and
 MigrationSettings are replaced by stubs, so no backend/.env and no database is needed. The
 malformed images are copies of data/EBCDIC with one DALYTRAN.PS field overwritten by text
-carrying SENSITIVE_MARKER.
+carrying SENSITIVE_MARKER; a missing image is DALYTRAN.PS deleted from such a copy, or the first
+image of an image directory that does not exist.
 """
 
 import errno
 import importlib.util
 import logging
+import os
 import shutil
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import NamedTuple, NoReturn
+from typing import NamedTuple
 
 import pytest
 
@@ -104,10 +108,11 @@ class SeededRun(NamedTuple):
 
 
 class ImageDirectoryCase(NamedTuple):
-    """A configured image directory and the text revision 0002's error line shows for it."""
+    """An image directory, its text in revision 0002's error line, and the seed image it lacks."""
 
     imageDir: Path
     shownDir: str
+    missingName: str
 
 
 # An image directory whose name holds a line feed before forged log text and an ANSI escape, an
@@ -118,14 +123,9 @@ HOSTILE_IMAGE_DIR = REPO_ROOT / "data" / f"EBCDIC\n{FORGED_LOG_TEXT}\x1b[31m"
 SHOWN_HOSTILE_IMAGE_DIR = f"{REPO_ROOT / 'data'}/EBCDIC\\n{FORGED_LOG_TEXT}\\x1b[31m"
 HOSTILE_IMAGE_NAME = f"{DAILY_IMAGE_NAME}\r{FORGED_LOG_TEXT}"
 SHOWN_HOSTILE_IMAGE_NAME = f"{DAILY_IMAGE_NAME}\\r{FORGED_LOG_TEXT}"
-IMAGE_DIRECTORY_CASES = (
-    pytest.param(
-        ImageDirectoryCase(SHIPPED_EBCDIC_DIR, str(SHIPPED_EBCDIC_DIR)), id="shipped-directory"
-    ),
-    pytest.param(
-        ImageDirectoryCase(HOSTILE_IMAGE_DIR, SHOWN_HOSTILE_IMAGE_DIR), id="control-bearing"
-    ),
-)
+# The accounts image is the first one revision 0002 reads, so it is the one an absent image
+# directory, such as HOSTILE_IMAGE_DIR, lacks.
+FIRST_IMAGE_NAME = SAMPLE_IMAGE_NAMES["accounts"].ebcdicName
 FIELD_CORRUPTIONS = (
     pytest.param(
         FieldCorruption(ORIG_TS_OFFSET, f"{SENSITIVE_MARKER}-123-45-6789-XYZ"),
@@ -213,6 +213,24 @@ def TruncateDailyImage(imageDir: Path) -> None:
     imagePath.write_bytes(imagePath.read_bytes()[:-1])
 
 
+def CopyWithoutDailyImage(seedImageDir: Path) -> ImageDirectoryCase:
+    """Delete DALYTRAN.PS from the per-test image copy; return the copy, shown as it is."""
+    (seedImageDir / DAILY_IMAGE_NAME).unlink()
+    return ImageDirectoryCase(seedImageDir, str(seedImageDir), DAILY_IMAGE_NAME)
+
+
+def AbsentHostileDirectory(seedImageDir: Path) -> ImageDirectoryCase:
+    """Return HOSTILE_IMAGE_DIR, which does not exist, so it lacks the first image read."""
+    return ImageDirectoryCase(HOSTILE_IMAGE_DIR, SHOWN_HOSTILE_IMAGE_DIR, FIRST_IMAGE_NAME)
+
+
+# Each takes the per-test image copy and returns the directory case revision 0002 is to read.
+MISSING_IMAGE_SETUPS = (
+    pytest.param(CopyWithoutDailyImage, id="image-deleted-from-copy"),
+    pytest.param(AbsentHostileDirectory, id="control-bearing-absent-directory"),
+)
+
+
 def RecordTexts(logRecord: logging.LogRecord) -> tuple[str, ...]:
     """Return every text a handler could write for logRecord: message, args, exception text."""
     return (logRecord.getMessage(), repr(logRecord.args), str(logRecord.exc_text))
@@ -296,24 +314,39 @@ def test_causeless_framing_error_is_logged_and_raised_by_its_fixed_code(
     assert errorMessage.endswith("cause framing")
 
 
-@pytest.mark.parametrize("directoryCase", IMAGE_DIRECTORY_CASES)
-def test_file_not_found_is_logged_by_its_class_and_reraised_unchanged(
-    stubRevision, monkeypatch, caplog, directoryCase
+def AssertReaderMissingImageError(
+    raisedError: ImageFormatError, directoryCase: ImageDirectoryCase
+) -> None:
+    """Assert raisedError is the reader's own error for the missing image, naming only its path.
+
+    It is record 0 and chained to the FileNotFoundError; its message is the escaped path and the
+    OS reason, so a line feed in the path starts no forged line of the traceback.
+    """
+    assert raisedError.recordNumber == 0
+    assert isinstance(raisedError.__cause__, FileNotFoundError)
+    assert Path(raisedError.path).name == directoryCase.missingName
+    assert "withheld" not in raisedError.reason
+    assert raisedError.reason == f"cannot read image: {os.strerror(errno.ENOENT)}"
+    shownPath = f"{directoryCase.shownDir}/{directoryCase.missingName}"
+    assert str(raisedError) == f"{shownPath}: record 0: {raisedError.reason}"
+    assert f"\n{FORGED_LOG_TEXT}" not in "".join(traceback.format_exception(raisedError))
+
+
+@pytest.mark.parametrize("prepareMissingImage", MISSING_IMAGE_SETUPS)
+def test_missing_image_is_logged_and_reraised_with_its_path_only(
+    stubRevision, prepareMissingImage, seedImageDir, caplog
 ):
-    missingError = FileNotFoundError(errno.ENOENT, "No such file", f"{SENSITIVE_MARKER}.PS")
-
-    def RaiseMissingImage(*loadArguments: object) -> NoReturn:
-        raise missingError
-
+    directoryCase = prepareMissingImage(seedImageDir)
     revisionModule = stubRevision(False, SettingsStub(directoryCase.imageDir))
-    monkeypatch.setattr(revisionModule, "LoadSampleData", RaiseMissingImage)
     caplog.set_level(logging.INFO, logger=MIGRATION_LOGGER_NAME)
-    with pytest.raises(FileNotFoundError) as raised:
+    with pytest.raises(ImageFormatError) as raised:
         revisionModule.upgrade()
-    assert raised.value is missingError
-    expectedMessage = f"sample seed failed for the images in {directoryCase.shownDir}: "
-    assert SoleErrorMessage(caplog.records) == expectedMessage + "FileNotFoundError"
-    assert SENSITIVE_MARKER not in caplog.text
+    AssertReaderMissingImageError(raised.value, directoryCase)
+    expectedMessage = (
+        f"sample seed failed for the images in {directoryCase.shownDir}: ImageFormatError"
+        f" in image {directoryCase.missingName} record 0, cause FileNotFoundError"
+    )
+    assert SoleErrorMessage(caplog.records) == expectedMessage
 
 
 def test_image_format_error_log_escapes_the_directory_and_image_name(seedRevision, caplog):

@@ -94,7 +94,7 @@ def ImageErrorCode(error: ImageFormatError) -> str:
 
 
 def LogImageFormatError(imageDir: Path, error: ImageFormatError, errorCode: str) -> None:
-    """Log a malformed image by whitelisted metadata only, never by the error's text.
+    """Log a missing or malformed image by whitelisted metadata only, never by the error's text.
 
     The metadata is the image directory, the image file name, the record number (0 for the
     whole file), the error class and errorCode, the class of its cause. The directory and file
@@ -120,10 +120,13 @@ def WithheldImageError(error: ImageFormatError, errorCode: str) -> ImageFormatEr
 def LoadImages(settings: MigrationSettings) -> dict[str, int]:
     """Load the EBCDIC sample images on the migration connection; return rows per table.
 
-    A malformed image is logged by its directory, file name, record number and error and cause
-    classes, then re-raised as an ImageFormatError with the same path and record number and no
-    record text. A FileNotFoundError is logged by the image directory and its class and re-raised
-    unchanged. Either way the whole upgrade rolls back in env.py's single migration transaction.
+    The image reader raises every image failure as an ImageFormatError, which is logged by its
+    directory, file name, record number and error and cause classes. A missing image, an
+    ImageFormatError for record 0 chained to a FileNotFoundError, is logged with cause
+    FileNotFoundError and re-raised unchanged, because it names only the path. Any other, such as
+    a malformed image, is re-raised as an ImageFormatError with the same path and record number
+    and no record text. Either way the whole upgrade rolls back in env.py's single migration
+    transaction.
     """
     imageDir = settings.EbcdicDir()
     try:
@@ -131,14 +134,13 @@ def LoadImages(settings: MigrationSettings) -> dict[str, int]:
     except ImageFormatError as error:
         errorCode = ImageErrorCode(error)
         LogImageFormatError(imageDir, error, errorCode)
+        if isinstance(error.__cause__, FileNotFoundError):
+            # Nothing was read from the absent file: the message holds only its escaped path and
+            # the OS reason, and the chained FileNotFoundError shows the path by repr.
+            raise
         # The original error is not chained: its message, and its causes' messages, can quote
         # raw field content of the malformed record, such as a card number or an SSN.
         raise WithheldImageError(error, errorCode) from None
-    except FileNotFoundError as error:
-        # Its message names only a path, which it shows by repr, so it is re-raised as it is.
-        shownDir = PrintableText(imageDir)
-        LOGGER.error("sample seed failed for the images in %s: %s", shownDir, type(error).__name__)
-        raise
 
 
 def LogSeedCounts(counts: dict[str, int]) -> None:

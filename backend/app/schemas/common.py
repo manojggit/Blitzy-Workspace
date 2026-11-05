@@ -355,16 +355,6 @@ class LegacyValidationErrorResponse(BaseModel):
     )
 
 
-class MessageResponse(BaseModel):
-    """A success body carrying only the program's message literal.
-
-    Replaces a screen sent back with only its ERRMSG line set, for example the COUSR03C
-    ``User <id> has been deleted ...`` confirmation.
-    """
-
-    message: str = Field(description="The program's success literal, verbatim.")
-
-
 class PageState(BaseModel):
     """The paging position of a list screen (CCLI, CT00, CU00).
 

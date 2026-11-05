@@ -1,5 +1,5 @@
 """Replaces: COBOL numeric-edited MOVE semantics for the pictures of copybook CVTRA07Y (CBTRN03C
-report), CBSTM03A statement lines and the COTRN0xC/COBIL00C/COACTVWC/COACTUPC display fields.
+report), CBSTM03A statement lines and the COTRN02C/COACTVWC/COACTUPC display fields.
 
 FormatEdited renders a Decimal or int as IBM Enterprise COBOL does when the value is moved,
 without ROUNDED, into a numeric-edited receiver built from 9, Z, the comma, the decimal point and
@@ -22,10 +22,8 @@ REPORT_TOTAL_AMOUNT_PICTURE = "+ZZZ,ZZZ,ZZZ.ZZ"
 STATEMENT_AMOUNT_PICTURE = "Z(9).99-"
 # CBSTM03A ST-CURR-BAL. It receives ACCT-CURR-BAL S9(10)V99, so the top integer digit is lost.
 STATEMENT_BALANCE_PICTURE = "9(9).99-"
-# WS-TRAN-AMT and WS-TRAN-AMT-E of COTRN00C, COTRN01C, COTRN02C and COBIL00C.
+# COTRN02C WS-TRAN-AMT-E: the screen amount moved back into TRNAMTI.
 ONLINE_AMOUNT_PICTURE = "+99999999.99"
-# COBIL00C WS-CURR-BAL.
-ONLINE_BALANCE_PICTURE = "+9999999999.99"
 # The COACTVW PICOUT amounts and the COACTUPC display amounts.
 ACCOUNT_AMOUNT_PICTURE = "+ZZZ,ZZZ,ZZZ.99"
 
