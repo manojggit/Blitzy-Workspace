@@ -716,12 +716,13 @@ async def test_confirmed_add_on_an_empty_file_writes_the_first_tran_id(
 async def test_next_tran_id_follows_the_highest_key(
     makeOnlineContext, syncEngine, highestTranId, nextTranId
 ):
-    """The new key is the highest TRAN-ID plus 1, kept to sixteen digits."""
+    """The new key is the highest TRAN-ID plus 1, kept to 16 digits; that record is unchanged."""
     InsertTransactionRow(syncEngine, highestTranId)
     context = await makeOnlineContext(REGULAR_USER_TYPE)
     response = await cotrn02c.AddTransaction(context, BuildAddRequest())
     assert response == AddedResponse(nextTranId)
     assert ReadStoredRow(syncEngine, nextTranId) == dict(ADDED_ROW)
+    assert ReadStoredRow(syncEngine, highestTranId) == dict(LAST_ROW_VALUES)
     assert CountTransactions(syncEngine) == 2
 
 
