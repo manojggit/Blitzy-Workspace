@@ -1,0 +1,486 @@
+"""Replaces: COMBTRAN (jcl/COMBTRAN.jcl: STEP05R SORT, STEP10 IDCAMS REPRO), copybook CVTRA05Y.
+
+Merge the backed-up and the interest transactions into a new TRANSACT.COMBINED generation and
+load them into the transaction master. Chain step 16 runs it, after the second TRANBKP (step 15)
+archived and emptied transactions.transactions.
+
+- STEP05R sorts the SORTIN concatenation of AWS.M2.CARDDEMO.TRANSACT.BKUP(0) and then
+  AWS.M2.CARDDEMO.SYSTRAN(0) with SORT FIELDS=(TRAN-ID,A), where SYMNAMES defines TRAN-ID as
+  1,16,CH, into TRANSACT.COMBINED(+1) (DCB=(*.SORTIN): the 350-byte CVTRA05Y record). CH
+  compares the field's EBCDIC bytes, so the port sorts on the code page 037 bytes of the first 16
+  characters. The sort is stable, so equal keys keep their SORTIN order. Records are written as
+  read, so the generation is the byte-exact sorted concatenation of the two inputs.
+- STEP10 REPRO INFILE(TRANSACT) OUTFILE(TRANVSAM) adds every combined record to the TRANSACT
+  KSDS; the port inserts each one into transactions.transactions in file order.
+
+The sort streams, so the records held in memory never grow with the generations; only the list
+of spilled run names grows, with the run count. Each input is checked for TRAN-ID order by a
+first read; one in order streams from its file, and one out of order (a SYSTRAN whose six-digit
+INTCALC suffix wrapped at 999999, or any other) is sorted stably with bounded record buffers and
+spilled runs, as DFSORT uses work files. The runs go to a private work directory in the
+TRANSACT.COMBINED base directory, beside the generation's .part file, which the job removes
+whatever happens and gdg.ReconcileCatalog removes after a killed run. The work directory and
+its run files, which hold card numbers, are reached only relative to held directory
+descriptors (gdg.WorkDirectory), so a symbolic link at the gdg or base directory is refused
+with gdg.ManagedDirectoryError, a file error, instead of being followed. The two ordered streams
+are merged stably, BKUP first on equal keys, and one pass writes each record, decodes it and
+inserts it in bounded batches.
+
+Both steps run in one transaction with the run's completion and then the generation's COMMITTED
+catalog row, the transaction's final write, so the step is atomic. This module never publishes:
+batch_chain publishes the generation once the transaction has committed, outside its
+runner-failure handling, so a publication error cannot turn the committed load into a failed,
+retryable step. A duplicate key, or any other database, file or record failure, rolls the
+transaction back: the table is left as it was and no generation is cataloged or published. A
+failure inside the generation block also deletes the .part file; a failure of the final commit
+leaves it uncataloged until gdg.ReconcileCatalog, which batch_chain runs once the failure is
+recorded and every command runs at its start, deletes it. This replaces the REPRO failure path
+(Technical Specification 0.6.12, "Utility steps").
+
+Exit statuses: EXIT_OK; or JobFailure with EXIT_FAILURE when an input generation is missing or
+LOST, on a duplicate key or another constraint violation, and on a database, file or record
+error. Failure texts name generations, record numbers, fields, constraints, SQLSTATEs and errno
+symbols, never a field's content (the batch/db.py diagnostics policy). docs/batch.md ("Step 16:
+COMBTRAN") transcribes this contract. Step identity in the run ledger, not this module, keeps a
+completed run from repeating in its cycle. The CLI holds the batch window around the command, so
+this job never enters the online window.
+"""
+
+import collections
+import contextlib
+import errno
+import heapq
+import itertools
+import logging
+from collections.abc import Iterable, Iterator, Sequence
+from pathlib import Path
+
+from app.core.logging import PrintableText
+from app.models import Transaction
+from app.utils.record_layouts import TRANSACTION_LAYOUT, DecodeRecord, RecordFormatError
+from sqlalchemy import insert
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import DBAPIError, IntegrityError
+
+from batch.orchestration import gdg, run_ledger
+from batch.orchestration.job_context import (
+    EXIT_FAILURE,
+    EXIT_OK,
+    JobContext,
+    JobFailure,
+    JobResult,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+JOB_NAME = "comb-tran"
+JCL_NAME = "COMBTRAN"
+
+# SYMNAMES TRAN-ID,1,16,CH of STEP05R: the sort key is the first 16 bytes, compared as EBCDIC.
+TRAN_ID_LENGTH = 16
+EBCDIC_CODEC = "cp037"
+# Rows per executemany statement of the STEP10 load.
+INSERT_BATCH_SIZE = 500
+# The external sort an input out of TRAN-ID order goes through, as DFSORT sorts with work
+# files: runs of at most SORT_RUN_RECORD_COUNT records are sorted in memory and spilled to a
+# work directory (SPILL_DIRECTORY_PREFIX, gdg.WORK_DIRECTORY_SUFFIX) in the TRANSACT.COMBINED
+# base directory, and at most MERGE_FAN_IN runs are open in any merge, so the records held in
+# memory and the run files open per merge stay bounded; only the list of run names grows with
+# the number of runs.
+SORT_RUN_RECORD_COUNT = 10_000
+MERGE_FAN_IN = 64
+SPILL_DIRECTORY_PREFIX = "carddemo-combtran-"
+RUN_FILE_PREFIX = "run-"
+RUN_FILE_SUFFIX = ".run"
+
+TRANSACTION_TABLE = Transaction.__table__
+# Every stored column except the generated sort key, which PostgreSQL computes from tran_id.
+INSERT_COLUMN_NAMES = frozenset(
+    column.name
+    for column in TRANSACTION_TABLE.columns
+    if column is not TRANSACTION_TABLE.c.tran_id_sort
+)
+
+RECORDS_COUNT_KEY = "records"
+BACKUP_RECORDS_COUNT_KEY = "backup_records"
+INTEREST_RECORDS_COUNT_KEY = "interest_records"
+
+# The failures, besides a constraint violation, that roll the job back: database statements,
+# the generation files and records the CVTRA05Y layout or the generation cannot hold. A
+# ValueError of any other origin, such as gdg's refusal of a context with no started run, is a
+# caller defect and propagates.
+COMBTRAN_FAILURES = (DBAPIError, OSError, RecordFormatError, gdg.GenerationRecordError)
+
+UNIQUE_VIOLATION_SQLSTATE = "23505"
+UNKNOWN_CODE = "UNKNOWN"
+FAILURE_TEMPLATE = "COMBTRAN FAILED: {reason}"
+DUPLICATE_KEY_TEMPLATE = (
+    "DUPLICATE KEY (SQLSTATE {sqlState}, CONSTRAINT {constraintName}); TRANSACT UNCHANGED AND"
+    " NO TRANSACT.COMBINED GENERATION CATALOGED"
+)
+CONSTRAINT_VIOLATION_TEMPLATE = (
+    "CONSTRAINT VIOLATION (SQLSTATE {sqlState}, CONSTRAINT {constraintName}); TRANSACT UNCHANGED"
+    " AND NO TRANSACT.COMBINED GENERATION CATALOGED"
+)
+DATABASE_ERROR_TEMPLATE = "DATABASE ERROR {errorClass} ({driverClass}) SQLSTATE {sqlState}"
+FILE_ERROR_TEMPLATE = "FILE ERROR {errorClass} ERRNO {errnoName}{fileName}"
+FILE_NAME_TEMPLATE = " ON {fileName}"
+RECORD_FIELD_TEMPLATE = (
+    "TRANSACT.COMBINED(+1) record {recordNumber}: field {fieldName} at offset {fieldOffset}"
+    " is not valid CVTRA05Y content"
+)
+RECORD_LAYOUT_TEMPLATE = "TRANSACT.COMBINED(+1) record {recordNumber} is not a CVTRA05Y record"
+UNORDERED_RECORD_TEMPLATE = "{path} record {recordNumber} sorts before the record ahead of it"
+COMBINED_LOG = (
+    "COMBTRAN: %d RECORDS (%d FROM TRANSACT.BKUP(0), %d FROM SYSTRAN(0)) SORTED INTO %s"
+    " AND LOADED INTO TRANSACT"
+)
+
+
+class UnorderedGenerationError(gdg.GenerationRecordError):
+    """A generation record whose TRAN-ID sorts before the TRAN-ID of the record ahead of it."""
+
+
+def ResolveInputGenerations(context: JobContext) -> tuple[gdg.Generation, gdg.Generation]:
+    """Resolve the STEP05R SORTIN concatenation: TRANSACT.BKUP(0), then SYSTRAN(0).
+
+    A missing generation, a JCL error on MVS, or a LOST one in the OPEN cycle stops the job
+    before anything is written, with EXIT_FAILURE and a message naming the base.
+    """
+    try:
+        bkupGeneration = gdg.ResolveGeneration(context, gdg.TRANSACT_BKUP, 0)
+        systranGeneration = gdg.ResolveGeneration(context, gdg.SYSTRAN, 0)
+    except gdg.MissingGenerationError as error:
+        raise JobFailure(EXIT_FAILURE, FAILURE_TEMPLATE.format(reason=error)) from error
+    except gdg.LostGenerationError as error:
+        raise JobFailure(EXIT_FAILURE, FAILURE_TEMPLATE.format(reason=error.message)) from error
+    return bkupGeneration, systranGeneration
+
+
+def TranIdSortKey(record: str) -> bytes:
+    """Return the STEP05R sort key: TRAN-ID (1,16) as code page 037 bytes, compared as CH.
+
+    Generation records are Latin-1 text, and code page 037 maps every Latin-1 character to one
+    byte, so the key is defined for every record a generation can hold.
+    """
+    return record[:TRAN_ID_LENGTH].encode(EBCDIC_CODEC)
+
+
+def KeyOrderedRecords(generation: gdg.Generation) -> Iterator[str]:
+    """Yield a generation's records as read, checking that their TRAN-IDs never descend.
+
+    Raises UnorderedGenerationError, naming the file and the 1-based record number, at the
+    first record whose key sorts before the key of the record ahead of it.
+    """
+    previousKey = b""
+    for recordNumber, record in enumerate(gdg.ReadGeneration(generation), start=1):
+        recordKey = TranIdSortKey(record)
+        if recordKey < previousKey:
+            reason = UNORDERED_RECORD_TEMPLATE.format(
+                path=PrintableText(generation.path), recordNumber=recordNumber
+            )
+            raise UnorderedGenerationError(reason)
+        previousKey = recordKey
+        yield record
+
+
+def IsInKeyOrder(generation: gdg.Generation) -> bool:
+    """Read a whole generation once, keeping no record; return whether it is in TRAN-ID order.
+
+    Every line is validated as it is read, so a malformed generation fails here, before the
+    write transaction opens.
+    """
+    try:
+        collections.deque(KeyOrderedRecords(generation), maxlen=0)
+    except UnorderedGenerationError:
+        return False
+    return True
+
+
+def WriteRun(records: Iterable[str], spillDirectory: gdg.ManagedDirectory) -> str:
+    """Write records, in the order given, to a new run file of the spill directory.
+
+    Returns the run file's name, random and created exclusively without following a link.
+    """
+    runName, runFile = spillDirectory.CreateUniqueFile(RUN_FILE_PREFIX, RUN_FILE_SUFFIX)
+    with runFile:
+        for record in records:
+            runFile.write(record.encode(gdg.GDG_FILE_ENCODING) + gdg.RECORD_TERMINATOR)
+    return runName
+
+
+def ReadRun(runName: str, spillDirectory: gdg.ManagedDirectory) -> Iterator[str]:
+    """Yield the records of a run file of the spill directory in file order, terminators removed."""
+    with spillDirectory.ReadFile(runName) as runFile:
+        for line in runFile:
+            yield line[: -len(gdg.RECORD_TERMINATOR)].decode(gdg.GDG_FILE_ENCODING)
+
+
+def MergeRuns(runNames: Sequence[str], spillDirectory: gdg.ManagedDirectory) -> Iterator[str]:
+    """Merge sorted runs by TRAN-ID; on equal keys, records of earlier runs come first."""
+    runs = (ReadRun(runName, spillDirectory) for runName in runNames)
+    return heapq.merge(*runs, key=TranIdSortKey)
+
+
+def MergeRunGroup(runGroup: Sequence[str], spillDirectory: gdg.ManagedDirectory) -> str:
+    """Merge consecutive runs into one new run, then delete them; return the new run's name."""
+    mergedName = WriteRun(MergeRuns(runGroup, spillDirectory), spillDirectory)
+    for runName in runGroup:
+        spillDirectory.Unlink(runName)
+    return mergedName
+
+
+def SpillSortedRuns(records: Iterable[str], spillDirectory: gdg.ManagedDirectory) -> list[str]:
+    """Cut records into runs of at most SORT_RUN_RECORD_COUNT, sort each stably and spill it."""
+    return [
+        WriteRun(sorted(runRecords, key=TranIdSortKey), spillDirectory)
+        for runRecords in itertools.batched(records, SORT_RUN_RECORD_COUNT)
+    ]
+
+
+def ExternalSort(
+    generation: gdg.Generation, cleanup: contextlib.ExitStack, spillRoot: Path
+) -> Iterator[str]:
+    """Return a generation's records in stable TRAN-ID order, sorted with bounded record buffers.
+
+    Stably sorted runs are spilled to a new private work directory of spillRoot, an archive base
+    directory, made and removed by gdg.WorkDirectory, which cleanup exits. The directory is held
+    by its descriptor and every run file is created, read and deleted relative to it, so a
+    symbolic link standing at the gdg, base or work directory is refused, never followed. The
+    runs are merged MERGE_FAN_IN consecutive runs at a time until one merge of at most
+    MERGE_FAN_IN remains. Only the list of run names grows, with the number of spilled runs.
+    Each merge puts earlier runs first on equal keys, so the input order of equal keys is kept.
+    The directory's gdg.WORK_DIRECTORY_SUFFIX lets gdg.ReconcileCatalog delete it when a killed
+    process never ran cleanup.
+    """
+    spillDirectory = cleanup.enter_context(gdg.WorkDirectory(spillRoot, SPILL_DIRECTORY_PREFIX))
+    runNames = SpillSortedRuns(gdg.ReadGeneration(generation), spillDirectory)
+    while len(runNames) > MERGE_FAN_IN:
+        runGroups = itertools.batched(runNames, MERGE_FAN_IN)
+        runNames = [MergeRunGroup(runGroup, spillDirectory) for runGroup in runGroups]
+    return MergeRuns(runNames, spillDirectory)
+
+
+def SortedInputRecords(
+    generation: gdg.Generation, cleanup: contextlib.ExitStack, spillRoot: Path
+) -> Iterator[str]:
+    """Return one SORTIN input's records in stable TRAN-ID order, as a stream cleanup closes.
+
+    A generation is never assumed to be sorted. A first read checks it: one in order streams
+    from its file, checked again as it streams, and one out of order, such as a SYSTRAN whose
+    six-digit INTCALC suffix wrapped from 999999 to 000000, goes through ExternalSort, which
+    spills under spillRoot. Only then is a spill directory made.
+    """
+    if IsInKeyOrder(generation):
+        records = KeyOrderedRecords(generation)
+    else:
+        records = ExternalSort(generation, cleanup, spillRoot)
+    return cleanup.enter_context(contextlib.closing(records))
+
+
+def MergedRecords(
+    inputGenerations: tuple[gdg.Generation, gdg.Generation],
+    cleanup: contextlib.ExitStack,
+    spillRoot: Path,
+) -> Iterator[str]:
+    """STEP05R: BKUP(0) then SYSTRAN(0) sorted by TRAN-ID ascending, as one bounded stream.
+
+    Each input is in stable key order and heapq.merge puts the earlier input first on equal
+    keys, so the stream equals the stable sort of the concatenation, BKUP before SYSTRAN, while
+    holding one record per input. Records are yielded as read, never re-encoded. An input out of
+    order spills its sorted runs under spillRoot, in a work directory cleanup removes.
+    """
+    sortedInputs = [
+        SortedInputRecords(generation, cleanup, spillRoot) for generation in inputGenerations
+    ]
+    return heapq.merge(*sortedInputs, key=TranIdSortKey)
+
+
+def DescribeRecordError(error: RecordFormatError, recordNumber: int) -> str:
+    """Name the combined record and, when known, the field a decode refused; never its content."""
+    if error.fieldName is None:
+        return RECORD_LAYOUT_TEMPLATE.format(recordNumber=recordNumber)
+    return RECORD_FIELD_TEMPLATE.format(
+        recordNumber=recordNumber, fieldName=error.fieldName, fieldOffset=error.fieldOffset
+    )
+
+
+def TransactionRow(record: str, recordNumber: int) -> dict[str, object]:
+    """Decode one combined CVTRA05Y record into the transactions.transactions columns it fills.
+
+    FILLER is never decoded and the generated tran_id_sort is never supplied. A refusal is
+    raised again as RecordFormatError naming the 1-based record number.
+    """
+    try:
+        decodedRecord = DecodeRecord(record, TRANSACTION_LAYOUT)
+    except RecordFormatError as error:
+        reason = DescribeRecordError(error, recordNumber)
+        raise RecordFormatError(reason, error.fieldName, error.fieldOffset) from error
+    return {name: value for name, value in decodedRecord.items() if name in INSERT_COLUMN_NAMES}
+
+
+def LoadMergedRecords(
+    connection: Connection, writer: gdg.GenerationWriter, mergedRecords: Iterable[str]
+) -> None:
+    """STEP05R SORTOUT and STEP10 REPRO in one pass, holding at most one insert batch.
+
+    Each merged record is written to TRANSACT.COMBINED(+1) as read, never re-encoded, then
+    decoded, and every INSERT_BATCH_SIZE rows go into transactions.transactions in one
+    executemany, in file order. A refused decode names the record's 1-based position. Records
+    are not deduplicated: a TRAN-ID that repeats, or that the table already holds, raises
+    IntegrityError, as the KSDS refuses a duplicate key.
+    """
+    transactionRows: list[dict[str, object]] = []
+    for record in mergedRecords:
+        writer.WriteRecord(record)
+        transactionRows.append(TransactionRow(record, writer.recordCount))
+        if len(transactionRows) == INSERT_BATCH_SIZE:
+            connection.execute(insert(TRANSACTION_TABLE), transactionRows)
+            transactionRows = []
+    if transactionRows:
+        connection.execute(insert(TRANSACTION_TABLE), transactionRows)
+
+
+def BuildResult(
+    recordCount: int, bkupGeneration: gdg.Generation, systranGeneration: gdg.Generation
+) -> JobResult:
+    """Return EXIT_OK with the combined count and the cataloged count of each input."""
+    counts = {
+        RECORDS_COUNT_KEY: recordCount,
+        BACKUP_RECORDS_COUNT_KEY: bkupGeneration.recordCount,
+        INTEREST_RECORDS_COUNT_KEY: systranGeneration.recordCount,
+    }
+    return JobResult(EXIT_OK, counts)
+
+
+def WriteAndLoadCombined(
+    context: JobContext,
+    connection: Connection,
+    mergedRecords: Iterable[str],
+    inputGenerations: tuple[gdg.Generation, gdg.Generation],
+) -> tuple[JobResult, gdg.GenerationWriter]:
+    """Write TRANSACT.COMBINED(+1) (STEP05R SORTOUT), load it (STEP10) and finish the run.
+
+    The load and the run's completion run inside the generation block, so a failure of either
+    discards the .part file. Given the connection, the generation's COMMITTED row, inserted as
+    the block exits, joins the job's transaction as its final write.
+    """
+    with gdg.NewGeneration(context, gdg.TRANSACT_COMBINED, connection=connection) as writer:
+        LoadMergedRecords(connection, writer, mergedRecords)
+        result = BuildResult(writer.recordCount, *inputGenerations)
+        run_ledger.FinishAtomicRun(connection, context, result)
+    return result, writer
+
+
+def CombineAndReload(context: JobContext) -> tuple[JobResult, gdg.GenerationWriter]:
+    """Order the inputs, then write, load and finish the run in one transaction.
+
+    The inputs are resolved, checked and, when out of order, sorted before the write
+    transaction opens; their merge then streams through it. Spilled runs go to a work directory
+    in the TRANSACT.COMBINED base directory, under CARDDEMO_OUTPUT_DIR beside the generation's
+    .part file rather than in the system temporary directory, and are removed whatever happens;
+    after a killed run, the next command's gdg.ReconcileCatalog removes them. gdg.BaseDirectory
+    creates that base directory and refuses a gdg or base directory that is a symbolic link,
+    as gdg.WorkDirectory and gdg.NewGeneration do again when they open it. The generation's
+    COMMITTED row is the transaction's last statement, after the run's completion.
+    """
+    inputGenerations = ResolveInputGenerations(context)
+    spillRoot = gdg.BaseDirectory(context, gdg.TRANSACT_COMBINED)
+    with contextlib.ExitStack() as cleanup:
+        mergedRecords = MergedRecords(inputGenerations, cleanup, spillRoot)
+        with context.engine.begin() as connection:
+            return WriteAndLoadCombined(context, connection, mergedRecords, inputGenerations)
+
+
+def SqlState(error: DBAPIError) -> str:
+    """Return the driver's SQLSTATE of a database error, or UNKNOWN when it has none."""
+    sqlState = getattr(error.orig, "pgcode", None)
+    if isinstance(sqlState, str) and sqlState:
+        return sqlState
+    return UNKNOWN_CODE
+
+
+def ConstraintName(error: IntegrityError) -> str:
+    """Return the name of the constraint a database error violated, or UNKNOWN."""
+    diagnostics = getattr(error.orig, "diag", None)
+    constraintName = getattr(diagnostics, "constraint_name", None)
+    if isinstance(constraintName, str) and constraintName:
+        return constraintName
+    return UNKNOWN_CODE
+
+
+def DescribeConstraintViolation(error: IntegrityError) -> str:
+    """Return the failure text of a refused insert: a duplicate key or another constraint."""
+    sqlState = SqlState(error)
+    template = CONSTRAINT_VIOLATION_TEMPLATE
+    if sqlState == UNIQUE_VIOLATION_SQLSTATE:
+        template = DUPLICATE_KEY_TEMPLATE
+    reason = template.format(sqlState=sqlState, constraintName=ConstraintName(error))
+    return FAILURE_TEMPLATE.format(reason=reason)
+
+
+def DescribeDatabaseError(error: DBAPIError) -> str:
+    """Return a database error's wrapper and driver classes and its SQLSTATE."""
+    driverClass = UNKNOWN_CODE if error.orig is None else type(error.orig).__name__
+    return DATABASE_ERROR_TEMPLATE.format(
+        errorClass=type(error).__name__, driverClass=driverClass, sqlState=SqlState(error)
+    )
+
+
+def DescribeFileError(error: OSError) -> str:
+    """Return a file error's class, errno symbol and, when known, the file it concerns.
+
+    The file, a str, bytes or file descriptor, is shown with every non-printable character
+    escaped, so a line break in its name cannot split the failure line.
+    """
+    errnoName = UNKNOWN_CODE
+    if isinstance(error.errno, int):
+        errnoName = errno.errorcode.get(error.errno, UNKNOWN_CODE)
+    fileName = ""
+    if error.filename is not None:
+        fileName = FILE_NAME_TEMPLATE.format(fileName=PrintableText(error.filename))
+    return FILE_ERROR_TEMPLATE.format(
+        errorClass=type(error).__name__, errnoName=errnoName, fileName=fileName
+    )
+
+
+def DescribeFailure(error: Exception) -> str:
+    """Return the failure text of a COMBTRAN_FAILURES error, free of any field's content.
+
+    GenerationRecordError and the RecordFormatError TransactionRow raises name generations,
+    record numbers, fields and offsets only, so their own text is shown.
+    """
+    if isinstance(error, DBAPIError):
+        reason = DescribeDatabaseError(error)
+    elif isinstance(error, OSError):
+        reason = DescribeFileError(error)
+    else:
+        reason = str(error)
+    return FAILURE_TEMPLATE.format(reason=reason)
+
+
+def RunJob(context: JobContext) -> JobResult:
+    """Run COMBTRAN: sort BKUP(0) and SYSTRAN(0) into COMBINED(+1) and load it (chain step 16).
+
+    Returns EXIT_OK with the records, backup_records and interest_records counts once the
+    transaction has committed, leaving the generation COMMITTED for batch_chain to publish.
+    Raises JobFailure with EXIT_FAILURE on a missing or LOST input, a duplicate key or another
+    failure, after which the table and the catalog are as they were and no generation is
+    published; a .part file a failed commit leaves is deleted by gdg.ReconcileCatalog.
+    """
+    try:
+        result, writer = CombineAndReload(context)
+    except IntegrityError as error:
+        raise JobFailure(EXIT_FAILURE, DescribeConstraintViolation(error)) from error
+    except COMBTRAN_FAILURES as error:
+        raise JobFailure(EXIT_FAILURE, DescribeFailure(error)) from error
+    counts = result.counts
+    generationName = gdg.GenerationName(gdg.TRANSACT_COMBINED.name, writer.generation)
+    LOGGER.info(
+        COMBINED_LOG,
+        counts[RECORDS_COUNT_KEY],
+        counts[BACKUP_RECORDS_COUNT_KEY],
+        counts[INTEREST_RECORDS_COUNT_KEY],
+        generationName,
+    )
+    return result

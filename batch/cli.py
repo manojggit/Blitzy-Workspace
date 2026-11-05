@@ -1,0 +1,746 @@
+"""The carddemo-batch command-line interface: run-all, seed-all, job and load.
+
+Replaces: CardDemo.ca7, CardDemo.controlm (scheduler); CLOSEFIL, OPENFIL, WAITSTEP (jcl)
+
+The CA-7 and Control-M job submission becomes these commands, and the EXEC PARM= and DD
+overrides of the job JCL become their options. Every command runs inside BatchWindow, which
+supersedes the CLOSEFIL and OPENFIL brackets; the sequential runner needs no WAITSTEP. Inside
+the window, interrupted runs are reclassified and the generation catalog is reconciled before
+the command's own work. Cycle, skip, resume, failure, force, LOST-generation and reload policy
+lives in batch.orchestration.batch_chain and run_ledger. This module parses options and exits
+with the status the chain returns: 0 and 4 let a chain continue, 8 or above stops it, and a
+usage error exits 2.
+
+The four command forms, with optional arguments in square brackets:
+
+```text
+carddemo-batch run-all [--new-cycle] [--start-at STEP] [--force]
+carddemo-batch seed-all
+carddemo-batch job JOB_NAME [--occurrence OCCURRENCE] [--force]
+carddemo-batch load LOADER_NAME
+```
+
+Replace STEP with a chain step number from 1 to 18 or a job name, JOB_NAME with a processing
+job such as post-tran, OCCURRENCE with 1 or 2 (tran-backup only), and LOADER_NAME with a loader
+such as accounts. Legacy JCL names such as POSTTRAN and ACCTFILE are accepted in any letter
+case. Each command's --help lists its options, and every help page ends with the environment
+variables batch reads, the exit statuses and examples (HelpEpilog).
+"""
+
+import errno
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Annotated, Any
+
+import typer
+from app.core.logging import ConfigureLogging, MaskSensitiveText, PrintableText
+from app.seed.image_reader import ENCODING_ASCII, ENCODING_EBCDIC
+from pydantic import ValidationError
+from sqlalchemy import Engine
+from sqlalchemy.exc import DBAPIError, OperationalError
+from typer._click import ClickException, Context
+from typer.core import TyperGroup
+
+from batch.config import BatchSettings, LoadBatchSettings
+from batch.db import BuildEngine
+from batch.orchestration import gdg, run_ledger
+from batch.orchestration.batch_chain import (
+    LOADER_JOB_NAMES,
+    PROCESSING_JOB_NAMES,
+    START_AT_RULE_MESSAGE,
+    UNKNOWN_CODE,
+    ChainOptions,
+    FindJobDefinition,
+    JobRequest,
+    ParseStartAt,
+    RunChain,
+    RunSeedAll,
+    RunStandaloneJob,
+    RunStandaloneLoad,
+)
+from batch.orchestration.batch_window import (
+    BATCH_WINDOW_LOST_MESSAGE,
+    BATCH_WINDOW_UNAVAILABLE_MESSAGE,
+    BatchWindow,
+    BatchWindowLostError,
+    BatchWindowUnavailableError,
+)
+from batch.orchestration.clock import Clock, ParseAsOf
+from batch.orchestration.job_context import (
+    DEFAULT_RUN_DATE,
+    EXIT_FAILURE,
+    OCCURRENCE_RULE_MESSAGE,
+    RUN_DATE_LENGTH,
+    JobContext,
+    JobParameters,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+# Batch operator messages, not legacy literals. None ever carries the database URL, a driver
+# message or a rejected setting value: only exception class names, SQLSTATEs and setting names
+# are logged. DATABASE ERROR names a database error that no step mapped to an exit status, for
+# example a missing relation in an unmigrated database: its wrapper class, driver class and
+# SQLSTATE, UNKNOWN_CODE standing in for either one the driver did not supply. FILE ERROR names
+# a file error that no step mapped, for example a directory where catalog recovery expects a
+# generation file or an orphan .part, or the gdg.ManagedDirectoryError of a gdg or base
+# directory that is a symbolic link, never followed: its class, its errno symbol (UNKNOWN_CODE
+# when it has none) and the path it names, the one the operator repairs, but never the OS error
+# text. The path is shown with every non-printable character escaped, so it stays on one line.
+DATABASE_UNAVAILABLE_MESSAGE = "DATABASE NOT AVAILABLE"
+DATABASE_ERROR_MESSAGE = "DATABASE ERROR"
+FILE_ERROR_MESSAGE = "FILE ERROR"
+SETTINGS_INVALID_MESSAGE = "BATCH SETTINGS INVALID"
+DATABASE_UNAVAILABLE_LOG = DATABASE_UNAVAILABLE_MESSAGE + " (%s)"
+DATABASE_ERROR_LOG = DATABASE_ERROR_MESSAGE + " %s (%s) SQLSTATE %s"
+FILE_ERROR_LOG = FILE_ERROR_MESSAGE + " %s ERRNO %s"
+FILE_ERROR_PATH_LOG = FILE_ERROR_LOG + " ON %s"
+SETTINGS_INVALID_LOG = SETTINGS_INVALID_MESSAGE + ": %d error(s) in %s"
+SETTINGS_INVALID_DETAIL_LOG = SETTINGS_INVALID_MESSAGE + ": %s"
+SETTING_NAME_SEPARATOR = ", "
+
+POST_TRAN_JOB = "post-tran"
+INTEREST_CALC_JOB = "interest-calc"
+TRAN_BACKUP_JOB = "tran-backup"
+COMB_TRAN_JOB = "comb-tran"
+STATEMENT_GEN_JOB = "statement-gen"
+TRAN_INDEX_JOB = "tran-index"
+
+# Loaders whose dataset has only an EBCDIC image: TRANFILE's DALYTRAN.PS.INIT and DUSRSECJ's
+# USRSEC.PS have no ASCII copy, so their load commands take no --encoding.
+EBCDIC_ONLY_LOADERS = ("transactions", "init-users")
+DAILY_TRANSACTIONS_LOADER = "daily-transactions"
+
+
+class EncodingChoice(str, Enum):
+    """The --encoding values: the seed-image encodings of app.seed.image_reader."""
+
+    EBCDIC = ENCODING_EBCDIC
+    ASCII = ENCODING_ASCII
+
+
+# token_normalize_func lowercases command and option names, so `job POSTTRAN`, `job PostTran`
+# and `load ACCTFILE` resolve to the lowercase alias commands registered below.
+NORMALIZED_CONTEXT = {"token_normalize_func": str.lower, "help_option_names": ["-h", "--help"]}
+
+
+class MaskedUsageErrorGroup(TyperGroup):
+    """The top-level command group: every usage error it shows has its card numbers masked.
+
+    Click prints a usage error to stderr before any command runs, so before ConfigureLogging
+    installs the masking filter, and the error repeats what the operator typed: an unknown
+    command or option, an extra argument or a refused option value. The errors of the job and
+    load groups and of every command propagate through this group's make_context and invoke,
+    where MaskSensitiveText, the filter's own masking, rewrites their message. typer.Exit and
+    typer.Abort are not ClickExceptions, so they pass through unchanged. Typer vendors Click as
+    typer._click, so the ClickException caught is that copy's, the class Typer raises and shows,
+    not the click package's.
+    """
+
+    # Click calls these exact names, so they stay lower-case: a framework-mandated exception
+    # to the MK_Modernization Rule's PascalCase method naming.
+    def make_context(
+        self,
+        info_name: str | None,
+        args: list[str],
+        parent: Context | None = None,
+        **extra: Any,
+    ) -> Context:
+        try:
+            return super().make_context(info_name, args, parent, **extra)
+        except ClickException as error:
+            error.message = MaskSensitiveText(error.message)
+            raise
+
+    def invoke(self, ctx: Context) -> Any:
+        try:
+            return super().invoke(ctx)
+        except ClickException as error:
+            error.message = MaskSensitiveText(error.message)
+            raise
+
+
+# The epilog every help page ends with: the variables BatchSettings reads, the exit statuses
+# and the page's examples. Click rewraps a help paragraph to the terminal width unless its first
+# line is "\b", a backspace it drops from the output, so each paragraph below opens with one
+# and keeps its columns. Every line fits 76 columns with the epilog's indentation.
+ENVIRONMENT_EPILOG = """\b
+Environment:
+  Process variables override backend/.env under the repository root, and
+  relative directories resolve against the repository root. SECRET_KEY is
+  not needed.
+
+\b
+  SYNC_DATABASE_URL    psycopg2 database URL; required, no default
+  CARDDEMO_OUTPUT_DIR  GDG archives, statements; default var/batch-output
+  CARDDEMO_EBCDIC_DIR  EBCDIC seed images; default data/EBCDIC
+  CARDDEMO_ASCII_DIR   ASCII seed images; default data/ASCII
+  APP_ENV              local (default), test or production; production
+                       makes load init-users exit 12
+  BCRYPT_ROUNDS        bcrypt cost of load init-users, 4-31; default 12"""
+EXIT_STATUS_EPILOG = """\b
+Exit status:
+  0   success
+  4   POSTTRAN rejected records; a chain continues
+  12  refusal or recoverable failure; a chain stops
+  16  abend; a chain stops
+  2   usage error: unknown command or option, or invalid option value"""
+EXAMPLES_HEADING = "\b\nExamples:"
+EXAMPLE_PREFIX = "  carddemo-batch "
+EPILOG_PARAGRAPH_BREAK = "\n\n"
+EPILOG_LINE_BREAK = "\n"
+
+# The examples of the top-level, job and load help pages: each is the command line after
+# carddemo-batch, and every one parses.
+APP_EXAMPLES = (
+    "seed-all",
+    "run-all --start-at POSTTRAN --as-of 2022-07-18T00:00:00",
+    "job tran-backup --occurrence 1",
+    "load accounts --encoding ascii",
+)
+JOB_GROUP_EXAMPLES = (
+    "job post-tran --as-of 2022-07-18T00:00:00",
+    "job interest-calc --run-date 2022071800",
+    "job tran-backup --occurrence 2 --force",
+)
+LOAD_GROUP_EXAMPLES = (
+    "load accounts --encoding ascii",
+    "load daily-transactions --daily-file PATH",
+    "load init-users",
+)
+
+
+def HelpEpilog(examples: tuple[str, ...]) -> str:
+    """Return a help page's epilog: the environment and exit-status blocks, then its examples.
+
+    Each example is a command line without its leading carddemo-batch, which is added here.
+    """
+    exampleLines = [EXAMPLES_HEADING, *(EXAMPLE_PREFIX + example for example in examples)]
+    return EPILOG_PARAGRAPH_BREAK.join(
+        (ENVIRONMENT_EPILOG, EXIT_STATUS_EPILOG, EPILOG_LINE_BREAK.join(exampleLines))
+    )
+
+
+# Plain Click help and error output (rich_markup_mode=None): help text is never read as Rich
+# markup, and the output stays the same in a terminal, a pipe and a test runner. Tracebacks of
+# unexpected errors never show local variables, which hold the settings and fetched rows. Usage
+# errors are shown with their card numbers masked (MaskedUsageErrorGroup).
+APP = typer.Typer(
+    name="carddemo-batch",
+    cls=MaskedUsageErrorGroup,
+    help="CardDemo batch jobs: the chain, the loaders and the processing jobs, run in the"
+    " batch window.",
+    epilog=HelpEpilog(APP_EXAMPLES),
+    no_args_is_help=True,
+    add_completion=False,
+    context_settings=NORMALIZED_CONTEXT,
+    rich_markup_mode=None,
+    pretty_exceptions_show_locals=False,
+)
+JOB_APP = typer.Typer(
+    no_args_is_help=True, context_settings=NORMALIZED_CONTEXT, rich_markup_mode=None
+)
+LOAD_APP = typer.Typer(
+    no_args_is_help=True, context_settings=NORMALIZED_CONTEXT, rich_markup_mode=None
+)
+APP.add_typer(
+    JOB_APP,
+    name="job",
+    help="Run one processing job as its step of the OPEN cycle.",
+    epilog=HelpEpilog(JOB_GROUP_EXAMPLES),
+)
+APP.add_typer(
+    LOAD_APP,
+    name="load",
+    help="Run one loader, recorded against its step of the OPEN cycle when there is one.",
+    epilog=HelpEpilog(LOAD_GROUP_EXAMPLES),
+)
+
+COMMAND_HELP = {
+    "run-all": "Run or resume the 18-step chain in legacy order (CA-7 and Control-M chains).",
+    "seed-all": "Abandon any OPEN cycle and run loader steps 1-5 and 7-12 in a new cycle.",
+    POST_TRAN_JOB: "POSTTRAN (CBTRN02C): post the staged daily transactions.",
+    INTEREST_CALC_JOB: "INTCALC (CBACT04C): compute monthly interest and write SYSTRAN(+1).",
+    TRAN_BACKUP_JOB: "TRANBKP: archive transactions to TRANSACT.BKUP(+1), then empty them.",
+    COMB_TRAN_JOB: "COMBTRAN: merge TRANSACT.BKUP(0) and SYSTRAN(0) into transactions.",
+    STATEMENT_GEN_JOB: "CREASTMT (CBSTM03A, CBSTM03B): write STATEMNT.PS and STATEMNT.HTML.",
+    TRAN_INDEX_JOB: "TRANIDX: rebuild the PROC-TS alternate index of transactions.",
+    "accounts": "ACCTFILE: replace the accounts from the ACCTDATA image.",
+    "cards": "CARDFILE: replace the cards from the CARDDATA image.",
+    "customers": "CUSTFILE: replace the customers from the CUSTDATA image.",
+    "card-xref": "XREFFILE: replace the card cross-reference from the CARDXREF image.",
+    "transactions": "TRANFILE: replace the transactions from DALYTRAN.PS.INIT (EBCDIC only).",
+    "tran-types": "TRANTYPE: replace the transaction types from the TRANTYPE image.",
+    "tran-categories": "TRANCATG: replace the transaction categories from the TRANCATG image.",
+    "disclosure-groups": "DISCGRP: replace the disclosure groups from the DISCGRP image.",
+    "tran-cat-balances": "TCATBALF: replace the category balances from the TCATBALF image.",
+    "init-users": "DUSRSECJ: replace the users from USRSEC.PS, passwords hashed (EBCDIC only).",
+    DAILY_TRANSACTIONS_LOADER: "DALYTRAN: stage the daily transaction file for POSTTRAN.",
+}
+
+# The examples of every command's help page, keyed like COMMAND_HELP: each is the command line
+# after carddemo-batch, using only options the command takes, and every one parses. A legacy JCL
+# alias shows its command's examples.
+COMMAND_EXAMPLES = {
+    "run-all": (
+        "run-all",
+        "run-all --new-cycle",
+        "run-all --start-at POSTTRAN --as-of 2022-07-18T00:00:00",
+    ),
+    "seed-all": ("seed-all", "seed-all --daily-file PATH"),
+    POST_TRAN_JOB: ("job post-tran", "job post-tran --as-of 2022-07-18T00:00:00"),
+    INTEREST_CALC_JOB: ("job interest-calc --run-date 2022071800", "job interest-calc --force"),
+    TRAN_BACKUP_JOB: ("job tran-backup", "job tran-backup --occurrence 2 --force"),
+    COMB_TRAN_JOB: ("job comb-tran", "job comb-tran --force"),
+    STATEMENT_GEN_JOB: ("job statement-gen", "job statement-gen --force"),
+    TRAN_INDEX_JOB: ("job tran-index", "job tran-index --force"),
+    "accounts": ("load accounts", "load accounts --encoding ascii"),
+    "cards": ("load cards", "load cards --encoding ascii"),
+    "customers": ("load customers", "load customers --encoding ascii"),
+    "card-xref": ("load card-xref", "load card-xref --encoding ascii"),
+    "transactions": ("load transactions", "load transactions --source-dir data/EBCDIC"),
+    "tran-types": ("load tran-types", "load tran-types --encoding ascii"),
+    "tran-categories": ("load tran-categories", "load tran-categories --encoding ascii"),
+    "disclosure-groups": ("load disclosure-groups", "load disclosure-groups --encoding ascii"),
+    "tran-cat-balances": ("load tran-cat-balances", "load tran-cat-balances --encoding ascii"),
+    "init-users": ("load init-users", "load init-users --source-dir data/EBCDIC"),
+    DAILY_TRANSACTIONS_LOADER: (
+        "load daily-transactions --daily-file PATH",
+        "load daily-transactions --encoding ascii",
+    ),
+}
+
+
+def ParseAsOfOption(text: str) -> datetime:
+    """Parse --as-of with ParseAsOf; a malformed value is a usage error, exit 2."""
+    try:
+        return ParseAsOf(text)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+
+
+def ParseRunDateOption(text: str) -> str:
+    """Return a --run-date JobParameters accepts; any other value is a usage error, exit 2.
+
+    The rule is JobParameters' own: RUN_DATE_LENGTH printable ASCII characters, the PARM-DATE
+    X(10) that CBACT04C reads.
+    """
+    try:
+        return JobParameters(runDate=text).runDate
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+
+
+def ParseOccurrenceOption(text: str) -> int:
+    """Return an --occurrence JobParameters accepts; any other value is a usage error, exit 2.
+
+    The rule is JobParameters' own: an integer in SUPPORTED_OCCURRENCES, TRANBKP's chain steps 6
+    and 15. A non-integer gets the same rule, and neither refusal repeats the value: int() drops
+    a typed card number's leading zero, leaving a digit run too short for the 16-digit masking.
+    """
+    try:
+        return JobParameters(occurrence=int(text)).occurrence
+    except ValueError as error:
+        raise typer.BadParameter(OCCURRENCE_RULE_MESSAGE) from error
+
+
+def ParseStartAtOption(text: str) -> str:
+    """Return a --start-at STEP the chain resolves; any other value is a usage error, exit 2.
+
+    The rule is ParseStartAt's own: a step number in the chain, leading zeros allowed, or a job
+    or loader name or JCL alias in any letter case. The text is returned unchanged, so RunChain
+    resolves it, TRANBKP's first incomplete occurrence included, as for a ChainOptions built in
+    code. The refusal states the rule without repeating the value, before the settings load,
+    the database is reached or the batch window is taken.
+    """
+    try:
+        ParseStartAt(text)
+    except KeyError as error:
+        raise typer.BadParameter(START_AT_RULE_MESSAGE) from error
+    return text
+
+
+# Option declarations shared by several commands. Every name is declared explicitly, and the
+# boolean flags have no negative --no-* form.
+AS_OF_OPTION = Annotated[
+    datetime | None,
+    typer.Option(
+        "--as-of",
+        parser=ParseAsOfOption,
+        metavar="TIMESTAMP",
+        help="Freeze the batch clock at YYYY-MM-DDTHH:MM:SS[.ffffff].",
+    ),
+]
+FORCE_OPTION = Annotated[
+    bool,
+    typer.Option("--force", help="Execute the step whatever its state, COMPLETED included."),
+]
+ENCODING_OPTION = Annotated[
+    EncodingChoice,
+    typer.Option("--encoding", help="The seed images to read: ebcdic, as the JCL loads, or ascii."),
+]
+SOURCE_DIR_OPTION = Annotated[
+    Path | None,
+    typer.Option(
+        "--source-dir",
+        metavar="DIRECTORY",
+        help="The image directory; a relative path resolves against the repository root.",
+    ),
+]
+DAILY_FILE_OPTION = Annotated[
+    Path | None,
+    typer.Option(
+        "--daily-file",
+        metavar="PATH",
+        help="The daily transaction image; a relative path resolves against the repository root.",
+    ),
+]
+RUN_DATE_OPTION = Annotated[
+    str,
+    typer.Option(
+        "--run-date",
+        parser=ParseRunDateOption,
+        metavar="DATE",
+        help=f"The {RUN_DATE_LENGTH}-character PARM-DATE that prefixes the interest TRAN-IDs.",
+    ),
+]
+OCCURRENCE_OPTION = Annotated[
+    int | None,
+    typer.Option(
+        "--occurrence",
+        parser=ParseOccurrenceOption,
+        metavar="OCCURRENCE",
+        help="The TRANBKP occurrence: 1 for chain step 6, 2 for step 15.",
+    ),
+]
+
+
+@dataclass(frozen=True)
+class CommandInvocation:
+    """What one command runs inside the batch window: its action, parameters and clock.
+
+    action is a closure over one batch_chain entry point; asOf freezes Clock.Now() when set.
+    """
+
+    action: Callable[[JobContext], int]
+    parameters: JobParameters
+    asOf: datetime | None = None
+
+
+def LoadSettingsOrExit() -> BatchSettings:
+    """Return the batch settings, or log which settings are invalid and exit 12.
+
+    Only the error count and the setting names are logged: a rejected value may be a database
+    URL with its password.
+    """
+    try:
+        return LoadBatchSettings()
+    except ValidationError as error:
+        settingNames = sorted({str(detail["loc"][0]) for detail in error.errors() if detail["loc"]})
+        LOGGER.error(
+            SETTINGS_INVALID_LOG, error.error_count(), SETTING_NAME_SEPARATOR.join(settingNames)
+        )
+        raise typer.Exit(code=EXIT_FAILURE) from None
+
+
+def BuildEngineOrExit(settings: BatchSettings) -> Engine:
+    """Return the job engine, or log why SYNC_DATABASE_URL is unusable and exit 12.
+
+    batch.db raises ValueError for an unparsable URL or a driver other than psycopg2, with a
+    message that never contains the URL, so the message itself is logged.
+    """
+    try:
+        return BuildEngine(settings)
+    except ValueError as error:
+        LOGGER.error(SETTINGS_INVALID_DETAIL_LOG, error)
+        raise typer.Exit(code=EXIT_FAILURE) from None
+
+
+def LogDatabaseError(error: DBAPIError) -> None:
+    """Log a database error by its wrapper class, driver class and SQLSTATE at ERROR.
+
+    Never str(error): the driver message and the statement text can quote row values such as
+    card numbers and SSNs, which the batch diagnostics policy of batch/db.py keeps out of every
+    log line.
+    """
+    driverError = error.orig
+    sqlState = getattr(driverError, "pgcode", None) or UNKNOWN_CODE
+    driverClass = UNKNOWN_CODE if driverError is None else type(driverError).__name__
+    LOGGER.error(DATABASE_ERROR_LOG, type(error).__name__, driverClass, sqlState)
+
+
+def LogFileError(error: OSError) -> None:
+    """Log a file error by its class, errno symbol and the path it names, if any, at ERROR.
+
+    Never str(error) or its strerror, which batch_chain.DescribeIoError leaves out too: only
+    names reach the log, as the batch diagnostics policy of batch/db.py requires. The path is
+    the one the operator repairs, such as a directory standing where catalog recovery expects
+    a generation file. Anyone who can write to the output directory chooses its name, so the
+    path, a str, bytes, path-like or file descriptor, is shown with every non-printable
+    character escaped: a line break or terminal escape in it neither splits the line nor forges
+    another. The logging filter then masks a card number in it as in any other line.
+    """
+    errnoName = errno.errorcode.get(error.errno, UNKNOWN_CODE) if error.errno else UNKNOWN_CODE
+    errorClass = type(error).__name__
+    if error.filename is None:
+        LOGGER.error(FILE_ERROR_LOG, errorClass, errnoName)
+        return
+    LOGGER.error(FILE_ERROR_PATH_LOG, errorClass, errnoName, PrintableText(str(error.filename)))
+
+
+def BuildCommandContext(
+    settings: BatchSettings, engine: Engine, invocation: CommandInvocation
+) -> JobContext:
+    """Return the context a command's prelude and action share, before any run is started."""
+    return JobContext(
+        engine=engine,
+        settings=settings,
+        clock=Clock(invocation.asOf),
+        parameters=invocation.parameters,
+    )
+
+
+def RunWindowedCommand(
+    settings: BatchSettings, engine: Engine, invocation: CommandInvocation
+) -> int:
+    """Hold the batch window, the job engine fenced, around the prelude and the action.
+
+    The order is fixed: interrupted runs are classified first, then the generation catalog is
+    reconciled, then the action resolves, skips or executes steps.
+    """
+    context = BuildCommandContext(settings, engine, invocation)
+    with BatchWindow(settings, jobEngine=engine):
+        run_ledger.ClassifyInterruptedRuns(context)
+        gdg.ReconcileCatalog(context)
+        return invocation.action(context)
+
+
+def RunInBatchWindow(settings: BatchSettings, engine: Engine, invocation: CommandInvocation) -> int:
+    """Run the invocation's prelude and action inside the batch window; return its status.
+
+    A window not granted within its lock timeout, a window lost while the command runs, or a
+    database that cannot be reached gives EXIT_FAILURE. So does any other database error that
+    neither the prelude nor the action mapped to a status, such as the missing relations of an
+    unmigrated database: it is logged by class and SQLSTATE only. A file error neither mapped,
+    such as a directory where catalog recovery expects a generation file or an orphan .part,
+    gives EXIT_FAILURE too, logged by class, errno symbol and path. A lost window has stopped
+    the command before any later commit or publication, leaving its run RUNNING for the next
+    command to classify. In each case BatchWindow has then already released whatever it held.
+    """
+    try:
+        return RunWindowedCommand(settings, engine, invocation)
+    except BatchWindowUnavailableError:
+        LOGGER.error(BATCH_WINDOW_UNAVAILABLE_MESSAGE)
+        return EXIT_FAILURE
+    except BatchWindowLostError:
+        LOGGER.error(BATCH_WINDOW_LOST_MESSAGE)
+        return EXIT_FAILURE
+    except OperationalError as error:
+        LOGGER.error(DATABASE_UNAVAILABLE_LOG, type(error).__name__)
+        return EXIT_FAILURE
+    except DBAPIError as error:
+        LogDatabaseError(error)
+        return EXIT_FAILURE
+    except OSError as error:
+        LogFileError(error)
+        return EXIT_FAILURE
+
+
+def ExecuteCommand(invocation: CommandInvocation) -> None:
+    """Run one command in the batch window and exit with its status.
+
+    The status, 0 included, is raised as typer.Exit, so the console script, the module form
+    and an in-process CliRunner all report the chain's status as the exit code. The job engine
+    is disposed of whatever happens.
+    """
+    ConfigureLogging()
+    settings = LoadSettingsOrExit()
+    engine = BuildEngineOrExit(settings)
+    try:
+        exitCode = RunInBatchWindow(settings, engine, invocation)
+    finally:
+        engine.dispose()
+    raise typer.Exit(code=exitCode)
+
+
+def ExecuteJob(request: JobRequest, parameters: JobParameters, asOf: datetime | None) -> None:
+    """Run one processing job as its step of the OPEN cycle and exit with its status."""
+    ExecuteCommand(
+        CommandInvocation(
+            action=lambda context: RunStandaloneJob(context, request),
+            parameters=parameters,
+            asOf=asOf,
+        )
+    )
+
+
+def ExecuteLoad(loaderName: str, parameters: JobParameters) -> None:
+    """Run one loader, in the OPEN cycle when there is one, and exit with its status."""
+    ExecuteCommand(
+        CommandInvocation(
+            action=lambda context: RunStandaloneLoad(context, loaderName),
+            parameters=parameters,
+        )
+    )
+
+
+@APP.command(
+    "run-all", help=COMMAND_HELP["run-all"], epilog=HelpEpilog(COMMAND_EXAMPLES["run-all"])
+)
+def RunAllCommand(
+    newCycle: Annotated[
+        bool,
+        typer.Option("--new-cycle", help="Abandon any OPEN cycle and run steps 1-18 anew."),
+    ] = False,
+    startAt: Annotated[
+        str | None,
+        typer.Option(
+            "--start-at",
+            parser=ParseStartAtOption,
+            metavar="STEP",
+            help="Resume the OPEN cycle at a step number 1-18 or a job name; for TRANBKP, its"
+            " first incomplete occurrence. A new cycle starts at step 1.",
+        ),
+    ] = None,
+    force: FORCE_OPTION = False,
+    asOf: AS_OF_OPTION = None,
+) -> None:
+    """Run or resume the chain with the default parameters: EBCDIC images and PARM 2022071800."""
+    options = ChainOptions(newCycle=newCycle, startAt=startAt, force=force)
+    ExecuteCommand(
+        CommandInvocation(
+            action=lambda context: RunChain(context, options),
+            parameters=JobParameters(),
+            asOf=asOf,
+        )
+    )
+
+
+# seed-all takes no --encoding: the TRANFILE and DUSRSECJ images exist in EBCDIC only, so an
+# ASCII seed-all could only abandon the OPEN cycle, reload steps 1-4 and stop at step 5.
+@APP.command(
+    "seed-all", help=COMMAND_HELP["seed-all"], epilog=HelpEpilog(COMMAND_EXAMPLES["seed-all"])
+)
+def SeedAllCommand(
+    sourceDir: SOURCE_DIR_OPTION = None, dailyFile: DAILY_FILE_OPTION = None
+) -> None:
+    """Reload every loaded table in a new cycle from the EBCDIC images."""
+    ExecuteCommand(
+        CommandInvocation(
+            action=RunSeedAll,
+            parameters=JobParameters(sourceDir=sourceDir, dailyFile=dailyFile),
+        )
+    )
+
+
+def PostTranCommand(force: FORCE_OPTION = False, asOf: AS_OF_OPTION = None) -> None:
+    """Run POSTTRAN as chain step 13."""
+    ExecuteJob(JobRequest(jobName=POST_TRAN_JOB, force=force), JobParameters(), asOf)
+
+
+def InterestCalcCommand(
+    runDate: RUN_DATE_OPTION = DEFAULT_RUN_DATE,
+    asOf: AS_OF_OPTION = None,
+    force: FORCE_OPTION = False,
+) -> None:
+    """Run INTCALC as chain step 14 with the PARM-DATE --run-date."""
+    request = JobRequest(jobName=INTEREST_CALC_JOB, force=force)
+    ExecuteJob(request, JobParameters(runDate=runDate), asOf)
+
+
+def TranBackupCommand(occurrence: OCCURRENCE_OPTION = None, force: FORCE_OPTION = False) -> None:
+    """Run TRANBKP as chain step 6 or 15: --occurrence, or its first incomplete occurrence."""
+    request = JobRequest(jobName=TRAN_BACKUP_JOB, occurrence=occurrence, force=force)
+    ExecuteJob(request, JobParameters(occurrence=occurrence), None)
+
+
+def CombTranCommand(force: FORCE_OPTION = False) -> None:
+    """Run COMBTRAN as chain step 16."""
+    ExecuteJob(JobRequest(jobName=COMB_TRAN_JOB, force=force), JobParameters(), None)
+
+
+def StatementGenCommand(force: FORCE_OPTION = False) -> None:
+    """Run CREASTMT as chain step 17."""
+    ExecuteJob(JobRequest(jobName=STATEMENT_GEN_JOB, force=force), JobParameters(), None)
+
+
+def TranIndexCommand(force: FORCE_OPTION = False) -> None:
+    """Run TRANIDX as chain step 18."""
+    ExecuteJob(JobRequest(jobName=TRAN_INDEX_JOB, force=force), JobParameters(), None)
+
+
+def BuildImageLoadCommand(loaderName: str) -> Callable[..., None]:
+    """Return the load command of a loader whose dataset has EBCDIC and ASCII images."""
+
+    def ImageLoadCommand(
+        encoding: ENCODING_OPTION = EncodingChoice.EBCDIC, sourceDir: SOURCE_DIR_OPTION = None
+    ) -> None:
+        """Replace the loader's table from its image in the chosen encoding."""
+        ExecuteLoad(loaderName, JobParameters(encoding=encoding.value, sourceDir=sourceDir))
+
+    return ImageLoadCommand
+
+
+def BuildEbcdicLoadCommand(loaderName: str) -> Callable[..., None]:
+    """Return the load command of a loader whose dataset has an EBCDIC image only."""
+
+    def EbcdicLoadCommand(sourceDir: SOURCE_DIR_OPTION = None) -> None:
+        """Replace the loader's table from its EBCDIC image."""
+        ExecuteLoad(loaderName, JobParameters(sourceDir=sourceDir))
+
+    return EbcdicLoadCommand
+
+
+def DailyTransactionsCommand(
+    dailyFile: DAILY_FILE_OPTION = None, encoding: ENCODING_OPTION = EncodingChoice.EBCDIC
+) -> None:
+    """Stage the daily file: --daily-file, or CARDDEMO_EBCDIC_DIR/AWS.M2.CARDDEMO.DALYTRAN.PS."""
+    parameters = JobParameters(encoding=encoding.value, dailyFile=dailyFile)
+    ExecuteLoad(DAILY_TRANSACTIONS_LOADER, parameters)
+
+
+def LoadCommandFor(loaderName: str) -> Callable[..., None]:
+    """Return a loader's command, whose options follow the images its dataset has."""
+    if loaderName == DAILY_TRANSACTIONS_LOADER:
+        return DailyTransactionsCommand
+    if loaderName in EBCDIC_ONLY_LOADERS:
+        return BuildEbcdicLoadCommand(loaderName)
+    return BuildImageLoadCommand(loaderName)
+
+
+def RegisterCommand(group: typer.Typer, canonicalName: str, function: Callable[..., None]) -> None:
+    """Register a command under its canonical name and, hidden, under its legacy JCL names.
+
+    Aliases are registered lowercase; NORMALIZED_CONTEXT lowercases what the operator types. An
+    alias shares its command's help and epilog, so only its usage line differs.
+    """
+    helpText = COMMAND_HELP[canonicalName]
+    epilogText = HelpEpilog(COMMAND_EXAMPLES[canonicalName])
+    group.command(canonicalName, help=helpText, epilog=epilogText)(function)
+    for alias in FindJobDefinition(canonicalName).aliases:
+        group.command(alias.lower(), help=helpText, epilog=epilogText, hidden=True)(function)
+
+
+JOB_COMMANDS = {
+    POST_TRAN_JOB: PostTranCommand,
+    INTEREST_CALC_JOB: InterestCalcCommand,
+    TRAN_BACKUP_JOB: TranBackupCommand,
+    COMB_TRAN_JOB: CombTranCommand,
+    STATEMENT_GEN_JOB: StatementGenCommand,
+    TRAN_INDEX_JOB: TranIndexCommand,
+}
+
+# Each tuple's canonical names register in order, their legacy JCL aliases hidden. Typer lists
+# commands in creation order, so `job --help` and `load --help` list the names in tuple order.
+for jobName in PROCESSING_JOB_NAMES:
+    RegisterCommand(JOB_APP, jobName, JOB_COMMANDS[jobName])
+for loaderName in LOADER_JOB_NAMES:
+    RegisterCommand(LOAD_APP, loaderName, LoadCommandFor(loaderName))
+
+
+if __name__ == "__main__":
+    APP()

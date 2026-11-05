@@ -1,0 +1,1092 @@
+"""Replaces: CORPT00C (CR00), BMS CORPT00, copybook CVTRA05Y; calls the CSUTLDTC date program.
+
+The CR00 transaction report screen. CORPT00C edited the request and wrote inline JCL to TDQ
+``JOBS``, which ran ``proc/TRANREPT.prc`` (backup, sort and filter, then CBTRN03C) to print the
+TRANREPT file; here the report is built within the request by ``cbtrn03c`` and rendered by
+``report_export`` as the screen's JSON (``PrepareTransactionReportJson``) or as a CSV or PDF
+download (``ExportTransactionReport``), a confirmed one as a ``ReportStream`` that the router
+sends, through ``StreamReport``, while it is built. ``RunTransactionReport`` returns the same
+screen as a ``TransactionReportResponse`` holding every line.
+
+The edits and the confirmation run first and wait for nothing. A confirmed report then takes one
+of the REPORT_WORKER_LIMIT report slots (``REPORT_SLOTS``) and, under a request admission
+(``core.database.AdmittedReads``), opens a read-only REPEATABLE READ snapshot, reads TRANTYPE
+and TRANCATG and checks every row of its range for the CBTRN03C abend
+(``cbtrn03c.CheckReportInput``). So every outcome that sets the status is known before a byte
+is sent. The build pass then reads the same snapshot again, and builds and renders the lines
+on a report thread, so neither a queued nor a running report keeps other online requests
+waiting. Both passes fetch the rows from a server-side cursor REPORT_BATCH_ROWS at a time, and
+the renderers yield the document in chunks as its lines are built, so a report never holds its
+row set, its line list or a joined copy of its document. A streamed report's unsent chunks wait
+in a buffer of REPORT_BUFFER_CHUNKS, which holds the whole document only when it is that small,
+and while the buffer is full the build waits for room. The report takes a REPORT_OUTPUT_BUDGET
+token before its slot and keeps it until its response ends, so the unsent output of all reports
+together stays within REPORT_STREAM_LIMIT buffers; its slot, admission and connection are freed
+when its build ends. A report whose client has disconnected stops at the next check: when its
+slot is granted, after its validation pass, at the next chunk of a streamed build (at once while
+it waits for room) and every DISCONNECT_CHECK_LINES lines of a listed one. A streamed report's
+response waits at most REPORT_SEND_TIMEOUT_SECONDS for its client to accept each message, so a
+client that stops reading without disconnecting stops the report the same way, and its body
+never ends normally.
+
+The TRANREPT STEP01R backup of TRANSACT is superseded: this module never writes, deletes or
+archives anything and only reads. CR00 never opened a CLOSEFIL file, so the report is not gated
+by the batch window: it calls only ``TransactionRepository.BeginReportSnapshot`` and
+``StreamReportTransactions`` and the two ``ReferenceRepository`` reads, which never enter the
+window.
+
+The edits run in first-failure mode: every ``PERFORM SEND-TRNRPT-SCREEN`` ends the task with
+``GO TO RETURN-TO-CICS`` (line 580), so the first failing edit raises its literal. Cursor names
+are the ``ReportQuery`` wire names, which are the CORPT00 page's field names.
+
+Legacy paths with no code here: ``EIBCALEN = 0`` (back to sign-on) is the session guard and its
+401; PF3 (``XCTL COMEN01C``) and the invalid-key branch are frontend navigation;
+POPULATE-HEADER-INFO is the frontend ScreenShell.
+"""
+
+import calendar
+import contextlib
+import functools
+import logging
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from dataclasses import dataclass, field
+from datetime import MINYEAR, date, datetime
+from typing import Any, NamedTuple
+
+from anyio import (
+    BrokenResourceError,
+    CapacityLimiter,
+    Event,
+    create_memory_object_stream,
+    create_task_group,
+    from_thread,
+    move_on_after,
+    to_thread,
+)
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+from starlette.requests import Request, empty_receive
+from starlette.types import Message, Send
+
+from app.core.database import AdmittedReads
+from app.core.dependencies import OnlineContext
+from app.core.errors import (
+    HTTP_EDIT_FAILURE,
+    HTTP_FILE_ERROR,
+    LegacyMessageError,
+    LogFileCondition,
+    RepositoryError,
+)
+from app.repositories.reference_repository import TRANTYPE_FILE_NAME, ReferenceRepository
+from app.repositories.transaction_repository import TransactionRepository
+from app.schemas.common import ExportFormat, ReportType
+from app.schemas.reports import ReportLine, ReportQuery, TransactionReportResponse
+from app.services.reports.cbtrn03c import CheckReportInput, IterateReport, ReportRequestData
+from app.services.reports.report_export import (
+    CSV_MEDIA_TYPE,
+    PDF_MEDIA_TYPE,
+    IterateCsv,
+    IterateJson,
+    IteratePdf,
+    RenderJson,
+    ReportChunk,
+)
+from app.utils.cobol_intrinsics import NumvalC
+from app.utils.date_validation import (
+    CEEDAYS_MSG_UNSUPPORTED_RANGE,
+    CEEDAYS_VALID_SEVERITY,
+    CheckDate,
+    DateCheckResult,
+)
+from app.utils.decimal_utils import StoreInto
+
+LOGGER = logging.getLogger(__name__)
+
+# WS-TRANID (line 38).
+TRANSACTION_ID = "CR00"
+# The TRANREPT reads of TRANTYPE, TRANCATG and TRANSACT that replace the TDQ write, as their
+# logged file conditions name them.
+READ_OPERATION = "READ"
+
+# PROCESS-ENTER-KEY WHEN OTHER (line 438): no report type was selected.
+SELECT_REPORT_TYPE_MESSAGE = "Select a report type to print report..."
+
+# The presence EVALUATE of the custom range (lines 258-303).
+START_MONTH_EMPTY_MESSAGE = "Start Date - Month can NOT be empty..."
+START_DAY_EMPTY_MESSAGE = "Start Date - Day can NOT be empty..."
+START_YEAR_EMPTY_MESSAGE = "Start Date - Year can NOT be empty..."
+END_MONTH_EMPTY_MESSAGE = "End Date - Month can NOT be empty..."
+END_DAY_EMPTY_MESSAGE = "End Date - Day can NOT be empty..."
+END_YEAR_EMPTY_MESSAGE = "End Date - Year can NOT be empty..."
+
+# The part checks after NUMVAL-C normalisation (lines 329-379).
+START_MONTH_INVALID_MESSAGE = "Start Date - Not a valid Month..."
+START_DAY_INVALID_MESSAGE = "Start Date - Not a valid Day..."
+START_YEAR_INVALID_MESSAGE = "Start Date - Not a valid Year..."
+END_MONTH_INVALID_MESSAGE = "End Date - Not a valid Month..."
+END_DAY_INVALID_MESSAGE = "End Date - Not a valid Day..."
+END_YEAR_INVALID_MESSAGE = "End Date - Not a valid Year..."
+
+# The CSUTLDTC checks of the composed dates (lines 400 and 420).
+START_DATE_INVALID_MESSAGE = "Start Date - Not a valid date..."
+END_DATE_INVALID_MESSAGE = "End Date - Not a valid date..."
+
+# SUBMIT-JOB-TO-INTRDR (lines 465-470 and 485-490) and the success STRING (lines 449-452).
+# WS-REPORT-NAME and CONFIRMI are DELIMITED BY SPACE.
+CONFIRM_PROMPT_TEMPLATE = "Please confirm to print the {reportName} report..."
+INVALID_CONFIRM_TEMPLATE = '"{value}" is not a valid value to confirm...'
+REPORT_SUBMITTED_TEMPLATE = "{reportName} report submitted for printing ..."
+
+# WIRTE-JOBSUB-TDQ WHEN OTHER (line 531), the program's only file-error literal. It answers
+# every repository failure of the report reads that replace the TDQ job submission.
+UNABLE_TO_WRITE_TDQ_MESSAGE = "Unable to Write TDQ (JOBS)..."
+
+# WS-REPORT-NAME values (lines 214, 240 and 433).
+MONTHLY_REPORT_NAME = "Monthly"
+YEARLY_REPORT_NAME = "Yearly"
+CUSTOM_REPORT_NAME = "Custom"
+
+# WS-DATE-FORMAT, passed to CSUTLDTC as CSUTLDTC-DATE-FORMAT.
+DATE_MASK = "YYYY-MM-DD"
+# WS-NUM-99 PIC 99 and WS-NUM-9999 PIC 9999: the unsigned receivers of the NUMVAL-C results.
+MONTH_DIGITS = 2
+DAY_DIGITS = 2
+YEAR_DIGITS = 4
+# The alphanumeric comparisons SDTMMI > '12' and SDTDDI > '31'.
+MAX_MONTH_TEXT = "12"
+MAX_DAY_TEXT = "31"
+# The NUMERIC class test of a PIC X field: every character is a digit 0-9.
+NUMERIC_CHARACTERS = frozenset("0123456789")
+# The padding a BMS input field carries; SPACES OR LOW-VALUES is a field holding only padding.
+FIELD_PADDING = " "
+FIRST_DAY_TEXT = "01"
+FIRST_MONTH_TEXT = "01"
+LAST_MONTH_TEXT = "12"
+LAST_DAY_OF_YEAR_TEXT = "31"
+
+# CONFIRMI = 'Y' OR 'y' and CONFIRMI = 'N' OR 'n'.
+CONFIRM_YES_VALUES = frozenset({"Y", "y"})
+CONFIRM_NO_VALUES = frozenset({"N", "n"})
+
+# The ReportQuery wire names, replacing MOVE -1 TO <field>L. MONTHLYL, the first selector of the
+# legacy map, is the single report-type selector.
+CURSOR_REPORT_TYPE = "reportType"
+CURSOR_START_MM = "startMm"
+CURSOR_START_DD = "startDd"
+CURSOR_START_YYYY = "startYyyy"
+CURSOR_END_MM = "endMm"
+CURSOR_END_DD = "endDd"
+CURSOR_END_YYYY = "endYyyy"
+CURSOR_CONFIRM = "confirm"
+
+EXPORT_FILENAME_TEMPLATE = "TRANREPT_{startDate}_{endDate}.{extension}"
+# The lines of a prompt or a cleared screen, which CORPT00C sends before any report is built.
+NO_REPORT_LINES: tuple[ReportLine, ...] = ()
+# The rows each fetch of a report pass takes from its server-side cursor. A pass holds the batch
+# it reads and, while it fetches the next, that one too, so this bounds the rows a report holds:
+# 200 rows keep a report's memory a fraction of even a one-day CSV, while costing few round trips.
+REPORT_BATCH_ROWS = 200
+NO_REPORT_ROWS: tuple[Mapping[str, Any], ...] = ()
+
+type RowBatches = AsyncIterator[Sequence[Mapping[str, Any]]]
+type PassRows = Iterator[Mapping[str, Any]]
+
+
+@dataclass(frozen=True)
+class ReportRange:
+    """The report name and range: WS-REPORT-NAME, WS-START-DATE and WS-END-DATE.
+
+    ``startDate`` and ``endDate`` are the 10-character YYYY-MM-DD texts CORPT00C wrote into the
+    job's SYMNAMES and DATEPARM records (PARM-START-DATE and PARM-END-DATE).
+    """
+
+    reportName: str
+    startDate: str
+    endDate: str
+
+
+@dataclass(frozen=True)
+class ReportOutcome:
+    """What the edits and the confirmation of one CORPT00 ENTER decided, before any read.
+
+    ``pendingResponse`` is the confirmation prompt, or the screen a confirmation of N clears;
+    it is None once Y confirms the report over ``reportRange``.
+    """
+
+    reportRange: ReportRange
+    pendingResponse: TransactionReportResponse | None
+
+
+@dataclass(frozen=True)
+class ReportJob:
+    """A confirmed report holding its slot, admission and snapshot: what its passes read.
+
+    ``openRowBatches`` opens one more pass over the STEP05R output, a server-side cursor of the
+    report's snapshot; the two maps are the TRANTYPE and TRANCATG records, as
+    ``cbtrn03c.IterateReport`` and ``cbtrn03c.CheckReportInput`` take them.
+    """
+
+    request: Request
+    requestData: ReportRequestData
+    openRowBatches: Callable[[], RowBatches]
+    typeDescriptions: Mapping[str, str]
+    categoryDescriptions: Mapping[tuple[str, int], str]
+
+
+@dataclass(frozen=True)
+class ReportStream:
+    """A confirmed report whose document is sent while it is built (``StreamReport``).
+
+    ``render`` turns the CBTRN03C lines into the document's chunks. The build puts each chunk
+    into ``chunkSender``, a buffer of REPORT_BUFFER_CHUNKS, and the response reads them from
+    ``chunks``. ``clientStalled`` is set once the response has stopped because its client
+    stopped reading (``SendThenClose``).
+    """
+
+    context: OnlineContext
+    reportRange: ReportRange
+    render: Callable[[Iterable[ReportLine]], Iterator[ReportChunk]]
+    chunkSender: MemoryObjectSendStream[ReportChunk]
+    chunks: MemoryObjectReceiveStream[ReportChunk]
+    clientStalled: Event = field(default_factory=Event)
+
+
+class ReportExport(NamedTuple):
+    """A confirmed download: the stream of its document, its media type and its file name."""
+
+    reportStream: ReportStream
+    mediaType: str
+    fileName: str
+
+
+class ReportAbandonedError(Exception):
+    """Internal: the report's client has disconnected, so the report is not finished."""
+
+
+class ReportClientStalledError(Exception):
+    """Internal: the report's client accepted no data within REPORT_SEND_TIMEOUT_SECONDS."""
+
+
+class DatePartField(NamedTuple):
+    """One CORPT00 date part: its ReportQuery attribute, cursor, width and literals.
+
+    ``maximumText`` is the alphanumeric upper bound of the part check, or None for a year,
+    which CORPT00C tests only for NUMERIC.
+    """
+
+    attributeName: str
+    cursorField: str
+    digits: int
+    emptyMessage: str
+    invalidMessage: str
+    maximumText: str | None
+
+
+class ReportDateField(NamedTuple):
+    """One composed CORPT00 date: its three parts, its CSUTLDTC literal and its cursor."""
+
+    yearAttribute: str
+    monthAttribute: str
+    dayAttribute: str
+    invalidMessage: str
+    cursorField: str
+
+
+class ExportRenderer(NamedTuple):
+    """The chunk renderer, media type and file extension of one report download format."""
+
+    render: Callable[[Iterable[ReportLine]], Iterator[ReportChunk]]
+    mediaType: str
+    extension: str
+
+
+# SDTMM, SDTDD, SDTYYYY, EDTMM, EDTDD, EDTYYYY: the order of the presence EVALUATE, the NUMVAL-C
+# moves and the part checks alike (lines 258-379).
+DATE_PART_FIELDS = (
+    DatePartField(
+        "start_mm",
+        CURSOR_START_MM,
+        MONTH_DIGITS,
+        START_MONTH_EMPTY_MESSAGE,
+        START_MONTH_INVALID_MESSAGE,
+        MAX_MONTH_TEXT,
+    ),
+    DatePartField(
+        "start_dd",
+        CURSOR_START_DD,
+        DAY_DIGITS,
+        START_DAY_EMPTY_MESSAGE,
+        START_DAY_INVALID_MESSAGE,
+        MAX_DAY_TEXT,
+    ),
+    DatePartField(
+        "start_yyyy",
+        CURSOR_START_YYYY,
+        YEAR_DIGITS,
+        START_YEAR_EMPTY_MESSAGE,
+        START_YEAR_INVALID_MESSAGE,
+        None,
+    ),
+    DatePartField(
+        "end_mm",
+        CURSOR_END_MM,
+        MONTH_DIGITS,
+        END_MONTH_EMPTY_MESSAGE,
+        END_MONTH_INVALID_MESSAGE,
+        MAX_MONTH_TEXT,
+    ),
+    DatePartField(
+        "end_dd",
+        CURSOR_END_DD,
+        DAY_DIGITS,
+        END_DAY_EMPTY_MESSAGE,
+        END_DAY_INVALID_MESSAGE,
+        MAX_DAY_TEXT,
+    ),
+    DatePartField(
+        "end_yyyy",
+        CURSOR_END_YYYY,
+        YEAR_DIGITS,
+        END_YEAR_EMPTY_MESSAGE,
+        END_YEAR_INVALID_MESSAGE,
+        None,
+    ),
+)
+
+# The start date is checked before the end date (lines 388-426). Both failures put the cursor on
+# the month part: MOVE -1 TO SDTMML and MOVE -1 TO EDTMML.
+REPORT_DATE_FIELDS = (
+    ReportDateField(
+        "start_yyyy", "start_mm", "start_dd", START_DATE_INVALID_MESSAGE, CURSOR_START_MM
+    ),
+    ReportDateField("end_yyyy", "end_mm", "end_dd", END_DATE_INVALID_MESSAGE, CURSOR_END_MM),
+)
+
+EXPORT_RENDERERS: dict[ExportFormat, ExportRenderer] = {
+    ExportFormat.CSV: ExportRenderer(IterateCsv, CSV_MEDIA_TYPE, "csv"),
+    ExportFormat.PDF: ExportRenderer(IteratePdf, PDF_MEDIA_TYPE, "pdf"),
+}
+
+# The most reports reading, building or rendering at once, across all requests. The work is pure
+# Python that holds the GIL, so more at once adds no throughput and only competes with the event
+# loop; and each report in a slot holds a request admission, a connection and a batch of rows
+# until its build ends. A build waiting for a slow client keeps its admission and connection, so
+# the limit also bounds what slow clients take from other online requests.
+REPORT_WORKER_LIMIT = 2
+# The report slots, taken before the reads and held until the report is built and rendered. A
+# report waits for its slot holding no admission and no connection, a streamed one only its
+# REPORT_OUTPUT_BUDGET token, and frees the slot when its build ends, while its client may still
+# be reading the chunks left in its buffer. Created at import, before any event loop runs, so
+# anyio creates the backend limiter on first use. A token is bound to the task that took it.
+REPORT_SLOTS = CapacityLimiter(REPORT_WORKER_LIMIT)
+# The worker threads of the reports in a slot. anyio lends a task one token of a limiter at a
+# time, and the task already holds its REPORT_SLOTS token, so the thread needs a limiter of its
+# own; it is never contended, because only reports in a slot borrow from it.
+REPORT_THREADS = CapacityLimiter(REPORT_WORKER_LIMIT)
+# The chunks one report's buffer holds, built and not yet taken by its response. The build waits
+# for room, so a slow client paces only its own build, and a document of at most this many chunks
+# is built without waiting: its slot, admission and connection are freed before its client has
+# read it.
+REPORT_BUFFER_CHUNKS = 16
+# The shared output budget. A confirmed streamed report takes one token before its slot, waiting
+# holding nothing else, and keeps it until its response has sent its last chunk, closed or
+# stalled, so the unsent output of all reports together stays within REPORT_STREAM_LIMIT
+# buffers, about 8 MiB of 16 KiB chunks, however slowly clients read.
+REPORT_STREAM_LIMIT = 32
+REPORT_OUTPUT_BUDGET = CapacityLimiter(REPORT_STREAM_LIMIT)
+# The report lines a report thread builds between two checks that its client is still connected.
+DISCONNECT_CHECK_LINES = 2000
+# nginx's 499 Client Closed Request, the status of a report stopped because its client
+# disconnected. The client is gone and never receives it, so it shows only in the server log.
+HTTP_CLIENT_CLOSED_REQUEST = 499
+CLIENT_CLOSED_MESSAGE = ""
+# One INFO record per stopped report; it names the transaction only, never the query or a PAN.
+REPORT_ABANDONED_LOG = "%s report stopped: the client disconnected"
+REPORT_STALLED_LOG = "%s report stopped: the client stopped reading"
+# nginx's send_timeout default: the longest a report's response waits for its client to accept
+# one ASGI message, so a client that stops reading without disconnecting frees its report's
+# slot, admission, connection and output token within that bound.
+REPORT_SEND_TIMEOUT_SECONDS = 60.0
+
+
+def CurrentDate() -> date:
+    """Return today's date in server local time, as ``FUNCTION CURRENT-DATE`` gives it."""
+    return datetime.now().date()
+
+
+def IsBlank(value: str) -> bool:
+    """Return True for ``SPACES OR LOW-VALUES``: an empty field or one holding only spaces."""
+    return not value.strip(FIELD_PADDING)
+
+
+def IsNumericText(value: str) -> bool:
+    """Return True when ``value IS NUMERIC`` holds for a PIC X field: digits 0-9 only."""
+    return value != "" and NUMERIC_CHARACTERS.issuperset(value)
+
+
+def DateText(yearText: str, monthText: str, dayText: str) -> str:
+    """Return the WS-START-DATE / WS-END-DATE layout: YYYY, '-', MM, '-', DD."""
+    return f"{yearText}-{monthText}-{dayText}"
+
+
+def MonthlyRange(today: date) -> ReportRange:
+    """Port the Monthly branch of PROCESS-ENTER-KEY (lines 213-238).
+
+    The start is the first of the current month. The end is DATE-OF-INTEGER(INTEGER-OF-DATE of
+    the first of the next month, December rolling into January of the next year, minus 1): the
+    last day of the current month, which ``calendar.monthrange`` gives directly.
+    """
+    yearText = f"{today.year:0{YEAR_DIGITS}d}"
+    monthText = f"{today.month:0{MONTH_DIGITS}d}"
+    lastDay = calendar.monthrange(today.year, today.month)[1]
+    return ReportRange(
+        MONTHLY_REPORT_NAME,
+        DateText(yearText, monthText, FIRST_DAY_TEXT),
+        DateText(yearText, monthText, f"{lastDay:0{DAY_DIGITS}d}"),
+    )
+
+
+def YearlyRange(today: date) -> ReportRange:
+    """Port the Yearly branch of PROCESS-ENTER-KEY (lines 239-255): 1 January to 31 December."""
+    yearText = f"{today.year:0{YEAR_DIGITS}d}"
+    return ReportRange(
+        YEARLY_REPORT_NAME,
+        DateText(yearText, FIRST_MONTH_TEXT, FIRST_DAY_TEXT),
+        DateText(yearText, LAST_MONTH_TEXT, LAST_DAY_OF_YEAR_TEXT),
+    )
+
+
+def CheckDatePartsPresent(query: ReportQuery) -> None:
+    """Port the presence EVALUATE of the Custom branch (lines 258-303).
+
+    Raises:
+        LegacyMessageError: 400 with the first blank part's literal and that part as the
+            cursor, in the order start month, day, year, then end month, day, year.
+    """
+    for part in DATE_PART_FIELDS:
+        if IsBlank(getattr(query, part.attributeName)):
+            raise LegacyMessageError(
+                part.emptyMessage, field=part.cursorField, httpStatus=HTTP_EDIT_FAILURE
+            )
+
+
+def NormaliseDatePart(text: str, digits: int) -> str:
+    """Port one ``COMPUTE WS-NUM-99 = FUNCTION NUMVAL-C(...)`` and its MOVE back (lines 305-327).
+
+    The value is stored into the unsigned PIC 99 or PIC 9999 receiver (absolute value, fraction
+    truncated, high-order digits dropped) and moved back as zero-padded text: ``5`` gives
+    ``05``, ``-5`` gives ``05``, ``1.9`` gives ``01``, and text NUMVAL-C cannot read gives
+    ``00`` or ``0000``.
+    """
+    stored = StoreInto(NumvalC(text), digits, 0, signed=False)
+    return f"{int(stored):0{digits}d}"
+
+
+def NormaliseDateParts(query: ReportQuery) -> dict[str, str]:
+    """Return every date part normalised by NUMVAL-C, keyed by its ReportQuery attribute.
+
+    The MOVEs back into SDTMMI and the other input fields also redisplayed the normalised parts
+    on the map. The CR00 response contract has no field slot for them, so they feed the checks
+    and reach the page only as the composed ``start_date`` and ``end_date``.
+    """
+    return {
+        part.attributeName: NormaliseDatePart(getattr(query, part.attributeName), part.digits)
+        for part in DATE_PART_FIELDS
+    }
+
+
+def CheckDatePartValues(partValues: dict[str, str]) -> None:
+    """Port the six part checks of the Custom branch (lines 329-379), as written.
+
+    A month fails when NOT NUMERIC or above '12', a day when NOT NUMERIC or above '31', and a
+    year when NOT NUMERIC. The parts arrive normalised to digits, so the NOT NUMERIC halves and
+    both ``Not a valid Year...`` literals are unreachable from any raw input; a month or day of
+    ``00`` passes here and fails the CSUTLDTC date check instead.
+
+    Raises:
+        LegacyMessageError: 400 with the first failing part's literal and that part as cursor.
+    """
+    for part in DATE_PART_FIELDS:
+        partText = partValues[part.attributeName]
+        isAboveMaximum = part.maximumText is not None and partText > part.maximumText
+        if not IsNumericText(partText) or isAboveMaximum:
+            raise LegacyMessageError(
+                part.invalidMessage, field=part.cursorField, httpStatus=HTTP_EDIT_FAILURE
+            )
+
+
+def IsAcceptedDate(result: DateCheckResult) -> bool:
+    """Return True for CSUTLDTC severity '0000', or message 2513 (unsupported range)."""
+    if result.severity == CEEDAYS_VALID_SEVERITY:
+        return True
+    return result.messageNumber == CEEDAYS_MSG_UNSUPPORTED_RANGE
+
+
+def CheckReportDate(partValues: dict[str, str], dateField: ReportDateField) -> str:
+    """Port one composed-date check (lines 381-426): MOVE the parts, then CALL 'CSUTLDTC'.
+
+    Returns:
+        The composed YYYY-MM-DD text.
+
+    Raises:
+        LegacyMessageError: 400 with the date's literal and its month part as the cursor.
+    """
+    dateText = DateText(
+        partValues[dateField.yearAttribute],
+        partValues[dateField.monthAttribute],
+        partValues[dateField.dayAttribute],
+    )
+    if not IsAcceptedDate(CheckDate(dateText, DATE_MASK)):
+        raise LegacyMessageError(
+            dateField.invalidMessage, field=dateField.cursorField, httpStatus=HTTP_EDIT_FAILURE
+        )
+    return dateText
+
+
+def CustomRange(query: ReportQuery) -> ReportRange:
+    """Port the Custom branch of PROCESS-ENTER-KEY (lines 256-436) in first-failure mode.
+
+    Presence, NUMVAL-C normalisation, the part checks and the start then end CSUTLDTC checks
+    run in source order, and the first failure ends the request.
+    """
+    CheckDatePartsPresent(query)
+    partValues = NormaliseDateParts(query)
+    CheckDatePartValues(partValues)
+    startDate, endDate = (
+        CheckReportDate(partValues, dateField) for dateField in REPORT_DATE_FIELDS
+    )
+    return ReportRange(CUSTOM_REPORT_NAME, startDate, endDate)
+
+
+def ResolveReportRange(query: ReportQuery, today: date) -> ReportRange:
+    """Port the report-type EVALUATE of PROCESS-ENTER-KEY (lines 212-256 and 437-442).
+
+    The legacy map's three one-character selectors, tested Monthly, Yearly, Custom in that
+    order, are the single ``report_type``. Monthly and Yearly run no date edit.
+
+    Raises:
+        LegacyMessageError: 400 ``Select a report type to print report...`` with the cursor on
+            the report type, or a Custom edit failure.
+    """
+    if query.report_type == ReportType.MONTHLY:
+        return MonthlyRange(today)
+    if query.report_type == ReportType.YEARLY:
+        return YearlyRange(today)
+    if query.report_type == ReportType.CUSTOM:
+        return CustomRange(query)
+    raise LegacyMessageError(
+        SELECT_REPORT_TYPE_MESSAGE, field=CURSOR_REPORT_TYPE, httpStatus=HTTP_EDIT_FAILURE
+    )
+
+
+def PromptResponse(reportRange: ReportRange) -> TransactionReportResponse:
+    """Return the blank-confirmation screen of SUBMIT-JOB-TO-INTRDR (lines 464-474).
+
+    A prompt rather than a failure, so it is sent with 200 and no lines; the cursor goes to the
+    confirm field (MOVE -1 TO CONFIRML).
+    """
+    return TransactionReportResponse(
+        start_date=reportRange.startDate,
+        end_date=reportRange.endDate,
+        message=CONFIRM_PROMPT_TEMPLATE.format(reportName=reportRange.reportName),
+        cursor_field=CURSOR_CONFIRM,
+        lines=[],
+    )
+
+
+def ClearedResponse() -> TransactionReportResponse:
+    """Return the screen INITIALIZE-ALL-FIELDS leaves after a confirmation of N (lines 633-646).
+
+    Every field and WS-MESSAGE are initialised and the cursor goes to the report type
+    (MOVE -1 TO MONTHLYL); the empty message with no lines tells the page to clear its form.
+    """
+    return TransactionReportResponse(
+        start_date="", end_date="", message="", cursor_field=CURSOR_REPORT_TYPE, lines=[]
+    )
+
+
+def ConfirmationResponse(
+    reportRange: ReportRange, confirm: str
+) -> TransactionReportResponse | None:
+    """Port the confirmation tests of SUBMIT-JOB-TO-INTRDR (lines 464-494).
+
+    Returns:
+        The prompt for a blank confirmation, the cleared screen for N or n, and None for Y or
+        y, which goes on to build the report.
+
+    Raises:
+        LegacyMessageError: 400 ``"<value>" is not a valid value to confirm...`` for any other
+            value, the value taken up to its first space, with the cursor on the confirm field.
+    """
+    if IsBlank(confirm):
+        return PromptResponse(reportRange)
+    # A PIC X(01) comparison pads the shorter operand with spaces, so trailing padding is equal.
+    confirmValue = confirm.rstrip(FIELD_PADDING)
+    if confirmValue in CONFIRM_YES_VALUES:
+        return None
+    if confirmValue in CONFIRM_NO_VALUES:
+        return ClearedResponse()
+    raise LegacyMessageError(
+        INVALID_CONFIRM_TEMPLATE.format(value=confirm.partition(FIELD_PADDING)[0]),
+        field=CURSOR_CONFIRM,
+        httpStatus=HTTP_EDIT_FAILURE,
+    )
+
+
+def ReportStartBound(startDate: str) -> date:
+    """Return the first date whose ISO text is at or after the accepted start-date text.
+
+    The TRANREPT INCLUDE compares TRAN-PROC-DT as 10 characters. CSUTLDTC accepts a year 0000
+    date (message 2513) that ``date`` cannot hold; every stored date's text follows it, so the
+    bound is ``date.min``.
+    """
+    if int(startDate[:YEAR_DIGITS]) < MINYEAR:
+        return date.min
+    return date.fromisoformat(startDate)
+
+
+def ReportEndBound(endDate: str) -> date | None:
+    """Return the last date whose ISO text is at or before the accepted end-date text.
+
+    None means no stored date's text can be at or before it: a year 0000 end date, which
+    CSUTLDTC accepts with message 2513, selects no transaction.
+    """
+    if int(endDate[:YEAR_DIGITS]) < MINYEAR:
+        return None
+    return date.fromisoformat(endDate)
+
+
+async def ReportRowBatches(
+    repository: TransactionRepository, reportRange: ReportRange
+) -> RowBatches:
+    """Yield the TRANREPT STEP05R output in batches: transactions in range, in TRAN-CARD-NUM order.
+
+    The repository filters on the PROC-TS date and sorts; this read never enters the batch
+    window. An end bound no stored date can meet skips the read, as the INCLUDE keeps nothing.
+    Closing the generator closes the repository's cursor.
+    """
+    endBound = ReportEndBound(reportRange.endDate)
+    if endBound is None:
+        return
+    startBound = ReportStartBound(reportRange.startDate)
+    rowBatches = repository.StreamReportTransactions(startBound, endBound, REPORT_BATCH_ROWS)
+    async with contextlib.aclosing(rowBatches):
+        async for rowBatch in rowBatches:
+            yield rowBatch
+
+
+async def NextRowBatch(rowBatches: RowBatches) -> Sequence[Mapping[str, Any]]:
+    return await anext(rowBatches, NO_REPORT_ROWS)
+
+
+def ThreadRows(rowBatches: RowBatches) -> PassRows:
+    """Yield the rows of rowBatches on a report thread, fetching each batch on the event loop.
+
+    Only the batch being read is held, and the one before it while the next is fetched.
+    """
+    while rowBatch := from_thread.run(NextRowBatch, rowBatches):
+        yield from rowBatch
+
+
+async def RunReportPass[PassResult](
+    job: ReportJob, work: Callable[[ReportJob, PassRows], PassResult]
+) -> PassResult:
+    """Run work on a report thread over one more pass of the job's rows, then close its cursor.
+
+    work's exceptions propagate unchanged, the repository's RepositoryError included.
+    """
+    async with contextlib.aclosing(job.openRowBatches()) as rowBatches:
+        return await to_thread.run_sync(work, job, ThreadRows(rowBatches), limiter=REPORT_THREADS)
+
+
+def CheckJobRows(job: ReportJob, rows: PassRows) -> None:
+    CheckReportInput(rows, job.typeDescriptions, job.categoryDescriptions)
+
+
+@contextlib.contextmanager
+def ReportReadFailures() -> Iterator[None]:
+    """Answer a failed report read with the program's WHEN OTHER literal (line 531).
+
+    Raises:
+        LegacyMessageError: 503 ``Unable to Write TDQ (JOBS)...`` with the cursor on the report
+            type, once the file condition of the block's RepositoryError is logged.
+    """
+    try:
+        yield
+    except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
+        raise LegacyMessageError(
+            UNABLE_TO_WRITE_TDQ_MESSAGE, field=CURSOR_REPORT_TYPE, httpStatus=HTTP_FILE_ERROR
+        ) from error
+
+
+async def ReadReportJob(context: OnlineContext, reportRange: ReportRange) -> ReportJob:
+    """Run the reads that replace the TDQ job (lines 496-535) and check the report's input.
+
+    Only reads run: the STEP01R backup of TRANSACT is superseded. The snapshot opens first, so
+    the TRANTYPE and TRANCATG reads and every TRANSACT pass see the same committed rows; the
+    validation pass then checks each row for the CBTRN03C abend on a report thread, so a
+    report that would abend is refused before any of it is sent.
+
+    Raises:
+        LegacyMessageError: 503 as ``ReportReadFailures`` when a repository read fails.
+        cbtrn03c.ReportAbendError: A row's card, type or category key is not on file.
+    """
+    transactionRepository = TransactionRepository(context)
+    referenceRepository = ReferenceRepository(context)
+    requestData = ReportRequestData(reportRange.startDate, reportRange.endDate)
+    openRowBatches = functools.partial(ReportRowBatches, transactionRepository, reportRange)
+    with ReportReadFailures():
+        await transactionRepository.BeginReportSnapshot()
+        typeDescriptions = await referenceRepository.GetTypeDescriptions()
+        categoryDescriptions = await referenceRepository.GetCategoryDescriptions()
+        job = ReportJob(
+            context.request, requestData, openRowBatches, typeDescriptions, categoryDescriptions
+        )
+        await RunReportPass(job, CheckJobRows)
+    return job
+
+
+async def ClientDisconnected(request: Request) -> bool:
+    """Return True once the client of ``request`` has closed its connection.
+
+    A request made without a receive channel, such as a service-level test context, has no
+    client that could disconnect, so it never reports one.
+    """
+    if request.receive is empty_receive:
+        return False
+    return await request.is_disconnected()
+
+
+async def StopIfClientGone(request: Request) -> None:
+    if await ClientDisconnected(request):
+        raise ReportAbandonedError
+
+
+def WatchClient(lines: Iterable[ReportLine], request: Request) -> Iterator[ReportLine]:
+    """Yield lines on a report thread, checking the client every DISCONNECT_CHECK_LINES lines.
+
+    Each check runs ``ClientDisconnected`` on the event loop and waits for its answer.
+
+    Raises:
+        ReportAbandonedError: The client has disconnected, so no further line is built.
+    """
+    for lineNumber, line in enumerate(lines, start=1):
+        isCheckLine = lineNumber % DISCONNECT_CHECK_LINES == 0
+        if isCheckLine and from_thread.run(ClientDisconnected, request):
+            raise ReportAbandonedError
+        yield line
+
+
+def JobLines(job: ReportJob, rows: PassRows) -> Iterator[ReportLine]:
+    return IterateReport(job.requestData, rows, job.typeDescriptions, job.categoryDescriptions)
+
+
+def ListReportLines(job: ReportJob, rows: PassRows) -> list[ReportLine]:
+    """Build every report line on a report thread for ``RunTransactionReport``.
+
+    Raises:
+        ReportAbandonedError: As ``WatchClient``.
+    """
+    return list(WatchClient(JobLines(job, rows), job.request))
+
+
+def SendReportChunks(reportStream: ReportStream, job: ReportJob, rows: PassRows) -> None:
+    """Build and render the report on a report thread, sending each chunk as it is rendered.
+
+    Each send runs on the event loop and waits while the buffer is full.
+
+    Raises:
+        BrokenResourceError: The response has stopped reading, because its client went away or
+            stopped reading; a build waiting for room gets it at once.
+    """
+    for chunk in reportStream.render(JobLines(job, rows)):
+        from_thread.run(reportStream.chunkSender.send, chunk)
+
+
+@contextlib.contextmanager
+def ClientGoneOutcome() -> Iterator[None]:
+    """Answer a report stopped because its client disconnected.
+
+    Raises:
+        LegacyMessageError: 499 (HTTP_CLIENT_CLOSED_REQUEST) with no message, once one INFO
+            record is logged.
+    """
+    try:
+        yield
+    except ReportAbandonedError:
+        LOGGER.info(REPORT_ABANDONED_LOG, TRANSACTION_ID)
+        raise LegacyMessageError(
+            CLIENT_CLOSED_MESSAGE, httpStatus=HTTP_CLIENT_CLOSED_REQUEST
+        ) from None
+
+
+async def OpenReportJob(
+    context: OnlineContext, reportRange: ReportRange, holdings: contextlib.AsyncExitStack
+) -> ReportJob:
+    """Take a report slot and a request admission into holdings, then read and check the report.
+
+    The slot comes first and is waited for holding no admission or connection; the admission is
+    taken only once it is granted. holdings keeps both, and the session's connection and
+    snapshot, until the caller's build ends. A request refused admission within its wait bound
+    (``core.database.AdmittedReads``) reads nothing and fails as an IOERR of TRANTYPE, its
+    first file read, so it answers the WHEN OTHER literal. A gone client is checked for when
+    the slot is granted and after the validation pass. ``cbtrn03c.ReportAbendError`` (the
+    CBTRN03C abend 999) is deliberately not caught, so it reaches FastAPI's 500 and the page
+    shows the legacy abend.
+
+    Raises:
+        ReportAbandonedError: The client has disconnected.
+        LegacyMessageError: 503 ``Unable to Write TDQ (JOBS)...`` as ``ReportReadFailures``
+            when the request is refused admission; otherwise as ``ReadReportJob``.
+    """
+    await holdings.enter_async_context(REPORT_SLOTS)
+    await StopIfClientGone(context.request)
+    admittedReads = AdmittedReads(context.request, context.session, TRANTYPE_FILE_NAME)
+    with ReportReadFailures():
+        await holdings.enter_async_context(admittedReads)
+    job = await ReadReportJob(context, reportRange)
+    await StopIfClientGone(context.request)
+    return job
+
+
+async def BuildReportLines(context: OnlineContext, reportRange: ReportRange) -> list[ReportLine]:
+    """Replace the TDQ job submission (lines 496-535) with the TRANREPT report, built online.
+
+    The slot, the admission and the snapshot are held until every line is built.
+
+    Raises:
+        LegacyMessageError: 503 as ``ReportReadFailures`` when a read of either pass fails;
+            499 as ``ClientGoneOutcome`` when the client disconnected.
+    """
+    with ClientGoneOutcome():
+        async with contextlib.AsyncExitStack() as holdings:
+            job = await OpenReportJob(context, reportRange, holdings)
+            with ReportReadFailures():
+                return await RunReportPass(job, ListReportLines)
+
+
+def OpenReportStream(
+    context: OnlineContext,
+    reportRange: ReportRange,
+    render: Callable[[Iterable[ReportLine]], Iterator[ReportChunk]],
+) -> ReportStream:
+    """Return the stream of the confirmed report over reportRange, rendered by render.
+
+    The chunk buffer holds REPORT_BUFFER_CHUNKS chunks, and the build waits for room while it
+    is full. ``StreamReport`` closes both ends of the buffer.
+    """
+    chunkSender, chunks = create_memory_object_stream[ReportChunk](REPORT_BUFFER_CHUNKS)
+    return ReportStream(context, reportRange, render, chunkSender, chunks)
+
+
+async def SendWithinTimeout(send: Send, message: Message) -> None:
+    """Pass message to send, waiting at most REPORT_SEND_TIMEOUT_SECONDS for the client.
+
+    Raises:
+        ReportClientStalledError: The client accepted no data within the bound.
+    """
+    with move_on_after(REPORT_SEND_TIMEOUT_SECONDS) as sendScope:
+        await send(message)
+    if sendScope.cancelled_caught:
+        raise ReportClientStalledError
+
+
+async def SendThenClose(
+    sendChunks: Callable[[], Awaitable[None]], reportStream: ReportStream
+) -> None:
+    """Run sendChunks, then close the stream's chunks, however sendChunks ends.
+
+    sendChunks returns early when the client goes away, and raises ReportClientStalledError
+    when it stops reading; closing chunks then stops the build (``BuildReportStream``). A stall
+    is logged here, once, and sets ``clientStalled`` before chunks closes, so the build does not
+    log it again. The body of a stalled response never ends normally.
+    """
+    with reportStream.chunks:
+        try:
+            await sendChunks()
+        except ReportClientStalledError:
+            reportStream.clientStalled.set()
+            LOGGER.info(REPORT_STALLED_LOG, TRANSACTION_ID)
+
+
+async def BuildReportStream(
+    reportStream: ReportStream, job: ReportJob, holdings: contextlib.AsyncExitStack
+) -> None:
+    """Build the checked report into its chunk buffer on a report thread, then free holdings.
+
+    The sender is closed only once every chunk is sent, so the body ends normally only for a
+    whole document. A build whose response has stopped reading, because the client went away
+    or stopped reading, stops at its next chunk, or at once when it is waiting for room; it logs
+    one INFO record for a gone client, as the response has logged a stalled one. The slot, the
+    admission and the connection are freed as soon as the build ends, however it ends, while
+    the response may still be sending the chunks left in the buffer.
+
+    Raises:
+        RepositoryError: A read of the build pass failed, once its file condition is logged.
+            The response has started, so the error ends the transfer without a last chunk.
+    """
+    try:
+        await RunReportPass(job, functools.partial(SendReportChunks, reportStream))
+    except BrokenResourceError:
+        if not reportStream.clientStalled.is_set():
+            LOGGER.info(REPORT_ABANDONED_LOG, TRANSACTION_ID)
+    except RepositoryError as error:
+        LogFileCondition(LOGGER, TRANSACTION_ID, READ_OPERATION, error)
+        raise
+    else:
+        reportStream.chunkSender.close()
+    finally:
+        await holdings.aclose()
+
+
+async def StreamReport(
+    reportStream: ReportStream, sendChunks: Callable[[], Awaitable[None]]
+) -> None:
+    """Run the confirmed report while sendChunks sends ``reportStream.chunks`` as the body.
+
+    First, in the calling task and before a byte is sent, the report takes a
+    REPORT_OUTPUT_BUDGET token, then its slot and admission, and is read and checked
+    (``OpenReportJob``), so each outcome that sets the status (the 503 literal, the abend 999,
+    the 499 of a gone client) is raised unwrapped, for the exception handlers. Then sendChunks
+    runs in a child task while the calling task, which holds both tokens, builds the report
+    (``BuildReportStream``). The budget token is released only once both the build and
+    sendChunks have ended, so it covers the chunks left in the buffer until the response has
+    sent them or stopped reading. A sendChunks that raises ReportClientStalledError, its client
+    having accepted nothing for REPORT_SEND_TIMEOUT_SECONDS, stops the report with one INFO
+    record and returns without the body's last message, so the client gets a truncated
+    transfer.
+
+    Raises:
+        LegacyMessageError: 503 as ``ReportReadFailures`` or 499 as ``ClientGoneOutcome``,
+            before the response starts.
+        cbtrn03c.ReportAbendError: As ``ReadReportJob``, before the response starts.
+        ExceptionGroup: Holding the RepositoryError of a failed build pass, after the response
+            started.
+    """
+    with reportStream.chunkSender, reportStream.chunks:
+        async with REPORT_OUTPUT_BUDGET, contextlib.AsyncExitStack() as holdings:
+            with ClientGoneOutcome():
+                job = await OpenReportJob(reportStream.context, reportStream.reportRange, holdings)
+            async with create_task_group() as taskGroup:
+                taskGroup.start_soon(SendThenClose, sendChunks, reportStream)
+                await BuildReportStream(reportStream, job, holdings)
+
+
+def SubmittedResponse(
+    reportRange: ReportRange, lines: list[ReportLine]
+) -> TransactionReportResponse:
+    """Return the success screen of lines 445-455: the green literal and the report lines.
+
+    The cursor goes to the report type (MOVE -1 TO MONTHLYL); the lines are empty when no
+    transaction lies in the range.
+    """
+    return TransactionReportResponse(
+        start_date=reportRange.startDate,
+        end_date=reportRange.endDate,
+        message=REPORT_SUBMITTED_TEMPLATE.format(reportName=reportRange.reportName),
+        cursor_field=CURSOR_REPORT_TYPE,
+        lines=lines,
+    )
+
+
+def EvaluateReportRequest(query: ReportQuery) -> ReportOutcome:
+    """Port the PROCESS-ENTER-KEY edits and SUBMIT-JOB-TO-INTRDR's confirmation (lines 208-494).
+
+    They run before any report slot, admission or read is taken, so a prompt, a cleared screen
+    or an edit failure never waits behind running reports.
+
+    Raises:
+        LegacyMessageError: 400 for the first failing edit or an invalid confirmation.
+    """
+    reportRange = ResolveReportRange(query, CurrentDate())
+    return ReportOutcome(reportRange, ConfirmationResponse(reportRange, query.confirm))
+
+
+async def RunTransactionReport(
+    context: OnlineContext, query: ReportQuery
+) -> TransactionReportResponse:
+    """Run CR00 ENTER: edit the request, confirm it and return the report lines.
+
+    Returns:
+        The prompt (blank confirmation), the cleared screen (N) or the submitted literal with
+        the CBTRN03C lines (Y), each with 200.
+
+    Raises:
+        LegacyMessageError: 400 for an edit or confirmation failure; 503 for a failed read;
+            499 when the client disconnected before the report was built.
+        cbtrn03c.ReportAbendError: As ``ReadReportJob``.
+    """
+    outcome = EvaluateReportRequest(query)
+    if outcome.pendingResponse is not None:
+        return outcome.pendingResponse
+    lines = await BuildReportLines(context, outcome.reportRange)
+    return SubmittedResponse(outcome.reportRange, lines)
+
+
+def PrepareTransactionReportJson(
+    context: OnlineContext, query: ReportQuery
+) -> bytes | ReportStream:
+    """Run CR00 ENTER's edits and confirmation and return the screen the route sends as JSON.
+
+    The JSON is what FastAPI sends for the ``TransactionReportResponse`` that
+    ``RunTransactionReport`` returns. The prompt (blank confirmation) and the cleared screen
+    (N) read nothing and are returned as those bytes. A confirmed report (Y) is returned as the
+    ``ReportStream`` whose chunks join into them: its lines are encoded one at a time as they
+    are built, so neither the line list nor a response model holding it exists.
+
+    Returns:
+        The JSON bytes of a pending screen, or the stream of the submitted literal with the
+        CBTRN03C lines; each is sent with 200.
+
+    Raises:
+        LegacyMessageError: 400 for an edit or confirmation failure; ``StreamReport`` raises
+            the outcomes of the confirmed report's reads.
+    """
+    outcome = EvaluateReportRequest(query)
+    if outcome.pendingResponse is not None:
+        return RenderJson(outcome.pendingResponse, NO_REPORT_LINES)
+    renderScreen = functools.partial(IterateJson, SubmittedResponse(outcome.reportRange, []))
+    return OpenReportStream(context, outcome.reportRange, renderScreen)
+
+
+def ExportTransactionReport(
+    context: OnlineContext, query: ReportQuery, exportFormat: ExportFormat
+) -> ReportExport:
+    """Run the CR00 edits and return the confirmed report as a CSV or PDF download.
+
+    The document is built in memory as its chunks are sent (``StreamReport``), on a report
+    thread, so rendering never holds the event loop. The line list is never built and the
+    document never joined: only its unsent chunks are held, at most REPORT_BUFFER_CHUNKS in its
+    buffer, and no file is written.
+
+    Returns:
+        The document's stream, its media type and its ``TRANREPT_<start>_<end>.<ext>`` name.
+
+    Raises:
+        LegacyMessageError: 400 with the prompt or cleared-screen message and cursor when the
+            request does not confirm a report; ``StreamReport`` raises the outcomes of the
+            confirmed report's reads.
+    """
+    outcome = EvaluateReportRequest(query)
+    pendingResponse = outcome.pendingResponse
+    if pendingResponse is not None:
+        raise LegacyMessageError(
+            pendingResponse.message,
+            field=pendingResponse.cursor_field or "",
+            httpStatus=HTTP_EDIT_FAILURE,
+        )
+    reportRange = outcome.reportRange
+    renderer = EXPORT_RENDERERS[exportFormat]
+    fileName = EXPORT_FILENAME_TEMPLATE.format(
+        startDate=reportRange.startDate, endDate=reportRange.endDate, extension=renderer.extension
+    )
+    reportStream = OpenReportStream(context, reportRange, renderer.render)
+    return ReportExport(reportStream, renderer.mediaType, fileName)

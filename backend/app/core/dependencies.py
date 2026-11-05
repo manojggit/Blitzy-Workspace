@@ -1,0 +1,269 @@
+"""Session identity, the admin and regular role guards, and the online request context.
+
+Replaces: the COMMAREA identity of copybook COCOM01Y (CDEMO-USER-ID X(08) and CDEMO-USER-TYPE
+X(01), 88 CDEMO-USRTYP-ADMIN VALUE 'A'), the COSGN00C routing that sends type A to COADM01C and
+every other type to COMEN01C (cbl/COSGN00C.cbl lines 230-239), and the COMMAREA user type that
+COCRDLIC and the other Style B programs reset to U. Specified in the Technical Specification,
+Sections 0.7.1 and 0.6.10.
+
+Identity comes only from the signed session cookie, which GetCurrentUser verifies. No request
+body, query parameter or header field is ever read as identity or role. The user type in the
+token holds for the token's lifetime, as the COMMAREA did for a CICS session, so no database read
+happens per request. Admin is exactly A; every other stored type (U, u, a, X, ...) is regular.
+
+- RequireAdmin guards CA00 (COADM01C) and CU00-CU03 (COUSR00C-COUSR03C). Anyone else gets 403
+  with the COMEN01C literal ``No access - Admin Only option... ``.
+- RequireRegular guards CM00, CAVW, CAUP, CCLI, CCDL, CCUP, CT00-CT02, CR00 and CB00. An admin
+  gets 403 with an empty message, and the client returns to the user's own menu.
+- RunSessionGuard runs one of SESSION_GUARDS on the cookie alone. app.api.v1.SessionFirstRoute
+  calls it before FastAPI reads a guarded route's body, so a missing or invalid cookie gives 401
+  and a wrong role 403 even when the body is malformed.
+- OnlineContext is the one parameter object services and repositories receive. Its engine, of
+  every write unit, is core.locks.RequestEngine, the engine of its batch-window connection too.
+  Every context dependency that can take the window releases the request's shared
+  batch-window lock (core.locks) when the request ends, whether it succeeds, fails or is
+  cancelled.
+- GetRegularReportContext serves CR00 alone. Its session comes from core.database
+  GetReportSession, which admits nothing, because the CR00 service takes the request admission
+  only for its reads and its build (core.database.AdmittedReads).
+- GetRegularMenuContext and GetAdminMenuContext serve CM00 (COMEN01C) and CA00 (COADM01C),
+  which do no file I/O. Their session comes from core.database GetUnadmittedSession, which
+  admits nothing and can never reach the pool, so the menus never wait behind other requests
+  or for the database.
+- Every other context is admitted by core.database GetSession for the whole request, or
+  refused when no admission comes free within DB_CONNECT_TIMEOUT_SECONDS.
+
+COMEN01C's own admin-only option check (CDEMO-USRTYP-USER, exactly U) is ported in the menu
+service, not here.
+"""
+
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, replace
+from typing import Annotated
+
+import jwt
+from anyio import CancelScope
+from fastapi import Depends, Request
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+
+from app.core.config import Settings
+from app.core.database import GetReportSession, GetSession, GetUnadmittedSession
+from app.core.errors import HTTP_ACCESS_REFUSED, HTTP_SIGN_ON_FAILURE, LegacyMessageError
+from app.core.locks import LeaveOnlineWindow, RequestEngine
+from app.core.messages import ADMIN_ONLY_MESSAGE
+from app.core.security import ReadSessionToken
+
+# COCOM01Y 88 CDEMO-USRTYP-ADMIN VALUE 'A': the only user type COSGN00C sends to COADM01C.
+ADMIN_USER_TYPE = "A"
+# The message of a 401 session refusal and of an admin refused a regular endpoint.
+NO_MESSAGE = ""
+
+
+def GetAppSettings(request: Request) -> Settings:
+    """Return the Settings that main.CreateApp keeps on app.state, so tests inject their own."""
+    return request.app.state.settings
+
+
+@dataclass(frozen=True)
+class CurrentUser:
+    """The signed-on user, read from the verified session token.
+
+    ``userId`` and ``userType`` replace CDEMO-USER-ID and CDEMO-USER-TYPE. This is not a
+    response model: ``GET /auth/me`` copies them into the snake_case ``user_id`` and
+    ``user_type`` keys of its Pydantic body.
+    """
+
+    userId: str
+    userType: str
+
+    def IsAdmin(self) -> bool:
+        """Return True only for type exactly A, the COSGN00C ``IF CDEMO-USRTYP-ADMIN`` test."""
+        return self.userType == ADMIN_USER_TYPE
+
+
+def SessionRefusal() -> LegacyMessageError:
+    """Return the 401 error of a missing, blank, expired or invalid session cookie."""
+    return LegacyMessageError(NO_MESSAGE, httpStatus=HTTP_SIGN_ON_FAILURE)
+
+
+async def GetCurrentUser(
+    request: Request, settings: Annotated[Settings, Depends(GetAppSettings)]
+) -> CurrentUser:
+    """Return the user of the verified session cookie; raise 401 when there is none.
+
+    Only the SESSION_COOKIE_NAME cookie is read. The token error is not chained, so nothing
+    about a rejected token reaches the response or the logged traceback.
+    """
+    token = request.cookies.get(settings.SESSION_COOKIE_NAME, "")
+    if not token.strip():
+        raise SessionRefusal()
+    try:
+        claims = ReadSessionToken(token, settings)
+    except jwt.InvalidTokenError:
+        raise SessionRefusal() from None
+    return CurrentUser(userId=claims.userId, userType=claims.userType)
+
+
+async def RequireAdmin(user: Annotated[CurrentUser, Depends(GetCurrentUser)]) -> CurrentUser:
+    """Pass a type A user; refuse any other with 403 and the admin-only literal."""
+    if not user.IsAdmin():
+        raise LegacyMessageError(ADMIN_ONLY_MESSAGE, httpStatus=HTTP_ACCESS_REFUSED)
+    return user
+
+
+async def RequireRegular(user: Annotated[CurrentUser, Depends(GetCurrentUser)]) -> CurrentUser:
+    """Pass any user whose type is not exactly A; refuse an admin with 403 and no message."""
+    if user.IsAdmin():
+        raise LegacyMessageError(NO_MESSAGE, httpStatus=HTTP_ACCESS_REFUSED)
+    return user
+
+
+# A dependency that returns the verified session user or raises its 401 or 403.
+type SessionGuard = Callable[..., Awaitable[CurrentUser]]
+# The session guards, role guards first: a route that depends on RequireAdmin or RequireRegular
+# also depends on GetCurrentUser beneath it, and the role guard is the one it needs.
+SESSION_GUARDS: tuple[SessionGuard, ...] = (RequireAdmin, RequireRegular, GetCurrentUser)
+
+
+async def RunSessionGuard(request: Request, sessionGuard: SessionGuard) -> CurrentUser:
+    """Run ``sessionGuard``, one of SESSION_GUARDS, on the request's session cookie alone.
+
+    It returns the guard's user or raises the guard's own 401 or 403. GetCurrentUser reads
+    only the SESSION_COOKIE_NAME cookie, so the request body is neither read nor needed.
+    """
+    user = await GetCurrentUser(request, GetAppSettings(request))
+    if sessionGuard is GetCurrentUser:
+        return user
+    return await sessionGuard(user)
+
+
+@dataclass
+class OnlineContext:
+    """What one online request hands its service and repositories.
+
+    ``session`` is the request session for reads that lock nothing. ``user`` is the verified
+    session user; it is None only in the anonymous context of the public sign-on request.
+    """
+
+    request: Request
+    session: AsyncSession
+    settings: Settings
+    user: CurrentUser | None = None
+
+    def Engine(self) -> AsyncEngine:
+        """Return the request's engine (core.locks.RequestEngine) of every WriteUnit it opens.
+
+        It is app.state.engine, or the refusing engine of a request core.database refused or
+        of a route that does no file I/O, so the request's write units, the login throttle's
+        included, come from the same engine as its batch-window connection.
+        """
+        return RequestEngine(self.request)
+
+    engine = property(Engine)
+
+
+async def GetOnlineContext(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(GetSession)],
+    settings: Annotated[Settings, Depends(GetAppSettings)],
+) -> AsyncIterator[OnlineContext]:
+    """Yield the request's anonymous context and release its batch-window lock at the end.
+
+    The context reads no cookie and carries no user: POST /auth/login is public and builds
+    its context here. GetAuthenticatedContext, GetAdminContext and GetRegularContext add the
+    verified user. There is no ``except``, so the endpoint's exceptions reach the handlers.
+    """
+    context = OnlineContext(request=request, session=session, settings=settings)
+    try:
+        yield context
+    finally:
+        # Shielded: under an anyio cancellation every await would be cancelled again, yet the
+        # shared window lock must be released even when the request task is cancelled.
+        with CancelScope(shield=True):
+            await LeaveOnlineWindow(request)
+
+
+async def GetFileFreeContext(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(GetUnadmittedSession)],
+    settings: Annotated[Settings, Depends(GetAppSettings)],
+) -> OnlineContext:
+    """Return the anonymous context of a route whose program does no file I/O.
+
+    The request takes no admission. Its session and its engine are core.database's refusing
+    engine, so the context can never reach the pool and never holds a batch-window lock to
+    release. GetRegularMenuContext and GetAdminMenuContext add the verified user.
+    """
+    return OnlineContext(request=request, session=session, settings=settings)
+
+
+async def GetRegularMenuContext(
+    user: Annotated[CurrentUser, Depends(RequireRegular)],
+    context: Annotated[OnlineContext, Depends(GetFileFreeContext)],
+) -> OnlineContext:
+    """Return the CM00 (COMEN01C) context of a regular user; the guard runs before the context."""
+    return replace(context, user=user)
+
+
+async def GetAdminMenuContext(
+    user: Annotated[CurrentUser, Depends(RequireAdmin)],
+    context: Annotated[OnlineContext, Depends(GetFileFreeContext)],
+) -> OnlineContext:
+    """Return the CA00 (COADM01C) context of an admin; the guard runs before the context."""
+    return replace(context, user=user)
+
+
+async def GetAuthenticatedContext(
+    user: Annotated[CurrentUser, Depends(GetCurrentUser)],
+    context: Annotated[OnlineContext, Depends(GetOnlineContext)],
+) -> OnlineContext:
+    """Return the context of any signed-on user, with no role guard (GET /auth/me).
+
+    The user is declared first, so a missing or invalid cookie gives 401 before the context
+    is built. FastAPI caches GetCurrentUser per request, so the cookie is decoded once.
+    """
+    return replace(context, user=user)
+
+
+async def GetAdminContext(
+    user: Annotated[CurrentUser, Depends(RequireAdmin)],
+    context: Annotated[OnlineContext, Depends(GetOnlineContext)],
+) -> OnlineContext:
+    """Return the context of an admin (CU00-CU03); the guard runs before the context."""
+    return replace(context, user=user)
+
+
+async def GetRegularContext(
+    user: Annotated[CurrentUser, Depends(RequireRegular)],
+    context: Annotated[OnlineContext, Depends(GetOnlineContext)],
+) -> OnlineContext:
+    """Return the context of a regular user; the guard runs before the context.
+
+    Serves CAVW, CAUP, CCLI, CCDL, CCUP, CT00-CT02 and CB00.
+    """
+    return replace(context, user=user)
+
+
+async def GetRegularReportContext(
+    user: Annotated[CurrentUser, Depends(RequireRegular)],
+    request: Request,
+    session: Annotated[AsyncSession, Depends(GetReportSession)],
+    settings: Annotated[Settings, Depends(GetAppSettings)],
+) -> AsyncIterator[OnlineContext]:
+    """Yield the CR00 context of a regular user, whose session holds no request admission.
+
+    The guard is declared first, so a missing cookie gives 401 and an admin 403 before the
+    session is made. The CR00 service admits itself only for its reads and its build, so the
+    request holds no admission while it waits for a report slot or while its client reads the
+    built report. The batch-window lock is released at the end, as GetOnlineContext releases
+    it, although CR00 never enters the window. There is no ``except``, so the endpoint's
+    exceptions reach the handlers.
+    """
+    context = OnlineContext(request=request, session=session, settings=settings, user=user)
+    try:
+        yield context
+    finally:
+        # Shielded: under an anyio cancellation every await would be cancelled again, yet the
+        # shared window lock must be released even when the request task is cancelled.
+        with CancelScope(shield=True):
+            await LeaveOnlineWindow(request)

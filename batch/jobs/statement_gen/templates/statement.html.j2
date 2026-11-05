@@ -1,0 +1,84 @@
+{# Replaces: CBSTM03A (job CREASTMT) HTML-LINES, cbl/CBSTM03A.CBL lines 148-223, written in the
+order of paragraphs 5100-WRITE-HTML-HEADER, 5200-WRITE-HTML-NMADBS, 6000-WRITE-TRANS (once per
+transaction) and the end of 4000-TRNXFILE-GET. Each line below is one STATEMNT.HTML record and is
+byte-exact: it has no indentation, and the double spaces after "<table" and before "</p>" come
+from the source. Field values are escaped only by the environment's finalize hook, so add no
+filters. Under the environment's trim_blocks setting, this comment and the loop tags emit no
+output. #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HTML Table Layout</title>
+</head>
+<body style="margin:0px;">
+<table  align="center" frame="box" style="width:70%; font:12px Segoe UI,sans-serif;">
+<tr>
+<td colspan="3" style="padding:0px 5px;background-color:#1d1d96b3;">
+<h3>Statement for Account Number: {{ accountNumberText }}</h3>
+</td>
+</tr>
+<tr>
+<td colspan="3" style="padding:0px 5px;background-color:#FFAF33;">
+<p style="font-size:16px">Bank of XYZ</p>
+<p>410 Terry Ave N</p>
+<p>Seattle WA 99999</p>
+</td>
+</tr>
+<tr>
+<td colspan="3" style="padding:0px 5px;background-color:#f2f2f2;">
+<p style="font-size:16px">{{ nameText }}  </p>
+<p>{{ addressLine1Text }}  </p>
+<p>{{ addressLine2Text }}  </p>
+<p>{{ addressLine3Text }}  </p>
+</td>
+</tr>
+<tr>
+<td colspan="3" style="padding:0px 5px;background-color:#33FFD1; text-align:center;">
+<p style="font-size:16px">Basic Details</p>
+</td>
+</tr>
+<tr>
+<td colspan="3" style="padding:0px 5px;background-color:#f2f2f2;">
+<p>Account ID         : {{ accountIdText }}</p>
+<p>Current Balance    : {{ currentBalanceText }}</p>
+<p>FICO Score         : {{ ficoScoreText }}</p>
+</td>
+</tr>
+<tr>
+<td colspan="3" style="padding:0px 5px;background-color:#33FFD1; text-align:center;">
+<p style="font-size:16px">Transaction Summary</p>
+</td>
+</tr>
+<tr>
+<td style="width:25%; padding:0px 5px; background-color:#33FF5E; text-align:left;">
+<p style="font-size:16px">Tran ID</p>
+</td>
+<td style="width:55%; padding:0px 5px; background-color:#33FF5E; text-align:left;">
+<p style="font-size:16px">Tran Details</p>
+</td>
+<td style="width:20%; padding:0px 5px; background-color:#33FF5E; text-align:right;">
+<p style="font-size:16px">Amount</p>
+</td>
+</tr>
+{% for transaction in transactions %}
+<tr>
+<td style="width:25%; padding:0px 5px; background-color:#f2f2f2; text-align:left;">
+<p>{{ transaction.tranIdText }}</p>
+</td>
+<td style="width:55%; padding:0px 5px; background-color:#f2f2f2; text-align:left;">
+<p>{{ transaction.tranDetailsText }}</p>
+</td>
+<td style="width:20%; padding:0px 5px; background-color:#f2f2f2; text-align:right;">
+<p>{{ transaction.tranAmountText }}</p>
+</td>
+</tr>
+{% endfor %}
+<tr>
+<td colspan="3" style="padding:0px 5px;background-color:#1d1d96b3;">
+<h3>End of Statement</h3>
+</td>
+</tr>
+</table>
+</body>
+</html>

@@ -1,0 +1,17 @@
+# Runtime dependencies of carddemo-backend (FastAPI + PostgreSQL 17 replacement of CardDemo CICS).
+# Versions are fixed by the Agent Action Plan, Section 0.4.1.
+# Read by backend/pyproject.toml as dynamic dependencies.
+# Install with: pip install -r backend/requirements.txt
+fastapi==0.136.1  # REST framework and OpenAPI generation
+uvicorn[standard]==0.34.0  # ASGI server
+pydantic==2.10.4  # request and response validation
+pydantic-settings==2.7.1  # environment settings (core/config.py)
+sqlalchemy[asyncio]==2.0.36  # ORM; [asyncio] pulls greenlet, required by the async engine on 3.13
+alembic==1.14.0  # migrations 0001-0009
+asyncpg==0.30.0  # async driver (DATABASE_URL, postgresql+asyncpg://)
+psycopg2-binary==2.9.10  # sync driver (SYNC_DATABASE_URL, postgresql+psycopg2://)
+passlib==1.7.4  # password hashing (bcrypt scheme)
+bcrypt==4.0.1  # the line passlib 1.7.4 supports; bcrypt >= 4.1 breaks its version probe
+PyJWT==2.13.0  # HS256 session cookie token
+cryptography==50.0.2  # Fernet card_ref and screen_token with HKDF-SHA256
+reportlab==4.5.1  # CR00 transaction-report PDF export

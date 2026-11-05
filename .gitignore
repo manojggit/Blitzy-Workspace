@@ -1,0 +1,27 @@
+# Environment files holding secrets and local settings (templates *.example stay tracked)
+backend/.env
+frontend/.env.local
+frontend/.env.e2e
+
+# Python virtual environment and bytecode
+.venv/
+**/__pycache__/
+
+# Node.js dependencies and Next.js build output
+node_modules/
+.next/
+
+# Batch output (CARDDEMO_OUTPUT_DIR default var/batch-output)
+var/
+
+# Playwright artefacts
+frontend/test-results/
+frontend/playwright-report/
+
+.coverage
+
+# Tool-generated artefacts
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+*.pyc
