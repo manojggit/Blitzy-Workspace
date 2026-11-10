@@ -1,0 +1,98 @@
+# carddemo-batch: the Python batch jobs and the `carddemo-batch` Typer CLI that replace the
+# in-scope CardDemo JCL jobs and the CA-7 and Control-M job chains.
+
+[build-system]
+# Same setuptools floor as backend/pyproject.toml. It builds PEP 660 editable installs with the
+# package-dir mapping below and ships bdist_wheel itself, so no separate wheel package is needed.
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carddemo-batch"
+version = "1.0.0"
+description = "CardDemo batch jobs and CLI replacing the CardDemo JCL, CA-7 and Control-M chains"
+requires-python = ">=3.13"
+# carddemo-backend supplies the shared `app` package. It is not on PyPI and resolves from the
+# editable backend/ install in the same pip command. The pins must equal batch/requirements.txt.
+dependencies = [
+    "carddemo-backend",
+    "typer==0.27.0",
+    "jinja2==3.1.6",
+]
+
+[project.scripts]
+carddemo-batch = "batch.cli:APP"
+
+[tool.setuptools]
+# This directory is the `batch` package itself, so packages are listed rather than discovered.
+# The test packages are included so `python -m batch.tests.reconciliation.build_expected` also
+# runs from a non-editable install.
+package-dir = {"batch" = "."}
+packages = [
+    "batch",
+    "batch.orchestration",
+    "batch.loaders",
+    "batch.jobs",
+    "batch.jobs.statement_gen",
+    "batch.tests",
+    "batch.tests.reconciliation",
+]
+
+[tool.setuptools.package-data]
+"batch.jobs.statement_gen" = ["templates/*.j2"]
+
+# The ruff tables below must stay identical to backend/pyproject.toml, because ruff reads the
+# nearest pyproject.toml and `ruff check backend batch` must lint both trees alike.
+[tool.ruff]
+# MK_Modernization Rule, clause 2: 4-space indentation and lines within 80-120 characters.
+line-length = 100
+indent-width = 4
+target-version = "py313"
+
+[tool.ruff.lint]
+# extend-select keeps ruff's default rule set and adds the Rule's checks. Ruff 0.17's defaults
+# omit most of E4, E7 and E9, so the classic baseline is listed explicitly.
+# The N (pep8-naming) function and variable rules are never selected: they demand snake_case,
+# the opposite of the Rule's PascalCase methods and camelCase variables. Naming is enforced
+# instead by backend/tests/test_code_standards.py.
+extend-select = [
+    # pycodestyle imports, statements and runtime errors, and pyflakes.
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    # Clause 2, formatting: line length, no tabs, no single-line compound statements.
+    "E501",
+    "W191",
+    "E701",
+    "E702",
+    "E703",
+    # Clause 3, fewer parameters: at most four (max-args below).
+    "PLR0913",
+    # Clause 3, no hardcoding: hard-coded passwords and secrets.
+    "S105",
+    "S106",
+    "S107",
+    # Clause 4, input checking: SQL built from strings.
+    "S608",
+    # Clause 4, specific exceptions: no blind, bare or silenced except.
+    "BLE001",
+    "E722",
+    "S110",
+]
+
+[tool.ruff.lint.pylint]
+max-args = 4
+
+[tool.ruff.format]
+indent-style = "space"
+quote-style = "double"
+line-ending = "lf"
+
+[tool.pytest.ini_options]
+# Batch tests are synchronous, so asyncio_mode stays at pytest-asyncio's strict default.
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "slow: interruption and synthetic-volume tests (20,000-record daily file, SIGKILL cases)",
+]

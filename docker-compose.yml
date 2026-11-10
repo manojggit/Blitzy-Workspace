@@ -1,0 +1,132 @@
+# CardDemo local stack, as specified in the Technical Specification, Section 0.11.1.
+#
+# The default profile runs PostgreSQL 17 only; the backend, the frontend and the carddemo-batch
+# CLI run natively on the host against it:
+#
+#     docker compose up -d db
+#
+# The `full` profile also containerises the backend and the frontend. It reads backend/.env,
+# copied from backend/.env.example with the signing key filled in, which keeps every secret out
+# of this file. The migrator applies `alembic upgrade head` before the backend starts, and the
+# batch chain runs in the backend image:
+#
+#     docker compose --profile full up -d --build
+#     docker compose --profile full run --rm backend carddemo-batch run-all
+#
+# POSTGRES_USER, POSTGRES_PASSWORD and POSTGRES_DB come from the shell environment and default to
+# carddemo, for the local database only. Every published port binds 127.0.0.1, the single host
+# all local URLs use, so the session cookie and the CORS origin name the same site.
+
+# Shared by migrator and backend, overriding backend/.env: the database host is the db service
+# and the seed images are the read-only ./data mount. The URLs carry the role, password and
+# database from the same POSTGRES_* expressions as db. Compose interpolates them verbatim into
+# URL syntax and cannot percent-encode them, so with the full profile each value must be URL-safe:
+# letters, digits, -, ., _ and ~ only. A backslash ending a line inside double quotes joins the
+# next line with no space, so each URL resolves to one string.
+x-backend-environment: &backend-environment
+    DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-carddemo}\
+        :${POSTGRES_PASSWORD:-carddemo}@db:5432/${POSTGRES_DB:-carddemo}"
+    SYNC_DATABASE_URL: "postgresql+psycopg2://${POSTGRES_USER:-carddemo}\
+        :${POSTGRES_PASSWORD:-carddemo}@db:5432/${POSTGRES_DB:-carddemo}"
+    CARDDEMO_EBCDIC_DIR: /app/data/EBCDIC
+    CARDDEMO_ASCII_DIR: /app/data/ASCII
+
+# One image serves both: migrator builds it from the repository root and backend reuses it.
+x-backend-common: &backend-common
+    profiles: ["full"]
+    image: carddemo-backend:local
+    env_file: backend/.env
+    environment: *backend-environment
+    volumes:
+        - ./data:/app/data:ro
+    depends_on:
+        db:
+            condition: service_healthy
+
+services:
+    db:
+        image: postgres:17
+        environment:
+            POSTGRES_USER: ${POSTGRES_USER:-carddemo}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-carddemo}
+            POSTGRES_DB: ${POSTGRES_DB:-carddemo}
+        ports:
+            - "127.0.0.1:5432:5432"
+        volumes:
+            - pgdata:/var/lib/postgresql/data
+            # Creates carddemo_test, owned by the POSTGRES_USER role, on a fresh pgdata volume only.
+            - ./docker/postgres/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+        healthcheck:
+            # Over TCP, not the default Unix socket: first initialisation runs init-test-db.sql
+            # on a socket-only temporary server, which a socket check would already report ready.
+            test:
+                - CMD-SHELL
+                - 'pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    # Applies `alembic upgrade head` on each `up`; backend's condition makes a backend that is
+    # starting wait for it to exit 0. Migrations must run with the backend stopped, so before a
+    # later upgrade stop it first with `docker compose --profile full stop backend`, then run
+    # `docker compose --profile full up -d --build`.
+    migrator:
+        <<: *backend-common
+        build:
+            context: .
+            dockerfile: backend/Dockerfile
+        command: ["alembic", "upgrade", "head"]
+        restart: "no"
+
+    backend:
+        <<: *backend-common
+        # The image exists only locally, built by migrator, so Compose never tries to pull it.
+        pull_policy: never
+        environment:
+            <<: *backend-environment
+            BACKEND_CORS_ORIGINS: http://127.0.0.1:3000
+            CARDDEMO_OUTPUT_DIR: /srv/var/batch-output
+        volumes:
+            - ./data:/app/data:ro
+            - ./var/batch-output:/srv/var/batch-output
+        depends_on:
+            db:
+                condition: service_healthy
+            migrator:
+                condition: service_completed_successfully
+        ports:
+            - "127.0.0.1:8000:8000"
+        healthcheck:
+            # The image has no curl. urlopen raises on the probe's 503, so a backend that cannot
+            # reach the database stays unhealthy.
+            test:
+                - CMD
+                - python
+                - -c
+                - >-
+                    import urllib.request;
+                    urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5)
+            interval: 10s
+            timeout: 10s
+            retries: 6
+            start_period: 10s
+
+    frontend:
+        profiles: ["full"]
+        image: carddemo-frontend:local
+        build:
+            context: ./frontend
+            dockerfile: Dockerfile
+            args:
+                # Next.js inlines it into the browser bundle at build time, so it is a build
+                # argument, not a runtime variable. The browser runs on the host, so it names the
+                # published backend port rather than the Compose service host.
+                NEXT_PUBLIC_API_URL: http://127.0.0.1:8000
+        ports:
+            - "127.0.0.1:3000:3000"
+        depends_on:
+            backend:
+                condition: service_healthy
+
+volumes:
+    pgdata: {}

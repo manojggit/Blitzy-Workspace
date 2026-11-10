@@ -1,0 +1,1 @@
+tran_id,tran_type_cd,tran_cat_cd,tran_source,tran_desc,tran_amt,merchant_id,merchant_name,merchant_city,merchant_zip,card_num,orig_ts,proc_ts,orig_ts_format,proc_ts_format

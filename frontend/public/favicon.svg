@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img"
+    aria-labelledby="favicon-title">
+    <title id="favicon-title">CardDemo</title>
+    <!-- Colours repeat the M3 primary and onPrimary tokens of src/app/theme.ts: an SVG asset
+        cannot import the theme, so these two literals are the only ones kept outside it. -->
+    <rect x="4" y="12" width="56" height="40" rx="6" fill="#6750A4"/>
+    <rect x="4" y="19" width="56" height="6" fill="#FFFFFF" fill-opacity="0.35"/>
+    <g fill="none" stroke="#FFFFFF" stroke-width="5">
+        <path d="M28.1 33.9 A6.5 6.5 0 1 0 28.1 43.1"/>
+        <path d="M36 32 H40.5 A6.5 6.5 0 0 1 40.5 45 H36 Z"/>
+    </g>
+</svg>

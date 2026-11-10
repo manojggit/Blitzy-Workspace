@@ -1,0 +1,5 @@
+# Runtime pins for carddemo-batch, the Typer CLI replacing the JCL/CA-7/Control-M batch chain.
+# carddemo-backend is declared in batch/pyproject.toml, not here, because it is installed
+# from the local backend/ tree.
+typer==0.27.0
+jinja2==3.1.6
